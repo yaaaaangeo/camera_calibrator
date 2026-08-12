@@ -1,0 +1,6 @@
+# cv2.aruco(ChArUco)는 contrib 모듈에 있음. opencv-python과 동시 설치 금지
+# (둘 다 cv2 네임스페이스를 쓰므로 충돌한다).
+opencv-contrib-python>=4.9
+numpy>=1.24
+PyYAML>=6.0
+PySide6>=6.6
