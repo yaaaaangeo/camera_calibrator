@@ -115,16 +115,6 @@ export_html_report("my_camera", camera_config, pattern, dataset,
 ## 6. 개발 진행 상황
 
 설계 문서 기준 V1(필수 기능)은 완료됐고, V2(완성도) 항목도 대부분 구현됐습니다.
-
-| V2 항목 | 상태 |
-|---|---|
-| Dataset Diversity Score | ✅ |
-| Undistortion Preview | ✅ |
-| Automatic Model Recommendation | ✅ |
-| Parameter Uncertainty (Pinhole/Extended) | ✅ (Fisheye는 OpenCV 미지원) |
-| **Frame Quality Score** | ✅ `calibration/frame_quality.py` |
-| **Edge Error Map (Radial Error Profile)** | ✅ `calibration/radial_profile.py` |
-| **Line Straightness Residual** | ✅ `calibration/straightness.py` |
-| **HTML Report** | ✅ `export/report.py` |
+Parameter Uncertainty (Pinhole/Extended): Fisheye는 OpenCV 미지원
 
 남은 것: V3(LiDAR-Camera Extrinsic, Multi-sensor Calibration Platform으로 확장).
