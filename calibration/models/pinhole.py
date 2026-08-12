@@ -34,6 +34,7 @@ from calibration.models.common import (
     compute_regional_error,
     fmt_optional,
 )
+from calibration.radial_profile import compute_radial_error_profile
 
 # Pinhole 전용 플래그: 방사/접선 왜곡을 전부 0으로 고정
 _PINHOLE_FLAGS = (
@@ -107,6 +108,9 @@ def calibrate_pinhole(
         frame.reprojection_error = per_frame_error[frame.image_info.image_id]
 
     regional_error = compute_regional_error(frames, per_frame_error, image_size)
+    radial_profile = compute_radial_error_profile(
+        frames, list(rvecs), list(tvecs), camera_matrix, dist_coeffs, image_size, CameraModelType.PINHOLE
+    )
 
     # stdDeviationsIntrinsics 순서: fx, fy, cx, cy, k1, k2, p1, p2, k3, ...
     param_uncertainty = ParameterUncertainty(
@@ -125,6 +129,7 @@ def calibrate_pinhole(
         rms_error=float(rms),
         per_frame_error=per_frame_error,
         regional_error=regional_error,
+        radial_profile=radial_profile,
         param_uncertainty=param_uncertainty,
         success=True,
     )

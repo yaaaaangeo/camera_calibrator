@@ -23,6 +23,8 @@ from calibration.types import (
 )
 from calibration.detector import detect_dataset
 from calibration.quality import analyze_dataset_quality
+from calibration.frame_quality import compute_frame_quality_scores
+from calibration.models.common import infer_image_size
 from calibration.compare import run_all_models
 from calibration.validation import validate_all_models
 from calibration.recommender import compute_model_scores, build_recommendation_message
@@ -66,14 +68,26 @@ class PipelineWorker(QObject):
             warnings = analyze_dataset_quality(dataset, self.camera_config)
             self.quality_ready.emit(warnings)
 
+            self.progress.emit("프레임별 품질 점수 계산 중...")
+            image_size = infer_image_size(dataset, self.camera_config)
+            compute_frame_quality_scores(
+                dataset, self.pattern_config, image_size, use_reprojection=False
+            )
+            self.dataset_ready.emit(dataset)  # 1차 점수(재투영 오차 제외) 반영해서 테이블 갱신
+
             self.progress.emit("Pinhole / Extended Pinhole / Fisheye 3개 모델 계산 중...")
             results_list = run_all_models(dataset, self.camera_config)
             calibration_results = {r.model_name: r for r in results_list}
+
+            self.progress.emit("재투영 오차를 반영해 프레임 품질 점수 갱신 중...")
+            compute_frame_quality_scores(
+                dataset, self.pattern_config, image_size, use_reprojection=True
+            )
             self.models_ready.emit(calibration_results)
 
             self.progress.emit("Hold-out Validation (Train/Test 분할 검증) 중...")
             validation_results = validate_all_models(
-                dataset, self.camera_config, test_ratio=self.test_ratio
+                dataset, self.camera_config, self.pattern_config, test_ratio=self.test_ratio
             )
             self.validation_ready.emit(validation_results)
 
@@ -112,6 +126,7 @@ class OutlierPruneWorker(QObject):
         self,
         dataset: Dataset,
         camera_config: CameraConfig,
+        pattern_config: PatternConfig,
         reference_model: CameraModelType,
         max_iterations: int = 3,
         test_ratio: float = 0.25,
@@ -119,6 +134,7 @@ class OutlierPruneWorker(QObject):
         super().__init__()
         self.dataset = dataset
         self.camera_config = camera_config
+        self.pattern_config = pattern_config
         self.reference_model = reference_model
         self.max_iterations = max_iterations
         self.test_ratio = test_ratio
@@ -137,14 +153,24 @@ class OutlierPruneWorker(QObject):
             warnings = analyze_dataset_quality(self.dataset, self.camera_config)
             self.quality_ready.emit(warnings)
 
+            image_size = infer_image_size(self.dataset, self.camera_config)
+            compute_frame_quality_scores(
+                self.dataset, self.pattern_config, image_size, use_reprojection=False
+            )
+            self.dataset_updated.emit(self.dataset)
+
             self.progress.emit("정제된 데이터셋으로 3개 모델 재계산 중...")
             results_list = run_all_models(self.dataset, self.camera_config)
             calibration_results = {r.model_name: r for r in results_list}
+
+            compute_frame_quality_scores(
+                self.dataset, self.pattern_config, image_size, use_reprojection=True
+            )
             self.models_ready.emit(calibration_results)
 
             self.progress.emit("Hold-out Validation 재실행 중...")
             validation_results = validate_all_models(
-                self.dataset, self.camera_config, test_ratio=self.test_ratio
+                self.dataset, self.camera_config, self.pattern_config, test_ratio=self.test_ratio
             )
             self.validation_ready.emit(validation_results)
 

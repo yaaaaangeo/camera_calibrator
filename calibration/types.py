@@ -260,8 +260,32 @@ class RegionalError:
 
 
 @dataclass
+class RadialBin:
+    """설계 문서 4번 - Radial Error Profile의 구간 하나.
+    이미지 중심으로부터의 반지름 구간별 평균 재투영 오차.
+    """
+    radius_min: float
+    radius_max: float
+    mean_error: Optional[float] = None
+    num_points: int = 0   # 이 구간에 걸린 코너 포인트 개수 (프레임 수가 아님)
+
+    @property
+    def radius_center(self) -> float:
+        return (self.radius_min + self.radius_max) / 2.0
+
+
+@dataclass
+class RadialErrorProfile:
+    """설계 문서 4번 - "렌즈 외곽에서 모델이 잘 동작하는지" 확인용 그래프 데이터.
+    코너 포인트 단위(프레임 단위 아님)로 집계해야 화각 전역의 경향을 정확히 반영한다.
+    """
+    bins: list[RadialBin] = field(default_factory=list)
+    max_radius: float = 0.0   # 정규화(반지름 -> 0~1)에 사용할 수 있는 기준값 (이미지 대각선의 절반)
+
+
+@dataclass
 class CalibrationResult:
-    """설계 문서 17번 Step4 CalibrationResult 그대로 + 영역별 오차 확장"""
+    """설계 문서 17번 Step4 CalibrationResult 그대로 + 영역별/반경별 오차 확장"""
     model_name: CameraModelType
     camera_matrix: Optional[np.ndarray] = None       # 3x3
     distortion: Optional[np.ndarray] = None           # 모델별로 길이 다름 (k1~k6, p1, p2 등)
@@ -270,6 +294,7 @@ class CalibrationResult:
     rms_error: Optional[float] = None
     per_frame_error: dict[str, float] = field(default_factory=dict)  # frame_id -> px error
     regional_error: Optional[RegionalError] = None
+    radial_profile: Optional[RadialErrorProfile] = None  # 설계 문서 4번 V2 - Radial Error Profile
     param_uncertainty: Optional[ParameterUncertainty] = None
     success: bool = False
     error_message: Optional[str] = None

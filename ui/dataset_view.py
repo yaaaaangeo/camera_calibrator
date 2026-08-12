@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from calibration.types import Dataset, FrameStatus
+from calibration.types import Dataset, FrameStatus, QualityGrade
 
 _STATUS_LABEL = {
     FrameStatus.PENDING: "대기",
@@ -37,6 +37,25 @@ _STATUS_COLOR = {
     FrameStatus.DISABLED_MANUAL: "#6d4c41",
 }
 
+# 설계 문서 6번 - Frame Quality Score 등급 표시
+_GRADE_LABEL = {
+    QualityGrade.EXCELLENT: "✓ Excellent",
+    QualityGrade.VERY_GOOD: "✓ Very Good",
+    QualityGrade.GOOD: "✓ Good",
+    QualityGrade.WARNING: "⚠ Warning",
+    QualityGrade.POOR: "⚠ Poor",
+    QualityGrade.REJECT: "✕ Reject",
+}
+
+_GRADE_COLOR = {
+    QualityGrade.EXCELLENT: "#2e7d32",
+    QualityGrade.VERY_GOOD: "#558b2f",
+    QualityGrade.GOOD: "#9e9d24",
+    QualityGrade.WARNING: "#ef6c00",
+    QualityGrade.POOR: "#d84315",
+    QualityGrade.REJECT: "#c62828",
+}
+
 
 class DatasetView(QWidget):
     """이미지 목록 테이블 + 요약 라벨."""
@@ -51,9 +70,9 @@ class DatasetView(QWidget):
         group = QGroupBox("Dataset")
         group_layout = QVBoxLayout(group)
 
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["파일", "상태", "코너 수", "선명도", "재투영 오차(px)"]
+            ["파일", "상태", "코너 수", "선명도", "재투영 오차(px)", "품질 점수", "등급"]
         )
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
@@ -75,11 +94,20 @@ class DatasetView(QWidget):
             sharpness = f"{frame.image_info.sharpness:.0f}" if frame.image_info.sharpness else "-"
             error = f"{frame.reprojection_error:.3f}" if frame.reprojection_error is not None else "-"
 
+            score_text = f"{frame.quality.overall_score:.0f}" if frame.quality else "-"
+            grade_item = QTableWidgetItem(
+                _GRADE_LABEL.get(frame.quality.grade, "-") if frame.quality else "-"
+            )
+            if frame.quality:
+                grade_item.setForeground(_qcolor(_GRADE_COLOR.get(frame.quality.grade, "#000000")))
+
             self.table.setItem(row, 0, name_item)
             self.table.setItem(row, 1, status_item)
             self.table.setItem(row, 2, QTableWidgetItem(corners))
             self.table.setItem(row, 3, QTableWidgetItem(sharpness))
             self.table.setItem(row, 4, QTableWidgetItem(error))
+            self.table.setItem(row, 5, QTableWidgetItem(score_text))
+            self.table.setItem(row, 6, grade_item)
 
         total = dataset.num_total
         detected = dataset.num_detected

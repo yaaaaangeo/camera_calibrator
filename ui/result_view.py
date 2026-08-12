@@ -46,6 +46,7 @@ class ResultView(QWidget):
     outlier_prune_requested = Signal(object)  # CameraModelType
     export_opencv_requested = Signal(object)  # CameraModelType
     export_ros_requested = Signal(object)     # CameraModelType
+    export_report_requested = Signal(object)  # CameraModelType
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -64,10 +65,10 @@ class ResultView(QWidget):
         # --- 비교/검증/추천 테이블 ---
         compare_group = QGroupBox("Model Comparison & Validation & Score")
         compare_layout = QVBoxLayout(compare_group)
-        self.table = QTableWidget(6, 3)
+        self.table = QTableWidget(7, 3)
         self.table.setHorizontalHeaderLabels([_MODEL_LABELS[m] for m in _MODEL_ORDER])
         self.table.setVerticalHeaderLabels(
-            ["Train RMS", "Test RMS", "Edge RMS", "Complexity", "Score", "Recommend"]
+            ["Train RMS", "Test RMS", "Edge RMS", "Straightness", "Complexity", "Score", "Recommend"]
         )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -103,8 +104,13 @@ class ResultView(QWidget):
         self.export_ros_button.clicked.connect(
             lambda: self.export_ros_requested.emit(self.model_combo.currentData())
         )
+        self.export_report_button = QPushButton("Export HTML Report")
+        self.export_report_button.clicked.connect(
+            lambda: self.export_report_requested.emit(self.model_combo.currentData())
+        )
         export_layout.addWidget(self.export_opencv_button)
         export_layout.addWidget(self.export_ros_button)
+        export_layout.addWidget(self.export_report_button)
         layout.addWidget(export_group)
 
     # ------------------------------------------------------------------
@@ -131,11 +137,14 @@ class ResultView(QWidget):
                 edge_rms = _fmt(regional_edge_average(cal.regional_error))
             else:
                 edge_rms = "N/A"
+            straightness = _fmt(val.straightness_residual) if val else "N/A"
             complexity = {"pinhole": "★", "extended_pinhole": "★★", "fisheye": "★★★"}[m.value]
             score_str = f"{score.score:.3f}" if score else "N/A"
             recommend = "⭐" if (score and score.is_recommended) else ""
 
-            for row, value in enumerate([train_rms, test_rms, edge_rms, complexity, score_str, recommend]):
+            for row, value in enumerate(
+                [train_rms, test_rms, edge_rms, straightness, complexity, score_str, recommend]
+            ):
                 self.table.setItem(row, col, QTableWidgetItem(value))
 
     def set_recommendation_message(self, message: str) -> None:

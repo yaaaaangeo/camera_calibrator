@@ -31,6 +31,7 @@ from calibration.models.common import (
     infer_image_size,
     compute_regional_error,
 )
+from calibration.radial_profile import compute_radial_error_profile
 
 
 def calibrate_extended_pinhole(
@@ -101,6 +102,10 @@ def calibrate_extended_pinhole(
         frame.reprojection_error = per_frame_error[frame.image_info.image_id]
 
     regional_error = compute_regional_error(frames, per_frame_error, image_size)
+    radial_profile = compute_radial_error_profile(
+        frames, list(rvecs), list(tvecs), camera_matrix, dist_coeffs, image_size,
+        CameraModelType.EXTENDED_PINHOLE,
+    )
 
     param_uncertainty = ParameterUncertainty(
         fx_std=float(std_intrinsics[0][0]),
@@ -118,6 +123,7 @@ def calibrate_extended_pinhole(
         rms_error=float(rms),
         per_frame_error=per_frame_error,
         regional_error=regional_error,
+        radial_profile=radial_profile,
         param_uncertainty=param_uncertainty,
         success=True,
     )

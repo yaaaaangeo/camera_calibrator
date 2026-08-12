@@ -22,8 +22,11 @@ from __future__ import annotations
 from calibration.types import (
     CalibrationResult,
     CameraModelType,
+    FinalResult,
     ModelScore,
     ModelScoreWeights,
+    OutlierResult,
+    QualityGrade,
     ValidationResult,
 )
 from calibration.models.common import regional_edge_average
@@ -258,3 +261,81 @@ def format_score_table(
         row("Recommend", rec_vals),
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 최종 결과 조립 (설계 문서 12번, 18번 - FinalResult)
+# ---------------------------------------------------------------------------
+
+# 설계 문서 3.1번 RMS 등급표를 "종합 등급" 산정에도 재사용한다. 문서가 반복
+# 경고하듯 이건 절대적 pass/fail 기준이 아니라 안내용 가이드라인이다 - 최종
+# 판단은 여전히 사용자의 몫이며, 이 등급은 리포트에 "참고 지표"로만 나간다.
+def _grade_for_value(v: float | None) -> QualityGrade | None:
+    if v is None:
+        return None
+    if v < 0.3:
+        return QualityGrade.EXCELLENT
+    if v < 0.5:
+        return QualityGrade.VERY_GOOD
+    if v < 1.0:
+        return QualityGrade.GOOD
+    if v < 2.0:
+        return QualityGrade.WARNING
+    return QualityGrade.POOR
+
+
+_GRADE_BADNESS_ORDER = [
+    QualityGrade.EXCELLENT,
+    QualityGrade.VERY_GOOD,
+    QualityGrade.GOOD,
+    QualityGrade.WARNING,
+    QualityGrade.POOR,
+    QualityGrade.REJECT,
+]
+
+
+def _worst_grade(grades: list[QualityGrade]) -> QualityGrade:
+    """여러 지표의 등급 중 "가장 나쁜" 등급을 최종 등급으로 채택한다.
+    한 지표라도 나쁘면 종합 등급도 낮아져야 리포트가 낙관 편향되지 않는다
+    (예: Train RMS는 훌륭한데 Edge RMS가 나쁘면 종합은 Edge 기준을 따라야 함).
+    """
+    if not grades:
+        return QualityGrade.WARNING  # 판단 근거 자체가 없으면 "주의" 취급 (낙관 금지)
+    return max(grades, key=_GRADE_BADNESS_ORDER.index)
+
+
+def compute_final_result(
+    chosen_model: CameraModelType,
+    calibration_results: dict[CameraModelType, CalibrationResult],
+    validation_results: dict[CameraModelType, ValidationResult],
+    dataset_coverage_pct: float | None = None,
+    outlier_result: OutlierResult | None = None,
+    scores: list[ModelScore] | None = None,
+) -> FinalResult:
+    """사용자가 최종적으로 선택한 모델을 기준으로 FinalResult를 조립한다.
+
+    "추천"(is_recommended)이 아니라 "선택"(chosen_model)을 기준으로 한다는
+    점이 중요하다 - 설계 문서 8번 "추천과 선택의 분리" 원칙: 사용자가 추천과
+    다른 모델을 골랐어도 리포트는 항상 실제 선택된 모델 기준으로 나가야 한다.
+    """
+    cal = calibration_results.get(chosen_model)
+    val = validation_results.get(chosen_model)
+
+    if cal is None or not cal.success:
+        overall_grade = QualityGrade.REJECT
+    else:
+        candidate_values = [cal.rms_error]
+        if val and val.success:
+            candidate_values += [val.test_rms, val.edge_rms, val.straightness_residual]
+        grades = [g for g in (_grade_for_value(v) for v in candidate_values) if g is not None]
+        overall_grade = _worst_grade(grades)
+
+    return FinalResult(
+        chosen_model=chosen_model,
+        calibration=cal,
+        validation=val,
+        outlier=outlier_result,
+        dataset_coverage_pct=dataset_coverage_pct,
+        overall_grade=overall_grade,
+        model_scores=scores or [],
+    )

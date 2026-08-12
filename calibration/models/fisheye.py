@@ -38,6 +38,7 @@ from calibration.models.common import (
     infer_image_size,
     compute_regional_error,
 )
+from calibration.radial_profile import compute_radial_error_profile
 
 # fisheye는 파라미터가 적어도(k1~k4) Brown-Conrady보다 화각 전역에서 비선형성이
 # 강해, 뷰 개수가 부족하면 발산 위험이 pinhole/extended보다 크다.
@@ -161,6 +162,9 @@ def calibrate_fisheye(
         frame.reprojection_error = per_frame_error[frame.image_info.image_id]
 
     regional_error = compute_regional_error(frames, per_frame_error, image_size)
+    radial_profile = compute_radial_error_profile(
+        frames, list(rvecs), list(tvecs), K, D, image_size, CameraModelType.FISHEYE
+    )
 
     return CalibrationResult(
         model_name=CameraModelType.FISHEYE,
@@ -171,6 +175,7 @@ def calibrate_fisheye(
         rms_error=float(rms),
         per_frame_error=per_frame_error,
         regional_error=regional_error,
+        radial_profile=radial_profile,
         param_uncertainty=None,  # fisheye는 stdDeviations를 제공하지 않음 (V2에서 별도 구현 필요)
         success=True,
     )

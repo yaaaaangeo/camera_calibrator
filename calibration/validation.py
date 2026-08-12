@@ -32,6 +32,7 @@ from calibration.types import (
     CameraModelType,
     Dataset,
     Frame,
+    PatternConfig,
     ValidationResult,
 )
 from calibration.models.common import (
@@ -43,6 +44,7 @@ from calibration.models.common import (
 from calibration.models.pinhole import calibrate_pinhole
 from calibration.models.extended_pinhole import calibrate_extended_pinhole
 from calibration.models.fisheye import calibrate_fisheye
+from calibration.straightness import compute_straightness_residual
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +237,7 @@ def _train_model(
 def validate_holdout(
     dataset: Dataset,
     camera_config: CameraConfig,
+    pattern_config: PatternConfig,
     model: CameraModelType,
     train_ids: list[str],
     test_ids: list[str],
@@ -277,10 +280,17 @@ def validate_holdout(
     if not test_ids:
         # Test 프레임이 없으면(데이터셋이 너무 작음) train 결과만 반환하고
         # test_rms는 None으로 남겨 "검증 못 함"을 명확히 구분한다.
+        # Straightness는 train 프레임으로라도 계산 가능하면 채운다 (test_rms와는
+        # 독립적인 지표이므로 - intrinsic 재최적화 없이 순수 기하 검증이라 무방).
+        straightness, _ = compute_straightness_residual(
+            train_dataset.enabled_frames, pattern_config,
+            train_result.camera_matrix, train_result.distortion, model,
+        )
         return ValidationResult(
             train_frame_ids=train_ids,
             test_frame_ids=[],
             train_rms=train_result.rms_error,
+            straightness_residual=straightness,
             success=True,
             error_message="Test 프레임이 없어 Hold-out 검증을 수행하지 못했습니다.",
         )
@@ -309,13 +319,28 @@ def validate_holdout(
     )
     edge_rms = regional_edge_average(regional)
 
+    # 설계 문서 3.4번 - Line Straightness. Test 프레임(학습에 쓰이지 않은
+    # 이미지)에서 측정하는 게 원칙적으로 더 정직하지만, ChArUco 코너 개수가
+    # 적은 소규모 데이터셋에서는 test 프레임만으로 직선(4점 이상)이 하나도
+    # 안 나올 수 있다 - 그럴 땐 train 프레임으로 대체해서라도 값을 낸다
+    # ("측정 안 함"보다 "약간 낙관적인 값"이 recommender.py 입장에서 더 유용).
+    straightness, n_lines = compute_straightness_residual(
+        test_frames, pattern_config, train_result.camera_matrix, train_result.distortion, model
+    )
+    if straightness is None:
+        train_frames_for_fallback = _subset_dataset(dataset, train_ids).enabled_frames
+        straightness, n_lines = compute_straightness_residual(
+            train_frames_for_fallback, pattern_config,
+            train_result.camera_matrix, train_result.distortion, model,
+        )
+
     return ValidationResult(
         train_frame_ids=train_ids,
         test_frame_ids=test_ids,
         train_rms=train_result.rms_error,
         test_rms=test_rms,
         edge_rms=edge_rms,
-        straightness_residual=None,  # V2
+        straightness_residual=straightness,
         success=True,
         failed_test_frame_ids=failed_ids,
     )
@@ -324,6 +349,7 @@ def validate_holdout(
 def validate_all_models(
     dataset: Dataset,
     camera_config: CameraConfig,
+    pattern_config: PatternConfig,
     test_ratio: float = 0.25,
     seed: int = 42,
     use_rational_model: bool = False,
@@ -342,11 +368,12 @@ def validate_all_models(
 
     results: dict[CameraModelType, ValidationResult] = {}
     results[CameraModelType.PINHOLE] = validate_holdout(
-        dataset, camera_config, CameraModelType.PINHOLE, train_ids, test_ids
+        dataset, camera_config, pattern_config, CameraModelType.PINHOLE, train_ids, test_ids
     )
     results[CameraModelType.EXTENDED_PINHOLE] = validate_holdout(
         dataset,
         camera_config,
+        pattern_config,
         CameraModelType.EXTENDED_PINHOLE,
         train_ids,
         test_ids,
@@ -355,6 +382,7 @@ def validate_all_models(
     results[CameraModelType.FISHEYE] = validate_holdout(
         dataset,
         camera_config,
+        pattern_config,
         CameraModelType.FISHEYE,
         train_ids,
         test_ids,
@@ -390,6 +418,7 @@ def format_validation_table(results: dict[CameraModelType, ValidationResult]) ->
     lines.append(row("Train RMS", [fmt(results[m].train_rms) if results[m].success else "FAIL" for m in order]))
     lines.append(row("Test RMS", [fmt(results[m].test_rms) for m in order]))
     lines.append(row("Edge RMS(test)", [fmt(results[m].edge_rms) for m in order]))
+    lines.append(row("Straightness", [fmt(results[m].straightness_residual) for m in order]))
 
     gaps = []
     for m in order:

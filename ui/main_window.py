@@ -34,17 +34,22 @@ from calibration.types import (
     CameraModelType,
     Dataset,
     ModelScore,
+    OutlierResult,
     PatternConfig,
     PatternType,
     ValidationResult,
 )
+from calibration.recommender import compute_final_result
+from calibration.quality import coverage_percentage
 from export.opencv import export_opencv_yaml
 from export.ros import export_ros_camera_info
+from export.report import export_html_report
 
 from ui.dataset_view import DatasetView
 from ui.coverage_view import CoverageView
 from ui.result_view import ResultView
 from ui.preview import PreviewView
+from ui.radial_profile_view import RadialProfileView
 from ui.worker import PipelineWorker, OutlierPruneWorker, run_worker_in_thread
 
 # ChArUco에서 흔히 쓰이는 사전 목록 (cv2.aruco.DICT_* 속성명 그대로)
@@ -69,6 +74,7 @@ class MainWindow(QMainWindow):
         self.calibration_results: dict[CameraModelType, CalibrationResult] = {}
         self.validation_results: dict[CameraModelType, ValidationResult] = {}
         self.scores: list[ModelScore] = []
+        self.outlier_result: OutlierResult | None = None
         self._thread: QThread | None = None
         self._worker = None  # QThread가 살아있는 동안 GC 방지용 강한 참조
 
@@ -83,10 +89,12 @@ class MainWindow(QMainWindow):
         self.coverage_view = CoverageView()
         self.result_view = ResultView()
         self.preview_view = PreviewView()
+        self.radial_profile_view = RadialProfileView()
         self.tabs.addTab(self.dataset_view, "① Dataset")
         self.tabs.addTab(self.coverage_view, "② Coverage")
         self.tabs.addTab(self.result_view, "③ Model / Validation / Export")
         self.tabs.addTab(self.preview_view, "④ Undistort Preview")
+        self.tabs.addTab(self.radial_profile_view, "⑤ Edge Error Map")
         layout.addWidget(self.tabs, stretch=1)
 
         self.status_label = QLabel("이미지를 불러온 뒤 [캘리브레이션 실행]을 누르세요.")
@@ -95,6 +103,7 @@ class MainWindow(QMainWindow):
         self.result_view.outlier_prune_requested.connect(self._on_outlier_prune_requested)
         self.result_view.export_opencv_requested.connect(self._on_export_opencv)
         self.result_view.export_ros_requested.connect(self._on_export_ros)
+        self.result_view.export_report_requested.connect(self._on_export_report)
 
     # ------------------------------------------------------------------
     # 설정 패널 (설계 문서 14번 ① Camera Setup, ③ Calibration Pattern)
@@ -230,6 +239,7 @@ class MainWindow(QMainWindow):
         if self.dataset is not None and self.camera_config is not None:
             self.preview_view.set_context(self.dataset, self.camera_config, results)
             self.dataset_view.set_dataset(self.dataset)  # per_frame_error 채워졌으니 갱신
+        self.radial_profile_view.set_results(results)
         self._refresh_result_view()
 
     def _on_validation_ready(self, results: dict[CameraModelType, ValidationResult]) -> None:
@@ -243,6 +253,7 @@ class MainWindow(QMainWindow):
         if recommended is not None:
             self.result_view.select_model(recommended)
             self.preview_view.select_model(recommended)
+            self.radial_profile_view.select_model(recommended)
         self._refresh_result_view()
 
     def _on_error(self, message: str) -> None:
@@ -270,14 +281,16 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        worker = OutlierPruneWorker(self.dataset, self.camera_config, reference_model)
+        worker = OutlierPruneWorker(
+            self.dataset, self.camera_config, self.pattern_config, reference_model
+        )
         thread = run_worker_in_thread(worker, self)
 
         worker.progress.connect(self.status_label.setText)
         worker.dataset_updated.connect(lambda ds: self.dataset_view.set_dataset(ds))
         worker.quality_ready.connect(self._on_quality_ready)
         worker.outlier_ready.connect(
-            lambda ref_result, outlier_result: self.result_view.set_outlier_result(reference_model, outlier_result)
+            lambda ref_result, outlier_result: self._on_outlier_ready(reference_model, outlier_result)
         )
         worker.models_ready.connect(self._on_models_ready)
         worker.validation_ready.connect(self._on_validation_ready)
@@ -288,6 +301,10 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(False)
         thread.finished.connect(lambda: self.run_button.setEnabled(True))
         thread.start()
+
+    def _on_outlier_ready(self, reference_model: CameraModelType, outlier_result: OutlierResult) -> None:
+        self.outlier_result = outlier_result  # 리포트(export/report.py)에서 재사용
+        self.result_view.set_outlier_result(reference_model, outlier_result)
 
     # ------------------------------------------------------------------
     # Export
@@ -318,5 +335,42 @@ class MainWindow(QMainWindow):
         try:
             export_ros_camera_info(result, self.camera_config, path)
             self.status_label.setText(f"ROS CameraInfo YAML 저장 완료: {path}")
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Export 실패", str(e))
+
+    def _on_export_report(self, model: CameraModelType) -> None:
+        result = self.calibration_results.get(model)
+        if (
+            not result or not result.success or self.dataset is None
+            or self.camera_config is None or self.pattern_config is None
+        ):
+            QMessageBox.warning(self, "Export 불가", f"{model.value} 모델의 캘리브레이션 결과가 없습니다.")
+            return
+        path = self.result_view.prompt_save_path("calibration_report.html", "HTML (*.html)")
+        if not path:
+            return
+        try:
+            coverage_pct = (
+                coverage_percentage(self.dataset.coverage_grid) if self.dataset.coverage_grid else None
+            )
+            final_result = compute_final_result(
+                chosen_model=model,
+                calibration_results=self.calibration_results,
+                validation_results=self.validation_results,
+                dataset_coverage_pct=coverage_pct,
+                outlier_result=self.outlier_result,
+                scores=self.scores,
+            )
+            export_html_report(
+                project_name=(self.camera_config.sensor_name or "camera_calibrator"),
+                camera_config=self.camera_config,
+                pattern_config=self.pattern_config,
+                dataset=self.dataset,
+                calibration_results=self.calibration_results,
+                validation_results=self.validation_results,
+                final_result=final_result,
+                path=path,
+            )
+            self.status_label.setText(f"HTML 리포트 저장 완료: {path}")
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Export 실패", str(e))
