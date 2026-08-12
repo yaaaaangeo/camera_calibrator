@@ -4,3 +4,8 @@ opencv-contrib-python>=4.9
 numpy>=1.24
 PyYAML>=6.0
 PySide6>=6.6
+
+# 선택 사항: rosbag(.bag/.db3/.mcap)에서 이미지를 직접 불러오는 기능에만 필요.
+# 순수 Python 라이브러리라 ROS 정식 설치(rospy/rclpy) 없이도 동작한다.
+# 설치 안 해도 나머지 기능(폴더에서 이미지 불러오기 등)은 그대로 동작한다.
+rosbags>=0.9

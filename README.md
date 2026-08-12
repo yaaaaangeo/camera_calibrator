@@ -31,6 +31,7 @@ pip install -r requirements.txt
 | `numpy` | 행렬/배열 연산 |
 | `PyYAML` | ROS CameraInfo YAML export |
 | `PySide6` | 데스크톱 UI (Qt6) |
+| `rosbags` | (선택) rosbag(.bag/.db3/.mcap)에서 이미지 직접 불러오기. 순수 Python이라 ROS 설치 불필요 |
 
 > ⚠️ `opencv-python`과 `opencv-contrib-python`을 **동시에 설치하면 안 됩니다**
 > (둘 다 `cv2`라는 이름을 써서 충돌합니다). 이미 `opencv-python`이 깔려있다면
@@ -45,7 +46,12 @@ python -m app.main
 창이 뜨면:
 1. 상단에서 해상도(Width/Height)와 ChArUco 패턴 정보(사각형 개수, 한 칸 크기(m),
    마커 크기(m), dictionary)를 입력
-2. **[이미지 불러오기]** 로 촬영한 사진 여러 장 선택 (jpg/png/bmp)
+2. **[이미지 불러오기]** 로 촬영한 사진 여러 장 선택 (jpg/png/bmp), 또는
+   **[rosbag에서 불러오기]** 로 ROS1(.bag)/ROS2(.db3, .mcap) 로그에서 이미지 토픽을
+   골라 자동 추출 (rospy/rclpy 설치 불필요, 순수 Python `rosbags` 라이브러리 사용), 또는
+   **[실시간 카메라 구독]** 으로 ROS1/ROS2 이미지 토픽을 실시간 구독해서 라이브
+   프리뷰를 보며 원하는 자세에서 직접 캡처 (이 기능은 실제 ROS1 또는 ROS2가
+   컴퓨터에 설치되어 있어야 함 - rospy/rclpy는 pip로 설치되지 않음)
 3. **[캘리브레이션 실행]** 클릭 → 검출 → 3모델 계산 → Hold-out → 추천까지 자동 진행
 4. 탭을 넘기며 결과 확인:
    - **① Dataset**: 이미지별 검출 상태/코너 수/재투영 오차/**품질 점수(Frame Quality Score)·등급**
@@ -72,20 +78,51 @@ camera_calibrator/
 │   ├── frame_quality.py      # 프레임별 품질 점수 (Detection + Geometric)
 │   ├── radial_profile.py     # Edge Error Map (반지름별 재투영 오차)
 │   ├── straightness.py       # Line Straightness Residual (ChArUco 격자 재활용)
+│   ├── rosbag_reader.py      # ROS1(.bag)/ROS2(.db3, .mcap)에서 이미지 추출
+│   ├── ros_live.py           # 실시간 ROS1(rospy)/ROS2(rclpy) 토픽 구독 (자동 감지)
+│   ├── ros_image_codec.py    # sensor_msgs/Image·CompressedImage 디코딩 (위 둘이 공유)
 │   └── recommender.py        # Model Score 기반 추천 + 최종 결과(FinalResult) 조립
 ├── export/                   # OpenCV YAML / ROS CameraInfo YAML / HTML 리포트
 │   ├── opencv.py
 │   ├── ros.py
 │   └── report.py             # 종합 HTML 리포트 (브라우저 인쇄로 PDF 변환 가능)
 ├── ui/                       # PySide6 화면 (계산 로직 없음, calibration/*만 호출)
-│   └── radial_profile_view.py   # Edge Error Map 그래프 (QPainter 커스텀 위젯)
+│   ├── radial_profile_view.py   # Edge Error Map 그래프 (QPainter 커스텀 위젯)
+│   └── live_capture_dialog.py   # 실시간 구독 + 라이브 프리뷰 + 수동/자동 캡처 다이얼로그
 └── requirements.txt
 ```
 
 `calibration/`은 UI와 완전히 독립적이라, CLI 스크립트나 다른 프론트엔드에서도
 그대로 재사용할 수 있습니다.
 
-## 5. CLI로만 써보고 싶다면 (UI 없이)
+## 5. ROS 연동
+
+두 단계로 나뉩니다.
+
+### 7.1 rosbag에서 이미지 불러오기 (`[rosbag에서 불러오기]` 버튼, ROS 설치 불필요)
+
+순수 Python 라이브러리 `rosbags`로 ROS1(.bag)/ROS2(.db3, .mcap)를 직접 읽습니다.
+ROS가 설치 안 된 컴퓨터에서도 동작합니다.
+
+### 7.2 실시간 토픽 구독 (`[실시간 카메라 구독]` 버튼, **ROS1 또는 ROS2 설치 필요**)
+
+이건 다릅니다 - `rospy`/`rclpy`는 pip로 설치되지 않고, 실제 ROS1(noetic 등) 또는
+ROS2(humble 등)가 컴퓨터에 설치되고 환경이 source 되어 있어야만 동작합니다
+(예: `source /opt/ros/noetic/setup.bash`). ROS1/ROS2 어느 쪽이 설치돼 있는지는
+`calibration/ros_live.py`가 자동으로 감지합니다 (`rospy` 먼저 시도 -> 없으면
+`rclpy` 시도 -> 둘 다 없으면 버튼을 눌러도 안내 메시지만 뜨고 앱은 정상 동작).
+
+동작 방식: 토픽을 구독하면서 라이브 프리뷰를 보여주고, `[📸 캡처]` 버튼을 누른
+시점의 프레임을 저장합니다 (자동 전체 녹화가 아니라 원하는 자세에서 직접
+캡처하는 방식 - 설계 문서 7번, 장수보다 자세 다양성이 중요하기 때문). 편의를
+위해 "N초마다 자동 캡처" 옵션도 있습니다.
+
+> ⚠️ `calibration/ros_live.py`의 rospy/rclpy 경로는 실제 ROS 런타임(roscore 또는
+> ROS2 데몬)이 있어야만 끝까지 검증할 수 있어, 개발 과정에서 end-to-end로
+> 테스트하지 못했습니다. 표준 API 기준으로 작성했지만, 실제 ROS 환경에서
+> 한 번 확인해보시는 걸 권장합니다. 문제가 있으면 이슈로 알려주세요.
+
+## 6. CLI로만 써보고 싶다면 (UI 없이)
 
 ```python
 from calibration.types import PatternConfig, PatternType, CameraConfig
@@ -112,7 +149,19 @@ export_html_report("my_camera", camera_config, pattern, dataset,
                     calibration_results, validation_results, final_result, "report.html")
 ```
 
-## 6. 개발 진행 상황
+rosbag에서 이미지를 뽑고 싶다면:
+
+```python
+from calibration.rosbag_reader import list_image_topics, extract_images_from_bag
+
+for t in list_image_topics("drive.bag"):
+    print(t.name, t.msg_type, t.count)
+
+paths = extract_images_from_bag("drive.bag", "/camera/image_raw", "extracted/", min_interval_sec=0.5)
+dataset = detect_dataset(paths, pattern)  # 이후 흐름은 위 예시와 동일
+```
+
+## 7. 개발 진행 상황
 
 설계 문서 기준 V1(필수 기능)은 완료됐고, V2(완성도) 항목도 대부분 구현됐습니다.
 Parameter Uncertainty (Pinhole/Extended): Fisheye는 OpenCV 미지원

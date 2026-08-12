@@ -10,6 +10,8 @@ calibration/*.py에 있고, 여기서는 그 함수들을 worker.py를 통해 �
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import QThread
 from PySide6.QtWidgets import (
     QComboBox,
@@ -18,6 +20,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -41,6 +44,8 @@ from calibration.types import (
 )
 from calibration.recommender import compute_final_result
 from calibration.quality import coverage_percentage
+from calibration.rosbag_reader import list_image_topics, extract_images_from_bag
+from calibration.ros_live import ROS_LIVE_BACKEND
 from export.opencv import export_opencv_yaml
 from export.ros import export_ros_camera_info
 from export.report import export_html_report
@@ -50,6 +55,7 @@ from ui.coverage_view import CoverageView
 from ui.result_view import ResultView
 from ui.preview import PreviewView
 from ui.radial_profile_view import RadialProfileView
+from ui.live_capture_dialog import LiveCaptureDialog
 from ui.worker import PipelineWorker, OutlierPruneWorker, run_worker_in_thread
 
 # ChArUco에서 흔히 쓰이는 사전 목록 (cv2.aruco.DICT_* 속성명 그대로)
@@ -155,11 +161,17 @@ class MainWindow(QMainWindow):
         action_layout = QVBoxLayout()
         self.load_button = QPushButton("이미지 불러오기")
         self.load_button.clicked.connect(self._on_load_images)
+        self.load_bag_button = QPushButton("rosbag에서 불러오기")
+        self.load_bag_button.clicked.connect(self._on_load_from_bag)
+        self.load_live_button = QPushButton("실시간 카메라 구독")
+        self.load_live_button.clicked.connect(self._on_load_from_live)
         self.loaded_label = QLabel("불러온 이미지: 0장")
         self.run_button = QPushButton("캘리브레이션 실행")
         self.run_button.clicked.connect(self._on_run_pipeline)
         self.run_button.setEnabled(False)
         action_layout.addWidget(self.load_button)
+        action_layout.addWidget(self.load_bag_button)
+        action_layout.addWidget(self.load_live_button)
         action_layout.addWidget(self.loaded_label)
         action_layout.addWidget(self.run_button)
         action_layout.addStretch(1)
@@ -179,6 +191,84 @@ class MainWindow(QMainWindow):
             return
         self.image_paths = paths
         self.loaded_label.setText(f"불러온 이미지: {len(paths)}장")
+        self.run_button.setEnabled(True)
+
+    def _on_load_from_bag(self) -> None:
+        """ROS1(.bag)/ROS2(.db3, .mcap) 로그 파일에서 이미지를 뽑아 불러온다.
+        rospy/rclpy 없이 순수 Python(rosbags)으로 읽으므로 ROS 설치가 필요 없다.
+        """
+        bag_path, _ = QFileDialog.getOpenFileName(
+            self, "rosbag 파일 선택", "", "ROS bag (*.bag *.db3 *.mcap);;All files (*)"
+        )
+        if not bag_path:
+            return
+
+        try:
+            topics = list_image_topics(bag_path)
+        except ImportError as e:
+            QMessageBox.critical(self, "rosbags 미설치", str(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "bag 읽기 실패", f"bag 파일을 여는 데 실패했습니다:\n{e}")
+            return
+
+        if not topics:
+            QMessageBox.warning(self, "이미지 토픽 없음", "이 bag 안에서 이미지 토픽을 찾지 못했습니다.")
+            return
+
+        labels = [f"{t.name}  ({t.msg_type.split('/')[-1]}, {t.count}개)" for t in topics]
+        label, ok = QInputDialog.getItem(
+            self, "이미지 토픽 선택", "추출할 토픽을 고르세요:", labels, 0, False
+        )
+        if not ok:
+            return
+        topic = topics[labels.index(label)].name
+
+        interval, ok = QInputDialog.getDouble(
+            self, "샘플링 간격",
+            "이미지 추출 최소 간격(초)\n"
+            "(bag은 보통 15~60fps라 그대로 다 뽑으면 거의 똑같은 프레임이 수백 장 나옵니다.\n"
+            " 간격을 두면 자세 다양성 있는 데이터셋에 더 가까워집니다.)",
+            0.5, 0.05, 30.0, 2,
+        )
+        if not ok:
+            return
+
+        out_dir = str(Path(bag_path).with_suffix("").as_posix()) + "_extracted"
+        try:
+            extracted = extract_images_from_bag(bag_path, topic, out_dir, min_interval_sec=interval)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "이미지 추출 실패", str(e))
+            return
+
+        if not extracted:
+            QMessageBox.warning(self, "추출된 이미지 없음", "선택한 토픽/간격으로 추출된 이미지가 없습니다.")
+            return
+
+        self.image_paths = extracted
+        self.loaded_label.setText(f"불러온 이미지: {len(extracted)}장 (rosbag: {Path(bag_path).name})")
+        self.run_button.setEnabled(True)
+
+    def _on_load_from_live(self) -> None:
+        """실시간 ROS 토픽을 구독해서 사용자가 직접 캡처한 이미지를 불러온다."""
+        if ROS_LIVE_BACKEND is None:
+            QMessageBox.warning(
+                self, "ROS 미설치",
+                "실시간 구독을 쓰려면 이 컴퓨터에 ROS1 또는 ROS2가 설치되어 있고 "
+                "환경이 source 되어 있어야 합니다 (rospy/rclpy는 pip로 설치되지 않습니다).\n\n"
+                "이미 녹화된 bag 파일만 있다면 [rosbag에서 불러오기]를 대신 쓰세요.",
+            )
+            return
+
+        out_dir = str(Path.cwd() / "live_captures")
+        dialog = LiveCaptureDialog(out_dir, parent=self)
+        if dialog.exec() != LiveCaptureDialog.Accepted:
+            return
+        if not dialog.captured_paths:
+            return
+
+        self.image_paths = dialog.captured_paths
+        self.loaded_label.setText(f"불러온 이미지: {len(dialog.captured_paths)}장 (실시간 캡처)")
         self.run_button.setEnabled(True)
 
     def _current_pattern_config(self) -> PatternConfig:
