@@ -161,9 +161,75 @@ paths = extract_images_from_bag("drive.bag", "/camera/image_raw", "extracted/", 
 dataset = detect_dataset(paths, pattern)  # 이후 흐름은 위 예시와 동일
 ```
 
-## 7. 개발 진행 상황
+## 7. 테스트
+
+`tests/` 폴더에 pytest 스위트가 있다 (64개, 빠른 것만 돌리면 수 초 - 전체는 3모델
+계산이 포함된 시나리오 때문에 2분 정도). 코드를 고치다가
+뭔가 깨지면 이게 잡아준다 - 예전엔 검증할 때마다 스크립트를 즉석으로 짰다가
+끝나면 지웠는데, 그러면 다음에 같은 곳이 또 깨져도 아무도 모른다.
+
+```bash
+pip install -r requirements-dev.txt
+pytest              # 전체 실행
+pytest -m "not slow"   # 느린 통합 테스트(파이프라인 전체 e2e) 빼고 빠르게만
+pytest tests/test_straightness.py -v   # 특정 파일만
+```
+
+`tests/conftest.py`가 왜곡이 실제로 적용된 합성 ChArUco 이미지 데이터셋을
+세션당 한 번만 만들어서 여러 테스트가 공유한다. `test_pipeline_integration.py`가
+가장 중요한 파일 - Detection부터 Export(OpenCV/ROS/HTML)까지 전체 파이프라인을
+실제로 이어붙여서 돈다.
+
+`rosbags`가 설치 안 돼 있으면 `test_rosbag_reader.py`는 자동으로 스킵된다
+(선택적 의존성이라 앱도, 테스트도 없어도 동작해야 하므로).
+
+`.github/workflows/tests.yml`로 GitHub Actions CI가 붙어있어 push/PR마다
+Python 3.10/3.11/3.12에서 자동으로 돌아간다.
+
+## 8. Model Score 가중치 튜닝
+
+`scripts/tune_model_score_weights.py`로 실제 카메라 데이터셋 없이도 가중치를
+"정답을 아는" 합성 시나리오로 검증해봤다. 진짜 Pinhole/Extended
+Pinhole/Fisheye 카메라를 합성으로 만들어(픽셀 노이즈, 저데이터 경계 케이스
+포함) "정답 모델을 골랐는가"를 채점하고, Dirichlet 무작위 탐색으로 더 나은
+가중치를 찾아봤다.
+
+```bash
+# 시드 하나씩 캐시를 만들어 pickle로 저장 (계산이 오래 걸려 나눠서 실행 가능)
+python scripts/tune_model_score_weights.py --build-cache 1 --out /tmp/c1.pkl
+python scripts/tune_model_score_weights.py --build-cache 2 --out /tmp/c2.pkl
+
+# 캐시로 가중치 탐색 + held-out 검증
+python scripts/tune_model_score_weights.py --search /tmp/c1.pkl /tmp/c2.pkl --holdout /tmp/c11.pkl
+```
+
+**결론: 기본 가중치(`ModelScoreWeights()`)는 바꾸지 않았다.** 탐색용
+데이터에서는 튜닝된 가중치가 이겨 보였지만(정답률 66.7%→75.0%), **탐색에
+안 쓴 held-out 시드로 재확인하니 기본 가중치와 완전히 동률(50.0%=50.0%)이었다**
+- 2회 독립 반복 모두 같은 패턴. 즉 "개선"처럼 보였던 건 8~12개짜리 작은
+탐색 세트에 대한 과적합이었다. 자세한 수치와 방법론은
+[`scripts/TUNING_RESULTS.md`](scripts/TUNING_RESULTS.md) 참고.
+
+가중치와 무관하게 발견한 진짜 한계도 있다: 화각이 넓지 않은 데이터에서는
+Extended Pinhole과 Fisheye가 통계적으로 구분하기 어려워질 수 있다 (근본적인
+모델 식별성 문제, 가중치 튜닝으로 해결 안 됨). `tests/test_recommender_accuracy.py`에
+이 한계를 `xfail`로 정직하게 기록해뒀다.
+
+## 9. 개발 진행 상황
 
 설계 문서 기준 V1(필수 기능)은 완료됐고, V2(완성도) 항목도 대부분 구현됐습니다.
-Parameter Uncertainty (Pinhole/Extended): Fisheye는 OpenCV 미지원
+
+| V2 항목 | 상태 |
+|---|---|
+| Dataset Diversity Score | ✅ |
+| Undistortion Preview | ✅ |
+| Automatic Model Recommendation | ✅ |
+| Parameter Uncertainty (Pinhole/Extended) | ✅ (Fisheye는 OpenCV 미지원) |
+| **Frame Quality Score** | ✅ `calibration/frame_quality.py` |
+| **Edge Error Map (Radial Error Profile)** | ✅ `calibration/radial_profile.py` |
+| **Line Straightness Residual** | ✅ `calibration/straightness.py` |
+| **HTML Report** | ✅ `export/report.py` |
+| **ROS 연동 확장 (rosbag 이미지 직접 불러오기)** | ✅ `calibration/rosbag_reader.py` (ROS1/ROS2 둘 다 지원, 순수 Python, ROS 설치 불필요) |
+| **ROS 연동 확장 (실시간 토픽 구독)** | ✅ `calibration/ros_live.py` + `ui/live_capture_dialog.py` (ROS1/ROS2 자동 감지, ⚠️ 실제 ROS 환경에서 최종 검증 필요 — 아래 5번 참고) |
 
 남은 것: V3(LiDAR-Camera Extrinsic, Multi-sensor Calibration Platform으로 확장).

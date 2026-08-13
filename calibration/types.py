@@ -340,7 +340,13 @@ class ValidationResult:
 
 @dataclass
 class ModelScoreWeights:
-    """Score = w1*E_train + w2*E_test + w3*E_edge + w4*E_line + w5*P"""
+    """Score = w1*E_train + w2*E_test + w3*E_edge + w4*E_line + w5*P
+
+    합성 데이터로 튜닝을 시도해봤지만(scripts/tune_model_score_weights.py),
+    held-out 검증에서 기본값 대비 뚜렷한 개선을 재현하지 못해 기본값을
+    그대로 유지하고 있다. 자세한 과정과 발견한 한계는
+    scripts/TUNING_RESULTS.md 참고.
+    """
     w_train: float = 0.15
     w_test: float = 0.35
     w_edge: float = 0.25
