@@ -1,0 +1,181 @@
+name: Tests
+
+# push/PR마다 자동 실행. README 8번 "GitHub Actions CI가 붙어있다" 서술을
+# 실제로 참으로 만들기 위한 워크플로우.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Actions 탭에서 수동 실행도 가능하게
+
+# 같은 브랜치/PR에 새 커밋이 오면 이전 실행은 취소 (CI 자원 낭비 방지)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # PySide6(Qt)가 내부적으로 여러 시스템 라이브러리(libEGL, libxkbcommon,
+      # libxcb 계열 등)를 필요로 한다. GUI를 실제로 띄우진 않지만(offscreen
+      # 플랫폼 사용) import 자체는 이 라이브러리들이 없으면 실패한다.
+      - name: Install Qt runtime dependencies (for headless PySide6)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 \
+            libxkbcommon0 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xinerama0 \
+            libgl1
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run test suite
+        env:
+          # 러너에는 디스플레이가 없으므로 Qt를 offscreen 플랫폼으로 강제.
+          # 없으면 QApplication을 만드는 UI 테스트들이 전부 실패한다.
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          pytest -v --junitxml=pytest-report.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report-py${{ matrix.python-version }}
+          path: pytest-report.xml
+          retention-days: 14
+
+  # 빠른 티어(단위 테스트 + 스모크)만 도는 별도 잡. PR에 커밋을 자주 올리는
+  # 동안은 이 결과만으로도 "핵심 배선이 안 끊어졌는지" 몇 초 안에 알 수 있다.
+  # (README 8번 "빠른 티어" 설명 참고 - 느린 통합 테스트는 위 test job이 커버)
+  smoke:
+    name: smoke tests (fast tier)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install Qt runtime dependencies (for headless PySide6)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 \
+            libxkbcommon0 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xinerama0 \
+            libgl1
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run fast tests only
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          pytest -m "not slow" -v
+
+  # README 10번이 "OpenCV 4.13.0/5.0.0 둘 다에서 전체 테스트 통과를 확인했다"고
+  # 명시적으로 주장하는 부분을 실제로 계속 참으로 유지하기 위한 잡.
+  # requirements.txt가 opencv-contrib-python>=4.9로 상한이 없어서, 나중에 새
+  # OpenCV 메이저 버전이 나오면 fisheye 관련 회귀(cv2.fisheye.CALIB_* 플래그
+  # 위치, calibrate() shape 요구사항 변경 등, calibration/models/fisheye.py 참고)가
+  # 조용히 재발해도 기본 CI는 못 잡아낸다. 두 버전을 명시적으로 고정해 매트릭스로 돈다.
+  opencv-compat:
+    name: OpenCV ${{ matrix.opencv-version }} compat
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        opencv-version: ["4.9.0.80", "5.0.0.93"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install Qt runtime dependencies (for headless PySide6)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 \
+            libxkbcommon0 \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xinerama0 \
+            libgl1
+
+      - name: Install dependencies with pinned OpenCV
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install "opencv-contrib-python==${{ matrix.opencv-version }}"
+
+      - name: Run test suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          pytest -v
