@@ -16,6 +16,8 @@ ChArUco 패턴으로 동시에 캘리브레이션하고, Hold-out 검증 + Model
 
 ## 2. 설치
 
+**방법 A - requirements.txt (기존 방식)**
+
 ```bash
 # 1) 이 폴더(camera_calibrator/)로 이동
 cd camera_calibrator
@@ -42,10 +44,29 @@ pip install -r requirements.txt
 > (둘 다 `cv2`라는 이름을 써서 충돌합니다). 이미 `opencv-python`이 깔려있다면
 > `pip uninstall opencv-python opencv-python-headless` 먼저 실행하세요.
 
+**방법 B - pyproject.toml (패키지로 설치, `camera-calibrator` 커맨드 사용 가능)**
+
+```bash
+pip install -e .            # 기본 설치
+pip install -e ".[ros]"     # rosbag 기능까지 포함
+pip install -e ".[dev]"     # 테스트(pytest)까지 포함
+```
+
+이렇게 설치하면 레포 폴더 밖 어디서든 아래 커맨드로 바로 실행할 수 있습니다
+(3번 섹션 참고). `requirements.txt` 방식과 설치되는 의존성은 동일하며, 어느
+쪽을 쓰든 상관없습니다 - 개발/기여 목적이면 방법 B, 그냥 써보는 목적이면
+방법 A가 조금 더 단순합니다.
+
 ## 3. 실행
 
 ```bash
 python -m app.main
+```
+
+`pyproject.toml`로 설치했다면(2번 방법 B) 이 커맨드로도 동일하게 실행됩니다:
+
+```bash
+camera-calibrator
 ```
 
 창이 뜨면:
@@ -127,7 +148,11 @@ camera_calibrator/
 │   ├── radial_profile_view.py   # Edge Error Map 그래프 (QPainter 커스텀 위젯)
 │   ├── straightness_view.py     # Straightness Map (행/열 라인을 이미지 위에 색으로 오버레이)
 │   └── live_capture_dialog.py   # 실시간 구독 + 라이브 프리뷰 + 수동/자동 캡처 다이얼로그
-└── requirements.txt
+├── .github/workflows/tests.yml  # GitHub Actions CI (push/PR마다 Python 3.10/3.11/3.12 자동 테스트)
+├── .gitignore                   # __pycache__, venv, .ccproj 등 로컬 산출물 제외
+├── pyproject.toml                # 패키징 메타데이터 (pip install -e ., camera-calibrator 콘솔 커맨드)
+├── requirements.txt
+└── requirements-dev.txt          # 테스트(pytest) 실행용 추가 의존성
 ```
 
 `calibration/`은 UI와 완전히 독립적이라, CLI 스크립트나 다른 프론트엔드에서도
