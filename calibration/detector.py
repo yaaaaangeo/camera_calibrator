@@ -355,9 +355,14 @@ def build_detect_fn(pattern: PatternConfig) -> Callable[[np.ndarray, str], Detec
         return lambda img, image_id: detect_charuco(img, board, image_id=image_id, detector=detector)
     if pattern.type == PatternType.CHESSBOARD:
         return lambda img, image_id: detect_chessboard(img, pattern, image_id=image_id)
+    # PatternType에는 향후 확장을 위해 미리 정의만 해 둔 값이 있을 수 있다
+    # (예: APRILGRID) - 실제 검출 로직이 붙기 전까지는 특정 이름을 언급하지
+    # 않고 여기서 일괄적으로 막는다. 특정 패턴 이름을 하드코딩해서 언급하면
+    # PatternType이 바뀔 때 메시지가 실제와 어긋나기 쉽다.
+    supported = (PatternType.CHARUCO, PatternType.CHESSBOARD)
     raise ValueError(
-        f"현재는 ChArUco, Chessboard 패턴만 지원합니다 (입력: {pattern.type}). "
-        f"AprilGrid는 아직 미구현입니다."
+        f"현재 지원하는 패턴 타입은 {', '.join(p.value for p in supported)}뿐입니다 "
+        f"(입력: {pattern.type.value}). 검출 로직이 아직 구현되지 않았습니다."
     )
 
 
