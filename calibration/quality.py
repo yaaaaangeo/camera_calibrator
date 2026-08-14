@@ -11,9 +11,11 @@ camera_calibrator.calibration.quality
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
-from calibration.types import CameraConfig, CoverageCell, Dataset, DiversityScores
+from calibration.types import CameraConfig, CoverageCell, Dataset, DiversityScores, Frame
 from calibration.models.common import infer_image_size
 
 
@@ -172,6 +174,23 @@ def _normalized_spread(values: list[float], full_score_spread: float) -> float:
     return float(min(1.0, spread / full_score_spread)) if full_score_spread > 0 else 0.0
 
 
+def _distance_diversity_from_area_ratios(area_ratios: list[float]) -> float:
+    """거리 다양성: 보드 면적 비율(=촬영 거리의 대리 지표)의 상대 퍼짐(CV).
+    compute_diversity_scores와 compute_live_coverage_bars(실시간 캡처)가
+    동일한 기준을 쓰도록 공용화 - 사후 Coverage 탭과 실시간 바가 서로
+    다른 숫자를 말하면 사용자가 혼란스러우므로 반드시 같은 함수를 재사용한다.
+    """
+    if len(area_ratios) < 2 or np.mean(area_ratios) <= 0:
+        return 0.0
+    cv = float(np.std(area_ratios) / np.mean(area_ratios))
+    return float(min(1.0, cv / 0.5))  # CV 0.5 이상이면 만점
+
+
+def _rotation_diversity_from_tilts(tilts: list[float]) -> float:
+    """자세(기울기) 다양성. 위 함수와 같은 이유로 공용화."""
+    return _normalized_spread(tilts, full_score_spread=30.0)  # 표준편차 30도 이상이면 만점
+
+
 def compute_diversity_scores(
     dataset: Dataset,
     cells: list[CoverageCell],
@@ -206,20 +225,82 @@ def compute_diversity_scores(
     )
 
     area_ratios = [f.detection.board_area_ratio for f in frames if f.detection.board_area_ratio is not None]
-    # 거리 다양성: 보드 면적 비율(=촬영 거리의 대리 지표)의 상대 퍼짐(CV)
-    distance_diversity = 0.0
-    if len(area_ratios) >= 2 and np.mean(area_ratios) > 0:
-        cv = float(np.std(area_ratios) / np.mean(area_ratios))
-        distance_diversity = float(min(1.0, cv / 0.5))  # CV 0.5 이상이면 만점
+    distance_diversity = _distance_diversity_from_area_ratios(area_ratios)
 
     tilts = [f.detection.board_tilt_deg for f in frames if f.detection.board_tilt_deg is not None]
-    rotation_diversity = _normalized_spread(tilts, full_score_spread=30.0)  # 표준편차 30도 이상이면 만점
+    rotation_diversity = _rotation_diversity_from_tilts(tilts)
 
     return DiversityScores(
         position_coverage=position_coverage,
         distance_diversity=distance_diversity,
         rotation_diversity=rotation_diversity,
         edge_coverage=edge_coverage,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 실시간 캡처 중 X/Y/Size/Skew 바 (ROS camera_calibration의 cameracalibrator.py
+# 스타일 실시간 피드백을 이 프로젝트 지표로 재현)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LiveCoverageBars:
+    """실시간 캡처 다이얼로그에 표시할 4개 진행률 바 (0~1).
+
+    ROS의 고전 cameracalibrator.py GUI가 보여주는 X/Y/Size/Skew 바와
+    같은 역할을 하되, 계산 방식은 이 프로젝트가 이미 쓰고 있는 지표를
+    그대로 재사용한다:
+      - x_coverage / y_coverage: 지금까지 캡처된 프레임들의
+        board_center_px가 가로/세로로 얼마나 퍼져서 찍혔는가
+        (classify_regions가 쓰는 것과 같은 "프레임 중심 1점" 기준).
+      - size_coverage: distance_diversity와 동일 (보드 면적비 퍼짐 = 거리 다양성).
+      - skew_coverage: rotation_diversity와 동일 (기울기 퍼짐).
+    """
+    x_coverage: float = 0.0
+    y_coverage: float = 0.0
+    size_coverage: float = 0.0
+    skew_coverage: float = 0.0
+
+
+def compute_live_coverage_bars(
+    frames: list[Frame],
+    image_size: tuple[int, int],
+    x_full_spread_ratio: float = 0.25,
+    y_full_spread_ratio: float = 0.25,
+) -> LiveCoverageBars:
+    """지금까지 캡처된 프레임 리스트로 X/Y/Size/Skew 바를 계산.
+
+    캡처 즉시(파일 저장 직후) 호출되는 걸 전제로 가벼운 함수로 유지한다 -
+    Dataset 전체 파이프라인(Coverage Map, Outlier 등)을 돌릴 필요 없이
+    detect_charuco() 결과만 있으면 계산 가능하다.
+
+    x_full_spread_ratio / y_full_spread_ratio: 이미지 너비/높이의 이 비율만큼
+    표준편차가 퍼지면 만점(1.0)으로 본다. 기본값 25% - distance_diversity가
+    CV 0.5, rotation_diversity가 표준편차 30도를 만점 기준으로 삼는 것과
+    같은 성격의 V1 휴리스틱이다 (calibration/quality.py 모듈 docstring 참고).
+    """
+    w, h = image_size
+    successful = [
+        f for f in frames
+        if f.detection and f.detection.success and f.detection.board_center_px is not None
+    ]
+
+    xs = [f.detection.board_center_px[0] for f in successful]
+    ys = [f.detection.board_center_px[1] for f in successful]
+    x_coverage = _normalized_spread(xs, full_score_spread=w * x_full_spread_ratio)
+    y_coverage = _normalized_spread(ys, full_score_spread=h * y_full_spread_ratio)
+
+    area_ratios = [f.detection.board_area_ratio for f in successful if f.detection.board_area_ratio is not None]
+    size_coverage = _distance_diversity_from_area_ratios(area_ratios)
+
+    tilts = [f.detection.board_tilt_deg for f in successful if f.detection.board_tilt_deg is not None]
+    skew_coverage = _rotation_diversity_from_tilts(tilts)
+
+    return LiveCoverageBars(
+        x_coverage=x_coverage,
+        y_coverage=y_coverage,
+        size_coverage=size_coverage,
+        skew_coverage=skew_coverage,
     )
 
 

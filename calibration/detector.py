@@ -342,6 +342,25 @@ def detect_chessboard(
 # 데이터셋 전체 검출
 # ---------------------------------------------------------------------------
 
+def build_detect_fn(pattern: PatternConfig) -> Callable[[np.ndarray, str], DetectionResult]:
+    """PatternConfig에 맞는 detect_fn(image_array, image_id) 콜백을 만든다.
+
+    detect_dataset()과 실시간 캡처(ui/live_capture_dialog.py)가 "패턴 타입별로
+    어느 검출 함수를 쓸지" 분기 로직을 중복해서 들고 있으면 하나가 바뀔 때
+    다른 쪽을 깜빡 놓치기 쉬워서, 이 분기 자체를 공용 함수로 뺐다.
+    """
+    if pattern.type == PatternType.CHARUCO:
+        board = build_charuco_board(pattern)
+        detector = build_charuco_detector(board)
+        return lambda img, image_id: detect_charuco(img, board, image_id=image_id, detector=detector)
+    if pattern.type == PatternType.CHESSBOARD:
+        return lambda img, image_id: detect_chessboard(img, pattern, image_id=image_id)
+    raise ValueError(
+        f"현재는 ChArUco, Chessboard 패턴만 지원합니다 (입력: {pattern.type}). "
+        f"AprilGrid는 아직 미구현입니다."
+    )
+
+
 def detect_dataset(
     image_paths: list[str],
     pattern: PatternConfig,
@@ -352,17 +371,7 @@ def detect_dataset(
     패턴 타입(ChArUco/체스보드)에 따라 알맞은 검출 함수로 분기한다 - 이 함수
     호출부(quality.py, compare.py 등)는 어느 패턴이었는지 몰라도 된다.
     """
-    if pattern.type == PatternType.CHARUCO:
-        board = build_charuco_board(pattern)
-        detector = build_charuco_detector(board)
-        detect_fn = lambda img, image_id: detect_charuco(img, board, image_id=image_id, detector=detector)
-    elif pattern.type == PatternType.CHESSBOARD:
-        detect_fn = lambda img, image_id: detect_chessboard(img, pattern, image_id=image_id)
-    else:
-        raise ValueError(
-            f"현재는 ChArUco, Chessboard 패턴만 지원합니다 (입력: {pattern.type}). "
-            f"AprilGrid는 아직 미구현입니다."
-        )
+    detect_fn = build_detect_fn(pattern)
 
     dataset = Dataset()
     for image_path in image_paths:

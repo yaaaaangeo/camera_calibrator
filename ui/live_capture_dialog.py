@@ -38,7 +38,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from calibration.detector import build_detect_fn
+from calibration.quality import compute_live_coverage_bars
 from calibration.ros_live import ROS_LIVE_BACKEND, LiveTopicSubscriber
+from calibration.types import CameraConfig, Frame, ImageInfo, PatternConfig
+from ui.live_coverage_bars import LiveCoverageBarsWidget
 
 _PREVIEW_MAX_WIDTH = 480
 
@@ -60,7 +64,13 @@ class LiveCaptureDialog(QDialog):
     _frame_ready = Signal(object, float)  # (img_bgr, timestamp_sec) - ROS 콜백 스레드 -> GUI 스레드
     _decode_error = Signal(str)  # 프레임은 왔지만 디코딩 실패 - ROS 콜백 스레드 -> GUI 스레드
 
-    def __init__(self, output_dir: str, parent=None):
+    def __init__(
+        self,
+        output_dir: str,
+        pattern_config: PatternConfig | None = None,
+        camera_config: CameraConfig | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("실시간 ROS 토픽 구독")
         self.setMinimumWidth(540)
@@ -72,6 +82,19 @@ class LiveCaptureDialog(QDialog):
         self._subscriber: LiveTopicSubscriber | None = None
         self._latest_frame: np.ndarray | None = None
         self._last_auto_capture_t: float | None = None
+
+        # 캡처될 때마다 여기 채워지는 (프레임별) 검출 결과 - X/Y/Size/Skew
+        # 바를 실시간으로 갱신하는 데 쓰인다. 패턴/카메라 설정이 없으면
+        # (예: 다이얼로그를 독립적으로 띄우는 다른 진입점) 바 갱신은 그냥 건너뛴다.
+        self._pattern_config = pattern_config
+        self._camera_config = camera_config
+        self._detect_fn = None
+        if pattern_config is not None:
+            try:
+                self._detect_fn = build_detect_fn(pattern_config)
+            except ValueError:
+                self._detect_fn = None
+        self._detected_frames: list[Frame] = []
 
         self._frame_ready.connect(self._on_frame_ready)
         self._decode_error.connect(self._on_decode_error)
@@ -98,6 +121,19 @@ class LiveCaptureDialog(QDialog):
         self.preview_label.setMinimumHeight(300)
         self.preview_label.setStyleSheet("background:#222; color:#aaa;")
         layout.addWidget(self.preview_label)
+
+        # X/Y/Size/Skew 커버리지 바 - 캡처할 때마다 갱신된다 (아래 _save_frame 참고).
+        # pattern_config가 없어 detect_fn을 못 만든 경우엔 위젯을 숨긴다 -
+        # 계산할 수 없는 바를 0%로 보여주면 "부족하다"는 잘못된 신호가 된다.
+        self.coverage_bars = LiveCoverageBarsWidget()
+        self.coverage_bars.setVisible(self._detect_fn is not None)
+        if self._detect_fn is None:
+            hint = QLabel(
+                "⚠ 패턴 설정이 없어 X/Y/Size/Skew 실시간 커버리지 바를 표시할 수 없습니다."
+            )
+            hint.setStyleSheet("color:#c0392b;")
+            layout.addWidget(hint)
+        layout.addWidget(self.coverage_bars)
 
         capture_row = QHBoxLayout()
         self.capture_button = QPushButton("📸 캡처")
@@ -226,6 +262,29 @@ class LiveCaptureDialog(QDialog):
         cv2.imwrite(str(filename), img_bgr)
         self.captured_paths.append(str(filename))
         self.count_label.setText(f"캡처된 이미지: {len(self.captured_paths)}장")
+        self._update_coverage_bars(img_bgr, image_id=filename.stem)
+
+    def _update_coverage_bars(self, img_bgr: np.ndarray, image_id: str) -> None:
+        """방금 캡처한 프레임에 검출을 돌려서 X/Y/Size/Skew 바를 갱신.
+
+        캡처 직후에만 돌리는 이유: 매 라이브 프레임(수십 fps)마다 검출을
+        돌리면 GUI 스레드가 버벅일 수 있고, 어차피 이 프로젝트는 "자동으로
+        계속 찍지 않고 사용자가 캡처한 프레임만" 데이터셋에 반영한다는
+        설계 원칙(파일 상단 docstring)을 따른다 - 실시간 피드백도 같은
+        원칙을 지켜야 사용자가 보는 바 = 실제로 저장되는 데이터셋과 일치한다.
+        """
+        if self._detect_fn is None or self._camera_config is None:
+            return
+        h, w = img_bgr.shape[:2]
+        info = ImageInfo(image_id=image_id, path="", width=w, height=h)
+        detection = self._detect_fn(img_bgr, image_id)
+        self._detected_frames.append(Frame(image_info=info, detection=detection))
+
+        bars = compute_live_coverage_bars(
+            self._detected_frames,
+            image_size=(self._camera_config.width, self._camera_config.height),
+        )
+        self.coverage_bars.set_bars(bars)
 
     # ------------------------------------------------------------------
 

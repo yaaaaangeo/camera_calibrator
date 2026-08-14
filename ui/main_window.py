@@ -298,7 +298,12 @@ class MainWindow(QMainWindow):
             return
 
         out_dir = str(Path.cwd() / "live_captures")
-        dialog = LiveCaptureDialog(out_dir, parent=self)
+        dialog = LiveCaptureDialog(
+            out_dir,
+            pattern_config=self._current_pattern_config(),
+            camera_config=self._current_camera_config(),
+            parent=self,
+        )
         if dialog.exec() != LiveCaptureDialog.Accepted:
             return
         if not dialog.captured_paths:
