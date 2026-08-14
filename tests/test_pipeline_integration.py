@@ -24,7 +24,6 @@ from calibration.models.common import infer_image_size
 from calibration.outlier import recalibrate_with_outlier_pruning
 from calibration.quality import analyze_dataset_quality, coverage_percentage
 from calibration.recommender import compute_final_result, compute_model_scores
-from calibration.types import CameraModelType
 from calibration.validation import validate_all_models
 from export.opencv import export_opencv_yaml
 from export.report import export_html_report

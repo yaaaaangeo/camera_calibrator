@@ -1,5 +1,7 @@
 # cv2.aruco(ChArUco)는 contrib 모듈에 있음. opencv-python과 동시 설치 금지
 # (둘 다 cv2 네임스페이스를 쓰므로 충돌한다).
+# 4.9~5.0.0까지 실제 테스트로 검증됨 (5.0에서 바뀐 cv2.fisheye 관련 동작에
+# calibration/models/fisheye.py가 대응함 - README 10번 참고).
 opencv-contrib-python>=4.9
 numpy>=1.24
 PyYAML>=6.0

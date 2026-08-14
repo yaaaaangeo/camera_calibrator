@@ -58,6 +58,7 @@ class LiveCaptureDialog(QDialog):
     """반환값: self.captured_paths (list[str]) - 다이얼로그가 accept()된 뒤 읽는다."""
 
     _frame_ready = Signal(object, float)  # (img_bgr, timestamp_sec) - ROS 콜백 스레드 -> GUI 스레드
+    _decode_error = Signal(str)  # 프레임은 왔지만 디코딩 실패 - ROS 콜백 스레드 -> GUI 스레드
 
     def __init__(self, output_dir: str, parent=None):
         super().__init__(parent)
@@ -73,6 +74,7 @@ class LiveCaptureDialog(QDialog):
         self._last_auto_capture_t: float | None = None
 
         self._frame_ready.connect(self._on_frame_ready)
+        self._decode_error.connect(self._on_decode_error)
 
         layout = QVBoxLayout(self)
 
@@ -174,6 +176,7 @@ class LiveCaptureDialog(QDialog):
             self._subscriber.start(
                 topic_obj.name, topic_obj.msg_type,
                 on_frame=lambda img, t: self._frame_ready.emit(img, t),
+                on_error=lambda detail: self._decode_error.emit(detail),
             )
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "구독 실패", str(e))
@@ -203,6 +206,15 @@ class LiveCaptureDialog(QDialog):
             if self._last_auto_capture_t is None or (now - self._last_auto_capture_t) >= interval:
                 self._save_frame(img_bgr)
                 self._last_auto_capture_t = now
+
+    def _on_decode_error(self, detail: str) -> None:
+        """프레임은 도착했는데 디코딩에 실패하는 상황 - "환경 감지되고 토픽도
+        맞는데 계속 대기 중"처럼 보이는 문제의 실제 원인(대부분 지원 안 하는
+        인코딩)을 화면에 바로 보여준다. 캡처된 이미지가 하나도 없으면
+        프리뷰 영역에 표시하고, 이미 캡처된 게 있으면 상태만 갱신한다.
+        """
+        self.preview_label.setText(f"⚠ {detail}")
+        self.count_label.setText(f"캡처된 이미지: {len(self.captured_paths)}장  |  ⚠ {detail}")
 
     def _manual_capture(self) -> None:
         if self._latest_frame is not None:

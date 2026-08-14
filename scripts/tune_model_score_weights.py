@@ -294,7 +294,7 @@ def main():
     print("\n=== 2. 가중치 무작위 탐색 (Dirichlet random search, 탐색용 캐시만 사용) ===")
     best_weights, train_acc, train_margin = random_search(train_cache, n_candidates=6000)
 
-    print(f"\n[탐색용 세트] 기본 가중치 vs 튜닝된 가중치")
+    print("\n[탐색용 세트] 기본 가중치 vs 튜닝된 가중치")
     default_acc, default_margin = evaluate_weights(train_cache, ModelScoreWeights())
     print(f"  기본:   정답률={default_acc:.1%}  마진={default_margin:.4f}")
     print(f"  튜닝됨: 정답률={train_acc:.1%}  마진={train_margin:.4f}")

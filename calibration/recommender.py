@@ -52,8 +52,8 @@ def _complexity_counts(use_rational_model: bool) -> dict[CameraModelType, int]:
 def _normalize(values: dict[CameraModelType, float | None]) -> dict[CameraModelType, float]:
     """0(가장 좋음)~1(가장 나쁨)로 min-max 정규화.
 
-    - 값이 전부 None(해당 지표를 아무 모델도 갖고 있지 않음, 예: straightness
-      V2 미구현)이면 전부 0.0을 줘서 그 항목이 점수에 영향을 주지 않게 한다.
+    - 값이 전부 None(예: 프레임이 너무 적어 어떤 모델도 straightness를 계산
+      못한 경우)이면 전부 0.0을 줘서 그 항목이 점수에 영향을 주지 않게 한다.
     - 일부만 None(그 모델만 실패했거나 데이터가 없음)이면 그 모델에는 1.0(최악)을
       줘서 불이익을 준다 - "몰라서 좋아 보이는" 상황을 방지.
     """
@@ -110,7 +110,9 @@ def compute_model_scores(
         else:
             e_edge[m] = None
 
-    # Straightness (V2, 아직 미구현) - 전부 None -> _normalize가 중립 0으로 처리
+    # Straightness (calibration/straightness.py, validate_holdout에서 채워짐).
+    # 프레임이 너무 적어 라인을 하나도 못 만든 모델은 None으로 남고,
+    # _normalize가 "값이 하나라도 있으면 없는 모델에 불리하게" 처리한다.
     e_line = {}
     for m in models:
         vr = validation_results.get(m)
@@ -175,9 +177,9 @@ def build_recommendation_message(
     vr = validation_results.get(model)
     test_rms = vr.test_rms if vr else None
 
-    # "line"(직선성, V2 미구현)처럼 아무 모델도 값을 갖지 못한 지표는 전부 0으로
-    # 정규화되어 "가장 유리한 항목"처럼 보이지만, 실제로는 측정된 적이 없다.
-    # 측정이 하나라도 있었던 지표만 근거 후보로 인정한다.
+    # "line"(직선성)처럼 프레임 부족 등으로 아무 모델도 값을 갖지 못한 경우엔
+    # 전부 0으로 정규화되어 "가장 유리한 항목"처럼 보이지만, 실제로는 측정된
+    # 적이 없다. 측정이 하나라도 있었던 지표만 근거 후보로 인정한다.
     line_measured = any(
         (validation_results.get(m) and validation_results[m].straightness_residual is not None)
         for m in validation_results

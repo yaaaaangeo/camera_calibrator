@@ -14,7 +14,7 @@ from __future__ import annotations
 import numpy as np
 
 from calibration.types import CameraConfig, CoverageCell, Dataset, DiversityScores
-from calibration.models.common import classify_regions, infer_image_size
+from calibration.models.common import infer_image_size
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 camera_calibrator.calibration.detector
 ========================================
 
-설계 문서 17번 Step2 - ChArUco Detection.
+설계 문서 17번 Step2 - ChArUco Detection + 일반 체스보드(Chessboard) 검출.
 
 이미지(경로 또는 배열)를 받아 코너를 검출하고 DetectionResult를 채운다.
 UI 없이 이 모듈만으로 터미널에서 다음처럼 확인 가능해야 한다:
@@ -18,18 +18,30 @@ UI 없이 이 모듈만으로 터미널에서 다음처럼 확인 가능해야 �
 - 코너 검출 실패 이미지는 예외를 던지지 않고 DetectionResult(success=False)로
   반환한다. Frame.status만 DETECTION_FAILED로 바뀔 뿐 파일이나 레코드는
   삭제되지 않는다 (설계 문서 9번, 17번 원칙).
+
+체스보드(PatternType.CHESSBOARD) 지원에 대한 중요한 한계:
+    설계 문서 2번이 애초에 ChArUco를 우선한 이유가 두 가지 있다 -
+    (1) 부분 가림 시 검출 불가(보드 전체가 다 보여야 함), (2) 대칭 패턴이라
+    "어느 쪽이 진짜 첫 번째 코너인지"를 원리적으로 구분할 방법이 없다.
+    ChArUco는 마커 ID로 (2)를 해결하지만 일반 체스보드는 못 한다 - 같은
+    보드를 정방향으로 찍든 180도 돌려서 찍든(대칭이라 육안으로는 구분도 안 됨)
+    검출 알고리즘은 "이미지 안에서 먼저 발견한 쪽"을 코너 0번으로 삼을 뿐이라,
+    데이터셋 안에 방향이 뒤섞인 사진이 섞이면 캘리브레이션이 심하게 틀어질
+    수 있다. 이건 OpenCV 표준 체스보드 캘리브레이션 자체의 잘 알려진 한계이며
+    (거의 모든 OpenCV 체스보드 튜토리얼이 "보드를 항상 같은 방향으로 촬영하라"고
+    권장하는 이유), 이 프로젝트가 새로 만든 문제가 아니다. 가능하면 ChArUco를
+    쓰고, 체스보드를 꼭 써야 한다면 촬영 내내 보드 방향을 일관되게 유지할 것.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
 
 from calibration.types import (
-    CameraConfig,
     Dataset,
     DetectionResult,
     Frame,
@@ -153,9 +165,11 @@ def detect_charuco(
             image_id=image_id,
             success=False,
             num_corners=0,
-            failure_reason="no charuco corners found"
-            if marker_ids is None or len(marker_ids) == 0
-            else "markers found but charuco interpolation failed",
+            failure_reason=(
+                "ArUco 마커가 하나도 검출되지 않음 (조명/초점/각도 확인 필요)"
+                if marker_ids is None or len(marker_ids) == 0
+                else "마커는 검출됐지만 체스보드 코너 보간 실패 (보드 일부만 보이거나 각도가 너무 큼)"
+            ),
         )
 
     num_corners = int(len(charuco_ids))
@@ -178,13 +192,14 @@ def detect_charuco(
 
 def detect_image_file(
     image_path: str,
-    board: cv2.aruco.CharucoBoard,
-    detector: Optional[cv2.aruco.CharucoDetector] = None,
+    detect_fn: Callable[[np.ndarray, str], DetectionResult],
     image_id: Optional[str] = None,
 ) -> tuple[ImageInfo, DetectionResult]:
     """파일 경로를 받아 ImageInfo + DetectionResult를 함께 반환.
 
-    파일이 없거나 읽을 수 없는 경우에도 예외를 던지지 않고
+    detect_fn(image_array, image_id) -> DetectionResult 형태의 콜백을 받는다 -
+    ChArUco든 체스보드든(또는 나중에 추가될 다른 패턴이든) 이 함수는 몰라도
+    되게 분리했다. 파일이 없거나 읽을 수 없는 경우에도 예외를 던지지 않고
     success=False DetectionResult를 반환한다 (파이프라인이 한 장 때문에 죽지 않도록).
     """
     path = Path(image_path)
@@ -213,8 +228,114 @@ def detect_image_file(
         sharpness=sharpness,
         brightness=brightness,
     )
-    result = detect_charuco(img, board, image_id=image_id, detector=detector)
+    result = detect_fn(img, image_id)
     return info, result
+
+
+# ---------------------------------------------------------------------------
+# 체스보드(Chessboard) 검출
+# ---------------------------------------------------------------------------
+
+def build_chessboard_object_points(pattern: PatternConfig) -> np.ndarray:
+    """PatternConfig -> 체스보드 내부 코너의 3D object point 배열, shape (N,1,3).
+
+    row-major 순서(row가 느리게, col이 빠르게 증가)로 만든다 - 이게
+    detect_chessboard()가 코너를 정렬하는 순서와 정확히 일치해야
+    calibrateCamera에 넘길 때 대응이 맞는다. calibration/straightness.py의
+    row/col 역산 공식(id // cols, id % cols)도 이 순서를 전제로 한다.
+    """
+    cols = pattern.squares_x - 1
+    rows = pattern.squares_y - 1
+    objp = np.zeros((rows * cols, 3), dtype=np.float32)
+    objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
+    objp *= pattern.square_size
+    return objp.reshape(-1, 1, 3)
+
+
+def _normalize_chessboard_corner_order(corners: np.ndarray) -> np.ndarray:
+    """findChessboardCornersSB와 findChessboardCorners(고전)는 서로 정확히
+    반대 순서로 코너를 반환할 수 있다(실측 확인됨) - 어느 함수로 검출됐든
+    "이미지 원점(왼쪽 위)에 더 가까운 쪽이 첫 코너"라는 하나의 관례로
+    통일한다. 이렇게 해야 build_chessboard_object_points()가 만든 순서와
+    항상 짝이 맞는다.
+
+    한계: 이건 SB와 고전 함수 사이의 순서 불일치만 해결한다 - "물리적으로
+    180도 돌려서 찍은 보드"까지 구분해주진 못한다 (모듈 docstring 참고,
+    체스보드 자체의 근본적인 한계).
+    """
+    flat = corners.reshape(-1, 2)
+    origin_dist_first = float(np.hypot(*flat[0]))
+    origin_dist_last = float(np.hypot(*flat[-1]))
+    if origin_dist_first > origin_dist_last:
+        return corners[::-1]
+    return corners
+
+
+def detect_chessboard(
+    image: np.ndarray,
+    pattern: PatternConfig,
+    image_id: str,
+) -> DetectionResult:
+    """이미 메모리에 로드된 이미지에 대해 일반 체스보드 코너 검출 수행.
+
+    findChessboardCornersSB(더 강건, OpenCV 4.x+)를 먼저 시도하고, 실패하면
+    고전 방식(findChessboardCorners + cornerSubPix)으로 재시도한다 - fisheye
+    모듈의 "엄격한 조건 실패 시 완화해서 재시도" 패턴과 같은 철학이다.
+    """
+    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    cols = pattern.squares_x - 1
+    rows = pattern.squares_y - 1
+    pattern_size = (cols, rows)
+
+    found = False
+    corners = None
+
+    if hasattr(cv2, "findChessboardCornersSB"):
+        try:
+            found, corners = cv2.findChessboardCornersSB(
+                gray, pattern_size, flags=cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
+            )
+        except cv2.error:
+            found = False
+
+    if not found:
+        found, corners = cv2.findChessboardCorners(
+            gray, pattern_size, flags=cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+        )
+        if found:
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+            corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+
+    if not found or corners is None:
+        return DetectionResult(
+            image_id=image_id,
+            success=False,
+            num_corners=0,
+            failure_reason=(
+                f"체스보드 코너를 찾지 못함 (내부 코너 {cols}x{rows}개 필요). "
+                f"일반 체스보드는 ChArUco와 달리 보드 전체가 이미지 안에 다 보여야 "
+                f"검출됩니다 - 모서리가 잘렸거나 각도가 너무 크면 실패하기 쉽습니다."
+            ),
+        )
+
+    corners = _normalize_chessboard_corner_order(corners.astype(np.float32))
+    num_corners = cols * rows
+    ids = np.arange(num_corners, dtype=np.int32).reshape(-1, 1)
+    object_points = build_chessboard_object_points(pattern)
+
+    area_ratio, center_px, tilt_deg = _compute_board_geometry(corners, gray.shape[:2])
+
+    return DetectionResult(
+        image_id=image_id,
+        success=True,
+        corners=corners,
+        object_points=object_points,
+        ids=ids,
+        num_corners=num_corners,
+        board_area_ratio=area_ratio,
+        board_center_px=center_px,
+        board_tilt_deg=tilt_deg,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -228,13 +349,24 @@ def detect_dataset(
     """이미지 경로 리스트 전체를 검출해 Dataset(Frame 리스트)으로 반환.
 
     UI 없이 이 함수 하나로 2단계 목표(검출 파이프라인 안정화)를 검증할 수 있다.
+    패턴 타입(ChArUco/체스보드)에 따라 알맞은 검출 함수로 분기한다 - 이 함수
+    호출부(quality.py, compare.py 등)는 어느 패턴이었는지 몰라도 된다.
     """
-    board = build_charuco_board(pattern)
-    detector = build_charuco_detector(board)
+    if pattern.type == PatternType.CHARUCO:
+        board = build_charuco_board(pattern)
+        detector = build_charuco_detector(board)
+        detect_fn = lambda img, image_id: detect_charuco(img, board, image_id=image_id, detector=detector)
+    elif pattern.type == PatternType.CHESSBOARD:
+        detect_fn = lambda img, image_id: detect_chessboard(img, pattern, image_id=image_id)
+    else:
+        raise ValueError(
+            f"현재는 ChArUco, Chessboard 패턴만 지원합니다 (입력: {pattern.type}). "
+            f"AprilGrid는 아직 미구현입니다."
+        )
 
     dataset = Dataset()
     for image_path in image_paths:
-        info, result = detect_image_file(image_path, board, detector=detector)
+        info, result = detect_image_file(image_path, detect_fn)
 
         if result.success:
             status = (

@@ -8,6 +8,11 @@ ChArUco 패턴으로 동시에 캘리브레이션하고, Hold-out 검증 + Model
 
 - **Python 3.10 이상** (3.11 권장)
 - OS: Windows / macOS / Linux 모두 가능 (PySide6가 크로스플랫폼)
+- **OpenCV**: 4.7 이상, **5.0.0도 지원** (`opencv-contrib-python==5.0.0.93`으로
+  실제 검증됨). 4.x와 5.x 둘 다에서 전체 테스트 스위트가 통과한다 - OpenCV
+  5.0에서 `cv2.fisheye.CALIB_*` 플래그 위치가 바뀌고 `cv2.fisheye.calibrate()`의
+  요구 shape이 엄격해진 것에 대응하는 코드가 `calibration/models/fisheye.py`에
+  있다 (자세한 내용은 10번 섹션).
 
 ## 2. 설치
 
@@ -44,8 +49,22 @@ python -m app.main
 ```
 
 창이 뜨면:
-1. 상단에서 해상도(Width/Height)와 ChArUco 패턴 정보(사각형 개수, 한 칸 크기(m),
-   마커 크기(m), dictionary)를 입력
+1. 상단에서 해상도(Width/Height)와 패턴 정보를 입력. **Pattern type**을
+   ChArUco(기본, 권장) 또는 Chessboard(일반 체스보드) 중 고를 수 있다 -
+   Chessboard를 고르면 Marker size/Dictionary 입력칸이 자동으로 숨겨진다
+   (체스보드엔 필요 없으므로). ChArUco는 사각형 개수/한 칸 크기(mm)/마커
+   크기(mm)/dictionary가 필요하고, Chessboard는 사각형 개수/한 칸 크기(mm)만
+   있으면 된다.
+
+   > ⚠️ **Chessboard를 쓸 때 주의**: 일반 체스보드는 대칭 패턴이라 ChArUco와
+   > 달리 (1) 보드 전체가 이미지 안에 다 보여야 검출되고, (2) "어느 쪽이
+   > 진짜 첫 번째 코너인지"를 원리적으로 구분할 방법이 없다 - 같은 보드를
+   > 정방향으로 찍든 180도 돌려서 찍든 육안으로는 구분도 안 되는데, 촬영
+   > 방향이 데이터셋 안에서 뒤섞이면 캘리브레이션이 심하게 틀어질 수 있다.
+   > 이건 이 프로젝트가 만든 문제가 아니라 OpenCV 표준 체스보드 캘리브레이션
+   > 자체의 잘 알려진 한계다 (설계 문서 2번이 애초에 ChArUco를 우선한 이유이기도
+   > 하다). 가능하면 ChArUco를 쓰고, 꼭 체스보드를 써야 한다면 촬영 내내
+   > 보드 방향을 일관되게 유지할 것.
 2. **[이미지 불러오기]** 로 촬영한 사진 여러 장 선택 (jpg/png/bmp), 또는
    **[rosbag에서 불러오기]** 로 ROS1(.bag)/ROS2(.db3, .mcap) 로그에서 이미지 토픽을
    골라 자동 추출 (rospy/rclpy 설치 불필요, 순수 Python `rosbags` 라이브러리 사용), 또는
@@ -57,19 +76,32 @@ python -m app.main
    - **① Dataset**: 이미지별 검출 상태/코너 수/재투영 오차/**품질 점수(Frame Quality Score)·등급**
    - **② Coverage**: 4×4 커버리지 맵 + 데이터셋 다양성 점수 + 경고
    - **③ Model / Validation / Export**: 3모델 비교표(Train/Test/Edge RMS + **Line Straightness**) +
-     추천 + 이상치 제거 + OpenCV/ROS YAML export + **HTML 종합 리포트 export**
+     추천 + 이상치 제거 + OpenCV/ROS YAML export + **HTML 종합 리포트 export** +
+     **JSON export**(구조화된 전체 결과, 외부 도구 연동용) +
+     **CSV export**(이미지별 상세 데이터, 스프레드시트 분석용)
    - **④ Undistort Preview**: 원본 vs 보정 이미지 비교
    - **⑤ Edge Error Map**: 이미지 중심으로부터의 거리(반지름)별 재투영 오차 막대그래프
      (Radial Error Profile) — 렌즈 외곽에서 모델이 잘 맞는지 한눈에 확인
+   - **⑥ Straightness Map**: 체스보드의 각 행/열을 실제 이미지 위에 선으로
+     그려서, 얼마나 휘었는지 초록(곧음)~빨강(많이 휨)으로 색칠해 보여준다.
+     숫자 하나(Line Straightness)로만 보던 걸 "어느 부분이 특히 안 맞는지"
+     직관적으로 확인할 수 있다 - 이미지/모델을 바꿔가며 비교 가능
+5. 상단 메뉴 **파일 → 프로젝트 저장(Ctrl+S)** 으로 지금까지의 전체 상태(데이터셋,
+   3모델 결과, 검증, 추천)를 `.ccproj` 파일로 저장할 수 있다. **파일 → 프로젝트
+   불러오기(Ctrl+O)** 로 나중에 이어서 작업 가능 — 원본 이미지 파일이 없어져도
+   재계산/이상치 제거/export는 그대로 된다 (자세한 내용은 4번 폴더 구조의
+   `project_io.py` 설명 참고).
 
 ## 4. 폴더 구조
 
 ```
 camera_calibrator/
-├── app/main.py              # 실행 진입점
+├── app/
+│   ├── main.py                # GUI 실행 진입점 (python -m app.main)
+│   └── cli.py                 # 헤드리스 CLI 진입점 (python -m app.cli), CI/배치용
 ├── calibration/              # 순수 계산 로직 (UI 의존성 없음)
 │   ├── types.py              # 전체가 공유하는 데이터 구조
-│   ├── detector.py           # ChArUco 검출
+│   ├── detector.py           # ChArUco + Chessboard(일반 체스보드) 검출
 │   ├── models/                # pinhole / extended_pinhole / fisheye
 │   ├── compare.py            # 3모델 동시 실행 + 비교표
 │   ├── validation.py         # Hold-out 검증 (+ Line Straightness)
@@ -77,17 +109,23 @@ camera_calibrator/
 │   ├── quality.py            # Coverage Map / 데이터셋 다양성
 │   ├── frame_quality.py      # 프레임별 품질 점수 (Detection + Geometric)
 │   ├── radial_profile.py     # Edge Error Map (반지름별 재투영 오차)
-│   ├── straightness.py       # Line Straightness Residual (ChArUco 격자 재활용)
+│   ├── straightness.py       # Line Straightness Residual (ChArUco 격자 재활용,
+│   │                          #   compute_frame_straightness_lines()가 행/열별 상세 제공)
 │   ├── rosbag_reader.py      # ROS1(.bag)/ROS2(.db3, .mcap)에서 이미지 추출
 │   ├── ros_live.py           # 실시간 ROS1(rospy)/ROS2(rclpy) 토픽 구독 (자동 감지)
 │   ├── ros_image_codec.py    # sensor_msgs/Image·CompressedImage 디코딩 (위 둘이 공유)
+│   ├── project_io.py         # .ccproj 프로젝트 저장/불러오기 (JSON, pickle 미사용)
+│   ├── json_utils.py         # dataclass/numpy -> JSON 안전 변환 (project_io.py, export/json_export.py 공유)
 │   └── recommender.py        # Model Score 기반 추천 + 최종 결과(FinalResult) 조립
-├── export/                   # OpenCV YAML / ROS CameraInfo YAML / HTML 리포트
+├── export/                   # OpenCV YAML / ROS CameraInfo YAML / HTML 리포트 / JSON / CSV
 │   ├── opencv.py
 │   ├── ros.py
-│   └── report.py             # 종합 HTML 리포트 (브라우저 인쇄로 PDF 변환 가능)
+│   ├── report.py             # 종합 HTML 리포트 (브라우저 인쇄로 PDF 변환 가능)
+│   ├── json_export.py        # 구조화된 JSON (카메라 행렬·오차 지표·최종 등급, 외부 도구 연동용)
+│   └── csv_export.py         # 이미지별 상세 데이터 CSV (스프레드시트 분석용)
 ├── ui/                       # PySide6 화면 (계산 로직 없음, calibration/*만 호출)
 │   ├── radial_profile_view.py   # Edge Error Map 그래프 (QPainter 커스텀 위젯)
+│   ├── straightness_view.py     # Straightness Map (행/열 라인을 이미지 위에 색으로 오버레이)
 │   └── live_capture_dialog.py   # 실시간 구독 + 라이브 프리뷰 + 수동/자동 캡처 다이얼로그
 └── requirements.txt
 ```
@@ -99,12 +137,27 @@ camera_calibrator/
 
 두 단계로 나뉩니다.
 
-### 7.1 rosbag에서 이미지 불러오기 (`[rosbag에서 불러오기]` 버튼, ROS 설치 불필요)
+### 5.1 rosbag에서 이미지 불러오기 (`[rosbag에서 불러오기]` 버튼, ROS 설치 불필요)
 
 순수 Python 라이브러리 `rosbags`로 ROS1(.bag)/ROS2(.db3, .mcap)를 직접 읽습니다.
 ROS가 설치 안 된 컴퓨터에서도 동작합니다.
 
-### 7.2 실시간 토픽 구독 (`[실시간 카메라 구독]` 버튼, **ROS1 또는 ROS2 설치 필요**)
+> **알려진 이슈 (해결됨)**: `ros2 bag record`로 녹화한 bag은 메시지 타입 정의가
+> bag 안에 통째로 안 담기는 경우가 흔한데, 그런 bag을 열면
+> `Bag contains no type definitions. Instantiate AnyReader with a
+> default_typestore argument.` 에러가 났었습니다. `AnyReader`에
+> `default_typestore=get_typestore(Stores.LATEST)`를 넘기도록 고쳤습니다
+> (`calibration/rosbag_reader.py`) - sensor_msgs/Image, CompressedImage는
+> ROS2 배포판이 달라도 정의가 동일해 어떤 배포판의 bag이든 문제없습니다.
+
+지원하는 이미지 인코딩(`calibration/ros_image_codec.py`):
+`mono8`, `mono16`, `bgr8`, `rgb8`, `bgra8`, `rgba8`,
+`bayer_rggb8/bggr8/gbrg8/grbg8`(+16비트 버전), `yuv422`/`yuv422_yuy2`/`yuyv`/`uyvy`/`yuy2`
+(YUYV·UYVY 계열, v4l2_camera/usb_cam 등 흔한 드라이버가 씀), CompressedImage(jpeg/png).
+지원 안 하는 인코딩을 만나면 에러 메시지에 실제 인코딩 이름이 나옵니다
+(예: "발견된 인코딩: nv12") - 필요하면 이슈로 알려주시면 추가하겠습니다.
+
+### 5.2 실시간 토픽 구독 (`[실시간 카메라 구독]` 버튼, **ROS1 또는 ROS2 설치 필요**)
 
 이건 다릅니다 - `rospy`/`rclpy`는 pip로 설치되지 않고, 실제 ROS1(noetic 등) 또는
 ROS2(humble 등)가 컴퓨터에 설치되고 환경이 source 되어 있어야만 동작합니다
@@ -117,12 +170,89 @@ ROS2(humble 등)가 컴퓨터에 설치되고 환경이 source 되어 있어야�
 캡처하는 방식 - 설계 문서 7번, 장수보다 자세 다양성이 중요하기 때문). 편의를
 위해 "N초마다 자동 캡처" 옵션도 있습니다.
 
+> **알려진 이슈 (부분 해결)**: 환경이 감지되고 토픽도 맞게 골랐는데 "프레임
+> 수신 대기 중..."에서 멈추는 경우가 있었습니다. 원인 중 하나를 찾아 고쳤습니다:
+> 카메라가 지원 안 하는 인코딩(예: yuv422)으로 발행하면 프레임이 실제로 도착해도
+> 디코딩에 실패해 **조용히 버려지고 있었습니다** - 이제 디코딩 실패 시 화면에
+> "⚠ 프레임은 도착했지만 디코딩에 실패했습니다 (encoding='...')" 라고 표시됩니다
+> (3초 rate-limit). 그래도 계속 멈춰있다면 다른 원인(토픽에 실제로 발행이
+>없거나, ROS 네트워크 설정 문제 등)일 수 있습니다.
+>
 > ⚠️ `calibration/ros_live.py`의 rospy/rclpy 경로는 실제 ROS 런타임(roscore 또는
 > ROS2 데몬)이 있어야만 끝까지 검증할 수 있어, 개발 과정에서 end-to-end로
 > 테스트하지 못했습니다. 표준 API 기준으로 작성했지만, 실제 ROS 환경에서
 > 한 번 확인해보시는 걸 권장합니다. 문제가 있으면 이슈로 알려주세요.
 
-## 6. CLI로만 써보고 싶다면 (UI 없이)
+## 6. 프로젝트 저장/불러오기 (`.ccproj`)
+
+데이터셋이 크거나 캘리브레이션에 시간이 걸릴 때, 앱을 껐다 켜도(또는 CLI를
+여러 번 나눠 실행해도) 이어서 작업할 수 있다.
+
+- **저장되는 것**: 카메라/패턴 설정, 데이터셋(이미지별 검출 결과·품질 점수·상태),
+  3모델 캘리브레이션 결과, Hold-out Validation 결과, 추천 점수, 이상치 제거 이력,
+  최종 결과 - 사실상 화면에 보이는 모든 것.
+- **저장 안 되는 것**: 원본 이미지 파일 자체(바이트 복사 안 함, 경로만 저장) -
+  설계 문서 9번의 "파일을 삭제/복제하지 않는다" 원칙과 같은 이유. 그래서
+  **원본 이미지가 없어지거나 옮겨져도** 불러오기 자체는 되고, 재계산(이상치 제거
+  등)이나 export도 그대로 된다 - 다만 UI의 "Undistort Preview" 탭만 해당
+  이미지를 못 보여준다.
+- **포맷**: JSON (pickle 아님 - `.ccproj`는 나중에 공유하거나 버전관리에 올릴 수도
+  있는 파일이라, pickle의 "불러올 때 임의 코드 실행 위험"을 피하려고 일부러
+  더 번거로운 JSON 직렬화를 택했다).
+
+```bash
+# CLI
+python -m app.cli --images ./photos --squares-x 7 --squares-y 5 \
+  --square-size 0.04 --marker-size 0.03 --save-project ./session.ccproj
+
+python -m app.cli --load-project ./session.ccproj --outlier --output-dir ./out
+```
+
+UI에서는 메뉴 **파일 → 프로젝트 저장/불러오기** (`Ctrl+S` / `Ctrl+O`).
+
+## 7. UI 없이 쓰기 (CLI / Python API)
+
+### 6.1 CLI (`app/cli.py`) — CI/서버/배치 처리용
+
+UI를 안 띄우고 헤드리스로 전체 파이프라인(검출→3모델→검증→추천→export)을
+한 번에 돌린다. 종료 코드로 성공/실패를 판단할 수 있어 CI 파이프라인에
+바로 끼워 넣기 좋다 (0=성공, 1=입력 문제, 2=전 모델 캘리브레이션 실패).
+
+```bash
+python -m app.cli \
+  --images ./photos \
+  --squares-x 7 --squares-y 5 --square-size 0.04 --marker-size 0.03 \
+  --output-dir ./out \
+  --json-summary ./out/summary.json
+```
+
+주요 옵션:
+
+| 옵션 | 설명 |
+|---|---|
+| `--images` | 이미지 파일/디렉토리/glob 패턴 (여러 개 가능) |
+| `--pattern {charuco,chessboard}` | 패턴 타입 (기본 charuco). chessboard는 `--marker-size`/`--dictionary` 불필요 |
+| `--bag`, `--topic`, `--bag-interval` | rosbag에서 이미지 추출 (`--images` 대신) |
+| `--list-topics BAG_PATH` | bag의 이미지 토픽 목록만 보고 종료 |
+| `--model {pinhole,extended_pinhole,fisheye}` | 자동 추천 대신 강제로 이 모델 선택 |
+| `--outlier` | 이상치 탐지 + 재계산까지 수행 |
+| `--rational` | Extended Pinhole에 8계수(rational) 모델 사용 |
+| `--export {opencv,ros,report,json,csv}` | 내보낼 형식 선택 (기본: opencv/ros/report - json/csv는 명시해야 포함됨) |
+| `--json-summary PATH` | 기계가 읽는 JSON 요약 저장 (CI 스크립팅용) |
+| `--quiet` | 진행상황 출력 최소화 |
+
+전체 옵션은 `python -m app.cli --help` 참고. rosbag 예시:
+
+```bash
+python -m app.cli --list-topics drive.bag   # 토픽 확인
+python -m app.cli --bag drive.bag --topic /camera/image_raw --bag-interval 0.5 \
+  --squares-x 7 --squares-y 5 --square-size 0.04 --marker-size 0.03 \
+  --output-dir ./out
+```
+
+### 6.2 Python API 직접 사용
+
+CLI보다 세밀하게 제어하고 싶다면 `calibration/`, `export/` 모듈을 직접 호출한다:
 
 ```python
 from calibration.types import PatternConfig, PatternType, CameraConfig
@@ -149,6 +279,20 @@ export_html_report("my_camera", camera_config, pattern, dataset,
                     calibration_results, validation_results, final_result, "report.html")
 ```
 
+JSON/CSV로도 export할 수 있다:
+
+```python
+from export.json_export import export_json
+from export.csv_export import export_csv
+
+# 구조화된 전체 결과(카메라 행렬, 오차 지표, 등급) - 다른 스크립트/도구가 읽기 좋음
+export_json(camera_config, pattern, dataset, calibration_results, validation_results,
+            recommended, "calibration.json", final_result=final_result, model_scores=scores)
+
+# 이미지별 상세 데이터(코너 수, 선명도, 재투영 오차, 품질 점수/등급) - 스프레드시트 분석용
+export_csv(dataset, "dataset.csv")
+```
+
 rosbag에서 이미지를 뽑고 싶다면:
 
 ```python
@@ -161,19 +305,37 @@ paths = extract_images_from_bag("drive.bag", "/camera/image_raw", "extracted/", 
 dataset = detect_dataset(paths, pattern)  # 이후 흐름은 위 예시와 동일
 ```
 
-## 7. 테스트
+## 8. 테스트
 
-`tests/` 폴더에 pytest 스위트가 있다 (64개, 빠른 것만 돌리면 수 초 - 전체는 3모델
-계산이 포함된 시나리오 때문에 2분 정도). 코드를 고치다가
+`tests/` 폴더에 pytest 스위트가 있다 (161개, 빠른 것만 돌리면 ~11초 - 전체는
+3~4분 정도, OpenCV 4.x/5.x 둘 다에서 통과 확인됨). 코드를 고치다가
 뭔가 깨지면 이게 잡아준다 - 예전엔 검증할 때마다 스크립트를 즉석으로 짰다가
 끝나면 지웠는데, 그러면 다음에 같은 곳이 또 깨져도 아무도 모른다.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest              # 전체 실행
-pytest -m "not slow"   # 느린 통합 테스트(파이프라인 전체 e2e) 빼고 빠르게만
+pytest              # 전체 실행 (~1분 40초)
+pytest -m "not slow"   # 느린 통합 테스트 빼고 빠르게만 (~7초, 스모크 테스트 포함)
 pytest tests/test_straightness.py -v   # 특정 파일만
 ```
+
+**두 단계로 나뉜다:**
+- **빠른 티어** (마커 없음, `not slow`로 걸러짐): 단위 테스트 대부분 +
+  `test_smoke_pipeline.py` - 3D->2D 직접 사영으로 이미지 렌더링/검출 없이,
+  Pinhole+Extended 2모델만(Fisheye 생략, 셋 중 가장 느리고 발산 위험도 큼)
+  작은 데이터셋(8~10장)으로 도는 가벼운 파이프라인 스모크 테스트. "핵심
+  배선이 안 끊어졌는지"를 몇 초 안에 확인하는 용도.
+- **느린 티어** (`@pytest.mark.slow`): 실제 ChArUco 이미지 렌더링+검출,
+  3모델 전부, Hold-out validation, export까지 포함하는 진짜 통합 테스트
+  (`test_pipeline_integration.py` 등). 정확성 자체를 검증하는 최종 보루.
+
+**fixture 캐싱**: 무거운 계산(3모델+검증+이상치 제거 전체 파이프라인)을
+쓰는 파일들(`test_project_io.py`, `test_ui_project_io.py`)은 그 계산을
+`module` 스코프 fixture로 한 번만 돌리고 파일 안의 여러 테스트가 공유한다 -
+전에는 테스트마다 매번 새로 계산해서 낭비가 컸다(전체 스위트가 이 변경
+하나로 127초 -> 102초). 세션 전체가 공유하는 `synthetic_dataset`
+fixture(`conftest.py`)를 건드리는 fixture는 `copy.deepcopy()`로 복사본을
+써서 다른 테스트 파일에 상태가 새지 않게 한다.
 
 `tests/conftest.py`가 왜곡이 실제로 적용된 합성 ChArUco 이미지 데이터셋을
 세션당 한 번만 만들어서 여러 테스트가 공유한다. `test_pipeline_integration.py`가
@@ -186,7 +348,7 @@ pytest tests/test_straightness.py -v   # 특정 파일만
 `.github/workflows/tests.yml`로 GitHub Actions CI가 붙어있어 push/PR마다
 Python 3.10/3.11/3.12에서 자동으로 돌아간다.
 
-## 8. Model Score 가중치 튜닝
+## 9. Model Score 가중치 튜닝
 
 `scripts/tune_model_score_weights.py`로 실제 카메라 데이터셋 없이도 가중치를
 "정답을 아는" 합성 시나리오로 검증해봤다. 진짜 Pinhole/Extended
@@ -215,7 +377,7 @@ Extended Pinhole과 Fisheye가 통계적으로 구분하기 어려워질 수 있
 모델 식별성 문제, 가중치 튜닝으로 해결 안 됨). `tests/test_recommender_accuracy.py`에
 이 한계를 `xfail`로 정직하게 기록해뒀다.
 
-## 9. 개발 진행 상황
+## 10. 개발 진행 상황
 
 설계 문서 기준 V1(필수 기능)은 완료됐고, V2(완성도) 항목도 대부분 구현됐습니다.
 
@@ -231,5 +393,28 @@ Extended Pinhole과 Fisheye가 통계적으로 구분하기 어려워질 수 있
 | **HTML Report** | ✅ `export/report.py` |
 | **ROS 연동 확장 (rosbag 이미지 직접 불러오기)** | ✅ `calibration/rosbag_reader.py` (ROS1/ROS2 둘 다 지원, 순수 Python, ROS 설치 불필요) |
 | **ROS 연동 확장 (실시간 토픽 구독)** | ✅ `calibration/ros_live.py` + `ui/live_capture_dialog.py` (ROS1/ROS2 자동 감지, ⚠️ 실제 ROS 환경에서 최종 검증 필요 — 아래 5번 참고) |
+| **CLI 진입점 (헤드리스 실행)** | ✅ `app/cli.py` (CI/배치 처리용, JSON 요약, 종료 코드 설계) |
+| **프로젝트 저장/불러오기** | ✅ `calibration/project_io.py` (`.ccproj`, JSON, 원본 이미지 없이도 이어서 작업 가능) |
+| **Straightness Residual 시각화** | ✅ `ui/straightness_view.py` (⑥ Straightness Map 탭, 행/열 라인을 이미지 위에 초록~빨강으로 오버레이) |
+| **JSON/CSV export** | ✅ `export/json_export.py`, `export/csv_export.py` (구조화된 전체 결과 / 이미지별 상세 데이터, UI·CLI 둘 다 지원) |
+| **Chessboard(일반 체스보드) 패턴 지원** | ✅ `calibration/detector.py` (UI/CLI 둘 다, ChArUco와 동일한 파이프라인 재사용 - straightness.py 등 기존 모듈 변경 없음. ⚠️ 대칭 패턴이라 방향 모호성 있음, README 3번 주의사항 참고) |
 
 남은 것: V3(LiDAR-Camera Extrinsic, Multi-sensor Calibration Platform으로 확장).
+
+### 실사용 중 발견/수정된 버그 (2026-08)
+
+실제 사용자 환경(ROS2 humble, OpenCV 5.0.0)에서 나온 리포트를 그 환경을
+직접 재현해서 고쳤습니다:
+
+- **OpenCV 5.0.0에서 Fisheye 캘리브레이션 실패**: `cv2.fisheye.CALIB_*` 플래그가
+  5.0부터 최상위 `cv2.CALIB_*`로 옮겨간 것과, `cv2.fisheye.calibrate()`가
+  `(N,1,3)`이 아니라 `(1,N,3)` shape을 요구하게 된 것(4.x에서는 관대했음) 두
+  가지가 원인이었습니다. `opencv-contrib-python==5.0.0.93`을 직접 설치해
+  재현하고 수정 후 4.13.0/5.0.0 둘 다에서 전체 테스트 통과를 확인했습니다.
+- **rosbag 읽기 실패("Bag contains no type definitions")**: 위 5번 섹션 참고.
+- **실시간 구독이 "프레임 수신 대기 중"에서 안 멈춤**: 지원 안 하는 인코딩으로
+  프레임이 오면 조용히 버려지던 것을 고쳐 화면에 표시되게 함. YUV422 계열
+  인코딩(`yuv422`/`yuyv`/`uyvy` 등, 흔한 카메라 드라이버가 씀) 지원 추가.
+- **Dataset 탭 UI**: 검출 실패 이유 표시, "상태" 컬럼 폭/줄바꿈 개선,
+  Coverage 탭 막대그래프 정렬, Square/Marker size mm 입력, Complexity 행 제거,
+  모델 선택 콤보 위치 및 실패 모델 상태 표시 개선.

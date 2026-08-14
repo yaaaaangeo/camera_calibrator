@@ -17,8 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Any
-from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -383,7 +382,15 @@ class FinalResult:
 
 @dataclass
 class CalibrationProject:
-    """설계 문서 13, 18번 - 전체를 감싸는 최상위 구조.
+    """설계 문서 13, 18번 - 전체를 감싸는 최상위 구조. 저장/불러오기(.ccproj)의
+    최상위 컨테이너 - calibration/project_io.py가 이 클래스를 JSON으로
+    직렬화/역직렬화한다.
+
+    필드 형태를 실제 UI(ui/main_window.py)와 CLI(app/cli.py)가 런타임에
+    들고 다니는 형태(dict[CameraModelType, ...])에 맞췄다 - 원래 설계
+    문서 18번 초안은 list/단일값이었지만, 3모델을 항상 함께 다루는
+    실제 파이프라인 구조상 모델별 dict가 훨씬 자연스럽고 실수를 줄인다.
+
     LiDAR-Camera Extrinsic 등 향후 확장 필드는 별도 dataclass로 추가하되
     이 클래스에 Optional 필드로만 얹는 방식으로 확장한다 (V3, 아직 미구현).
     """
@@ -391,16 +398,11 @@ class CalibrationProject:
     camera_config: CameraConfig
     pattern_config: PatternConfig
     dataset: Dataset = field(default_factory=Dataset)
-    calibration_results: list[CalibrationResult] = field(default_factory=list)  # 3개 모델 동시 계산 결과
+    calibration_results: dict[CameraModelType, CalibrationResult] = field(default_factory=dict)
+    validation_results: dict[CameraModelType, ValidationResult] = field(default_factory=dict)
+    model_scores: list[ModelScore] = field(default_factory=list)
     outlier_result: Optional[OutlierResult] = None
-    validation_result: Optional[ValidationResult] = None
     final_result: Optional[FinalResult] = None
     created_at: datetime = field(default_factory=datetime.now)
-    project_dir: Optional[Path] = None
+    updated_at: datetime = field(default_factory=datetime.now)
     export_paths: dict[ExportFormat, str] = field(default_factory=dict)
-
-    def get_result_by_model(self, model: CameraModelType) -> Optional[CalibrationResult]:
-        for r in self.calibration_results:
-            if r.model_name == model:
-                return r
-        return None

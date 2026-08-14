@@ -8,7 +8,6 @@ camera_calibrator.ui.dataset_view
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QGroupBox,
     QHeaderView,
@@ -74,7 +73,18 @@ class DatasetView(QWidget):
         self.table.setHorizontalHeaderLabels(
             ["파일", "상태", "코너 수", "선명도", "재투영 오차(px)", "품질 점수", "등급"]
         )
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        # "파일"(짧은 이름)이 아니라 "상태"(검출 실패 이유 등 긴 문장이 들어감)가
+        # 남는 공간을 가져가야 한다 - 예전엔 반대였어서 상태 텍스트가 좁은
+        # 칸에 잘려 보였다. 숫자/등급 컬럼들은 내용 크기에 맞춰 고정폭.
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        for col in range(2, 7):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self.table.setColumnWidth(0, 140)
+        # 상태 칸의 긴 문장이 줄바꿈되게 하고, 행 높이도 내용에 맞춰 늘어나게 한다
+        # (전에는 한 줄로 잘려서 tooltip으로만 전체 내용을 볼 수 있었음).
+        self.table.setWordWrap(True)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         group_layout.addWidget(self.table)
@@ -89,6 +99,12 @@ class DatasetView(QWidget):
 
             status_item = QTableWidgetItem(_STATUS_LABEL.get(frame.status, frame.status.value))
             status_item.setForeground(_qcolor(_STATUS_COLOR.get(frame.status, "#000000")))
+            if frame.status == FrameStatus.DETECTION_FAILED and det and det.failure_reason:
+                # 실패 이유를 셀에 바로 짧게 붙이고, 전체 문구는 tooltip으로 (칸이 좁아 잘릴 수 있음)
+                status_item.setText(f"{_STATUS_LABEL[FrameStatus.DETECTION_FAILED]}: {det.failure_reason}")
+                status_item.setToolTip(det.failure_reason)
+            elif frame.status in (FrameStatus.DISABLED_OUTLIER, FrameStatus.DISABLED_MANUAL) and frame.disabled_reason:
+                status_item.setToolTip(frame.disabled_reason)
 
             corners = str(det.num_corners) if det else "-"
             sharpness = f"{frame.image_info.sharpness:.0f}" if frame.image_info.sharpness else "-"
@@ -116,6 +132,9 @@ class DatasetView(QWidget):
             f"총 {total}장  |  검출 성공 {detected}장  |  "
             f"현재 사용 중 {enabled}장 ({enabled/total*100:.0f}%)" if total else "이미지 없음"
         )
+        # 상태 칸의 긴 문장이 줄바꿈된 만큼 행 높이도 늘려준다 (안 그러면
+        # 텍스트는 wrap됐는데 행이 여전히 한 줄 높이라 위아래로 잘려 보임).
+        self.table.resizeRowsToContents()
 
     def refresh_errors(self, dataset: Dataset) -> None:
         """재계산 후 프레임별 오차/상태만 갱신 (테이블 구조는 그대로)."""

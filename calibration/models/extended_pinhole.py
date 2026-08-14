@@ -16,7 +16,6 @@ k4~k6(rational model)은 UI에서 사용자가 켜고 끌 수 있는 고급 옵�
 from __future__ import annotations
 
 import cv2
-import numpy as np
 
 from calibration.types import (
     CalibrationResult,

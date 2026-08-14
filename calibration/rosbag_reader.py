@@ -32,9 +32,12 @@ from calibration.ros_image_codec import decode_image_message
 
 try:
     from rosbags.highlevel import AnyReader
+    from rosbags.typesys import Stores, get_typestore
     ROSBAGS_AVAILABLE = True
 except ImportError:  # rosbags는 선택적 의존성 - 설치 안 해도 나머지 툴은 그대로 동작해야 함
     AnyReader = None  # type: ignore
+    Stores = None  # type: ignore
+    get_typestore = None  # type: ignore
     ROSBAGS_AVAILABLE = False
 
 _IMAGE_MSG_TYPES = {"sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage"}
@@ -57,6 +60,23 @@ def _require_rosbags() -> None:
         )
 
 
+def _open_reader(bag_path: str) -> AnyReader:
+    """AnyReader에 default_typestore를 넘겨서 연다.
+
+    실제로 발생한 사용자 버그: 'Bag contains no type definitions.
+    Instantiate AnyReader with a default_typestore argument.'
+
+    원인: ROS2 bag(metadata.yaml + .db3/.mcap)은 녹화 방식/rosbag2 버전에
+    따라 메시지 타입 정의(IDL)가 bag 안에 통째로 안 담기는 경우가 흔하다.
+    이 경우 rosbags 라이브러리는 대체 typestore가 없으면 이 에러를 던진다.
+    sensor_msgs/Image, CompressedImage는 ROS2 배포판이 달라도 정의가
+    사실상 동일하므로, Stores.LATEST를 기본 typestore로 넘겨주면
+    (ROS1 bag이나 타입 정의가 이미 내장된 ROS2 bag에는 영향 없음 - 그 경우엔
+    bag 안의 정의가 우선 사용됨) 이 문제를 해결할 수 있다.
+    """
+    return AnyReader([Path(bag_path)], default_typestore=get_typestore(Stores.LATEST))
+
+
 def list_image_topics(bag_path: str) -> list[BagImageTopic]:
     """bag 안에서 이미지 메시지 타입(Image/CompressedImage)인 토픽만 골라 반환.
 
@@ -67,7 +87,7 @@ def list_image_topics(bag_path: str) -> list[BagImageTopic]:
     counts: dict[str, int] = {}
     types: dict[str, str] = {}
 
-    with AnyReader([Path(bag_path)]) as reader:
+    with _open_reader(bag_path) as reader:
         for conn in reader.connections:
             if conn.msgtype not in _IMAGE_MSG_TYPES:
                 continue
@@ -105,8 +125,9 @@ def extract_images_from_bag(
     saved_paths: list[str] = []
     last_saved_t: float | None = None
     skipped_unsupported = 0
+    seen_encodings: set[str] = set()  # 실패 이유를 구체적으로 알려주기 위해 수집
 
-    with AnyReader([Path(bag_path)]) as reader:
+    with _open_reader(bag_path) as reader:
         connections = [c for c in reader.connections if c.topic == topic]
         if not connections:
             raise ValueError(f"토픽 '{topic}'을 bag에서 찾을 수 없습니다.")
@@ -127,6 +148,9 @@ def extract_images_from_bag(
 
             if img is None:
                 skipped_unsupported += 1
+                detail = getattr(msg, "encoding", None) or getattr(msg, "format", None)
+                if detail:
+                    seen_encodings.add(detail)
                 continue
 
             idx = len(saved_paths)
@@ -136,9 +160,10 @@ def extract_images_from_bag(
             last_saved_t = t_sec
 
     if not saved_paths and skipped_unsupported > 0:
+        encodings_str = ", ".join(sorted(seen_encodings)) or "알 수 없음"
         raise ValueError(
             f"토픽 '{topic}'에서 지원하지 않는 인코딩만 발견돼 추출된 이미지가 없습니다 "
-            f"({skipped_unsupported}개 건너뜀)."
+            f"({skipped_unsupported}개 건너뜀). 발견된 인코딩: {encodings_str}"
         )
 
     return saved_paths

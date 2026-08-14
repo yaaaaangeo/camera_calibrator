@@ -84,9 +84,16 @@ class DiversityBarsWidget(QWidget):
         layout = QVBoxLayout(self)
         self._bars: dict[str, QProgressBar] = {}
 
+        # 라벨 텍스트 길이가 제각각이면(Position Coverage vs Edge Coverage 등)
+        # 그 뒤에 붙는 막대(stretch=1)의 시작 x좌표가 줄마다 달라져서 막대
+        # 크기가 서로 다르게 보인다 - 라벨 너비를 고정해서 막대 시작점을 맞춘다.
+        _LABEL_WIDTH = 170
+
         for key, label in self._ROWS:
             row = QHBoxLayout()
-            row.addWidget(QLabel(label), stretch=0)
+            label_widget = QLabel(label)
+            label_widget.setFixedWidth(_LABEL_WIDTH)
+            row.addWidget(label_widget, stretch=0)
             bar = QProgressBar()
             bar.setRange(0, 100)
             bar.setTextVisible(True)
@@ -95,13 +102,22 @@ class DiversityBarsWidget(QWidget):
             layout.addLayout(row)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("Overall Dataset Quality"))
+        overall_label = QLabel("Overall Dataset Quality")
+        overall_label.setFixedWidth(_LABEL_WIDTH)
+        row.addWidget(overall_label, stretch=0)
         self._overall_bar = QProgressBar()
         self._overall_bar.setRange(0, 100)
         row.addWidget(self._overall_bar, stretch=1)
         layout.addLayout(row)
 
-    def set_diversity(self, diversity: DiversityScores) -> None:
+    def set_diversity(self, diversity: DiversityScores | None) -> None:
+        if diversity is None:
+            # 아직 Coverage/Diversity 분석이 안 된 데이터셋(예: quality 분석 전에
+            # 저장된 프로젝트를 불러온 경우) - 바를 0으로 비워두고 크래시하지 않는다.
+            for bar in self._bars.values():
+                bar.setValue(0)
+            self._overall_bar.setValue(0)
+            return
         values = {
             "position_coverage": diversity.position_coverage,
             "distance_diversity": diversity.distance_diversity,
@@ -141,7 +157,7 @@ class CoverageView(QWidget):
     def set_quality(
         self,
         cells: list[CoverageCell],
-        diversity: DiversityScores,
+        diversity: DiversityScores | None,
         warnings: list[str],
         rows: int = 4,
         cols: int = 4,

@@ -69,6 +69,63 @@ def test_mono16_downcasts_to_8bit():
     assert out.dtype == np.uint8
 
 
+def test_bayer_16bit_variants_decode_to_3channel_8bit():
+    """산업용/저조도 카메라에서 흔한 16비트 Bayer - 8비트와 같은 디모자이킹
+    경로를 타되 다운캐스트까지 정상적으로 되는지 확인.
+    """
+    for enc, expected_code_name in [
+        ("bayer_rggb16", "COLOR_BayerRG2BGR"),
+        ("bayer_bggr16", "COLOR_BayerBG2BGR"),
+        ("bayer_gbrg16", "COLOR_BayerGB2BGR"),
+        ("bayer_grbg16", "COLOR_BayerGR2BGR"),
+    ]:
+        bayer16 = (np.random.rand(20, 20) * 65535).astype(np.uint16)
+        msg = _FakeImageMsg(20, 20, enc, 40, bayer16.reshape(-1))
+        out = decode_raw_image(msg)
+        assert out is not None, f"{enc} 디코딩 실패"
+        assert out.shape == (20, 20, 3)
+        assert out.dtype == np.uint8
+
+
+def test_yuv422_family_round_trips_correctly():
+    """실제 카메라 드라이버(v4l2_camera, usb_cam 등)가 흔히 쓰는 YUV422류
+    인코딩 4종(yuv422/yuv422_yuy2/yuyv/uyvy)이 전부 정확히 디코딩되는지
+    확인 - 사용자가 실제로 겪은 "지원하지 않는 인코딩" 실패의 유력한 원인.
+
+    매끄러운(공간적으로 변화가 적은) 이미지로 검증한다 - YUV422는 가로
+    2픽셀마다 색차 정보를 공유(크로마 서브샘플링)하는 손실 포맷이라, 무작위
+    노이즈 이미지로 테스트하면 그 손실 자체가 큰 오차로 나와 진짜 디코딩
+    버그와 구분이 안 된다.
+    """
+    H, W = 20, 30
+    bgr_original = np.zeros((H, W, 3), dtype=np.uint8)
+    bgr_original[:, :] = [180, 90, 40]
+    bgr_original[5:15, 10:20] = [30, 200, 100]
+
+    # (인코딩 이름, 그 인코딩을 만들어내는 올바른 cv2 인코드 코드) 쌍.
+    # yuyv/yuv422_yuy2는 YUY2 바이트 순서, yuv422/uyvy는 UYVY 바이트 순서
+    # (ROS의 "yuv422"는 역사적으로 UYVY를 의미하는 관례).
+    pairs = [
+        ("yuyv", cv2.COLOR_BGR2YUV_YUY2),
+        ("uyvy", cv2.COLOR_BGR2YUV_UYVY),
+        ("yuv422", cv2.COLOR_BGR2YUV_UYVY),
+        ("yuv422_yuy2", cv2.COLOR_BGR2YUV_YUY2),
+    ]
+    for enc, encode_code in pairs:
+        yuv = cv2.cvtColor(bgr_original, encode_code)
+        msg = _FakeImageMsg(H, W, enc, W * 2, yuv.reshape(-1))
+        out = decode_raw_image(msg)
+        assert out is not None, f"{enc} 디코딩 실패"
+        assert out.shape == (H, W, 3)
+        diff = np.abs(out.astype(int) - bgr_original.astype(int))
+        assert diff.mean() < 3, f"{enc} 색상 복원이 부정확함 (평균오차 {diff.mean():.2f})"
+
+
+def test_yuv422_corrupted_data_returns_none_not_crash():
+    msg = _FakeImageMsg(100, 100, "yuyv", 200, np.zeros(10, dtype=np.uint8))
+    assert decode_raw_image(msg) is None
+
+
 def test_unsupported_encoding_returns_none_not_crash():
     msg = _FakeImageMsg(5, 5, "unknown_weird_encoding", 5, np.zeros(25, dtype=np.uint8))
     assert decode_raw_image(msg) is None

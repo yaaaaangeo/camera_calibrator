@@ -27,9 +27,50 @@ _ENCODING_MAP: dict[str, tuple[type, int, int | None]] = {
     "bayer_bggr8": (np.uint8, 1, cv2.COLOR_BayerBG2BGR),
     "bayer_gbrg8": (np.uint8, 1, cv2.COLOR_BayerGB2BGR),
     "bayer_grbg8": (np.uint8, 1, cv2.COLOR_BayerGR2BGR),
+    # 16비트 Bayer(고해상도/저조도 산업용 카메라에서 흔함) - COLOR_Bayer*2BGR는
+    # 8/16비트 입력 둘 다 받아준다.
+    "bayer_rggb16": (np.uint16, 1, cv2.COLOR_BayerRG2BGR),
+    "bayer_bggr16": (np.uint16, 1, cv2.COLOR_BayerBG2BGR),
+    "bayer_gbrg16": (np.uint16, 1, cv2.COLOR_BayerGB2BGR),
+    "bayer_grbg16": (np.uint16, 1, cv2.COLOR_BayerGR2BGR),
     "mono16": (np.uint16, 1, None),
     "16UC1": (np.uint16, 1, None),
 }
+
+# YUV422류(2바이트/픽셀, 크로마 서브샘플링) - 위 _ENCODING_MAP과 reshape 방식
+# 자체가 달라서 별도 표로 분리한다 (decode_raw_image에서 분기 처리).
+#
+# "yuv422"는 ROS(sensor_msgs) 관례상 역사적으로 UYVY 바이트 순서를 의미한다
+# (실제 표준 YUV422와 이름은 같지만 바이트 순서가 다를 수 있어 흔히 혼동되는
+# 지점 - v4l2_camera/usb_cam 등 흔한 ROS 카메라 드라이버가 이 인코딩으로
+# 발행하는 경우가 많다). "yuv422_yuy2"는 최신 sensor_msgs에 추가된, 진짜
+# YUYV(YUY2) 순서의 인코딩. "yuyv"/"uyvy"/"yuy2"는 드라이버가 ROS 표준
+# 이름 대신 더 직접적인 이름을 쓰는 경우 대비.
+_YUV422_ENCODING_MAP: dict[str, int] = {
+    "yuv422": cv2.COLOR_YUV2BGR_UYVY,
+    "yuv422_yuy2": cv2.COLOR_YUV2BGR_YUY2,
+    "uyvy": cv2.COLOR_YUV2BGR_UYVY,
+    "yuyv": cv2.COLOR_YUV2BGR_YUY2,
+    "yuy2": cv2.COLOR_YUV2BGR_YUY2,
+}
+
+
+def _decode_yuv422(msg, cvt_code: int) -> np.ndarray | None:
+    """YUV422류(픽셀당 2바이트, 크로마 서브샘플링 패킹)는 _ENCODING_MAP의
+    "채널 N개가 픽셀마다 연속으로 붙어있다" 가정이 안 맞아 별도 경로로 뺐다.
+    """
+    raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+    row_bytes = msg.step  # uint8이라 itemsize=1, step은 이미 바이트 단위
+    if raw.size < msg.height * row_bytes:
+        return None  # 데이터 길이가 헤더와 안 맞음 - 손상된 프레임, 건너뜀
+
+    arr = raw.reshape(msg.height, row_bytes)
+    arr = arr[:, : msg.width * 2]  # YUV422은 픽셀당 2바이트
+    arr = arr.reshape(msg.height, msg.width, 2)
+    try:
+        return cv2.cvtColor(arr, cvt_code)
+    except cv2.error:
+        return None
 
 
 def decode_raw_image(msg) -> np.ndarray | None:
@@ -40,6 +81,9 @@ def decode_raw_image(msg) -> np.ndarray | None:
     msg.data는 rosbags(역직렬화된 numpy 배열)와 rospy(bytes/bytearray) 둘 다
     올 수 있어 np.frombuffer로 통일한다.
     """
+    if msg.encoding in _YUV422_ENCODING_MAP:
+        return _decode_yuv422(msg, _YUV422_ENCODING_MAP[msg.encoding])
+
     spec = _ENCODING_MAP.get(msg.encoding)
     if spec is None:
         return None

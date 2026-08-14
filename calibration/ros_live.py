@@ -102,6 +102,8 @@ class LiveTopicSubscriber:
         _require_backend()
         self._backend = ROS_LIVE_BACKEND
         self._on_frame: Callable[[np.ndarray, float], None] | None = None
+        self._on_error: Callable[[str], None] | None = None
+        self._last_error_report_t: float = 0.0
         self._running = False
 
         # ROS1 전용
@@ -159,16 +161,37 @@ class LiveTopicSubscriber:
     # 구독 시작/종료
     # ------------------------------------------------------------------
 
-    def start(self, topic: str, msg_type: str, on_frame: Callable[[np.ndarray, float], None]) -> None:
+    def start(
+        self,
+        topic: str,
+        msg_type: str,
+        on_frame: Callable[[np.ndarray, float], None],
+        on_error: Callable[[str], None] | None = None,
+    ) -> None:
+        """on_error: 프레임은 도착했지만 디코딩에 실패했을 때 호출된다
+        (예: 지원하지 않는 encoding). 이게 없으면 "토픽은 맞게 골랐는데
+        영원히 대기 중"처럼 보여서 사용자가 원인을 알 방법이 없다 - 최소
+        3초 간격으로 rate-limit해서 콜백을 스팸하지 않는다.
+        """
         if self._running:
             raise RuntimeError("이미 구독 중입니다. 먼저 stop()을 호출하세요.")
         self._on_frame = on_frame
+        self._on_error = on_error
         self._running = True
 
         if self._backend == "ros1":
             self._start_ros1(topic, msg_type)
         else:
             self._start_ros2(topic, msg_type)
+
+    def _report_decode_error(self, detail: str) -> None:
+        if self._on_error is None:
+            return
+        now = time.monotonic()
+        if now - self._last_error_report_t < 3.0:
+            return  # 매 프레임마다 알림이 뜨면 스팸이 되므로 3초에 한 번만
+        self._last_error_report_t = now
+        self._on_error(detail)
 
     def _start_ros1(self, topic: str, msg_type: str) -> None:
         self._ensure_ros1_node()
@@ -179,6 +202,11 @@ class LiveTopicSubscriber:
                 return
             img = decode_image_message(msg, msg_type)
             if img is None:
+                detail = getattr(msg, "encoding", None) or getattr(msg, "format", "알 수 없음")
+                self._report_decode_error(
+                    f"프레임은 도착했지만 디코딩에 실패했습니다 (encoding/format='{detail}'). "
+                    f"지원하지 않는 이미지 인코딩일 수 있습니다."
+                )
                 return
             t_sec = msg.header.stamp.to_sec() if msg.header.stamp else time.time()
             self._on_frame(img, t_sec)
@@ -198,6 +226,11 @@ class LiveTopicSubscriber:
                 return
             img = decode_image_message(msg, msg_type)
             if img is None:
+                detail = getattr(msg, "encoding", None) or getattr(msg, "format", "알 수 없음")
+                self._report_decode_error(
+                    f"프레임은 도착했지만 디코딩에 실패했습니다 (encoding/format='{detail}'). "
+                    f"지원하지 않는 이미지 인코딩일 수 있습니다."
+                )
                 return
             stamp = msg.header.stamp
             t_sec = stamp.sec + stamp.nanosec / 1e9 if stamp else time.time()
@@ -217,6 +250,7 @@ class LiveTopicSubscriber:
     def stop(self) -> None:
         self._running = False
         self._on_frame = None
+        self._on_error = None
 
         if self._backend == "ros1" and self._rospy_subscriber is not None:
             self._rospy_subscriber.unregister()

@@ -14,7 +14,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import cv2
-import numpy as np
 
 from calibration.types import CalibrationResult, CameraConfig, PatternConfig
 
