@@ -35,18 +35,28 @@ def run_all_models(
     dataset: Dataset,
     camera_config: CameraConfig,
     use_rational_model: bool = False,
+    estimate_fisheye_uncertainty: bool = True,
 ) -> list[CalibrationResult]:
     """세 모델을 정해진 순서로 계산.
 
     Pinhole을 가장 먼저 계산하는 이유: Fisheye 초기값으로 넘겨줘야 하기 때문
     (설계 문서 2번 발산 방지). 순서를 바꾸면 안 된다.
+
+    estimate_fisheye_uncertainty: 기본 True. 이 함수는 "사용자에게 보여줄 결과"를
+    만드는 1차 실행 경로(app/cli.py, ui/worker.py)에서만 호출되므로, 여기서는
+    fisheye의 bootstrap 불확실성 추정(비용이 있음, calibration/models/fisheye.py
+    참고)을 기본으로 켠다 - Pinhole/Extended가 공짜로 표준편차를 받는 것과
+    체감 상 동일하게 보이도록. validation.py(hold-out 교차검증)와
+    outlier.py(반복 재계산)는 fisheye 캘리브레이션을 여러 번 돌리므로 이 함수를
+    거치지 않고 calibrate_fisheye()를 직접 호출하며, 거기서는 기본값(False)이 유지된다.
     """
     pinhole_result = calibrate_pinhole(dataset, camera_config)
     extended_result = calibrate_extended_pinhole(
         dataset, camera_config, use_rational_model=use_rational_model
     )
     fisheye_result = calibrate_fisheye(
-        dataset, camera_config, initial_guess=pinhole_result
+        dataset, camera_config, initial_guess=pinhole_result,
+        estimate_uncertainty=estimate_fisheye_uncertainty,
     )
     return [pinhole_result, extended_result, fisheye_result]
 

@@ -6,7 +6,7 @@ camera_calibrator.calibration.models.fisheye
 
 cv2.fisheye 모듈은 cv2.calibrateCameraExtended()에 대응하는 Extended 버전이
 없다. 즉 perViewErrors(프레임별 오차)와 stdDeviations(파라미터 불확실성)를
-공짜로 주지 않는다. 그래서 이 모듈만 다음 두 가지를 직접 구현한다:
+공짜로 주지 않는다. 그래서 이 모듈만 다음 세 가지를 직접 구현한다:
 
 1. 초기값 안전장치 (설계 문서 2번):
    피쉬아이는 초기 fx, fy 추정이 나쁘면 최적화가 발산한다.
@@ -18,9 +18,19 @@ cv2.fisheye 모듈은 cv2.calibrateCameraExtended()에 대응하는 Extended 버
 2. 프레임별 재투영 오차 수동 계산:
    cv2.fisheye.projectPoints()를 프레임마다 호출해 pinhole.py가
    perViewErrors로 공짜로 받던 것을 직접 채운다.
+
+3. 파라미터 불확실성(fx_std/fy_std/cx_std/cy_std) - Bootstrap Resampling:
+   Pinhole/Extended Pinhole은 calibrateCameraExtended()가 stdDeviationsIntrinsics를
+   공짜로 주지만 cv2.fisheye에는 그런 API가 없다. 대신 통계학의 표준 기법인
+   bootstrap resampling으로 우회한다 - 자세한 설명은
+   `_bootstrap_fisheye_uncertainty()` docstring 참고. `calibrate_fisheye()`의
+   `estimate_uncertainty=True`(기본값 False - 비용이 있으므로 호출부가 명시적으로
+   켜야 함)로 활성화한다.
 """
 
 from __future__ import annotations
+
+import logging
 
 import cv2
 import numpy as np
@@ -30,6 +40,7 @@ from calibration.types import (
     CameraConfig,
     CameraModelType,
     Dataset,
+    ParameterUncertainty,
 )
 from calibration.models.common import (
     MIN_FRAMES_REQUIRED,
@@ -38,6 +49,15 @@ from calibration.models.common import (
     compute_regional_error,
 )
 from calibration.radial_profile import compute_radial_error_profile
+
+logger = logging.getLogger(__name__)
+
+# Bootstrap 재표본화 시 이 장수를 넘는 데이터셋은 건너뛴다 (n_bootstrap번 전체
+# 재캘리브레이션을 반복하는 구조라 프레임이 아주 많으면 비용이 선형으로 커진다 -
+# 데이터셋이 클수록 애초에 각 파라미터 추정 자체가 이미 안정적이라 불확실성
+# 추정의 한계효용도 낮다).
+_BOOTSTRAP_MAX_FRAMES = 150
+_BOOTSTRAP_MIN_SUCCESSFUL_SAMPLES = 5
 
 # fisheye는 파라미터가 적어도(k1~k4) Brown-Conrady보다 화각 전역에서 비선형성이
 # 강해, 뷰 개수가 부족하면 발산 위험이 pinhole/extended보다 크다.
@@ -123,10 +143,96 @@ def _per_frame_errors_fisheye(
     return errors
 
 
+def _bootstrap_fisheye_uncertainty(
+    object_points: list[np.ndarray],
+    image_points: list[np.ndarray],
+    image_size: tuple[int, int],
+    K_ref: np.ndarray,
+    D_ref: np.ndarray,
+    flags: int,
+    n_bootstrap: int,
+    rng_seed: int,
+) -> ParameterUncertainty | None:
+    """전체 데이터로 얻은 K_ref/D_ref를 초기값 삼아 프레임을 복원추출(bootstrap)로
+    재표본화해 n_bootstrap번 재캘리브레이션하고, fx/fy/cx/cy의 표준편차를 구한다.
+
+    cv2.fisheye는 stdDeviations를 안 준다(모듈 docstring 참고) - Pinhole/Extended처럼
+    "공짜로" 얻을 수 없다. 대신 통계학의 표준 기법인 bootstrap resampling으로
+    우회한다: 원래 N장짜리 데이터셋에서 매번 N장을 복원추출(같은 프레임이 여러 번
+    뽑히거나 아예 안 뽑힐 수 있음)해서 별도의 데이터셋을 만들고, 그걸로 다시
+    캘리브레이션한다. 이 과정을 여러 번 반복해서 나온 파라미터들이 흩어진 정도
+    (표준편차)가 곧 "이 데이터셋으로 추정한 파라미터가 얼마나 안정적인가"의
+    척도가 된다 - OpenCV가 못 주는 covariance를 흉내 내는 셈이다.
+
+    한계(정직하게 명시): 각 재표본은 전체 데이터의 K_ref를 초기값
+    (CALIB_USE_INTRINSIC_GUESS)으로 재사용한다. Fisheye는 초기값이 나쁘면
+    발산하기 쉬운데(모듈 docstring 1번), 매번 처음부터 추정하게 두면 실패율이
+    너무 높아 재표본 대부분을 못 쓰게 된다. 대신 이러면 "전체 데이터 추정치
+    근방에서의 국소적 분산"을 재는 셈이라, 완전히 독립적인 (초기값 없이 매번
+    새로 추정하는) 붓스트랩보다 분산을 다소 과소평가할 수 있다 - 그래도 "전혀
+    모른다"보다는 훨씬 유용한 근사치이며, Pinhole/Extended의 표준편차와 나란히
+    놓고 볼 상대적 비교 지표로는 충분하다.
+
+    일부 재표본은 그래도 발산하거나 예외를 던질 수 있다 - 조용히 건너뛰고 성공한
+    것만으로 표준편차를 계산한다. 성공한 재표본이 너무 적으면(기본 5개 미만)
+    통계적으로 의미가 없으므로 None을 반환한다(호출부는 이걸 "계산 안 됨"으로
+    표시해야지, 0으로 표시하면 안 된다).
+    """
+    n_frames = len(object_points)
+    rng = np.random.default_rng(rng_seed)
+
+    fx_samples: list[float] = []
+    fy_samples: list[float] = []
+    cx_samples: list[float] = []
+    cy_samples: list[float] = []
+
+    bootstrap_flags = flags | _fisheye_flag("CALIB_USE_INTRINSIC_GUESS")
+    K_init = K_ref.copy().astype(np.float64)
+    D_init = D_ref.copy().astype(np.float64)
+
+    for _ in range(n_bootstrap):
+        idx = rng.integers(0, n_frames, size=n_frames)
+        obj_sample = [object_points[i] for i in idx]
+        img_sample = [image_points[i] for i in idx]
+        try:
+            _, K_i, D_i, _, _ = cv2.fisheye.calibrate(
+                obj_sample, img_sample, image_size,
+                K_init.copy(), D_init.copy(),
+                flags=bootstrap_flags,
+            )
+        except cv2.error:
+            continue  # 이 재표본은 발산 - 조용히 건너뛴다 (아래에서 성공 개수로 판단)
+        fx_samples.append(float(K_i[0, 0]))
+        fy_samples.append(float(K_i[1, 1]))
+        cx_samples.append(float(K_i[0, 2]))
+        cy_samples.append(float(K_i[1, 2]))
+
+    if len(fx_samples) < _BOOTSTRAP_MIN_SUCCESSFUL_SAMPLES:
+        logger.warning(
+            "Fisheye bootstrap 재표본 %d/%d개만 성공해 불확실성 추정을 건너뜁니다.",
+            len(fx_samples), n_bootstrap,
+        )
+        return None
+
+    logger.info(
+        "Fisheye bootstrap 불확실성 추정 완료: %d/%d개 재표본 성공",
+        len(fx_samples), n_bootstrap,
+    )
+    return ParameterUncertainty(
+        fx_std=float(np.std(fx_samples, ddof=1)),
+        fy_std=float(np.std(fy_samples, ddof=1)),
+        cx_std=float(np.std(cx_samples, ddof=1)),
+        cy_std=float(np.std(cy_samples, ddof=1)),
+    )
+
+
 def calibrate_fisheye(
     dataset: Dataset,
     camera_config: CameraConfig,
     initial_guess: CalibrationResult | None = None,
+    estimate_uncertainty: bool = False,
+    n_bootstrap: int = 20,
+    bootstrap_seed: int = 42,
 ) -> CalibrationResult:
     """Fisheye(Kannala-Brandt) 캘리브레이션 실행.
 
@@ -134,6 +240,16 @@ def calibrate_fisheye(
         initial_guess: Pinhole 모델의 CalibrationResult를 넘기면
             fx, fy, cx, cy를 초기값으로 사용해 발산을 방지한다 (설계 문서 2번).
             없으면 OpenCV 기본 추정 로직(least-squares)에 맡긴다.
+        estimate_uncertainty: True면 bootstrap resampling으로 fx_std/fy_std/
+            cx_std/cy_std를 추정한다 (`_bootstrap_fisheye_uncertainty()` 참고).
+            기본값 False인 이유: 이 추정은 전체 재캘리브레이션을 n_bootstrap번
+            반복하는 구조라 비용이 있다 - validation.py의 hold-out 교차검증이나
+            outlier.py의 반복 재계산처럼 fisheye 캘리브레이션 자체를 이미 여러 번
+            돌리는 경로에서까지 기본으로 켜면 비용이 곱연산으로 불어난다. 최종
+            사용자에게 보여줄 "1차 실행" 결과(compare.py의 run_all_models())에서만
+            명시적으로 켠다.
+        n_bootstrap: 재표본화 반복 횟수. 데이터셋이 150장을 넘으면(비용이 커서)
+            자동으로 건너뛴다.
     """
     frames, object_points, image_points = collect_calibration_inputs(dataset)
 
@@ -205,6 +321,19 @@ def calibrate_fisheye(
         frames, list(rvecs), list(tvecs), K, D, image_size, CameraModelType.FISHEYE
     )
 
+    param_uncertainty: ParameterUncertainty | None = None
+    if estimate_uncertainty:
+        if len(object_points) > _BOOTSTRAP_MAX_FRAMES:
+            logger.info(
+                "Fisheye bootstrap 불확실성 추정 건너뜀: 프레임 %d장 > 상한 %d장",
+                len(object_points), _BOOTSTRAP_MAX_FRAMES,
+            )
+        else:
+            param_uncertainty = _bootstrap_fisheye_uncertainty(
+                object_points, image_points, image_size, K, D, flags,
+                n_bootstrap=n_bootstrap, rng_seed=bootstrap_seed,
+            )
+
     return CalibrationResult(
         model_name=CameraModelType.FISHEYE,
         camera_matrix=K,
@@ -215,6 +344,6 @@ def calibrate_fisheye(
         per_frame_error=per_frame_error,
         regional_error=regional_error,
         radial_profile=radial_profile,
-        param_uncertainty=None,  # fisheye는 stdDeviations를 제공하지 않음 (V2에서 별도 구현 필요)
+        param_uncertainty=param_uncertainty,
         success=True,
     )

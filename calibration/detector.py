@@ -35,6 +35,9 @@ UI 없이 이 모듈만으로 터미널에서 다음처럼 확인 가능해야 �
 
 from __future__ import annotations
 
+import logging
+import os
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -50,6 +53,8 @@ from calibration.types import (
     PatternConfig,
     PatternType,
 )
+
+logger = logging.getLogger(__name__)
 
 # ChArUco 코너가 이 개수 미만이면 검출 성공이어도 경고 취급 (캘리브레이션에는 사용 가능)
 MIN_RECOMMENDED_CORNERS = 6
@@ -369,32 +374,88 @@ def build_detect_fn(pattern: PatternConfig) -> Callable[[np.ndarray, str], Detec
 def detect_dataset(
     image_paths: list[str],
     pattern: PatternConfig,
+    *,
+    parallel: bool = False,
+    max_workers: Optional[int] = None,
 ) -> Dataset:
     """이미지 경로 리스트 전체를 검출해 Dataset(Frame 리스트)으로 반환.
 
     UI 없이 이 함수 하나로 2단계 목표(검출 파이프라인 안정화)를 검증할 수 있다.
     패턴 타입(ChArUco/체스보드)에 따라 알맞은 검출 함수로 분기한다 - 이 함수
     호출부(quality.py, compare.py 등)는 어느 패턴이었는지 몰라도 된다.
+
+    기본은 순차 처리다(기존 동작과 완전히 동일, 테스트 결과도 그대로 재현됨).
+    `parallel=True`를 주면 `concurrent.futures.ProcessPoolExecutor`로 이미지별
+    검출을 여러 프로세스에 나눠 돌린다 - 검출은 이미지 한 장 단위로 완전히
+    독립적인 순수 계산(cv2 호출만 함, 공유 상태 없음)이라 프레임 수가 많은
+    데이터셋(수백 장)에서 코어 수에 비례해 빨라진다. 결과 순서는 image_paths
+    순서와 항상 동일하게 유지된다(ProcessPoolExecutor.map은 완료 순서가 아니라
+    제출 순서로 결과를 돌려줌) - 그래야 Dataset.frames의 순서가 순차 실행 때와
+    똑같아서 이 함수를 호출하는 다른 코드(quality.py 등)가 병렬 여부를 몰라도 된다.
+
+    Args:
+        parallel: True면 프로세스 풀 사용. 이미지 1장뿐이거나 os.cpu_count()가
+            1인 환경에서는 parallel=True여도 자동으로 순차 처리로 내려간다
+            (프로세스 생성 비용이 이득보다 커서).
+        max_workers: 프로세스 개수. None이면 os.cpu_count() 그대로 사용.
     """
-    detect_fn = build_detect_fn(pattern)
+    if parallel and len(image_paths) > 1 and (os.cpu_count() or 1) > 1:
+        logger.info(
+            "병렬 검출 시작: 이미지 %d장, max_workers=%s",
+            len(image_paths), max_workers or os.cpu_count(),
+        )
+        pairs = _detect_dataset_parallel(image_paths, pattern, max_workers)
+    else:
+        logger.debug("순차 검출: 이미지 %d장", len(image_paths))
+        detect_fn = build_detect_fn(pattern)
+        pairs = [detect_image_file(p, detect_fn) for p in image_paths]
 
     dataset = Dataset()
-    for image_path in image_paths:
-        info, result = detect_image_file(image_path, detect_fn)
-
-        if result.success:
-            status = (
-                FrameStatus.DETECTED
-                if result.num_corners >= MIN_RECOMMENDED_CORNERS
-                else FrameStatus.DETECTED  # 검출은 성공, quality.py에서 점수로 별도 평가
-            )
-        else:
-            status = FrameStatus.DETECTION_FAILED
-
-        frame = Frame(image_info=info, detection=result, status=status)
-        dataset.frames.append(frame)
+    for info, result in pairs:
+        status = FrameStatus.DETECTED if result.success else FrameStatus.DETECTION_FAILED
+        dataset.frames.append(Frame(image_info=info, detection=result, status=status))
 
     return dataset
+
+
+# ---------------------------------------------------------------------------
+# 병렬 검출 (프로세스별 워커)
+# ---------------------------------------------------------------------------
+#
+# cv2.aruco.CharucoDetector 같은 OpenCV 객체는 pickle이 안 돼서 ProcessPoolExecutor로
+# 그대로 넘길 수 없다 - 그래서 각 워커 프로세스가 "자기 몫의 이미지를 처리하기
+# 시작할 때 딱 한 번" PatternConfig(순수 데이터라 pickle 가능)로부터 자기만의
+# detect_fn을 새로 만들게 한다(initializer). 프로세스당 한 번만 만들고, 그
+# 프로세스에 배정된 여러 이미지가 재사용하므로 이미지 1장마다 board를 새로 만드는
+# 낭비는 없다.
+
+_worker_detect_fn: Optional[Callable[[np.ndarray, str], DetectionResult]] = None
+
+
+def _init_worker(pattern: PatternConfig) -> None:
+    global _worker_detect_fn
+    _worker_detect_fn = build_detect_fn(pattern)
+
+
+def _detect_one_in_worker(image_path: str) -> tuple[ImageInfo, DetectionResult]:
+    if _worker_detect_fn is None:  # pragma: no cover - initializer가 항상 먼저 돎
+        raise RuntimeError("워커 프로세스 초기화가 안 된 상태에서 호출됨 (internal error)")
+    return detect_image_file(image_path, _worker_detect_fn)
+
+
+def _detect_dataset_parallel(
+    image_paths: list[str],
+    pattern: PatternConfig,
+    max_workers: Optional[int],
+) -> list[tuple[ImageInfo, DetectionResult]]:
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_init_worker,
+        initargs=(pattern,),
+    ) as executor:
+        # executor.map은 결과를 제출 순서대로 돌려준다 (완료 순서 아님) -
+        # 순차 실행과 동일한 프레임 순서를 보장하기 위해 중요.
+        return list(executor.map(_detect_one_in_worker, image_paths))
 
 
 def summarize_dataset(dataset: Dataset) -> str:

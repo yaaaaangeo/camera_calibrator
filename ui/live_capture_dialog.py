@@ -39,12 +39,19 @@ from PySide6.QtWidgets import (
 )
 
 from calibration.detector import build_detect_fn
-from calibration.quality import compute_live_coverage_bars
+from calibration.quality import compute_coverage_grid, compute_live_coverage_bars, coverage_warnings
 from calibration.ros_live import ROS_LIVE_BACKEND, LiveTopicSubscriber
-from calibration.types import CameraConfig, Frame, ImageInfo, PatternConfig
+from calibration.types import CameraConfig, Dataset, Frame, ImageInfo, PatternConfig
 from ui.live_coverage_bars import LiveCoverageBarsWidget
 
 _PREVIEW_MAX_WIDTH = 480
+
+# 이 정도 프레임이 검출되기 전엔 4x4 그리드 자체가 통계적으로 의미가 없다
+# (예: 1장만 찍었는데 "이 구역이 부족하다"고 말해봐야 당연한 얘기라 노이즈에
+# 가깝다) - 사후 Coverage 탭과 같은 low_threshold를 쓰되, 최소 프레임 수만
+# 실시간 코칭 전용으로 추가한다.
+_MIN_FRAMES_FOR_LIVE_COACHING = 3
+_MAX_WARNINGS_SHOWN = 2
 
 
 def _cv_to_qpixmap(img_bgr: np.ndarray, max_width: int = _PREVIEW_MAX_WIDTH) -> QPixmap:
@@ -134,6 +141,20 @@ class LiveCaptureDialog(QDialog):
             hint.setStyleSheet("color:#c0392b;")
             layout.addWidget(hint)
         layout.addWidget(self.coverage_bars)
+
+        # 4x4 구역별("좌측 상단", "우측 하단" 등) 실시간 다양성 코칭 문구.
+        # 캘리브레이션을 다 끝내야 사후 Coverage 탭(ui/coverage_view.py)에서나
+        # 보이던 걸, 촬영 도중에 바로 보여줘서 애초에 좋은 데이터셋을 찍게
+        # 유도한다 - quality.py의 동일한 compute_coverage_grid()/coverage_warnings()를
+        # 그대로 재사용하므로 "촬영 중에 본 안내"와 "캘리브레이션 후 리포트"가
+        # 같은 기준으로 계산된다 (기준이 서로 다르면 사용자가 혼란스러워짐).
+        self.coverage_warning_label = QLabel(
+            "이미지를 3장 이상 캡처하면 구역별 다양성 안내가 시작됩니다."
+        )
+        self.coverage_warning_label.setWordWrap(True)
+        self.coverage_warning_label.setStyleSheet("color:#888;")
+        self.coverage_warning_label.setVisible(self._detect_fn is not None)
+        layout.addWidget(self.coverage_warning_label)
 
         capture_row = QHBoxLayout()
         self.capture_button = QPushButton("📸 캡처")
@@ -265,7 +286,8 @@ class LiveCaptureDialog(QDialog):
         self._update_coverage_bars(img_bgr, image_id=filename.stem)
 
     def _update_coverage_bars(self, img_bgr: np.ndarray, image_id: str) -> None:
-        """방금 캡처한 프레임에 검출을 돌려서 X/Y/Size/Skew 바를 갱신.
+        """방금 캡처한 프레임에 검출을 돌려서 X/Y/Size/Skew 바 + 구역별 다양성
+        코칭 문구를 함께 갱신.
 
         캡처 직후에만 돌리는 이유: 매 라이브 프레임(수십 fps)마다 검출을
         돌리면 GUI 스레드가 버벅일 수 있고, 어차피 이 프로젝트는 "자동으로
@@ -285,6 +307,42 @@ class LiveCaptureDialog(QDialog):
             image_size=(self._camera_config.width, self._camera_config.height),
         )
         self.coverage_bars.set_bars(bars)
+        self._update_coverage_coaching()
+
+    def _update_coverage_coaching(self) -> None:
+        """4x4 구역 기준 "이 구역이 아직 부족합니다" 코칭 문구 갱신.
+
+        사후 Coverage 탭(ui/coverage_view.py)과 완전히 동일한 계산 함수
+        (quality.compute_coverage_grid / coverage_warnings)를 재사용한다 -
+        새 로직을 따로 만들면 실시간 안내와 사후 리포트의 기준이 미묘하게
+        어긋날 위험이 있다.
+        """
+        num_detected = sum(
+            1 for f in self._detected_frames if f.detection and f.detection.success
+        )
+        if num_detected < _MIN_FRAMES_FOR_LIVE_COACHING:
+            remaining = _MIN_FRAMES_FOR_LIVE_COACHING - num_detected
+            self.coverage_warning_label.setStyleSheet("color:#888;")
+            self.coverage_warning_label.setText(
+                f"이미지를 {remaining}장 더 캡처하면 구역별 다양성 안내가 시작됩니다."
+            )
+            return
+
+        temp_dataset = Dataset(frames=self._detected_frames)
+        cells = compute_coverage_grid(temp_dataset, self._camera_config)
+        warnings = coverage_warnings(cells)
+
+        if not warnings:
+            self.coverage_warning_label.setStyleSheet("color:#2e7d32;")  # 초록
+            self.coverage_warning_label.setText("✓ 지금까지 촬영한 자세가 구역별로 고르게 분포되어 있습니다.")
+            return
+
+        shown = warnings[:_MAX_WARNINGS_SHOWN]
+        text = "⚠ " + "  ".join(shown)
+        if len(warnings) > _MAX_WARNINGS_SHOWN:
+            text += f"  (+{len(warnings) - _MAX_WARNINGS_SHOWN}개 구역 더)"
+        self.coverage_warning_label.setStyleSheet("color:#c0392b;")  # 빨강
+        self.coverage_warning_label.setText(text)
 
     # ------------------------------------------------------------------
 

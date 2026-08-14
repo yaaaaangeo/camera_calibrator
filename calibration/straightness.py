@@ -146,6 +146,50 @@ def compute_frame_straightness_lines(
         # 해당 프레임만 건너뛰고 나머지는 계속 진행.
         return []
 
+    return _lines_from_points(det, pattern, undistorted, min_points_per_line)
+
+
+def compute_frame_raw_straightness_lines(
+    frame: Frame,
+    pattern: PatternConfig,
+    min_points_per_line: int = MIN_POINTS_PER_LINE,
+) -> list[StraightnessLine]:
+    """왜곡 보정을 아예 하지 않은, 검출된 그대로의(raw) 픽셀 좌표 기준 행/열 라인.
+
+    `compute_frame_straightness_lines()`의 "보정 후" 잔차와 짝을 이루는
+    "보정 전" 기준선이다 - Undistort Preview 탭(ui/preview.py)에서 "이 모델로
+    보정하면 얼마나 좋아지는가"를 숫자로 보여주려면 보정 전 잔차가 필요한데,
+    지금까지는 육안 비교만 있었다 (undistort_image()로 보정된 이미지를 보여줄
+    뿐, "곧아진 정도"를 정량화하지 않음 - 프로젝트 철학 "RMS만 보고 판단 금지"를
+    undistort 단계에서도 지키려면 여기도 숫자 근거가 있어야 한다).
+
+    `_undistort_points_pixel_space()`를 아예 거치지 않고 검출된 코너를 그대로
+    행/열로 묶어 직선을 피팅한다 - 카메라 모델(camera_matrix/distortion)이
+    전혀 필요 없다는 점이 핵심이다: "보정 안 한 원본이 얼마나 휘어 있었는가"는
+    어떤 모델을 나중에 적용할지와 무관한, 순수하게 검출 결과만으로 정해지는
+    값이기 때문이다.
+    """
+    det = frame.detection
+    if not det or not det.success or det.corners is None or det.ids is None:
+        return []
+    if det.num_corners < min_points_per_line:
+        return []
+
+    raw_points = det.corners.reshape(-1, 2).astype(np.float64)
+    return _lines_from_points(det, pattern, raw_points, min_points_per_line)
+
+
+def _lines_from_points(
+    det, pattern: PatternConfig, points: np.ndarray, min_points_per_line: int,
+) -> list[StraightnessLine]:
+    """검출 결과(det)의 board id로 점들을 행/열로 묶어 직선을 피팅.
+
+    compute_frame_straightness_lines()(보정 후)와
+    compute_frame_raw_straightness_lines()(보정 전) 둘 다 이 함수를 공유한다 -
+    "points가 어디서 왔는지"만 다르고 그 뒤 grouping/fitting 로직은 완전히
+    동일해야, 전/후 숫자를 공정하게 비교할 수 있다 (로직이 갈라지면 차이가
+    실제 개선 때문인지 계산 방식 차이 때문인지 알 수 없게 된다).
+    """
     cols_per_row = pattern.squares_x - 1  # id -> row/col 역산에 필요
     ids_flat = det.ids.reshape(-1)
     rows: dict[int, list[np.ndarray]] = {}
@@ -154,8 +198,8 @@ def compute_frame_straightness_lines(
         cid = int(cid)
         row_key = cid // cols_per_row
         col_key = cid % cols_per_row
-        rows.setdefault(row_key, []).append(undistorted[idx])
-        cols.setdefault(col_key, []).append(undistorted[idx])
+        rows.setdefault(row_key, []).append(points[idx])
+        cols.setdefault(col_key, []).append(points[idx])
 
     lines: list[StraightnessLine] = []
     for line_type, groups in (("row", rows), ("col", cols)):
@@ -170,6 +214,30 @@ def compute_frame_straightness_lines(
                 )
             )
     return lines
+
+
+def compute_straightness_improvement(
+    frame: Frame,
+    pattern: PatternConfig,
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray,
+    model: CameraModelType,
+    min_points_per_line: int = MIN_POINTS_PER_LINE,
+) -> tuple[float | None, float | None]:
+    """단일 프레임에 대해 (보정 전 잔차, 보정 후 잔차)를 함께 반환 (단위: px).
+
+    Undistort Preview 탭이 이미지 한 장 + 모델 하나를 고른 순간 바로 보여줄
+    "이 모델로 보정하면 직선이 얼마나 곧아지는가"를 위한 편의 함수 - 두 잔차가
+    같은 프레임, 같은 행/열 grouping 기준으로 계산되므로 그 차이가 곧 이
+    모델의 실질적인 보정 효과다. 계산할 수 있는 라인이 없으면 (None, None).
+    """
+    raw_lines = compute_frame_raw_straightness_lines(frame, pattern, min_points_per_line)
+    corrected_lines = compute_frame_straightness_lines(
+        frame, pattern, camera_matrix, distortion, model, min_points_per_line
+    )
+    raw_residual = float(np.mean([l.residual for l in raw_lines])) if raw_lines else None
+    corrected_residual = float(np.mean([l.residual for l in corrected_lines])) if corrected_lines else None
+    return raw_residual, corrected_residual
 
 
 def compute_straightness_residual(

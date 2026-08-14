@@ -384,7 +384,7 @@ class MainWindow(QMainWindow):
     def _on_models_ready(self, results: dict[CameraModelType, CalibrationResult]) -> None:
         self.calibration_results = results
         if self.dataset is not None and self.camera_config is not None:
-            self.preview_view.set_context(self.dataset, self.camera_config, results)
+            self.preview_view.set_context(self.dataset, self.camera_config, results, self.pattern_config)
             self.dataset_view.set_dataset(self.dataset)  # per_frame_error 채워졌으니 갱신
             if self.pattern_config is not None:
                 self.straightness_view.set_context(self.dataset, self.camera_config, results, self.pattern_config)
@@ -653,7 +653,7 @@ class MainWindow(QMainWindow):
         self.dataset_view.set_dataset(self.dataset)
         self.coverage_view.set_quality(self.dataset.coverage_grid, self.dataset.diversity, [])
         if self.calibration_results:
-            self.preview_view.set_context(self.dataset, self.camera_config, self.calibration_results)
+            self.preview_view.set_context(self.dataset, self.camera_config, self.calibration_results, self.pattern_config)
             self.radial_profile_view.set_results(self.calibration_results)
             self.straightness_view.set_context(
                 self.dataset, self.camera_config, self.calibration_results, self.pattern_config

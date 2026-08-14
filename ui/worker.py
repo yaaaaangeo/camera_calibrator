@@ -60,7 +60,11 @@ class PipelineWorker(QObject):
     def run(self) -> None:
         try:
             self.progress.emit(f"{len(self.image_paths)}장 이미지에서 ChArUco 코너 검출 중...")
-            dataset = detect_dataset(self.image_paths, self.pattern_config)
+            # 이미 QThread(백그라운드 스레드) 안이라 프로세스 풀을 더 띄워도 UI가
+            # 멈추지 않는다. 이미지가 충분히 많을 때만 병렬화 이득이 프로세스 생성
+            # 비용을 넘어서므로, 적은 장수(<= 8)에서는 그냥 순차로 둔다.
+            use_parallel = len(self.image_paths) > 8
+            dataset = detect_dataset(self.image_paths, self.pattern_config, parallel=use_parallel)
             self.dataset = dataset
             self.dataset_ready.emit(dataset)
 

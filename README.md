@@ -1,5 +1,7 @@
 # Camera Calibration Tool
 
+[![Tests](https://github.com/yaaaaangeo/camera_calibrator/actions/workflows/tests.yml/badge.svg)](https://github.com/yaaaaangeo/camera_calibrator/actions/workflows/tests.yml)
+
 Pinhole / Extended Pinhole(Brown-Conrady) / Fisheye(Kannala-Brandt) 세 모델을
 ChArUco 패턴으로 동시에 캘리브레이션하고, Hold-out 검증 + Model Score 기반으로
 근거 있는 추천을 해주는 도구.
@@ -57,6 +59,28 @@ pip install -e ".[dev]"     # 테스트(pytest)까지 포함
 쪽을 쓰든 상관없습니다 - 개발/기여 목적이면 방법 B, 그냥 써보는 목적이면
 방법 A가 조금 더 단순합니다.
 
+**방법 C - Docker (설치 없이 바로, CI/배치 처리에 특히 유용)**
+
+이 섹션이 스스로 경고하는 함정들(opencv-python과 opencv-contrib-python 동시
+설치 금지, PySide6의 시스템 라이브러리 의존성 등)을 매번 새로 겪고 싶지 않다면
+Docker가 제일 간단합니다:
+
+```bash
+docker build -t camera-calibrator .
+
+docker run --rm \
+  -v "$(pwd)/photos:/data/photos:ro" \
+  -v "$(pwd)/out:/data/out" \
+  camera-calibrator \
+  --images /data/photos --squares-x 7 --squares-y 5 \
+  --square-size 0.04 --marker-size 0.03 --output-dir /data/out
+```
+
+기본 이미지는 헤드리스 CLI 전용입니다 (컨테이너 안에 디스플레이가 없어
+`QT_QPA_PLATFORM=offscreen`이 기본값). GUI를 실제로 띄우거나, VS Code에서 이
+프로젝트를 곧바로 개발 컨테이너로 열고 싶다면 `Dockerfile` 상단 주석과
+`.devcontainer/devcontainer.json`을 참고하세요 (X11 포워딩 방법 포함).
+
 ## 3. 실행
 
 ```bash
@@ -100,7 +124,10 @@ camera-calibrator
      추천 + 이상치 제거 + OpenCV/ROS YAML export + **HTML 종합 리포트 export** +
      **JSON export**(구조화된 전체 결과, 외부 도구 연동용) +
      **CSV export**(이미지별 상세 데이터, 스프레드시트 분석용)
-   - **④ Undistort Preview**: 원본 vs 보정 이미지 비교
+   - **④ Undistort Preview**: 원본 vs 보정 이미지 비교 + Line Straightness Residual
+     정량 비교(보정 전 → 보정 후 px, 개선율 %) - "직선이 얼마나 곧아졌는지 눈으로
+     확인하세요"에서 그치지 않고, 사후 리포트(⑥번 탭, Model Score)와 동일한
+     지표로 실제 숫자를 함께 보여준다
    - **⑤ Edge Error Map**: 이미지 중심으로부터의 거리(반지름)별 재투영 오차 막대그래프
      (Radial Error Profile) — 렌즈 외곽에서 모델이 잘 맞는지 한눈에 확인
    - **⑥ Straightness Map**: 체스보드의 각 행/열을 실제 이미지 위에 선으로
@@ -147,12 +174,15 @@ camera_calibrator/
 ├── ui/                       # PySide6 화면 (계산 로직 없음, calibration/*만 호출)
 │   ├── radial_profile_view.py   # Edge Error Map 그래프 (QPainter 커스텀 위젯)
 │   ├── straightness_view.py     # Straightness Map (행/열 라인을 이미지 위에 색으로 오버레이)
-│   └── live_capture_dialog.py   # 실시간 구독 + 라이브 프리뷰 + 수동/자동 캡처 다이얼로그
-├── .github/workflows/tests.yml  # GitHub Actions CI (push/PR마다 Python 3.10/3.11/3.12 자동 테스트)
+│   └── live_capture_dialog.py   # 실시간 구독 + 라이브 프리뷰 + 수동/자동 캡처 + 구역별 다양성 코칭
+├── .github/workflows/tests.yml  # GitHub Actions CI (push/PR마다 Python 3.10/3.11/3.12 자동 테스트 + 커버리지)
+├── .devcontainer/devcontainer.json  # VS Code/Codespaces 개발 컨테이너 (아래 Dockerfile 재사용)
+├── Dockerfile                    # 헤드리스 CLI 실행 / 개발 컨테이너 베이스
+├── .dockerignore
 ├── .gitignore                   # __pycache__, venv, .ccproj 등 로컬 산출물 제외
 ├── pyproject.toml                # 패키징 메타데이터 (pip install -e ., camera-calibrator 콘솔 커맨드)
 ├── requirements.txt
-└── requirements-dev.txt          # 테스트(pytest) 실행용 추가 의존성
+└── requirements-dev.txt          # 테스트(pytest, pytest-cov) 실행용 추가 의존성
 ```
 
 `calibration/`은 UI와 완전히 독립적이라, CLI 스크립트나 다른 프론트엔드에서도
@@ -255,6 +285,7 @@ python -m app.cli \
 
 | 옵션 | 설명 |
 |---|---|
+| `--config PATH` | 패턴/카메라/파이프라인 옵션을 담은 `.yaml`/`.yml`/`.json` 파일 (아래 예시 참고). 같은 옵션을 커맨드라인에 또 주면 커맨드라인이 우선 |
 | `--images` | 이미지 파일/디렉토리/glob 패턴 (여러 개 가능) |
 | `--pattern {charuco,chessboard}` | 패턴 타입 (기본 charuco). chessboard는 `--marker-size`/`--dictionary` 불필요 |
 | `--bag`, `--topic`, `--bag-interval` | rosbag에서 이미지 추출 (`--images` 대신) |
@@ -262,9 +293,39 @@ python -m app.cli \
 | `--model {pinhole,extended_pinhole,fisheye}` | 자동 추천 대신 강제로 이 모델 선택 |
 | `--outlier` | 이상치 탐지 + 재계산까지 수행 |
 | `--rational` | Extended Pinhole에 8계수(rational) 모델 사용 |
+| `--jobs N` | 이미지 검출을 N개 프로세스로 병렬화 (기본 1=순차, 0=CPU 코어 수만큼 자동) |
 | `--export {opencv,ros,report,json,csv}` | 내보낼 형식 선택 (기본: opencv/ros/report - json/csv는 명시해야 포함됨) |
 | `--json-summary PATH` | 기계가 읽는 JSON 요약 저장 (CI 스크립팅용) |
 | `--quiet` | 진행상황 출력 최소화 |
+| `-v`/`--verbose`, `--log-file PATH` | 진단 로그 상세도/파일 저장 (버그 재현 시 유용) |
+
+**`--config` 사용 예시** - 같은 카메라로 반복 실행하는 운영 환경(예: 여러 로봇에
+같은 카메라 모듈)에서 패턴/카메라 설정을 매번 타이핑하는 대신 파일로 고정해두면
+실수를 줄일 수 있다:
+
+```yaml
+# camera.yaml
+squares_x: 7
+squares_y: 5
+square_size: 0.04
+marker_size: 0.03
+dictionary: DICT_5X5_100
+sensor_name: front_camera
+output_dir: ./out
+export: [opencv, ros, report, json]
+```
+
+```bash
+# 패턴/카메라 설정은 파일에서, 이미지 경로만 그때그때 커맨드라인으로
+python -m app.cli --config camera.yaml --images ./photos_2026_08_14
+
+# 특정 값만 그날 잠깐 다르게 쓰고 싶으면 커맨드라인이 파일 값을 덮어쓴다
+python -m app.cli --config camera.yaml --images ./photos --square-size 0.05
+```
+
+키 이름은 각 옵션의 `--long-name`에서 하이픈을 언더스코어로 바꾼 것과 동일하다
+(`--square-size` → `square_size`). 알 수 없는 키가 있으면 즉시 에러로 알려준다
+(오타 방지). JSON도 동일한 키로 그대로 쓸 수 있다.
 
 전체 옵션은 `python -m app.cli --help` 참고. rosbag 예시:
 
@@ -371,7 +432,22 @@ fixture(`conftest.py`)를 건드리는 fixture는 `copy.deepcopy()`로 복사본
 (선택적 의존성이라 앱도, 테스트도 없어도 동작해야 하므로).
 
 `.github/workflows/tests.yml`로 GitHub Actions CI가 붙어있어 push/PR마다
-Python 3.10/3.11/3.12에서 자동으로 돌아간다.
+Python 3.10/3.11/3.12에서 자동으로 돌아간다 (`test` 잡). 같은 워크플로우 안에
+OpenCV 4.x/5.x 호환성 매트릭스(`opencv-compat`)와 빠른 티어만 도는
+`smoke` 잡도 함께 있다.
+
+**커버리지**: Python 3.11 잡에서 `pytest-cov`로 커버리지를 측정한다
+(`calibration/`, `app/`, `export/`, `ui/` 대상). 매 실행마다:
+- Actions 실행 결과 페이지 상단 "Summary"에 모듈별 커버리지 표가 바로 보인다
+  (파일을 따로 열 필요 없음)
+- HTML 상세 리포트(`htmlcov/`)와 원본 `coverage.xml`을 Artifacts로 다운로드할 수
+  있다 (14일 보관)
+
+README 배지는 지금은 통과/실패 여부만 보여준다 - 커버리지 %까지 배지로
+고정하려면 Codecov 같은 외부 서비스 연동이 필요한데, 그건 저장소 소유자가
+직접 Codecov 계정을 만들어 토큰을 등록해야 해서 여기서는 붙이지 않았다
+(원하면 `.github/workflows/tests.yml`의 coverage 단계 뒤에 `codecov/codecov-action`
+스텝만 추가하면 된다).
 
 ## 9. Model Score 가중치 튜닝
 
@@ -411,7 +487,7 @@ Extended Pinhole과 Fisheye가 통계적으로 구분하기 어려워질 수 있
 | Dataset Diversity Score | ✅ |
 | Undistortion Preview | ✅ |
 | Automatic Model Recommendation | ✅ |
-| Parameter Uncertainty (Pinhole/Extended) | ✅ (Fisheye는 OpenCV 미지원) |
+| Parameter Uncertainty (Pinhole/Extended/Fisheye) | ✅ Pinhole/Extended는 `calibrateCameraExtended()`의 stdDeviations를 그대로 사용. Fisheye는 OpenCV가 covariance를 안 줘서 bootstrap resampling으로 별도 추정 (`calibration/models/fisheye.py`의 `_bootstrap_fisheye_uncertainty()`, `estimate_uncertainty=True`일 때만 - 1차 실행 결과에서 기본 활성화) |
 | **Frame Quality Score** | ✅ `calibration/frame_quality.py` |
 | **Edge Error Map (Radial Error Profile)** | ✅ `calibration/radial_profile.py` |
 | **Line Straightness Residual** | ✅ `calibration/straightness.py` |

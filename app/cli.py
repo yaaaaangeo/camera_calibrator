@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import glob as globmod
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -31,6 +32,7 @@ import cv2
 from calibration.compare import run_all_models, format_comparison_table
 from calibration.detector import detect_dataset, summarize_dataset
 from calibration.frame_quality import compute_frame_quality_scores
+from calibration.log_utils import setup_logging
 from calibration.models.common import infer_image_size
 from calibration.outlier import recalibrate_with_outlier_pruning
 from calibration.quality import analyze_dataset_quality, coverage_percentage
@@ -54,6 +56,8 @@ from export.ros import export_ros_camera_info
 from export.json_export import export_json
 from export.csv_export import export_csv
 
+logger = logging.getLogger(__name__)
+
 _IMAGE_EXTENSIONS = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
 
 _MODEL_BY_NAME = {
@@ -65,6 +69,71 @@ _MODEL_BY_NAME = {
 
 class CliError(Exception):
     """인자/입력 문제 - argparse 밖에서 나는 사용자 오류. 종료 코드 1로 변환됨."""
+
+
+def _load_config_file(path: str, known_dests: set[str]) -> dict:
+    """--config로 지정된 .yaml/.yml/.json 파일을 읽어 argparse dest 이름 ->
+    값 딕셔너리로 반환한다.
+
+    형식: 최상위가 key: value인 평범한 객체. 키는 각 옵션의 argparse dest와
+    동일해야 한다 (예: --square-size -> square_size, --images -> images).
+    하이픈(-)으로 써도 관대하게 받아준다 (예: square-size도 허용).
+
+        # camera.yaml 예시
+        squares_x: 7
+        squares_y: 5
+        square_size: 0.04
+        marker_size: 0.03
+        dictionary: DICT_5X5_100
+        sensor_name: front_camera
+        output_dir: ./out
+        export: [opencv, ros, report, json]
+
+    실행 시 --config camera.yaml --square-size 0.05 처럼 같은 옵션을 커맨드
+    라인에 또 주면, 커맨드라인 쪽이 항상 이긴다 (build_arg_parser()가 반환한
+    parser에 이 함수의 결과를 parser.set_defaults(**config)로 얹은 뒤 실제
+    파싱을 하기 때문 - argparse의 표준 동작: 명시적으로 준 옵션은 set_defaults()
+    보다 항상 우선한다).
+    """
+    p = Path(path)
+    if not p.exists():
+        raise CliError(f"--config 파일을 찾을 수 없습니다: {path}")
+
+    text = p.read_text(encoding="utf-8")
+    suffix = p.suffix.lower()
+    try:
+        if suffix in (".yaml", ".yml"):
+            import yaml
+            data = yaml.safe_load(text)
+        elif suffix == ".json":
+            data = json.loads(text)
+        else:
+            raise CliError(
+                f"--config는 .yaml/.yml/.json만 지원합니다 (입력: {p.suffix or '(확장자 없음)'})"
+            )
+    except CliError:
+        raise
+    except Exception as e:  # noqa: BLE001 - yaml/json 파서 예외를 CliError로 통일
+        raise CliError(f"--config 파일을 읽는 중 오류: {path}\n  {e}") from e
+
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise CliError(
+            f"--config 파일의 최상위는 key: value 형태의 객체여야 합니다 (입력: {path})"
+        )
+
+    # 하이픈 표기를 언더스코어로 정규화 (예: square-size -> square_size)
+    normalized = {str(k).replace("-", "_"): v for k, v in data.items()}
+
+    unknown = set(normalized) - known_dests
+    if unknown:
+        raise CliError(
+            f"--config 파일에 알 수 없는 키가 있습니다: {', '.join(sorted(unknown))}\n"
+            f"  (--help로 사용 가능한 옵션 이름을 확인하세요. 하이픈은 언더스코어로 "
+            f"바꿔 쓰세요 - 예: square-size -> square_size)"
+        )
+    return normalized
 
 
 def _log(quiet: bool, msg: str) -> None:
@@ -211,7 +280,11 @@ def run_pipeline(args) -> int:
 
     # --- 2. Detection ---
     _log(quiet, f"{pattern_config.type.value} 패턴 검출 중...")
-    dataset = detect_dataset(image_paths, pattern_config)
+    dataset = detect_dataset(
+        image_paths, pattern_config,
+        parallel=args.jobs != 1,
+        max_workers=None if args.jobs in (0, 1) else args.jobs,
+    )
     _log(quiet, summarize_dataset(dataset))
     if dataset.num_detected == 0:
         print("오류: 어떤 이미지에서도 ChArUco 패턴이 검출되지 않았습니다.", file=sys.stderr)
@@ -434,6 +507,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     src = p.add_argument_group("입력 (이미지 또는 rosbag 또는 저장된 프로젝트 중 하나)")
+    src.add_argument(
+        "--config", metavar="PATH",
+        help="패턴/카메라/파이프라인 옵션을 담은 .yaml/.yml/.json 파일. 같은 옵션을 "
+             "커맨드라인에서 또 주면 커맨드라인 쪽이 우선한다 (반복 실행하는 카메라 "
+             "설정을 파일로 고정해두고, 그때그때 바뀌는 값만 커맨드라인으로 덮어쓰는 "
+             "용도). 예: --config camera.yaml --images ./photos",
+    )
     src.add_argument("--images", nargs="+", help="이미지 파일/디렉토리/glob 패턴 (여러 개 가능)")
     src.add_argument("--bag", help="ROS1(.bag)/ROS2(.db3, .mcap) 파일 경로 (--images 대신 사용)")
     src.add_argument("--topic", help="--bag 사용 시 추출할 이미지 토픽")
@@ -485,14 +565,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="계산이 끝난 뒤 전체 상태(데이터셋, 3모델 결과, 검증, 추천)를 .ccproj 파일로 저장. "
              "나중에 --load-project로 다시 불러와 이어서 쓸 수 있음.",
     )
-    out.add_argument("--quiet", action="store_true", help="진행상황 출력을 최소화")
+    out.add_argument(
+        "--jobs", type=int, default=1, metavar="N",
+        help="이미지 검출을 N개 프로세스로 병렬화 (기본 1=순차 처리, 기존과 동일 동작). "
+             "0을 주면 CPU 코어 수만큼 자동 사용. 이미지 수백 장 이상일 때 효과가 큼 "
+             "(코어당 이미지 몇 십 장 미만이면 프로세스 생성 비용 때문에 오히려 느려질 수 있음).",
+    )
+    out.add_argument("--quiet", action="store_true", help="진행상황 출력을 최소화 (콘솔 로그도 ERROR만 표시)")
+    out.add_argument(
+        "-v", "--verbose", action="count", default=0,
+        help="진단 로그 상세도를 높임. -v: INFO, -vv: DEBUG (여러 번 줄 수 있음). "
+             "실시간 ROS 구독처럼 사용자 환경에서만 재현되는 문제를 진단할 때 유용.",
+    )
+    out.add_argument(
+        "--log-file", metavar="PATH",
+        help="진단 로그(DEBUG 레벨 전체)를 이 파일에 남김. --quiet/--verbose와 무관하게 "
+             "항상 전체 상세도로 기록됨 - 버그 재현 후 이 파일을 첨부하면 원인 파악이 빨라짐.",
+    )
 
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
+
+    # --config는 2단계로 처리한다: 먼저 (다른 옵션은 몰라도 되니) --config 값만
+    # 알아내고, 그 파일 내용을 parser의 기본값으로 얹은 뒤 실제 파싱을 한다.
+    # 이러면 "커맨드라인에서 명시적으로 준 옵션이 항상 이긴다"는 argparse의
+    # 표준 동작이 config 파일에도 자연스럽게 적용된다 (set_defaults()는 기본값만
+    # 바꿀 뿐, 이미 명시적으로 준 값을 덮어쓰지 않음).
+    pre_args, _ = parser.parse_known_args(argv)
+    if pre_args.config:
+        known_dests = {action.dest for action in parser._actions}
+        try:
+            config_values = _load_config_file(pre_args.config, known_dests)
+        except CliError as e:
+            print(f"오류: {e}", file=sys.stderr)
+            return 1
+        parser.set_defaults(**config_values)
+
     args = parser.parse_args(argv)
+
+    setup_logging(verbosity=args.verbose, quiet=args.quiet, log_file=args.log_file)
+    logger.debug("CLI 시작: argv=%s", argv if argv is not None else sys.argv[1:])
+    if pre_args.config:
+        logger.info("--config 적용됨: %s", pre_args.config)
+
+    if args.jobs < 0:
+        parser.error("--jobs는 0 이상이어야 합니다 (0=자동, 1=순차, N=N개 프로세스).")
 
     if args.list_topics:
         return _list_bag_topics(args.list_topics)
@@ -513,9 +633,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return run_pipeline(args)
     except KeyboardInterrupt:
+        logger.info("사용자에 의해 중단됨 (KeyboardInterrupt)")
         print("\n중단됨.", file=sys.stderr)
         return 130
     except Exception as e:  # noqa: BLE001
+        # logger.debug(..., exc_info=True): DEBUG 레벨이라 콘솔에는(별도로 -vv를
+        # 주지 않는 한) 안 뜨지만, --log-file을 지정했다면 파일 핸들러는 항상
+        # DEBUG 레벨이라 전체 스택트레이스가 거기엔 남는다. 콘솔 쪽 traceback
+        # 표시 여부는 기존과 동일하게 --quiet로 결정한다.
+        logger.debug("파이프라인 실행 중 처리되지 않은 예외 발생", exc_info=True)
         print(f"예상하지 못한 오류: {e}", file=sys.stderr)
         if not args.quiet:
             import traceback

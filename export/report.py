@@ -211,7 +211,12 @@ def _section_chosen_model_detail(cal: CalibrationResult | None, val: ValidationR
     ]
     if cal.param_uncertainty and cal.param_uncertainty.fx_std is not None:
         pu = cal.param_uncertainty
-        rows.append(("fx/fy std dev", f"{pu.fx_std:.3f} / {pu.fy_std:.3f}"))
+        # Fisheye는 OpenCV가 covariance를 안 줘서 bootstrap resampling으로 추정한
+        # 값이다 (calibration/models/fisheye.py 참고) - Pinhole/Extended의
+        # calibrateCameraExtended() 기반 표준편차와 계산 방식이 다르므로,
+        # 리포트를 보는 사람이 "왜 숫자가 다르게 느껴지지" 헷갈리지 않도록 표시한다.
+        method_note = " (bootstrap 추정)" if cal.model_name == CameraModelType.FISHEYE else ""
+        rows.append((f"fx/fy std dev{method_note}", f"{pu.fx_std:.3f} / {pu.fy_std:.3f}"))
         within = pu.is_within_threshold(fx, fy)
         rows.append(("Parameter Stability", "Good (within 1%)" if within else "Warning (over 1%)"))
 

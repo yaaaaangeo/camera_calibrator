@@ -27,6 +27,7 @@ camera_calibrator.calibration.ros_live
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -35,6 +36,8 @@ from typing import Callable
 import numpy as np
 
 from calibration.ros_image_codec import decode_image_message
+
+logger = logging.getLogger(__name__)
 
 _IMAGE_MSG_TYPES = {"sensor_msgs/Image", "sensor_msgs/CompressedImage"}
 _IMAGE_MSG_TYPES_ROS2 = {"sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage"}
@@ -51,14 +54,17 @@ try:
     import rospy as _rospy  # type: ignore
     from sensor_msgs.msg import Image as _RosImage1, CompressedImage as _RosCompressedImage1  # type: ignore
     ROS_LIVE_BACKEND = "ros1"
+    logger.info("ROS1(rospy) 백엔드를 사용합니다.")
 except ImportError:
     try:
         import rclpy as _rclpy  # type: ignore
         from rclpy.node import Node as _Ros2Node  # type: ignore
         from sensor_msgs.msg import Image as _RosImage2, CompressedImage as _RosCompressedImage2  # type: ignore
         ROS_LIVE_BACKEND = "ros2"
+        logger.info("ROS2(rclpy) 백엔드를 사용합니다.")
     except ImportError:
         ROS_LIVE_BACKEND = None
+        logger.info("rospy/rclpy 둘 다 찾지 못했습니다. 실시간 ROS 구독은 비활성화됩니다.")
 
 
 def _require_backend() -> None:
@@ -113,14 +119,20 @@ class LiveTopicSubscriber:
         self._ros2_node = None
         self._ros2_spin_thread: threading.Thread | None = None
 
+        logger.debug("LiveTopicSubscriber 생성 (backend=%s)", self._backend)
+
     # ------------------------------------------------------------------
     # 토픽 목록
     # ------------------------------------------------------------------
 
     def list_image_topics(self) -> list[LiveTopic]:
+        logger.debug("토픽 목록 조회 시작 (backend=%s)", self._backend)
         if self._backend == "ros1":
-            return self._list_topics_ros1()
-        return self._list_topics_ros2()
+            topics = self._list_topics_ros1()
+        else:
+            topics = self._list_topics_ros2()
+        logger.info("이미지 토픽 %d개 발견: %s", len(topics), [t.name for t in topics])
+        return topics
 
     def _list_topics_ros1(self) -> list[LiveTopic]:
         self._ensure_ros1_node()
@@ -148,12 +160,15 @@ class LiveTopicSubscriber:
         if not _rospy.core.is_initialized():
             # disable_signals=True: PySide6가 이미 메인 스레드의 시그널 핸들러를 쓰므로
             # rospy가 SIGINT 등을 가로채지 않게 한다 (Qt 앱 안에서 안전하게 공존하려면 필수).
+            logger.debug("rospy 노드 초기화 (camera_calibrator_live)")
             _rospy.init_node("camera_calibrator_live", anonymous=True, disable_signals=True)
 
     def _ensure_ros2_node(self):
         if _rclpy is not None and not _rclpy.ok():
+            logger.debug("rclpy.init() 호출")
             _rclpy.init()
         if self._ros2_node is None:
+            logger.debug("rclpy 노드 생성 (camera_calibrator_live)")
             self._ros2_node = _Ros2Node("camera_calibrator_live")
         return self._ros2_node
 
@@ -178,6 +193,7 @@ class LiveTopicSubscriber:
         self._on_frame = on_frame
         self._on_error = on_error
         self._running = True
+        logger.info("토픽 구독 시작: topic=%s, msg_type=%s, backend=%s", topic, msg_type, self._backend)
 
         if self._backend == "ros1":
             self._start_ros1(topic, msg_type)
@@ -185,12 +201,17 @@ class LiveTopicSubscriber:
             self._start_ros2(topic, msg_type)
 
     def _report_decode_error(self, detail: str) -> None:
+        # 프레임마다(예: 30fps) 호출될 수 있어 DEBUG로 매번 남기고, 실제로 화면에
+        # 표시되는(=rate-limit을 통과한) 경우만 WARNING으로 승격한다 - 안 그러면
+        # 로그 파일이 디코딩 실패 한 종류로 초 단위로 도배된다.
+        logger.debug("프레임 디코딩 실패: %s", detail)
         if self._on_error is None:
             return
         now = time.monotonic()
         if now - self._last_error_report_t < 3.0:
             return  # 매 프레임마다 알림이 뜨면 스팸이 되므로 3초에 한 번만
         self._last_error_report_t = now
+        logger.warning("프레임 디코딩 실패 (사용자에게 표시됨): %s", detail)
         self._on_error(detail)
 
     def _start_ros1(self, topic: str, msg_type: str) -> None:
@@ -241,13 +262,22 @@ class LiveTopicSubscriber:
         # rclpy는 rospy와 달리 콜백이 저절로 안 돈다 - 명시적으로 spin을 계속 돌려야 한다.
         # Qt 이벤트 루프를 막지 않도록 별도 스레드에서 spin_once를 반복한다.
         def _spin_loop() -> None:
-            while self._running and _rclpy.ok():
-                _rclpy.spin_once(node, timeout_sec=0.1)
+            logger.debug("ROS2 spin 스레드 시작")
+            try:
+                while self._running and _rclpy.ok():
+                    _rclpy.spin_once(node, timeout_sec=0.1)
+            except Exception:
+                # 이 스레드는 daemon이라 예외가 나면 조용히 죽어서 "이유 없이 멈춤"처럼
+                # 보인다 - 로그에 스택트레이스를 남겨서 추적 가능하게 한다.
+                logger.exception("ROS2 spin 스레드가 예외로 종료됨")
+            finally:
+                logger.debug("ROS2 spin 스레드 종료")
 
         self._ros2_spin_thread = threading.Thread(target=_spin_loop, daemon=True)
         self._ros2_spin_thread.start()
 
     def stop(self) -> None:
+        logger.info("토픽 구독 종료 (backend=%s)", self._backend)
         self._running = False
         self._on_frame = None
         self._on_error = None
@@ -259,6 +289,8 @@ class LiveTopicSubscriber:
         if self._backend == "ros2":
             if self._ros2_spin_thread is not None:
                 self._ros2_spin_thread.join(timeout=2.0)
+                if self._ros2_spin_thread.is_alive():
+                    logger.warning("ROS2 spin 스레드가 2초 안에 종료되지 않았습니다.")
                 self._ros2_spin_thread = None
             if self._ros2_node is not None:
                 self._ros2_node.destroy_node()

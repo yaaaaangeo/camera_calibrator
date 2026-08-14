@@ -2,6 +2,7 @@
 -r requirements.txt
 
 pytest>=7.4
+pytest-cov>=4.1  # CI 커버리지 리포트/배지용 (`pytest --cov`)
 
 # tests/test_rosbag_reader.py는 rosbags가 없으면 자동으로 스킵된다
 # (requirements.txt에도 있지만, 개발 환경에서 rosbag 테스트를 반드시

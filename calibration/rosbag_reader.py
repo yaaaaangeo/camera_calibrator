@@ -23,12 +23,15 @@ AnyReader가 흡수해주므로, 이 모듈은 두 포맷을 구분하는 코드
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 
 from calibration.ros_image_codec import decode_image_message
+
+logger = logging.getLogger(__name__)
 
 try:
     from rosbags.highlevel import AnyReader
@@ -74,6 +77,7 @@ def _open_reader(bag_path: str) -> AnyReader:
     (ROS1 bag이나 타입 정의가 이미 내장된 ROS2 bag에는 영향 없음 - 그 경우엔
     bag 안의 정의가 우선 사용됨) 이 문제를 해결할 수 있다.
     """
+    logger.debug("AnyReader 열기 (default_typestore=Stores.LATEST): %s", bag_path)
     return AnyReader([Path(bag_path)], default_typestore=get_typestore(Stores.LATEST))
 
 
@@ -84,6 +88,7 @@ def list_image_topics(bag_path: str) -> list[BagImageTopic]:
     토픽 이름 기준으로 메시지 수를 합산하고 중복 제거한다.
     """
     _require_rosbags()
+    logger.info("bag 열기 시도: %s", bag_path)
     counts: dict[str, int] = {}
     types: dict[str, str] = {}
 
@@ -94,10 +99,12 @@ def list_image_topics(bag_path: str) -> list[BagImageTopic]:
             counts[conn.topic] = counts.get(conn.topic, 0) + conn.msgcount
             types[conn.topic] = conn.msgtype
 
-    return [
+    topics = [
         BagImageTopic(name=topic, msg_type=types[topic], count=counts[topic])
         for topic in sorted(counts)
     ]
+    logger.info("bag에서 이미지 토픽 %d개 발견: %s", len(topics), [t.name for t in topics])
+    return topics
 
 
 def extract_images_from_bag(
@@ -118,6 +125,10 @@ def extract_images_from_bag(
     반환된 경로들은 detect_dataset()에 그대로 넘기면 된다.
     """
     _require_rosbags()
+    logger.info(
+        "bag에서 이미지 추출 시작: bag=%s, topic=%s, min_interval_sec=%s, max_images=%s",
+        bag_path, topic, min_interval_sec, max_images,
+    )
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -151,6 +162,7 @@ def extract_images_from_bag(
                 detail = getattr(msg, "encoding", None) or getattr(msg, "format", None)
                 if detail:
                     seen_encodings.add(detail)
+                logger.debug("디코딩 실패로 건너뜀 (t=%.3f, encoding/format=%s)", t_sec, detail)
                 continue
 
             idx = len(saved_paths)
@@ -159,8 +171,16 @@ def extract_images_from_bag(
             saved_paths.append(str(filename))
             last_saved_t = t_sec
 
+    logger.info(
+        "bag 추출 완료: %d장 저장, %d개 디코딩 실패로 건너뜀 (topic=%s)",
+        len(saved_paths), skipped_unsupported, topic,
+    )
+
     if not saved_paths and skipped_unsupported > 0:
         encodings_str = ", ".join(sorted(seen_encodings)) or "알 수 없음"
+        logger.warning(
+            "저장된 이미지가 0장입니다 - 발견된 인코딩이 전부 미지원: %s", encodings_str
+        )
         raise ValueError(
             f"토픽 '{topic}'에서 지원하지 않는 인코딩만 발견돼 추출된 이미지가 없습니다 "
             f"({skipped_unsupported}개 건너뜀). 발견된 인코딩: {encodings_str}"
