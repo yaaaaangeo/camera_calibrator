@@ -68,7 +68,39 @@ jobs:
           # 없으면 QApplication을 만드는 UI 테스트들이 전부 실패한다.
           QT_QPA_PLATFORM: offscreen
         run: |
-          pytest -v --junitxml=pytest-report.xml
+          if [ "${{ matrix.python-version }}" = "3.11" ]; then
+            # 커버리지 계측(coverage.py)은 매 줄 실행을 가로채서 오버헤드가 있다 -
+            # 매트릭스 3개 버전 전부에서 돌릴 필요는 없으므로 대표로 3.11에서만
+            # 측정하고, 나머지 버전은 기존처럼 순수 테스트 통과 여부만 본다.
+            pytest -v --junitxml=pytest-report.xml \
+              --cov=calibration --cov=app --cov=export --cov=ui \
+              --cov-report=term-missing --cov-report=xml --cov-report=html
+          else
+            pytest -v --junitxml=pytest-report.xml
+          fi
+
+      - name: Coverage summary in job summary
+        if: matrix.python-version == '3.11'
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename: coverage.xml
+          badge: true
+          format: markdown
+          output: both
+
+      - name: Append coverage summary to GitHub Actions summary page
+        if: matrix.python-version == '3.11'
+        run: cat code-coverage-results.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report (HTML + XML)
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            htmlcov/
+            coverage.xml
+          retention-days: 14
 
       - name: Upload test report
         if: always()
