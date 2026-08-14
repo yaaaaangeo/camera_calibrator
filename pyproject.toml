@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "camera-calibrator"
+version = "0.2.0"
+description = "ChArUco 기반 카메라 캘리브레이션 도구 - Pinhole/Extended Pinhole/Fisheye 3모델 비교 + Hold-out 검증 + 근거 기반 모델 추천"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "yaaaaangeo" }]
+
+# requirements.txt와 동일한 하한선을 그대로 반영 (opencv-python과 동시 설치
+# 금지 등 상세 이유는 requirements.txt 주석 참고 - 여기서는 pip install 시
+# 그대로 재사용되도록 dependencies에도 옮겨둔다).
+dependencies = [
+    "opencv-contrib-python>=4.9",
+    "numpy>=1.24",
+    "PyYAML>=6.0",
+    "PySide6>=6.6",
+]
+
+[project.optional-dependencies]
+# rosbag(.bag/.db3/.mcap)에서 이미지를 직접 불러오는 기능에만 필요한 선택 의존성.
+# `pip install camera-calibrator[ros]`로 함께 설치 가능.
+ros = ["rosbags>=0.9"]
+
+# 테스트 스위트 실행에만 필요 (requirements-dev.txt와 동일 구성).
+dev = [
+    "pytest>=7.4",
+    "rosbags>=0.9",
+]
+
+[project.urls]
+Repository = "https://github.com/yaaaaangeo/camera_calibrator"
+
+# `pip install -e .` 후 터미널 어디서든 바로 실행 가능하게 하는 콘솔 커맨드.
+# app/main.py, app/cli.py에 이미 있는 main() 함수를 그대로 연결한다 - 이 함수들
+# 자체는 손대지 않았으므로 `python -m app.main` / `python -m app.cli`로 실행하던
+# 기존 방식도 계속 동일하게 동작한다.
+[project.scripts]
+camera-calibrator = "app.main:main"
+camera-calibrator-cli = "app.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["app*", "calibration*", "export*", "ui*"]
+exclude = ["tests*", "scripts*"]
+
+# pytest 설정은 기존 pytest.ini를 그대로 유지한다 (pytest.ini가 있으면 pytest는
+# pyproject.toml의 [tool.pytest.ini_options]를 아예 읽지 않으므로, 여기 중복
+# 정의하면 오히려 "어느 게 적용되는지" 헷갈리기만 한다).
