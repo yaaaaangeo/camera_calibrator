@@ -9,9 +9,28 @@ QThread 워커로 분리한다.
 이 파일은 순전히 "언제 무엇을 호출하고 어떤 신호로 알릴지"만 담당하고,
 실제 계산 로직은 전부 calibration/*.py의 기존 함수를 그대로 호출한다.
 UI 계층이 계산 로직을 재구현하지 않는다는 원칙을 지키기 위함.
+
+--- QThread로 충분하지 않은 부분 (실제 사용자 버그) ---
+
+검출(detect_dataset)은 이미 ProcessPoolExecutor로 병렬화돼 있어 문제 없다.
+그런데 그 다음 3모델 계산(run_all_models)/Hold-out 검증(validate_all_models)은
+cv2.calibrateCamera/cv2.fisheye.calibrate 같은 C++ 확장 함수를 오래 호출하는데,
+이 함수들이 계산 도중 파이썬 GIL을 놓아준다는 보장이 없다. QThread는 같은
+프로세스 안의 스레드일 뿐이라 GIL은 프로세스 전체에 하나 - 계산 스레드가
+GIL을 계속 붙들면 GUI 스레드는 Qt 이벤트를 처리할 파이썬 코드를 돌릴 GIL을
+못 얻어 그대로 멈춘다. 이미지 수백 장 + Rational model처럼 계산이 몇 초~
+몇십 초 걸리면 OS가 이걸 "python3 is not responding"으로 표시한다.
+
+그래서 이 두 계산은 calibration/pipeline_process.py를 통해 완전히 별도의
+OS 프로세스에서 실행한다 - 그 프로세스는 자기만의 GIL을 가지므로 부모
+프로세스(GUI)의 GIL은 계산 시간과 무관하게 항상 비어 있다.
 """
 
 from __future__ import annotations
+
+import time
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
 from PySide6.QtCore import QObject, QThread, Signal
 
@@ -25,11 +44,34 @@ from calibration.detector import detect_dataset
 from calibration.quality import analyze_dataset_quality
 from calibration.frame_quality import compute_frame_quality_scores
 from calibration.models.common import infer_image_size
-from calibration.compare import run_all_models
-from calibration.validation import validate_all_models
 from calibration.recommender import compute_model_scores, build_recommendation_message
-from calibration.outlier import recalibrate_with_outlier_pruning
 from calibration.self_check import run_all_self_checks
+from calibration.rosbag_reader import extract_images_from_bag
+from calibration.pipeline_process import (
+    run_models_and_validation,
+    run_outlier_pruning_and_validation,
+)
+
+# 위 두 계산(3모델 + Hold-out 진행 상황)은 자식 프로세스 안에서 일어나므로
+# 세부 진행률 문자열을 실시간으로 받을 수 없다 - future.result()를 이 간격
+# 으로 짧게 타임아웃 걸어 반복 폴링하면서 "아직 죽지 않았다"는 하트비트만
+# 상태바에 남긴다 (실제로 몇 초~몇십 초 걸릴 수 있는 계산이라, 아무 표시도
+# 없으면 사용자가 또 "멈췄나?"하고 오해하기 쉽다).
+_HEARTBEAT_SEC = 2.0
+
+
+def _wait_with_heartbeat(future, progress_signal, label: str):
+    """future.result()를 기다리는 동안 주기적으로 progress_signal에 경과
+    시간을 emit한다. 계산 자체는 자식 프로세스에서 계속 진행 중이다.
+    """
+    start = time.monotonic()
+    while True:
+        try:
+            return future.result(timeout=_HEARTBEAT_SEC)
+        except FutureTimeoutError:
+            elapsed = time.monotonic() - start
+            progress_signal.emit(f"{label} ({elapsed:.0f}초 경과 - 계산 중입니다)")
+
 
 
 class PipelineWorker(QObject):
@@ -83,22 +125,25 @@ class PipelineWorker(QObject):
             self.dataset_ready.emit(dataset)  # 1차 점수(재투영 오차 제외) 반영해서 테이블 갱신
 
             self.progress.emit("Pinhole / Extended Pinhole / Fisheye 3개 모델 계산 중...")
-            results_list = run_all_models(
-                dataset, self.camera_config, use_rational_model=self.use_rational_model
-            )
-            calibration_results = {r.model_name: r for r in results_list}
+            # cv2.calibrateCamera 등은 GIL을 놓아준다는 보장이 없어, 완전히
+            # 별도 프로세스로 돌려서 GUI 스레드가 절대 막히지 않게 한다
+            # (자세한 이유는 파일 상단 docstring 참고).
+            with ProcessPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    run_models_and_validation,
+                    dataset, self.camera_config, self.pattern_config,
+                    self.test_ratio, self.use_rational_model,
+                )
+                calibration_results, validation_results = _wait_with_heartbeat(
+                    future, self.progress,
+                    "Pinhole / Extended Pinhole / Fisheye 3개 모델 + Hold-out Validation 계산 중...",
+                )
 
             self.progress.emit("재투영 오차를 반영해 프레임 품질 점수 갱신 중...")
             compute_frame_quality_scores(
                 dataset, self.pattern_config, image_size, use_reprojection=True
             )
             self.models_ready.emit(calibration_results)
-
-            self.progress.emit("Hold-out Validation (Train/Test 분할 검증) 중...")
-            validation_results = validate_all_models(
-                dataset, self.camera_config, self.pattern_config, test_ratio=self.test_ratio,
-                use_rational_model=self.use_rational_model,
-            )
             self.validation_ready.emit(validation_results)
 
             self.progress.emit("Model Score 계산 및 추천 생성 중...")
@@ -157,40 +202,36 @@ class OutlierPruneWorker(QObject):
     def run(self) -> None:
         try:
             self.progress.emit(f"{self.reference_model.value} 기준으로 이상치 탐지 및 반복 재계산 중...")
-            ref_result, outlier_result = recalibrate_with_outlier_pruning(
-                self.dataset, self.camera_config, self.reference_model,
-                max_iterations=self.max_iterations,
-                use_rational_model=self.use_rational_model,
-            )
+            # 이상치 반복 재계산 + 3모델 재계산 + Hold-out 재검증까지 전부
+            # 별도 프로세스에서 실행한다 (이유는 파일 상단 docstring 참고).
+            # recalibrate_with_outlier_pruning()이 dataset을 in-place로
+            # 바꾸는 부수효과가 있어서, 자식 프로세스가 반환한 dataset으로
+            # self.dataset을 통째로 교체해야 한다 - 그래야 이상치 제외 상태가
+            # 실제로 반영된다.
+            with ProcessPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    run_outlier_pruning_and_validation,
+                    self.dataset, self.camera_config, self.pattern_config, self.reference_model,
+                    self.max_iterations, self.test_ratio, self.use_rational_model,
+                )
+                (
+                    updated_dataset, ref_result, outlier_result, warnings,
+                    calibration_results, validation_results,
+                ) = _wait_with_heartbeat(
+                    future, self.progress,
+                    f"{self.reference_model.value} 기준 이상치 재계산 + 3모델 + Hold-out 계산 중...",
+                )
+
+            self.dataset = updated_dataset
+
             self.outlier_ready.emit(ref_result, outlier_result)
             self.dataset_updated.emit(self.dataset)  # 프레임 status가 바뀌었으므로 즉시 반영
 
             self.progress.emit("Coverage Map 재분석 중...")
-            warnings = analyze_dataset_quality(self.dataset, self.camera_config)
             self.quality_ready.emit(warnings)
-
-            image_size = infer_image_size(self.dataset, self.camera_config)
-            compute_frame_quality_scores(
-                self.dataset, self.pattern_config, image_size, use_reprojection=False
-            )
             self.dataset_updated.emit(self.dataset)
 
-            self.progress.emit("정제된 데이터셋으로 3개 모델 재계산 중...")
-            results_list = run_all_models(
-                self.dataset, self.camera_config, use_rational_model=self.use_rational_model
-            )
-            calibration_results = {r.model_name: r for r in results_list}
-
-            compute_frame_quality_scores(
-                self.dataset, self.pattern_config, image_size, use_reprojection=True
-            )
             self.models_ready.emit(calibration_results)
-
-            self.progress.emit("Hold-out Validation 재실행 중...")
-            validation_results = validate_all_models(
-                self.dataset, self.camera_config, self.pattern_config, test_ratio=self.test_ratio,
-                use_rational_model=self.use_rational_model,
-            )
             self.validation_ready.emit(validation_results)
 
             scores = compute_model_scores(
@@ -238,6 +279,64 @@ class SelfCheckWorker(QObject):
             self.progress.emit("자체 진단 완료.")
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"자체 진단 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
+class BagExtractionWorker(QObject):
+    """rosbag에서 이미지를 뽑아 .jpg로 저장하는 무거운 작업(수백~수천 개
+    메시지를 디코딩+디스크 기록)을 GUI 스레드 밖으로 분리한다.
+
+    실제 사용자 버그: main_window.py의 _on_load_from_bag()가
+    calibration.rosbag_reader.extract_images_from_bag()을 GUI 스레드에서
+    직접(동기) 호출하고 있었다. 큰 bag(수백 MB, 메시지 수천 개)에서는 이게
+    수십 초~몇 분씩 걸리는데, 그동안 Qt 이벤트 루프가 완전히 멈춰서 OS가
+    "python3 is not responding" 창을 띄운다. 다른 무거운 계산(검출/3모델
+    학습/Hold-out)은 이미 PipelineWorker로 QThread에 분리돼 있었는데 이
+    경로만 빠져 있었다.
+    """
+
+    progress = Signal(str)
+    finished_extraction = Signal(list)  # list[str] - 저장된 이미지 경로
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, bag_path: str, topic: str, output_dir: str, min_interval_sec: float):
+        super().__init__()
+        self.bag_path = bag_path
+        self.topic = topic
+        self.output_dir = output_dir
+        self.min_interval_sec = min_interval_sec
+        self._cancelled = False
+
+    def request_cancel(self) -> None:
+        """다른 스레드(GUI)에서 호출됨 - 진행률 다이얼로그의 취소 버튼용.
+        불리언 플래그 하나만 건드리므로 락 없이도 안전하다.
+        """
+        self._cancelled = True
+
+    def run(self) -> None:
+        def _on_progress(done: int, total: int, saved: int) -> None:
+            if total:
+                pct = done / total * 100
+                self.progress.emit(
+                    f"bag에서 이미지 추출 중... {pct:.0f}% ({done}/{total} 메시지, {saved}장 저장됨)"
+                )
+            else:
+                self.progress.emit(f"bag에서 이미지 추출 중... ({done}개 메시지 처리, {saved}장 저장됨)")
+
+        try:
+            extracted = extract_images_from_bag(
+                self.bag_path,
+                self.topic,
+                self.output_dir,
+                min_interval_sec=self.min_interval_sec,
+                progress_callback=_on_progress,
+                cancel_check=lambda: self._cancelled,
+            )
+            self.finished_extraction.emit(extracted)
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"bag 이미지 추출 중 오류: {e}")
         finally:
             self.finished.emit()
 

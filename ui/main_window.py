@@ -10,9 +10,10 @@ calibration/*.py에 있고, 여기서는 그 함수들을 worker.py를 통해 �
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt
+from PySide6.QtCore import QThread, QTimer, Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -47,7 +49,7 @@ from calibration.types import (
 )
 from calibration.recommender import compute_final_result
 from calibration.quality import coverage_percentage
-from calibration.rosbag_reader import list_image_topics, extract_images_from_bag
+from calibration.rosbag_reader import list_image_topics
 from calibration.ros_live import ROS_LIVE_BACKEND
 from calibration.project_io import load_project, save_project, PROJECT_EXTENSION
 from export.opencv import export_opencv_yaml
@@ -62,8 +64,23 @@ from ui.result_view import ResultView
 from ui.preview import PreviewView
 from ui.radial_profile_view import RadialProfileView
 from ui.straightness_view import StraightnessView
+from ui.external_compare_view import ExternalCompareView
 from ui.live_capture_dialog import LiveCaptureDialog
-from ui.worker import PipelineWorker, OutlierPruneWorker, SelfCheckWorker, run_worker_in_thread
+from ui.worker import (
+    PipelineWorker,
+    OutlierPruneWorker,
+    SelfCheckWorker,
+    BagExtractionWorker,
+    run_worker_in_thread,
+)
+
+logger = logging.getLogger(__name__)
+
+# 자동 저장 파일 경로 - 프로젝트 폴더가 아니라 홈 디렉터리 밑 고정 위치에 둔다.
+# 앱이 응답 없음/강제 종료로 죽어도 다음 실행에서 항상 같은 경로를 확인해
+# 복구를 제안할 수 있어야 하기 때문 (사용자가 저장 위치를 고를 필요 없음).
+_AUTOSAVE_DIR = Path.home() / ".camera_calibrator"
+_AUTOSAVE_PATH = _AUTOSAVE_DIR / "autosave.ccproj"
 
 # ChArUco에서 흔히 쓰이는 사전 목록 (cv2.aruco.DICT_* 속성명 그대로)
 _ARUCO_DICTIONARIES = [
@@ -92,6 +109,8 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker = None  # QThread가 살아있는 동안 GC 방지용 강한 참조
         self._self_check_thread: QThread | None = None
+        self._bag_thread: QThread | None = None
+        self._bag_worker = None  # QThread가 살아있는 동안 GC 방지용 강한 참조
         self._self_check_worker = None  # 위와 동일한 이유로 별도 워커도 강한 참조 보관
 
         self._build_menu_bar()
@@ -109,12 +128,14 @@ class MainWindow(QMainWindow):
         self.preview_view = PreviewView()
         self.radial_profile_view = RadialProfileView()
         self.straightness_view = StraightnessView()
+        self.external_compare_view = ExternalCompareView()
         self.tabs.addTab(self.dataset_view, "① Dataset")
         self.tabs.addTab(self.coverage_view, "② Coverage")
         self.tabs.addTab(self.result_view, "③ Model / Validation / Export")
         self.tabs.addTab(self.preview_view, "④ Undistort Preview")
         self.tabs.addTab(self.radial_profile_view, "⑤ Edge Error Map")
         self.tabs.addTab(self.straightness_view, "⑥ Straightness Map")
+        self.tabs.addTab(self.external_compare_view, "⑦ 외부 결과 비교")
         layout.addWidget(self.tabs, stretch=1)
 
         self.status_label = QLabel("이미지를 불러온 뒤 [캘리브레이션 실행]을 누르세요.")
@@ -126,6 +147,15 @@ class MainWindow(QMainWindow):
         self.result_view.export_report_requested.connect(self._on_export_report)
         self.result_view.export_json_requested.connect(self._on_export_json)
         self.result_view.export_csv_requested.connect(self._on_export_csv)
+
+        # 앱이 응답 없음/강제 종료 등으로 꺼져도 마지막으로 완료된 계산
+        # 결과는 자동 저장본에서 복구할 수 있게, 창이 뜨자마자 한 번 확인한다.
+        # (실제 사용자 버그: 큰 rosbag을 불러오다 응답 없음이 떠서 강제 종료한
+        # 뒤 다시 켜면 방금까지 보이던 계산 결과가 전부 사라져 있었음 -
+        # 저장하지 않은 결과는 메모리에만 있어서 프로세스가 죽으면 없어지는
+        # 게 원인이었다. 매 실행 완료 시 자동 저장해두면 이런 경우에도
+        # Export만큼은 다시 할 수 있다.)
+        QTimer.singleShot(0, self._offer_autosave_recovery)
 
     # ------------------------------------------------------------------
     # 설정 패널 (설계 문서 14번 ① Camera Setup, ③ Calibration Pattern)
@@ -300,14 +330,45 @@ class MainWindow(QMainWindow):
             return
 
         out_dir = str(Path(bag_path).with_suffix("").as_posix()) + "_extracted"
-        try:
-            extracted = extract_images_from_bag(bag_path, topic, out_dir, min_interval_sec=interval)
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.critical(self, "이미지 추출 실패", str(e))
-            return
 
+        # 이미지 추출 자체(메시지 디코딩 + 디스크 기록)는 큰 bag에서 수십 초~
+        # 몇 분까지 걸릴 수 있어 QThread로 분리한다. 예전엔 여기서 바로
+        # extract_images_from_bag()을 동기 호출해서, 큰 bag을 불러올 때
+        # GUI 스레드가 그대로 멈춰 OS가 "python3 is not responding"을
+        # 띄우는 원인이었다.
+        worker = BagExtractionWorker(bag_path, topic, out_dir, interval)
+        thread = run_worker_in_thread(worker, self)
+
+        progress = QProgressDialog("bag에서 이미지 추출 준비 중...", "취소", 0, 0, self)
+        progress.setWindowTitle("이미지 추출 중")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.canceled.connect(worker.request_cancel)
+
+        worker.progress.connect(progress.setLabelText)
+        worker.progress.connect(self.status_label.setText)
+        worker.finished_extraction.connect(
+            lambda extracted: self._on_bag_extraction_finished(extracted, bag_path)
+        )
+        worker.error.connect(self._on_error)
+        worker.finished.connect(progress.close)
+
+        self._bag_thread, self._bag_worker = thread, worker
+        self.load_button.setEnabled(False)
+        self.load_bag_button.setEnabled(False)
+        thread.finished.connect(lambda: self.load_button.setEnabled(True))
+        thread.finished.connect(lambda: self.load_bag_button.setEnabled(True))
+        thread.start()
+        progress.show()
+
+    def _on_bag_extraction_finished(self, extracted: list[str], bag_path: str) -> None:
         if not extracted:
-            QMessageBox.warning(self, "추출된 이미지 없음", "선택한 토픽/간격으로 추출된 이미지가 없습니다.")
+            QMessageBox.warning(
+                self, "추출된 이미지 없음",
+                "선택한 토픽/간격으로 추출된 이미지가 없습니다 (취소했거나 해당 구간에 이미지가 없음).",
+            )
             return
 
         self.image_paths = extracted
@@ -426,6 +487,11 @@ class MainWindow(QMainWindow):
     def _on_validation_ready(self, results: dict[CameraModelType, ValidationResult]) -> None:
         self.validation_results = results
         self._refresh_result_view()
+        if self.dataset is not None and self.camera_config is not None and self.pattern_config is not None:
+            self.external_compare_view.set_context(
+                self.dataset, self.camera_config, self.pattern_config,
+                self.validation_results, use_rational_model=self.use_rational_model,
+            )
 
     def _on_recommendation_ready(self, scores: list[ModelScore], message: str) -> None:
         self.scores = scores
@@ -437,6 +503,54 @@ class MainWindow(QMainWindow):
             self.radial_profile_view.select_model(recommended)
             self.straightness_view.select_model(recommended)
         self._refresh_result_view()
+        # 계산이 완전히 끝난 시점(추천까지 나온 시점)이라 여기서 조용히
+        # 자동 저장한다 - 다음에 앱이 비정상 종료돼도 이 결과는 남는다.
+        self._autosave()
+
+    def _autosave(self) -> None:
+        """마지막으로 완료된 계산 결과를 홈 디렉터리의 고정 파일에 저장한다.
+
+        실제 사용자 버그: 계산 결과가 메모리에만 있고 프로젝트로 저장하지
+        않은 상태에서 앱이 응답 없음 -> 강제 종료로 죽으면, 다시 켰을 때
+        방금까지 화면에 있던 Model Comparison/Export 결과가 통째로
+        사라져서 Export를 다시 할 수 없었다. 이 자동 저장은 사용자가
+        직접 [파일 -> 프로젝트 저장]을 누르지 않아도 매 계산 완료 시점마다
+        복구 지점을 하나 남겨둔다. 사용자 명시적 저장(_on_save_project)을
+        대체하지 않는다 - 그건 여전히 사용자가 원하는 위치/이름으로 남긴다.
+        """
+        if self.dataset is None or self.camera_config is None or self.pattern_config is None:
+            return
+        try:
+            _AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
+            project = CalibrationProject(
+                project_name=self.camera_config.sensor_name or "autosave",
+                camera_config=self.camera_config,
+                pattern_config=self.pattern_config,
+                dataset=self.dataset,
+                calibration_results=self.calibration_results,
+                validation_results=self.validation_results,
+                model_scores=self.scores,
+                outlier_result=self.outlier_result,
+            )
+            save_project(project, str(_AUTOSAVE_PATH))
+            logger.debug("자동 저장 완료: %s", _AUTOSAVE_PATH)
+        except Exception:  # noqa: BLE001 - 자동 저장 실패로 사용자 작업을 막으면 안 됨
+            logger.exception("자동 저장 실패 (무시하고 계속 진행)")
+
+    def _offer_autosave_recovery(self) -> None:
+        """창이 뜨자마자 한 번, 이전 실행의 자동 저장본이 있으면 복구를 제안한다."""
+        if not _AUTOSAVE_PATH.exists():
+            return
+        reply = QMessageBox.question(
+            self, "이전 계산 결과 복구",
+            "이전 실행에서 자동 저장된 계산 결과가 있습니다.\n"
+            "(응답 없음/강제 종료 등으로 예기치 않게 꺼졌을 때를 대비한 백업입니다.)\n\n"
+            "지금 불러올까요? ([아니오]를 눌러도 파일은 삭제되지 않습니다.)",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            self._load_project_from_path(str(_AUTOSAVE_PATH))
 
     def _on_error(self, message: str) -> None:
         QMessageBox.critical(self, "오류", message)
@@ -515,7 +629,7 @@ class MainWindow(QMainWindow):
         thread = run_worker_in_thread(worker, self)
 
         worker.progress.connect(self.status_label.setText)
-        worker.dataset_updated.connect(lambda ds: self.dataset_view.set_dataset(ds))
+        worker.dataset_updated.connect(self._on_outlier_dataset_updated)
         worker.quality_ready.connect(self._on_quality_ready)
         worker.outlier_ready.connect(
             lambda ref_result, outlier_result: self._on_outlier_ready(reference_model, outlier_result)
@@ -533,6 +647,16 @@ class MainWindow(QMainWindow):
     def _on_outlier_ready(self, reference_model: CameraModelType, outlier_result: OutlierResult) -> None:
         self.outlier_result = outlier_result  # 리포트(export/report.py)에서 재사용
         self.result_view.set_outlier_result(reference_model, outlier_result)
+
+    def _on_outlier_dataset_updated(self, dataset: Dataset) -> None:
+        """이상치 재계산은 이제 별도 프로세스(calibration/pipeline_process.py)에서
+        돌아서, 프레임 상태가 바뀐 dataset은 원본과 다른 객체(pickle로 왕복한
+        복사본)로 돌아온다. 그래서 화면 갱신뿐 아니라 self.dataset 참조 자체를
+        이걸로 교체해야 한다 - 안 그러면 이후 export/저장/재실행이 전부 이상치
+        제외 전 상태를 보게 되는 조용한 버그가 생긴다.
+        """
+        self.dataset = dataset
+        self.dataset_view.set_dataset(dataset)
 
     # ------------------------------------------------------------------
     # Export
@@ -695,7 +819,9 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self._load_project_from_path(path)
 
+    def _load_project_from_path(self, path: str) -> None:
         try:
             project, missing = load_project(path)
         except Exception as e:  # noqa: BLE001
@@ -735,6 +861,11 @@ class MainWindow(QMainWindow):
             self.radial_profile_view.set_results(self.calibration_results)
             self.straightness_view.set_context(
                 self.dataset, self.camera_config, self.calibration_results, self.pattern_config
+            )
+        if self.validation_results:
+            self.external_compare_view.set_context(
+                self.dataset, self.camera_config, self.pattern_config,
+                self.validation_results, use_rational_model=self.use_rational_model,
             )
         self._refresh_result_view()
         if self.scores:

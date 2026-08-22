@@ -93,3 +93,52 @@ def test_max_images_limit(synthetic_bag_path, tmp_path):
         synthetic_bag_path, "/camera/image_raw", out_dir, min_interval_sec=0.05, max_images=3
     )
     assert len(paths) == 3
+
+
+# ---------------------------------------------------------------------------
+# progress_callback / cancel_check - BagExtractionWorker(ui/worker.py)가
+# GUI 스레드를 막지 않고 진행률을 보여주기 위해 필요한 훅.
+# 실제 사용자 버그: 이 훅이 없어서 main_window.py가 extract_images_from_bag()을
+# GUI 스레드에서 동기 호출했고, 큰 bag에서 "python3 is not responding"이 떴었다.
+# ---------------------------------------------------------------------------
+
+
+def test_progress_callback_reports_total_and_reaches_full_count(synthetic_bag_path, tmp_path):
+    calls = []
+    out_dir = str(tmp_path / "progress")
+    extract_images_from_bag(
+        synthetic_bag_path, "/camera/image_raw", out_dir, min_interval_sec=0.05,
+        progress_callback=lambda done, total, saved: calls.append((done, total, saved)),
+    )
+    assert calls, "progress_callback이 한 번도 호출되지 않음"
+    # bag 전체 메시지 수(30개)를 모든 콜백이 동일하게 보고해야 한다.
+    assert all(total == 30 for _, total, _ in calls)
+    # 마지막 콜백은 전체 메시지를 다 처리했다는 뜻이어야 한다 (진행률 100%).
+    assert calls[-1][0] == 30
+
+
+def test_cancel_check_stops_early_but_keeps_already_saved_images(synthetic_bag_path, tmp_path):
+    """취소해도 그 시점까지 뽑힌 이미지는 버리지 않아야 한다 - 큰 bag의
+    앞부분만으로도 캘리브레이션을 시작할 수 있게 하기 위함."""
+    out_dir = str(tmp_path / "cancelled")
+    seen = {"n": 0}
+
+    def cancel_after_a_few():
+        seen["n"] += 1
+        return seen["n"] > 3
+
+    paths = extract_images_from_bag(
+        synthetic_bag_path, "/camera/image_raw", out_dir, min_interval_sec=0.05,
+        cancel_check=cancel_after_a_few,
+    )
+    assert 0 < len(paths) < 30
+    for p in paths:
+        import os
+        assert os.path.exists(p)
+
+
+def test_no_callback_or_cancel_check_behaves_exactly_as_before(synthetic_bag_path, tmp_path):
+    """새 옵션 인자들은 기본값(None)일 때 기존 동작을 한 글자도 안 바꿔야 한다."""
+    out_dir = str(tmp_path / "unchanged")
+    paths = extract_images_from_bag(synthetic_bag_path, "/camera/image_raw", out_dir, min_interval_sec=0.5)
+    assert 5 <= len(paths) <= 8

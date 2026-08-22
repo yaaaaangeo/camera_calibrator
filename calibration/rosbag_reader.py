@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional
 
 import cv2
 
@@ -113,6 +114,8 @@ def extract_images_from_bag(
     output_dir: str,
     min_interval_sec: float = 0.5,
     max_images: int | None = None,
+    progress_callback: Optional[Callable[[int, int, int], None]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> list[str]:
     """선택한 토픽의 이미지를 min_interval_sec 이상 간격으로 샘플링해서
     output_dir에 .jpg로 저장하고, 저장된 파일 경로 리스트를 반환한다.
@@ -123,6 +126,21 @@ def extract_images_from_bag(
     프레임을 수십 장 추출하는 걸 방지한다.
 
     반환된 경로들은 detect_dataset()에 그대로 넘기면 된다.
+
+    이 함수는 이미지 수백~수천 장짜리 bag에서는 수십 초가 걸릴 수 있다 -
+    반드시 UI(main_window.py)에서는 QThread 워커(ui/worker.py의
+    BagExtractionWorker)를 통해서만 호출해야 한다. GUI 스레드에서 직접
+    부르면 그동안 이벤트 루프가 멈춰 OS가 "응답 없음"으로 표시한다
+    (실제 사용자 버그: 큰 rosbag을 불러올 때 "python3 is not responding").
+
+    Args:
+        progress_callback: (처리한 메시지 수, bag 안의 전체 메시지 수,
+            지금까지 저장된 이미지 수)를 주기적으로 알려준다. UI가 진행률/
+            상태 텍스트를 갱신하는 용도이며, 계산 로직에는 영향을 주지 않는다.
+        cancel_check: 호출할 때마다 True를 반환하면 그 시점까지 저장된
+            이미지만 반환하고 즉시 중단한다 (사용자가 진행률 다이얼로그에서
+            취소를 눌렀을 때 사용). 지금까지 뽑은 이미지는 버리지 않는다 -
+            큰 bag 앞부분만으로도 캘리브레이션을 시작할 수 있게 하기 위함.
     """
     _require_rosbags()
     logger.info(
@@ -137,7 +155,11 @@ def extract_images_from_bag(
     last_saved_t: float | None = None
     skipped_unsupported = 0
     seen_encodings: set[str] = set()  # 실패 이유를 구체적으로 알려주기 위해 수집
+    processed = 0
 
+    # 진행률 표시용 - 이 토픽에 몇 개 메시지가 있는지 미리 알아둔다
+    # (list_image_topics에서 이미 구한 값과 같지만, 이 함수만 단독으로
+    # 호출해도 동작해야 하므로 다시 조회한다).
     with _open_reader(bag_path) as reader:
         connections = [c for c in reader.connections if c.topic == topic]
         if not connections:
@@ -145,8 +167,32 @@ def extract_images_from_bag(
         msg_type = connections[0].msgtype
         if msg_type not in _IMAGE_MSG_TYPES:
             raise ValueError(f"토픽 '{topic}'은 이미지 타입이 아닙니다 ({msg_type}).")
+        total_msgs = sum(c.msgcount for c in connections)
+
+        # 매 메시지마다 progress_callback을 호출하면 콜백 자체(Qt signal emit)의
+        # 오버헤드가 수천~수만 번 쌓여 오히려 느려질 수 있어, 20개 메시지에
+        # 한 번 또는 최소 0.2초에 한 번 정도로만 알린다.
+        # total_msgs가 정상적인 int가 아닌 상황(예: 테스트에서 reader를
+        # MagicMock으로 대체한 경우)에도 추출 자체는 그대로 동작해야 하므로
+        # 여기서만 방어적으로 처리한다.
+        try:
+            report_every = max(1, total_msgs // 200) if total_msgs else 20
+        except TypeError:
+            total_msgs = 0
+            report_every = 20
 
         for connection, timestamp, rawdata in reader.messages(connections=connections):
+            if cancel_check is not None and cancel_check():
+                logger.info(
+                    "사용자 취소로 추출 중단 (처리 %d/%d 메시지, 저장 %d장)",
+                    processed, total_msgs, len(saved_paths),
+                )
+                break
+
+            processed += 1
+            if progress_callback is not None and processed % report_every == 0:
+                progress_callback(processed, total_msgs, len(saved_paths))
+
             if max_images is not None and len(saved_paths) >= max_images:
                 break
 
@@ -170,6 +216,9 @@ def extract_images_from_bag(
             cv2.imwrite(str(filename), img)
             saved_paths.append(str(filename))
             last_saved_t = t_sec
+
+        if progress_callback is not None:
+            progress_callback(processed, total_msgs, len(saved_paths))
 
     logger.info(
         "bag 추출 완료: %d장 저장, %d개 디코딩 실패로 건너뜀 (topic=%s)",

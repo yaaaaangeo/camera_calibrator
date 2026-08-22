@@ -65,10 +65,15 @@ class RadialProfileChartWidget(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._profile: RadialErrorProfile | None = None
+        self._fixed_max_error: float | None = None
         self.setMinimumHeight(260)
 
-    def set_profile(self, profile: RadialErrorProfile | None) -> None:
+    def set_profile(self, profile: RadialErrorProfile | None, fixed_max_error: float | None = None) -> None:
+        """fixed_max_error를 주면 y축 최댓값을 이 값으로 고정한다 (모델 간
+        비교용 - 안 주면 이 프로필 자기 자신의 최댓값으로 스케일된다,
+        기존 동작과 동일)."""
         self._profile = profile
+        self._fixed_max_error = fixed_max_error
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802 (Qt override naming)
@@ -89,9 +94,17 @@ class RadialProfileChartWidget(QWidget):
             return
 
         bins = self._profile.bins
-        valid_errors = [b.mean_error for b in bins if b.mean_error is not None]
-        max_error = max(valid_errors) if valid_errors else 1.0
-        max_error = max(max_error, 1e-6) * 1.15  # 여유 15%
+        if self._fixed_max_error is not None:
+            # 모델 3개 중 하나라도 가장 큰 오차 구간을 기준으로 y축을 고정해서,
+            # 콤보박스로 모델을 바꿔도 막대 높이를 그대로 비교할 수 있게 한다.
+            # (예전 버그: 모델마다 자기 자신의 최댓값으로 다시 스케일해서
+            # 매번 축이 바뀌었고, 그래서 어느 모델이 실제로 더 나은지
+            # 막대 높이만 봐서는 알 수 없었다.)
+            max_error = self._fixed_max_error
+        else:
+            valid_errors = [b.mean_error for b in bins if b.mean_error is not None]
+            max_error = max(valid_errors) if valid_errors else 1.0
+            max_error = max(max_error, 1e-6) * 1.15  # 여유 15%
 
         # --- 축 ---
         painter.setPen(QPen(_AXIS_COLOR, 1))
@@ -161,6 +174,7 @@ class RadialProfileView(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._results: dict[CameraModelType, CalibrationResult] = {}
+        self._global_max_error: float | None = None
 
         layout = QVBoxLayout(self)
 
@@ -188,6 +202,18 @@ class RadialProfileView(QWidget):
 
     def set_results(self, calibration_results: dict[CameraModelType, CalibrationResult]) -> None:
         self._results = calibration_results
+        # 3개 모델 전체를 통틀어 가장 큰 구간 평균 오차를 y축 상한으로 고정한다.
+        # _refresh_chart()가 모델 콤보 변경마다 호출되는데, 그때마다 축이
+        # 다시 스케일되면 막대 높이로 모델 간 비교가 안 되기 때문
+        # (사용자 피드백: "세로 축이 계속 바뀌니깐 뭐가 더 좋은지 잘 모르겠어").
+        all_errors: list[float] = []
+        for result in calibration_results.values():
+            if not result or not result.success or not result.radial_profile:
+                continue
+            all_errors.extend(
+                b.mean_error for b in result.radial_profile.bins if b.mean_error is not None
+            )
+        self._global_max_error = max(all_errors) * 1.15 if all_errors else None
         self._refresh_chart()
 
     def select_model(self, model: CameraModelType) -> None:
@@ -208,7 +234,7 @@ class RadialProfileView(QWidget):
             return
 
         profile = result.radial_profile
-        self.chart.set_profile(profile)
+        self.chart.set_profile(profile, fixed_max_error=self._global_max_error)
 
         if profile and profile.bins:
             valid = [b for b in profile.bins if b.mean_error is not None]

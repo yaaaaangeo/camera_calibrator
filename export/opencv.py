@@ -14,8 +14,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import cv2
+import numpy as np
 
-from calibration.types import CalibrationResult, CameraConfig, PatternConfig
+from calibration.types import CalibrationResult, CameraConfig, CameraModelType, PatternConfig
 from calibration.models.common import distortion_coeff_labels
 
 
@@ -76,3 +77,71 @@ def load_opencv_yaml(path: str) -> dict:
     }
     fs.release()
     return data
+
+
+# ---------------------------------------------------------------------------
+# 외부 캘리브레이션 결과 불러오기 (calibration/external_compare.py에서 사용)
+# ---------------------------------------------------------------------------
+#
+# "예전에 다른 사람/다른 툴로 구한 파라미터"와 지금 결과를 비교하는 기능의
+# 입력 경로. load_opencv_yaml()과 다른 점: 이 툴이 만든 파일이 아니어도
+# (calibration_model 필드가 없어도) camera_matrix/distortion_coefficients만
+# 표준 OpenCV FileStorage 필드명으로 있으면 읽을 수 있게 관대하게 만든다.
+
+
+def load_camera_matrix_and_distortion_from_opencv_yaml(
+    path: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """camera_matrix(3x3)와 distortion 벡터만 읽는다. "calibration_model"
+    같은 이 툴 고유 필드는 없어도 된다 - ROS camera_calibration 패키지나
+    다른 OpenCV 기반 툴이 만든 파일도 이 두 필드명은 표준으로 쓰는 경우가
+    많아서, 그런 파일도 그대로 불러올 수 있게 하기 위함.
+    """
+    fs = cv2.FileStorage(path, cv2.FILE_STORAGE_READ)
+    try:
+        cm_node = fs.getNode("camera_matrix")
+        d_node = fs.getNode("distortion_coefficients")
+        if cm_node.empty() or d_node.empty():
+            raise ValueError(
+                "이 YAML에서 'camera_matrix' 또는 'distortion_coefficients' 항목을 "
+                "찾을 수 없습니다 (OpenCV FileStorage 표준 포맷이 아닌 것 같습니다)."
+            )
+        camera_matrix = cm_node.mat()
+        distortion = d_node.mat()
+    finally:
+        fs.release()
+
+    if camera_matrix is None or camera_matrix.shape != (3, 3):
+        raise ValueError("camera_matrix가 3x3 형태가 아닙니다.")
+    if distortion is None or distortion.size == 0:
+        raise ValueError("distortion_coefficients가 비어 있습니다.")
+
+    return (
+        np.asarray(camera_matrix, dtype=np.float64),
+        np.asarray(distortion, dtype=np.float64).reshape(-1, 1),
+    )
+
+
+def detect_model_hint_from_opencv_yaml(path: str) -> CameraModelType | None:
+    """이 툴이 남긴 "calibration_model" 필드가 파일 안에 있으면 그 값을
+    그대로 돌려준다 (UI에서 모델 선택 콤보박스의 기본값으로만 쓴다).
+
+    없다고 임의로 추측하지 않는 이유: distortion 배열 길이만으로는 예를 들어
+    Pinhole(k1,k2,p1,p2 4개)과 Fisheye(k1~k4 4개)를 구분할 수 없다 - 잘못
+    추측하면 재투영 계산 자체가 조용히 틀어진다. 그래서 힌트가 없으면
+    사용자가 직접 고르게 하고, 이 함수는 None만 돌려준다.
+    """
+    fs = cv2.FileStorage(path, cv2.FILE_STORAGE_READ)
+    try:
+        node = fs.getNode("calibration_model")
+        if node.empty():
+            return None
+        value = node.string()
+    finally:
+        fs.release()
+    if not value:
+        return None
+    try:
+        return CameraModelType(value)
+    except ValueError:
+        return None

@@ -230,6 +230,33 @@ def _train_model(
     raise ValueError(f"알 수 없는 모델: {model}")
 
 
+def refit_on_train_split(
+    dataset: Dataset,
+    camera_config: CameraConfig,
+    model: CameraModelType,
+    train_ids: list[str],
+    use_rational_model: bool = False,
+    fisheye_initial_guess: CalibrationResult | None = None,
+) -> CalibrationResult:
+    """validate_holdout()이 내부적으로 만드는 것과 완전히 동일한
+    "train 프레임만으로 학습한" CalibrationResult를 다시 만들어 돌려준다.
+
+    쓰임새: 외부(다른 사람/다른 세션) 캘리브레이션 결과와 공정하게 비교하려면
+    (calibration/external_compare.py), "내 파라미터" 쪽도 정확히 같은
+    test 프레임에서 한 번도 안 본 상태로 평가해야 한다. ValidationResult는
+    집계된 숫자(test_rms 등)만 들고 있고 그때 쓰인 camera_matrix/distortion
+    자체는 버려지므로, 똑같은 절차를 다시 돌려 그 파라미터를 복원한다
+    (계산 로직 자체는 새로 만들지 않고 _train_model을 그대로 재사용 -
+    계산 로직 중복 금지 원칙).
+    """
+    train_dataset = _subset_dataset(dataset, train_ids)
+    return _train_model(
+        train_dataset, camera_config, model,
+        use_rational_model=use_rational_model,
+        fisheye_initial_guess=fisheye_initial_guess,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 메인 함수
 # ---------------------------------------------------------------------------
