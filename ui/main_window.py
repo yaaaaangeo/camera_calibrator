@@ -12,9 +12,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QThread, Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -62,7 +63,7 @@ from ui.preview import PreviewView
 from ui.radial_profile_view import RadialProfileView
 from ui.straightness_view import StraightnessView
 from ui.live_capture_dialog import LiveCaptureDialog
-from ui.worker import PipelineWorker, OutlierPruneWorker, run_worker_in_thread
+from ui.worker import PipelineWorker, OutlierPruneWorker, SelfCheckWorker, run_worker_in_thread
 
 # ChArUco에서 흔히 쓰이는 사전 목록 (cv2.aruco.DICT_* 속성명 그대로)
 _ARUCO_DICTIONARIES = [
@@ -87,8 +88,11 @@ class MainWindow(QMainWindow):
         self.validation_results: dict[CameraModelType, ValidationResult] = {}
         self.scores: list[ModelScore] = []
         self.outlier_result: OutlierResult | None = None
+        self.use_rational_model: bool = False
         self._thread: QThread | None = None
         self._worker = None  # QThread가 살아있는 동안 GC 방지용 강한 참조
+        self._self_check_thread: QThread | None = None
+        self._self_check_worker = None  # 위와 동일한 이유로 별도 워커도 강한 참조 보관
 
         self._build_menu_bar()
 
@@ -141,6 +145,16 @@ class MainWindow(QMainWindow):
         load_action.triggered.connect(self._on_load_project)
         file_menu.addAction(load_action)
 
+        tools_menu = menu_bar.addMenu("도구")
+        self.self_check_action = QAction("자체 진단 (합성 데이터로 정확도 확인)...", self)
+        self.self_check_action.setToolTip(
+            "정답을 미리 아는 가짜(합성) ChArUco 데이터로 Pinhole/Extended Pinhole/\n"
+            "Rational model을 돌려서 복원된 fx/fy/cx/cy가 정답에 가까운지 확인합니다.\n"
+            "현재 불러온 이미지/캘리브레이션 결과와는 무관하며, 몇 초~수십 초 걸립니다."
+        )
+        self.self_check_action.triggered.connect(self._on_run_self_check)
+        tools_menu.addAction(self.self_check_action)
+
     def _build_settings_panel(self) -> QWidget:
         group = QGroupBox("Camera Setup & Pattern")
         outer = QHBoxLayout(group)
@@ -154,6 +168,20 @@ class MainWindow(QMainWindow):
         self.height_spin.setValue(1080)
         camera_form.addRow("Width", self.width_spin)
         camera_form.addRow("Height", self.height_spin)
+
+        self.rational_checkbox = QCheckBox("Rational model 사용 (k4~k6 포함)")
+        self.rational_checkbox.setToolTip(
+            "Extended Pinhole에서 cv2.CALIB_RATIONAL_MODEL을 켭니다.\n"
+            "기본값(꺼짐)은 k1,k2,p1,p2,k3 5계수만 추정합니다.\n"
+            "켜면 k1~k6,p1,p2 8개를 추정합니다 (OpenCV 버전에 따라 배열 길이\n"
+            "자체는 14칸으로 나올 수 있으나, 나머지 6개(s1~s4,taux,tauy)는\n"
+            "항상 0으로 고정되고 실제 추정 자유도는 8개입니다).\n"
+            "⚠ 파라미터가 많을수록 데이터가 충분치 않으면 k4~k6 값이 불안정하게\n"
+            "튈 수 있습니다. 광각/왜곡이 매우 심한 렌즈 + 데이터가 많을 때만\n"
+            "권장하며, 켠 뒤에는 Model Score/Test RMS로 실제 개선됐는지 꼭 확인하세요.\n"
+            "(CLI의 --rational 플래그와 동일한 옵션입니다.)"
+        )
+        camera_form.addRow("", self.rational_checkbox)
         outer.addLayout(camera_form)
 
         pattern_form = QFormLayout()
@@ -352,7 +380,11 @@ class MainWindow(QMainWindow):
         self.validation_results = {}
         self.scores = []
 
-        worker = PipelineWorker(self.image_paths, self.pattern_config, self.camera_config)
+        self.use_rational_model = self.rational_checkbox.isChecked()
+        worker = PipelineWorker(
+            self.image_paths, self.pattern_config, self.camera_config,
+            use_rational_model=self.use_rational_model,
+        )
         thread = run_worker_in_thread(worker, self)
 
         worker.progress.connect(self.status_label.setText)
@@ -410,6 +442,51 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "오류", message)
         self.status_label.setText(message)
 
+    # ------------------------------------------------------------------
+    # 자체 진단 (합성 데이터 기반 정확도 확인) - "도구" 메뉴
+    # ------------------------------------------------------------------
+
+    def _on_run_self_check(self) -> None:
+        self.self_check_action.setEnabled(False)
+        worker = SelfCheckWorker()
+        thread = run_worker_in_thread(worker, self)
+
+        worker.progress.connect(self.status_label.setText)
+        worker.result_ready.connect(self._on_self_check_result)
+        worker.error.connect(self._on_self_check_error)
+
+        self._self_check_thread, self._self_check_worker = thread, worker
+        thread.finished.connect(lambda: self.self_check_action.setEnabled(True))
+        thread.start()
+
+    def _on_self_check_result(self, results: list) -> None:
+        all_passed = all(r.passed for r in results)
+        header = "✅ 모든 항목 통과" if all_passed else "⚠ 일부 항목 실패"
+        lines = [f"<b>{header}</b><br><br>"]
+        for r in results:
+            if not r.success:
+                lines.append(f"✕ <b>{r.label}</b>: 계산 실패 - {r.message}<br><br>")
+                continue
+            mark = "✅" if r.passed else "✕"
+            lines.append(f"{mark} <b>{r.label}</b><br>{r.message}<br><br>")
+
+        box = QMessageBox(self)
+        box.setWindowTitle("자체 진단 결과")
+        box.setTextFormat(Qt.RichText)
+        box.setIcon(QMessageBox.Information if all_passed else QMessageBox.Warning)
+        box.setText("".join(lines))
+        box.setInformativeText(
+            "정답을 미리 아는 합성 데이터로 검증한 결과입니다. 실제 카메라로 찍은\n"
+            "데이터셋의 정확도를 보장하지는 않으며, 계산 엔진 자체가 정상 동작하는지\n"
+            "확인하는 용도입니다."
+        )
+        box.exec()
+        self.status_label.setText(header)
+
+    def _on_self_check_error(self, message: str) -> None:
+        QMessageBox.critical(self, "자체 진단 실패", message)
+        self.status_label.setText(message)
+
     def _refresh_result_view(self) -> None:
         self.result_view.set_comparison(self.calibration_results, self.validation_results, self.scores)
 
@@ -432,7 +509,8 @@ class MainWindow(QMainWindow):
             return
 
         worker = OutlierPruneWorker(
-            self.dataset, self.camera_config, self.pattern_config, reference_model
+            self.dataset, self.camera_config, self.pattern_config, reference_model,
+            use_rational_model=self.use_rational_model,
         )
         thread = run_worker_in_thread(worker, self)
 

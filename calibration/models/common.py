@@ -130,6 +130,29 @@ def fmt_optional(v: float | None) -> str:
     return f"{v:.3f}" if v is not None else "N/A"
 
 
+def distortion_coeff_labels(model_name: CameraModelType, count: int) -> list[str]:
+    """왜곡 계수 벡터(distortion.ravel())의 각 원소 이름을 순서대로 반환.
+
+    OpenCV의 계수 순서는 모델/플래그에 따라 원소 "개수"가 달라도 앞부분
+    순서는 고정이다 (뒤에 이어붙는 방식):
+      - Pinhole/Extended Pinhole (calibrateCamera 계열):
+        k1, k2, p1, p2, [k3, [k4, k5, k6, [s1, s2, s3, s4, [taux, tauy]]]]
+        (5개면 k3까지, CALIB_RATIONAL_MODEL을 쓰면 8개로 k4~k6까지 늘어난다)
+      - Fisheye (cv2.fisheye, Kannala-Brandt): k1, k2, k3, k4 (항상 4개)
+
+    개수가 알려진 패턴과 다르면(예: 향후 s1~s4/tau 확장) 안전하게
+    "d{i}" 형태로 채운다 - 라벨이 없다고 값 자체를 숨기지 않는다.
+    """
+    if model_name == CameraModelType.FISHEYE:
+        base = ["k1", "k2", "k3", "k4"]
+    else:
+        base = ["k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4", "taux", "tauy"]
+
+    if count <= len(base):
+        return base[:count]
+    return base + [f"d{i}" for i in range(len(base), count)]
+
+
 def regional_edge_average(regional_error: RegionalError) -> float | None:
     """RegionalError에서 외곽(left/right/top/bottom/corner)만 평균낸 값.
     compare.py와 validation.py가 '외곽 오차'를 정의할 때 같은 기준을 쓰도록 공용화.

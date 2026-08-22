@@ -29,6 +29,7 @@ from calibration.compare import run_all_models
 from calibration.validation import validate_all_models
 from calibration.recommender import compute_model_scores, build_recommendation_message
 from calibration.outlier import recalibrate_with_outlier_pruning
+from calibration.self_check import run_all_self_checks
 
 
 class PipelineWorker(QObject):
@@ -49,12 +50,14 @@ class PipelineWorker(QObject):
         pattern_config: PatternConfig,
         camera_config: CameraConfig,
         test_ratio: float = 0.25,
+        use_rational_model: bool = False,
     ):
         super().__init__()
         self.image_paths = image_paths
         self.pattern_config = pattern_config
         self.camera_config = camera_config
         self.test_ratio = test_ratio
+        self.use_rational_model = use_rational_model
         self.dataset: Dataset | None = None
 
     def run(self) -> None:
@@ -80,7 +83,9 @@ class PipelineWorker(QObject):
             self.dataset_ready.emit(dataset)  # 1차 점수(재투영 오차 제외) 반영해서 테이블 갱신
 
             self.progress.emit("Pinhole / Extended Pinhole / Fisheye 3개 모델 계산 중...")
-            results_list = run_all_models(dataset, self.camera_config)
+            results_list = run_all_models(
+                dataset, self.camera_config, use_rational_model=self.use_rational_model
+            )
             calibration_results = {r.model_name: r for r in results_list}
 
             self.progress.emit("재투영 오차를 반영해 프레임 품질 점수 갱신 중...")
@@ -91,12 +96,16 @@ class PipelineWorker(QObject):
 
             self.progress.emit("Hold-out Validation (Train/Test 분할 검증) 중...")
             validation_results = validate_all_models(
-                dataset, self.camera_config, self.pattern_config, test_ratio=self.test_ratio
+                dataset, self.camera_config, self.pattern_config, test_ratio=self.test_ratio,
+                use_rational_model=self.use_rational_model,
             )
             self.validation_ready.emit(validation_results)
 
             self.progress.emit("Model Score 계산 및 추천 생성 중...")
-            scores = compute_model_scores(calibration_results, validation_results)
+            scores = compute_model_scores(
+                calibration_results, validation_results,
+                use_rational_model=self.use_rational_model,
+            )
             message = build_recommendation_message(scores, calibration_results, validation_results)
             self.recommendation_ready.emit(scores, message)
 
@@ -134,6 +143,7 @@ class OutlierPruneWorker(QObject):
         reference_model: CameraModelType,
         max_iterations: int = 3,
         test_ratio: float = 0.25,
+        use_rational_model: bool = False,
     ):
         super().__init__()
         self.dataset = dataset
@@ -142,6 +152,7 @@ class OutlierPruneWorker(QObject):
         self.reference_model = reference_model
         self.max_iterations = max_iterations
         self.test_ratio = test_ratio
+        self.use_rational_model = use_rational_model
 
     def run(self) -> None:
         try:
@@ -149,6 +160,7 @@ class OutlierPruneWorker(QObject):
             ref_result, outlier_result = recalibrate_with_outlier_pruning(
                 self.dataset, self.camera_config, self.reference_model,
                 max_iterations=self.max_iterations,
+                use_rational_model=self.use_rational_model,
             )
             self.outlier_ready.emit(ref_result, outlier_result)
             self.dataset_updated.emit(self.dataset)  # 프레임 status가 바뀌었으므로 즉시 반영
@@ -164,7 +176,9 @@ class OutlierPruneWorker(QObject):
             self.dataset_updated.emit(self.dataset)
 
             self.progress.emit("정제된 데이터셋으로 3개 모델 재계산 중...")
-            results_list = run_all_models(self.dataset, self.camera_config)
+            results_list = run_all_models(
+                self.dataset, self.camera_config, use_rational_model=self.use_rational_model
+            )
             calibration_results = {r.model_name: r for r in results_list}
 
             compute_frame_quality_scores(
@@ -174,17 +188,56 @@ class OutlierPruneWorker(QObject):
 
             self.progress.emit("Hold-out Validation 재실행 중...")
             validation_results = validate_all_models(
-                self.dataset, self.camera_config, self.pattern_config, test_ratio=self.test_ratio
+                self.dataset, self.camera_config, self.pattern_config, test_ratio=self.test_ratio,
+                use_rational_model=self.use_rational_model,
             )
             self.validation_ready.emit(validation_results)
 
-            scores = compute_model_scores(calibration_results, validation_results)
+            scores = compute_model_scores(
+                calibration_results, validation_results,
+                use_rational_model=self.use_rational_model,
+            )
             message = build_recommendation_message(scores, calibration_results, validation_results)
             self.recommendation_ready.emit(scores, message)
 
             self.progress.emit("완료.")
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"이상치 재계산 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
+class SelfCheckWorker(QObject):
+    """설계 문서 원칙과 무관하게, "이 툴이 실제로 정확한 결과를 내는지"를
+    이미지 없이 즉석에서 확인하고 싶다는 요청으로 추가된 워커.
+
+    알려진 정답 카메라 파라미터로 합성 ChArUco 이미지를 만들고, 실제
+    calibrate_pinhole/calibrate_extended_pinhole을 그 데이터에 돌려서
+    복원된 fx/fy/cx/cy가 정답에 얼마나 가까운지 검증한다
+    (calibration/self_check.py, tests/test_calibration_accuracy.py와 동일한
+    로직 재사용 - 계산 로직 중복 금지 원칙).
+
+    사용자가 불러온 실제 이미지/데이터셋과는 무관하게 항상 같은 합성
+    데이터로 돌아가므로, 실행 중인 캘리브레이션 세션 상태를 전혀 건드리지
+    않는다 - 아무 때나 눌러도 안전하다.
+    """
+
+    progress = Signal(str)
+    result_ready = Signal(list)   # list[SelfCheckResult]
+    error = Signal(str)
+    finished = Signal()
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(
+                "합성 데이터(정답을 미리 아는 가짜 카메라)로 Pinhole/Extended Pinhole/"
+                "Rational model 정확도를 확인하는 중... (수십 초 정도 걸릴 수 있습니다)"
+            )
+            results = run_all_self_checks()
+            self.result_ready.emit(results)
+            self.progress.emit("자체 진단 완료.")
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"자체 진단 중 오류: {e}")
         finally:
             self.finished.emit()
 

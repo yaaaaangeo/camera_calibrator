@@ -35,7 +35,7 @@ from calibration.types import (
     QualityGrade,
     ValidationResult,
 )
-from calibration.models.common import regional_edge_average
+from calibration.models.common import regional_edge_average, distortion_coeff_labels
 from calibration.quality import coverage_percentage
 
 _MODEL_LABELS = {
@@ -203,10 +203,13 @@ def _section_chosen_model_detail(cal: CalibrationResult | None, val: ValidationR
     fx, fy = float(K[0, 0]), float(K[1, 1])
     cx, cy = float(K[0, 2]), float(K[1, 2])
 
+    labels = distortion_coeff_labels(cal.model_name, D.size)
+    distortion_str = ", ".join(f"{name}={v:.6f}" for name, v in zip(labels, D.tolist()))
+
     rows = [
         ("fx, fy", f"{fx:.2f}, {fy:.2f}"),
         ("cx, cy", f"{cx:.2f}, {cy:.2f}"),
-        ("Distortion coeffs", ", ".join(f"{v:.6f}" for v in D.tolist())),
+        (f"Distortion coeffs ({D.size}개)", distortion_str),
         ("RMS Reprojection Error", _fmt(cal.rms_error)),
     ]
     if cal.param_uncertainty and cal.param_uncertainty.fx_std is not None:

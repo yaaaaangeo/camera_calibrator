@@ -16,6 +16,7 @@ from pathlib import Path
 import cv2
 
 from calibration.types import CalibrationResult, CameraConfig, PatternConfig
+from calibration.models.common import distortion_coeff_labels
 
 
 def export_opencv_yaml(
@@ -42,6 +43,10 @@ def export_opencv_yaml(
     fs.write("camera_matrix", result.camera_matrix)
     fs.write("distortion_coefficients", result.distortion)
     fs.write("distortion_coefficient_count", int(result.distortion.size))
+    fs.write(
+        "distortion_coefficient_order",
+        ",".join(distortion_coeff_labels(result.model_name, int(result.distortion.size))),
+    )
     fs.write("rms_reprojection_error", float(result.rms_error))
 
     # 패턴 메타정보 (설계 문서 10번)
