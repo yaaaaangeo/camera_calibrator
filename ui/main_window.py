@@ -40,6 +40,7 @@ from calibration.types import (
     CalibrationProject,
     CameraConfig,
     CameraModelType,
+    CrossDatasetValidationResult,
     Dataset,
     ModelScore,
     OutlierResult,
@@ -66,10 +67,13 @@ from ui.preview import PreviewView
 from ui.radial_profile_view import RadialProfileView
 from ui.straightness_view import StraightnessView
 from ui.external_compare_view import ExternalCompareView
+from ui.diagnosis_view import DiagnosisView
+from ui.stability_view import StabilityView
 from ui.live_capture_dialog import LiveCaptureDialog
 from ui.worker import (
     PipelineWorker,
     OutlierPruneWorker,
+    CrossDatasetValidationWorker,
     SelfCheckWorker,
     BagExtractionWorker,
     run_worker_in_thread,
@@ -88,7 +92,10 @@ _ARUCO_DICTIONARIES = [
     "DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000",
     "DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000",
     "DICT_6X6_50", "DICT_6X6_100", "DICT_6X6_250", "DICT_6X6_1000",
+    "DICT_APRILTAG_16h5", "DICT_APRILTAG_25h9",
+    "DICT_APRILTAG_36h10", "DICT_APRILTAG_36h11",
 ]
+_IMAGE_EXTENSIONS = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
 
 
 class MainWindow(QMainWindow):
@@ -104,6 +111,7 @@ class MainWindow(QMainWindow):
         self.pattern_config: PatternConfig | None = None
         self.calibration_results: dict[CameraModelType, CalibrationResult] = {}
         self.validation_results: dict[CameraModelType, ValidationResult] = {}
+        self.cross_dataset_results: list[CrossDatasetValidationResult] = []
         self.scores: list[ModelScore] = []
         self.outlier_result: OutlierResult | None = None
         self.use_rational_model: bool = False
@@ -123,20 +131,27 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_settings_panel())
 
         self.tabs = QTabWidget()
-        self.dataset_view = DatasetView()
+        self.dataset_view = DatasetView(group_title="Dataset")
+        self.detection_view = DatasetView(group_title="Detection")
         self.coverage_view = CoverageView()
-        self.result_view = ResultView()
+        self.result_view = ResultView(standalone=False)
         self.preview_view = PreviewView()
         self.radial_profile_view = RadialProfileView()
         self.straightness_view = StraightnessView()
         self.external_compare_view = ExternalCompareView()
+        self.diagnosis_view = DiagnosisView()
+        self.stability_view = StabilityView()
+        self.error_analysis_tab = self._build_error_analysis_tab()
         self.tabs.addTab(self.dataset_view, "① Dataset")
-        self.tabs.addTab(self.coverage_view, "② Coverage")
-        self.tabs.addTab(self.result_view, "③ Model / Validation / Export")
-        self.tabs.addTab(self.preview_view, "④ Undistort Preview")
-        self.tabs.addTab(self.radial_profile_view, "⑤ Edge Error Map")
-        self.tabs.addTab(self.straightness_view, "⑥ Straightness Map")
-        self.tabs.addTab(self.external_compare_view, "⑦ 외부 결과 비교")
+        self.tabs.addTab(self.detection_view, "② Detection")
+        self.tabs.addTab(self.coverage_view, "③ Coverage")
+        self.tabs.addTab(self.result_view.calibration_widget, "④ Calibration")
+        self.tabs.addTab(self.result_view.validation_widget, "⑤ Validation")
+        self.tabs.addTab(self.error_analysis_tab, "⑥ Error Analysis")
+        self.tabs.addTab(self.stability_view, "⑦ Stability")
+        self.tabs.addTab(self.result_view.model_comparison_widget, "⑧ Model Comparison")
+        self.tabs.addTab(self.diagnosis_view, "⑨ Diagnosis")
+        self.tabs.addTab(self.result_view.export_widget, "⑩ Export")
         layout.addWidget(self.tabs, stretch=1)
 
         self.status_label = QLabel("이미지를 불러온 뒤 [캘리브레이션 실행]을 누르세요.")
@@ -148,6 +163,7 @@ class MainWindow(QMainWindow):
         self.result_view.export_report_requested.connect(self._on_export_report)
         self.result_view.export_json_requested.connect(self._on_export_json)
         self.result_view.export_csv_requested.connect(self._on_export_csv)
+        self.result_view.cross_dataset_requested.connect(self._on_cross_dataset_requested)
 
         # 앱이 응답 없음/강제 종료 등으로 꺼져도 마지막으로 완료된 계산
         # 결과는 자동 저장본에서 복구할 수 있게, 창이 뜨자마자 한 번 확인한다.
@@ -157,6 +173,17 @@ class MainWindow(QMainWindow):
         # 게 원인이었다. 매 실행 완료 시 자동 저장해두면 이런 경우에도
         # Export만큼은 다시 할 수 있다.)
         QTimer.singleShot(0, self._offer_autosave_recovery)
+
+    def _build_error_analysis_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        sub_tabs = QTabWidget()
+        sub_tabs.addTab(self.preview_view, "Undistort Preview")
+        sub_tabs.addTab(self.radial_profile_view, "Edge Error Map")
+        sub_tabs.addTab(self.straightness_view, "Straightness Map")
+        sub_tabs.addTab(self.external_compare_view, "External Compare")
+        layout.addWidget(sub_tabs)
+        return tab
 
     # ------------------------------------------------------------------
     # 설정 패널 (설계 문서 14번 ① Camera Setup, ③ Calibration Pattern)
@@ -243,6 +270,7 @@ class MainWindow(QMainWindow):
         # 문자열 비교 없이 바로 꺼내 쓸 수 있다.
         self.pattern_type_combo.addItem("ChArUco (권장)", userData=PatternType.CHARUCO)
         self.pattern_type_combo.addItem("Chessboard (일반 체스보드)", userData=PatternType.CHESSBOARD)
+        self.pattern_type_combo.addItem("AprilGrid (AprilTag grid)", userData=PatternType.APRILGRID)
         self.pattern_type_combo.currentIndexChanged.connect(self._on_pattern_type_changed)
 
         pattern_form.addRow("Pattern type", self.pattern_type_combo)
@@ -405,27 +433,37 @@ class MainWindow(QMainWindow):
 
     def _on_pattern_type_changed(self) -> None:
         """Chessboard는 marker_size/dictionary가 필요 없으니 해당 입력 행을
-        숨긴다 - 안 그러면 사용자가 "이거 왜 입력해야 하지?" 헷갈리기 쉽다.
+        숨긴다. ChArUco/AprilGrid는 마커 기반 패턴이라 둘 다 유지한다.
         """
-        is_charuco = self.pattern_type_combo.currentData() == PatternType.CHARUCO
+        pattern_type = self.pattern_type_combo.currentData()
+        uses_marker_dictionary = pattern_type in (PatternType.CHARUCO, PatternType.APRILGRID)
         # 행 인덱스: 0=Pattern type, 1=Squares X, 2=Squares Y, 3=Square size,
         # 4=Marker size, 5=Dictionary (addRow 호출 순서와 동일).
-        self._pattern_form.setRowVisible(4, is_charuco)
-        self._pattern_form.setRowVisible(5, is_charuco)
+        self._pattern_form.setRowVisible(4, uses_marker_dictionary)
+        self._pattern_form.setRowVisible(5, uses_marker_dictionary)
+        current_dictionary = self.dictionary_combo.currentText()
+        if pattern_type == PatternType.APRILGRID and not current_dictionary.startswith("DICT_APRILTAG_"):
+            idx = self.dictionary_combo.findText("DICT_APRILTAG_36h11")
+            if idx >= 0:
+                self.dictionary_combo.setCurrentIndex(idx)
+        elif pattern_type == PatternType.CHARUCO and current_dictionary.startswith("DICT_APRILTAG_"):
+            idx = self.dictionary_combo.findText("DICT_5X5_100")
+            if idx >= 0:
+                self.dictionary_combo.setCurrentIndex(idx)
 
     def _current_pattern_config(self) -> PatternConfig:
         # UI는 mm로 입력받지만(보드 인쇄 스펙이 보통 mm 단위), 내부 계산/export는
         # 전부 미터(m) 기준이라 여기서 한 번만 변환한다 - 이후 파이프라인은
         # 이 값이 mm에서 왔는지 몰라도 된다.
         pattern_type = self.pattern_type_combo.currentData()
-        is_charuco = pattern_type == PatternType.CHARUCO
+        uses_marker_dictionary = pattern_type in (PatternType.CHARUCO, PatternType.APRILGRID)
         return PatternConfig(
             type=pattern_type,
             squares_x=self.squares_x_spin.value(),
             squares_y=self.squares_y_spin.value(),
             square_size=self.square_size_spin.value() / 1000.0,
-            marker_size=(self.marker_size_spin.value() / 1000.0) if is_charuco else None,
-            dictionary=self.dictionary_combo.currentText() if is_charuco else None,
+            marker_size=(self.marker_size_spin.value() / 1000.0) if uses_marker_dictionary else None,
+            dictionary=self.dictionary_combo.currentText() if uses_marker_dictionary else None,
         )
 
     def _current_camera_config(self) -> CameraConfig:
@@ -440,6 +478,7 @@ class MainWindow(QMainWindow):
         self.camera_config = self._current_camera_config()
         self.calibration_results = {}
         self.validation_results = {}
+        self.cross_dataset_results = []
         self.scores = []
 
         self.use_rational_model = self.rational_checkbox.isChecked()
@@ -469,6 +508,7 @@ class MainWindow(QMainWindow):
     def _on_dataset_ready(self, dataset: Dataset) -> None:
         self.dataset = dataset
         self.dataset_view.set_dataset(dataset)
+        self.detection_view.set_dataset(dataset)
         self.coverage_view.set_dataset_quality_score(dataset.quality_score)
 
     def _on_quality_ready(self, warnings: list[str]) -> None:
@@ -481,6 +521,7 @@ class MainWindow(QMainWindow):
         if self.dataset is not None and self.camera_config is not None:
             self.preview_view.set_context(self.dataset, self.camera_config, results, self.pattern_config)
             self.dataset_view.set_dataset(self.dataset)  # per_frame_error 채워졌으니 갱신
+            self.detection_view.set_dataset(self.dataset)
             if self.pattern_config is not None:
                 self.straightness_view.set_context(self.dataset, self.camera_config, results, self.pattern_config)
             # 설계 문서 8번 - 3모델 계산이 끝날 때마다 sanity check도 함께 갱신한다
@@ -496,7 +537,9 @@ class MainWindow(QMainWindow):
         if self.dataset is not None and self.camera_config is not None and self.pattern_config is not None:
             self.external_compare_view.set_context(
                 self.dataset, self.camera_config, self.pattern_config,
-                self.validation_results, use_rational_model=self.use_rational_model,
+                self.validation_results,
+                calibration_results=self.calibration_results,
+                use_rational_model=self.use_rational_model,
             )
 
     def _on_recommendation_ready(self, scores: list[ModelScore], message: str) -> None:
@@ -535,6 +578,7 @@ class MainWindow(QMainWindow):
                 dataset=self.dataset,
                 calibration_results=self.calibration_results,
                 validation_results=self.validation_results,
+                cross_dataset_results=self.cross_dataset_results,
                 model_scores=self.scores,
                 outlier_result=self.outlier_result,
             )
@@ -609,6 +653,68 @@ class MainWindow(QMainWindow):
 
     def _refresh_result_view(self) -> None:
         self.result_view.set_comparison(self.calibration_results, self.validation_results, self.scores)
+        self.result_view.set_cross_dataset_results(self.cross_dataset_results)
+        self.diagnosis_view.set_results(self.calibration_results, self.validation_results, self.dataset)
+        self.stability_view.set_results(self.calibration_results, self.validation_results, self.scores, self.dataset)
+
+    def _image_paths_from_directory(self, directory: str) -> list[str]:
+        paths: list[str] = []
+        p = Path(directory)
+        for ext in _IMAGE_EXTENSIONS:
+            paths.extend(sorted(str(x) for x in p.glob(ext)))
+        return paths
+
+    def _on_cross_dataset_requested(self) -> None:
+        if (
+            self.dataset is None or self.camera_config is None or self.pattern_config is None
+            or not any(r.success for r in self.calibration_results.values())
+        ):
+            QMessageBox.warning(self, "Cross-Dataset 불가", "먼저 캘리브레이션을 실행하세요.")
+            return
+
+        directory = QFileDialog.getExistingDirectory(self, "Dataset B/C 이미지 폴더 선택")
+        if not directory:
+            return
+        paths = self._image_paths_from_directory(directory)
+        if not paths:
+            QMessageBox.warning(self, "이미지 없음", "선택한 폴더에서 jpg/jpeg/png/bmp 이미지를 찾지 못했습니다.")
+            return
+
+        default_label = Path(directory).name or f"Dataset {len(self.cross_dataset_results) + 1}"
+        dataset_id, ok = QInputDialog.getText(
+            self,
+            "Target Dataset Label",
+            "Report/JSON에 표시할 target dataset 이름:",
+            text=default_label,
+        )
+        if not ok:
+            return
+        dataset_id = dataset_id.strip() or default_label
+
+        source_dataset_id = self.camera_config.sensor_name or "Dataset A"
+        worker = CrossDatasetValidationWorker(
+            {dataset_id: paths},
+            self.calibration_results,
+            self.camera_config,
+            self.pattern_config,
+            source_dataset_id=source_dataset_id,
+        )
+        thread = run_worker_in_thread(worker, self)
+        worker.progress.connect(self.status_label.setText)
+        worker.results_ready.connect(self._on_cross_dataset_results_ready)
+        worker.error.connect(self._on_error)
+
+        self._thread, self._worker = thread, worker
+        self.result_view.cross_dataset_button.setEnabled(False)
+        thread.finished.connect(lambda: self.result_view.cross_dataset_button.setEnabled(True))
+        thread.start()
+
+    def _on_cross_dataset_results_ready(self, results: list[CrossDatasetValidationResult]) -> None:
+        self.cross_dataset_results.extend(results)
+        self.result_view.set_cross_dataset_results(self.cross_dataset_results)
+        ok = sum(1 for r in results if r.success)
+        self.status_label.setText(f"Cross-dataset validation 완료: {ok}/{len(results)} 성공")
+        self._autosave()
 
     # ------------------------------------------------------------------
     # Outlier 재계산
@@ -663,6 +769,7 @@ class MainWindow(QMainWindow):
         """
         self.dataset = dataset
         self.dataset_view.set_dataset(dataset)
+        self.detection_view.set_dataset(dataset)
         self.coverage_view.set_dataset_quality_score(dataset.quality_score)
 
     # ------------------------------------------------------------------
@@ -719,6 +826,8 @@ class MainWindow(QMainWindow):
                 dataset_coverage_pct=coverage_pct,
                 outlier_result=self.outlier_result,
                 scores=self.scores,
+                coverage_grid=self.dataset.coverage_grid,
+                dataset_diversity=self.dataset.diversity,
             )
             export_html_report(
                 project_name=(self.camera_config.sensor_name or "camera_calibrator"),
@@ -729,6 +838,7 @@ class MainWindow(QMainWindow):
                 validation_results=self.validation_results,
                 final_result=final_result,
                 path=path,
+                cross_dataset_results=self.cross_dataset_results,
             )
             self.status_label.setText(f"HTML 리포트 저장 완료: {path}")
         except Exception as e:  # noqa: BLE001
@@ -756,6 +866,8 @@ class MainWindow(QMainWindow):
                 dataset_coverage_pct=coverage_pct,
                 outlier_result=self.outlier_result,
                 scores=self.scores,
+                coverage_grid=self.dataset.coverage_grid,
+                dataset_diversity=self.dataset.diversity,
             )
             export_json(
                 camera_config=self.camera_config,
@@ -767,6 +879,7 @@ class MainWindow(QMainWindow):
                 path=path,
                 final_result=final_result,
                 model_scores=self.scores,
+                cross_dataset_results=self.cross_dataset_results,
             )
             self.status_label.setText(f"JSON 저장 완료: {path}")
         except Exception as e:  # noqa: BLE001
@@ -811,6 +924,7 @@ class MainWindow(QMainWindow):
             dataset=self.dataset,
             calibration_results=self.calibration_results,
             validation_results=self.validation_results,
+            cross_dataset_results=self.cross_dataset_results,
             model_scores=self.scores,
             outlier_result=self.outlier_result,
         )
@@ -841,6 +955,7 @@ class MainWindow(QMainWindow):
         self.pattern_config = project.pattern_config
         self.calibration_results = project.calibration_results
         self.validation_results = project.validation_results
+        self.cross_dataset_results = project.cross_dataset_results
         self.scores = project.model_scores
         self.outlier_result = project.outlier_result
         self.image_paths = [f.image_info.path for f in project.dataset.frames]
@@ -862,6 +977,7 @@ class MainWindow(QMainWindow):
 
         # --- 각 탭 새로고침 ---
         self.dataset_view.set_dataset(self.dataset)
+        self.detection_view.set_dataset(self.dataset)
         self.coverage_view.set_quality(self.dataset.coverage_grid, self.dataset.diversity, [])
         if self.calibration_results:
             self.preview_view.set_context(self.dataset, self.camera_config, self.calibration_results, self.pattern_config)
@@ -872,7 +988,9 @@ class MainWindow(QMainWindow):
         if self.validation_results:
             self.external_compare_view.set_context(
                 self.dataset, self.camera_config, self.pattern_config,
-                self.validation_results, use_rational_model=self.use_rational_model,
+                self.validation_results,
+                calibration_results=self.calibration_results,
+                use_rational_model=self.use_rational_model,
             )
         self._refresh_result_view()
         if self.scores:

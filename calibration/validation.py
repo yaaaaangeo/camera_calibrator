@@ -30,6 +30,7 @@ from calibration.types import (
     CalibrationResult,
     CameraConfig,
     CameraModelType,
+    CrossDatasetValidationResult,
     Dataset,
     Frame,
     OutlierResult,
@@ -458,6 +459,147 @@ def validate_all_models(
         fisheye_initial_guess=pinhole_train_for_init,
     )
     return results
+
+
+# ---------------------------------------------------------------------------
+# Cross-dataset validation (Dataset A -> Dataset B/C)
+# ---------------------------------------------------------------------------
+
+def _usable_test_frame_ids(dataset: Dataset) -> list[str]:
+    return [
+        f.image_info.image_id
+        for f in dataset.enabled_frames
+        if f.detection and f.detection.success and f.detection.num_corners >= 4
+    ]
+
+
+def _cross_result_from_validation(
+    source_dataset_id: str,
+    target_dataset_id: str,
+    model: CameraModelType,
+    validation: ValidationResult,
+) -> CrossDatasetValidationResult:
+    test_p95 = validation.test_residual_stats.p95 if validation.test_residual_stats else None
+    gap = (
+        validation.test_rms - validation.train_rms
+        if validation.test_rms is not None and validation.train_rms is not None
+        else None
+    )
+    return CrossDatasetValidationResult(
+        source_dataset_id=source_dataset_id,
+        target_dataset_id=target_dataset_id,
+        model_name=model,
+        train_rms=validation.train_rms,
+        test_rms=validation.test_rms,
+        test_p95=test_p95,
+        edge_rms=validation.edge_rms,
+        straightness_residual=validation.straightness_residual,
+        generalization_gap=gap,
+        num_test_frames=len(validation.test_frame_ids),
+        failed_test_frame_ids=validation.failed_test_frame_ids,
+        success=validation.success,
+        error_message=validation.error_message,
+    )
+
+
+def validate_cross_dataset(
+    calibration_result: CalibrationResult,
+    target_dataset: Dataset,
+    camera_config: CameraConfig,
+    pattern_config: PatternConfig,
+    source_dataset_id: str = "A",
+    target_dataset_id: str = "B",
+) -> CrossDatasetValidationResult:
+    """Dataset A에서 학습된 intrinsic/distortion을 Dataset B에 고정 평가한다.
+
+    Target dataset으로 intrinsic을 다시 최적화하지 않는다. 각 target 프레임은
+    pose만 solvePnP로 새로 추정하고, Hold-out과 같은 _evaluate_on_test()
+    경로로 RMS/P95/edge/straightness를 계산한다.
+    """
+    model = calibration_result.model_name
+    if (
+        not calibration_result.success
+        or calibration_result.camera_matrix is None
+        or calibration_result.distortion is None
+    ):
+        return CrossDatasetValidationResult(
+            source_dataset_id=source_dataset_id,
+            target_dataset_id=target_dataset_id,
+            model_name=model,
+            train_rms=calibration_result.rms_error,
+            success=False,
+            error_message=calibration_result.error_message or "Calibration result is not usable.",
+        )
+
+    test_ids = _usable_test_frame_ids(target_dataset)
+    if not test_ids:
+        return CrossDatasetValidationResult(
+            source_dataset_id=source_dataset_id,
+            target_dataset_id=target_dataset_id,
+            model_name=model,
+            train_rms=calibration_result.rms_error,
+            success=False,
+            error_message="Target dataset has no usable detected frames.",
+        )
+    validation = _evaluate_on_test(
+        target_dataset,
+        camera_config,
+        pattern_config,
+        model,
+        train_ids=[],
+        test_ids=test_ids,
+        train_result=calibration_result,
+    )
+    return _cross_result_from_validation(source_dataset_id, target_dataset_id, model, validation)
+
+
+def validate_cross_datasets(
+    calibration_results: dict[CameraModelType, CalibrationResult],
+    target_datasets: dict[str, Dataset],
+    camera_config: CameraConfig,
+    pattern_config: PatternConfig,
+    source_dataset_id: str = "A",
+) -> list[CrossDatasetValidationResult]:
+    """여러 모델을 여러 외부 Dataset(B/C/...)에 대해 일괄 평가한다."""
+    results: list[CrossDatasetValidationResult] = []
+    for target_id, target_dataset in target_datasets.items():
+        for model in (CameraModelType.PINHOLE, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE):
+            cal = calibration_results.get(model)
+            if cal is None:
+                continue
+            results.append(
+                validate_cross_dataset(
+                    cal,
+                    target_dataset,
+                    camera_config,
+                    pattern_config,
+                    source_dataset_id=source_dataset_id,
+                    target_dataset_id=target_id,
+                )
+            )
+    return results
+
+
+def format_cross_dataset_validation_table(results: list[CrossDatasetValidationResult]) -> str:
+    """Dataset A -> B/C generalization 결과를 콘솔/로그용 표로 포맷."""
+    if not results:
+        return "Cross-dataset validation: no results."
+
+    def fmt(v: float | None) -> str:
+        return f"{v:.3f}" if v is not None else "N/A"
+
+    lines = [
+        "Cross-dataset validation (fixed intrinsics; target pose only):",
+        f"{'Source':<10}{'Target':<10}{'Model':<18}{'Train':>10}{'Test':>10}{'P95':>10}{'Gap':>10}{'Frames':>8}",
+    ]
+    for r in results:
+        status = "" if r.success else " FAIL"
+        lines.append(
+            f"{r.source_dataset_id:<10}{r.target_dataset_id:<10}{(r.model_name.value + status):<18}"
+            f"{fmt(r.train_rms):>10}{fmt(r.test_rms):>10}{fmt(r.test_p95):>10}"
+            f"{fmt(r.generalization_gap):>10}{r.num_test_frames:>8}"
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

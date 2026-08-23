@@ -35,6 +35,9 @@ def test_all_excellent_metrics_give_excellent_grade():
 
     final = compute_final_result(CameraModelType.EXTENDED_PINHOLE, cal, val)
     assert final.overall_grade == QualityGrade.EXCELLENT
+    assert final.confidence is not None
+    assert final.confidence.score >= 85.0
+    assert final.confidence.level == "HIGH"
 
 
 def test_one_bad_metric_drags_down_overall_grade():
@@ -49,6 +52,8 @@ def test_one_bad_metric_drags_down_overall_grade():
     assert final.overall_grade == QualityGrade.POOR, (
         "Train RMS가 훌륭해도 Edge RMS가 나쁘면 종합 등급이 Poor여야 함"
     )
+    assert final.confidence is not None
+    assert final.confidence.score <= 49.0
 
 
 def test_failed_calibration_gives_reject():
@@ -56,6 +61,9 @@ def test_failed_calibration_gives_reject():
     val = {}
     final = compute_final_result(CameraModelType.PINHOLE, cal, val)
     assert final.overall_grade == QualityGrade.REJECT
+    assert final.confidence is not None
+    assert final.confidence.score == 0.0
+    assert final.confidence.level == "REJECT"
 
 
 def test_chosen_model_not_recommended_model_is_respected():
@@ -83,3 +91,5 @@ def test_missing_validation_falls_back_to_train_rms_only():
     cal = {CameraModelType.PINHOLE: _cal(0.4)}
     final = compute_final_result(CameraModelType.PINHOLE, cal, {})
     assert final.overall_grade in (QualityGrade.VERY_GOOD, QualityGrade.GOOD)
+    assert final.confidence is not None
+    assert "Hold-out validation is missing or failed." in final.confidence.warnings

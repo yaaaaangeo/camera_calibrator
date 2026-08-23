@@ -141,6 +141,13 @@ def test_manual_input_comparison_populates_table_and_verdict(qapp, dataset_and_c
     # 표가 실제로 채워졌는지 (N/A나 빈 셀이 아니라 숫자 텍스트) 확인.
     item = view.table.item(0, 0)
     assert item is not None and item.text() not in ("", "-", "N/A")
+    assert view.table.verticalHeaderItem(5).text() == "P95 (px)"
+    assert view.table.item(5, 0) is not None
+    assert view.table.item(5, 1) is not None
+    assert view.table.item(5, 2) is not None
+    assert view.table.item(5, 3) is not None
+    assert view.table.item(5, 0).text() not in ("", "-", "N/A")
+    assert view.table.item(5, 2).text().endswith("%")
     assert "내 결과" in view.verdict_label.text() or "Pinhole" in view.verdict_label.text()
     assert view.image_combo.count() > 0
 

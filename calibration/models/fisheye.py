@@ -156,6 +156,7 @@ def _bootstrap_fisheye_uncertainty(
     flags: int,
     n_bootstrap: int,
     rng_seed: int,
+    n_jobs: int = 1,
 ) -> ParameterUncertainty | None:
     """설계 문서 20번 - bootstrap 불확실성 추정 로직 자체는 이제
     calibration/bootstrap.py로 옮겨져 세 모델이 공유한다(중복 로직을 한
@@ -167,7 +168,7 @@ def _bootstrap_fisheye_uncertainty(
     bootstrap_flags = flags | _fisheye_flag("CALIB_USE_INTRINSIC_GUESS")
     return compute_parameter_bootstrap(
         object_points, image_points, image_size, CameraModelType.FISHEYE,
-        K_ref, D_ref, bootstrap_flags, n_bootstrap=n_bootstrap, rng_seed=rng_seed,
+        K_ref, D_ref, bootstrap_flags, n_bootstrap=n_bootstrap, rng_seed=rng_seed, n_jobs=n_jobs,
     )
 
 
@@ -178,6 +179,7 @@ def calibrate_fisheye(
     estimate_uncertainty: bool = False,
     n_bootstrap: int = 20,
     bootstrap_seed: int = 42,
+    bootstrap_jobs: int = 1,
 ) -> CalibrationResult:
     """Fisheye(Kannala-Brandt) 캘리브레이션 실행.
 
@@ -293,7 +295,7 @@ def calibrate_fisheye(
         else:
             param_uncertainty = _bootstrap_fisheye_uncertainty(
                 object_points, image_points, image_size, K, D, flags,
-                n_bootstrap=n_bootstrap, rng_seed=bootstrap_seed,
+                n_bootstrap=n_bootstrap, rng_seed=bootstrap_seed, n_jobs=bootstrap_jobs,
             )
 
     return CalibrationResult(

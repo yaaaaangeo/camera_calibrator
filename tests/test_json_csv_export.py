@@ -122,8 +122,22 @@ def test_build_export_dict_contains_expected_top_level_keys(full_pipeline_result
         full_pipeline_result["chosen"], final_result=full_pipeline_result["final_result"],
         model_scores=full_pipeline_result["scores"],
     )
-    for key in ("camera", "pattern", "dataset", "chosen_model", "models", "final_result", "model_scores"):
+    for key in (
+        "camera",
+        "pattern",
+        "dataset",
+        "chosen_model",
+        "models",
+        "cross_validation",
+        "bootstrap_stability",
+        "final_result",
+        "final_calibration_summary",
+        "model_scores",
+    ):
         assert key in d
+    assert "failure_reasons" in d["dataset"]
+    assert "holdout" in d["cross_validation"]
+    assert d["final_calibration_summary"]["chosen_model"] == full_pipeline_result["chosen"].value
 
 
 def test_export_json_writes_valid_json_file(full_pipeline_result, camera_config, pattern_config, tmp_path):
@@ -182,7 +196,10 @@ def test_export_json_includes_radial_profile_and_validation(full_pipeline_result
     assert "radial_error_profile" in entry
     assert isinstance(entry["radial_error_profile"]["bins"], list)
     assert "validation" in entry
+    assert "residual_stats" in entry
+    assert "parameter_uncertainty_bootstrap" in entry
     assert "final_result" in loaded
+    assert "final_calibration_summary" in loaded
     assert "model_scores" in loaded and len(loaded["model_scores"]) == 3
 
 

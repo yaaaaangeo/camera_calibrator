@@ -40,7 +40,7 @@ from calibration.types import (
     Dataset,
     PatternConfig,
 )
-from calibration.detector import detect_dataset
+from calibration.detector import detect_dataset, summarize_dataset
 from calibration.quality import analyze_dataset_quality
 from calibration.frame_quality import compute_frame_quality_scores, compute_dataset_quality_score
 from calibration.image_quality import evaluate_dataset_image_quality
@@ -49,6 +49,7 @@ from calibration.models.common import infer_image_size
 from calibration.recommender import compute_model_scores, build_recommendation_message
 from calibration.self_check import run_all_self_checks
 from calibration.rosbag_reader import extract_images_from_bag
+from calibration.validation import validate_cross_datasets
 from calibration.pipeline_process import (
     run_models_and_validation,
     run_outlier_pruning_and_validation,
@@ -270,6 +271,60 @@ class OutlierPruneWorker(QObject):
             self.progress.emit("완료.")
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"이상치 재계산 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
+class CrossDatasetValidationWorker(QObject):
+    """외부 Dataset B/C/...를 검출하고 현재 calibration으로 generalization을 평가한다."""
+
+    progress = Signal(str)
+    results_ready = Signal(list)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        target_image_paths: dict[str, list[str]],
+        calibration_results: dict[CameraModelType, object],
+        camera_config: CameraConfig,
+        pattern_config: PatternConfig,
+        source_dataset_id: str = "Dataset A",
+    ):
+        super().__init__()
+        self.target_image_paths = target_image_paths
+        self.calibration_results = calibration_results
+        self.camera_config = camera_config
+        self.pattern_config = pattern_config
+        self.source_dataset_id = source_dataset_id
+
+    def run(self) -> None:
+        try:
+            target_datasets: dict[str, Dataset] = {}
+            for dataset_id, paths in self.target_image_paths.items():
+                self.progress.emit(f"Cross-dataset target '{dataset_id}' 검출 중... ({len(paths)}장)")
+                target = detect_dataset(
+                    paths,
+                    self.pattern_config,
+                    parallel=len(paths) > 8,
+                )
+                self.progress.emit(f"{dataset_id}: {summarize_dataset(target)}")
+                if target.num_detected > 0:
+                    analyze_dataset_quality(target, self.camera_config)
+                target_datasets[dataset_id] = target
+
+            self.progress.emit("Cross-dataset validation 계산 중...")
+            results = validate_cross_datasets(
+                self.calibration_results,
+                target_datasets,
+                self.camera_config,
+                self.pattern_config,
+                source_dataset_id=self.source_dataset_id,
+            )
+            self.results_ready.emit(results)
+            self.progress.emit("Cross-dataset validation 완료.")
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"Cross-dataset validation 중 오류: {e}")
         finally:
             self.finished.emit()
 

@@ -12,6 +12,12 @@ recommender.py는 Hold-out Validation(5단계) 결과가 있어야 의미가 있
 
 from __future__ import annotations
 
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+from calibration.cache import PersistentResultCache, model_results_cache_key
+from calibration.performance import resolve_worker_count
 from calibration.types import (
     CalibrationResult,
     CameraConfig,
@@ -22,6 +28,10 @@ from calibration.models.pinhole import calibrate_pinhole
 from calibration.models.extended_pinhole import calibrate_extended_pinhole
 from calibration.models.fisheye import calibrate_fisheye
 from calibration.models.common import fmt_optional, regional_edge_average
+from calibration.observability import attach_observability_report
+from calibration.undistortion_quality import attach_undistortion_quality_report
+
+logger = logging.getLogger(__name__)
 
 # 모델 복잡도 (자유도) - 참고용 별점. Score 공식은 recommender.py에서 사용.
 _COMPLEXITY_STARS = {
@@ -36,6 +46,10 @@ def run_all_models(
     camera_config: CameraConfig,
     use_rational_model: bool = False,
     estimate_fisheye_uncertainty: bool = True,
+    bootstrap_jobs: int = 1,
+    model_jobs: int = 1,
+    persistent_cache_dir: str | Path | None = None,
+    models: list[CameraModelType] | tuple[CameraModelType, ...] | None = None,
 ) -> list[CalibrationResult]:
     """세 모델을 정해진 순서로 계산.
 
@@ -50,15 +64,68 @@ def run_all_models(
     outlier.py(반복 재계산)는 fisheye 캘리브레이션을 여러 번 돌리므로 이 함수를
     거치지 않고 calibrate_fisheye()를 직접 호출하며, 거기서는 기본값(False)이 유지된다.
     """
-    pinhole_result = calibrate_pinhole(dataset, camera_config)
-    extended_result = calibrate_extended_pinhole(
-        dataset, camera_config, use_rational_model=use_rational_model
+    requested_models = tuple(models or (
+        CameraModelType.PINHOLE,
+        CameraModelType.EXTENDED_PINHOLE,
+        CameraModelType.FISHEYE,
+    ))
+    requested_set = set(requested_models)
+    needs_pinhole = CameraModelType.PINHOLE in requested_set or CameraModelType.FISHEYE in requested_set
+    needs_extended = CameraModelType.EXTENDED_PINHOLE in requested_set
+
+    cache = PersistentResultCache(persistent_cache_dir, namespace="model-results") if persistent_cache_dir else None
+    cache_key = model_results_cache_key(
+        dataset, camera_config, use_rational_model, estimate_fisheye_uncertainty, bootstrap_jobs,
+        tuple(m.value for m in requested_models),
     )
-    fisheye_result = calibrate_fisheye(
-        dataset, camera_config, initial_guess=pinhole_result,
-        estimate_uncertainty=estimate_fisheye_uncertainty,
-    )
-    return [pinhole_result, extended_result, fisheye_result]
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            logger.info("모델 결과 persistent cache hit: %s", cache_key[:12])
+            return cached
+
+    pinhole_result = None
+    extended_result = None
+    workers = resolve_worker_count(model_jobs, int(needs_pinhole) + int(needs_extended))
+    if workers > 1 and needs_pinhole and needs_extended:
+        logger.info("Pinhole/Extended 모델 병렬 계산 시작: %d workers", workers)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            pinhole_future = executor.submit(calibrate_pinhole, dataset, camera_config)
+            extended_future = executor.submit(
+                calibrate_extended_pinhole,
+                dataset,
+                camera_config,
+                use_rational_model=use_rational_model,
+            )
+            pinhole_result = pinhole_future.result()
+            extended_result = extended_future.result()
+    else:
+        if needs_pinhole:
+            pinhole_result = calibrate_pinhole(dataset, camera_config)
+        if needs_extended:
+            extended_result = calibrate_extended_pinhole(
+                dataset, camera_config, use_rational_model=use_rational_model
+            )
+    fisheye_result = None
+    if CameraModelType.FISHEYE in requested_set:
+        fisheye_result = calibrate_fisheye(
+            dataset, camera_config, initial_guess=pinhole_result,
+            estimate_uncertainty=estimate_fisheye_uncertainty,
+            bootstrap_jobs=bootstrap_jobs,
+        )
+    by_model = {
+        CameraModelType.PINHOLE: pinhole_result,
+        CameraModelType.EXTENDED_PINHOLE: extended_result,
+        CameraModelType.FISHEYE: fisheye_result,
+    }
+    results = [by_model[m] for m in requested_models if by_model.get(m) is not None]
+    for result in results:
+        attach_observability_report(result, dataset)
+        attach_undistortion_quality_report(result, dataset, camera_config)
+    if cache is not None:
+        cache.set(cache_key, results)
+        logger.info("모델 결과 persistent cache 저장: %s", cache_key[:12])
+    return results
 
 
 def _model_label(model: CameraModelType) -> str:
@@ -122,6 +189,16 @@ def format_comparison_table(results: list[CalibrationResult]) -> str:
             return "N/A"
         return fmt_optional(r.residual_stats.p99)
 
+    def valid_pixels(r: CalibrationResult) -> str:
+        if not r.success or r.undistortion_quality is None:
+            return "N/A"
+        return f"{r.undistortion_quality.valid_pixel_ratio * 100:.1f}%"
+
+    def roi_loss(r: CalibrationResult) -> str:
+        if not r.success or r.undistortion_quality is None:
+            return "N/A"
+        return f"{r.undistortion_quality.roi_loss_ratio * 100:.1f}%"
+
     def complexity(r: CalibrationResult) -> str:
         return _COMPLEXITY_STARS.get(r.model_name, "")
 
@@ -133,6 +210,8 @@ def format_comparison_table(results: list[CalibrationResult]) -> str:
         row("Max Error", [max_error(r) for r in results]),
         row("P95 (pt)", [p95_pt(r) for r in results]),
         row("P99 (pt)", [p99_pt(r) for r in results]),
+        row("Valid Pixels", [valid_pixels(r) for r in results]),
+        row("ROI Loss", [roi_loss(r) for r in results]),
         row("Complexity", [complexity(r) for r in results]),
     ]
 

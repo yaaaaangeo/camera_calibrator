@@ -59,14 +59,14 @@ _GRADE_COLOR = {
 class DatasetView(QWidget):
     """이미지 목록 테이블 + 요약 라벨."""
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, parent: QWidget | None = None, *, group_title: str = "Dataset"):
         super().__init__(parent)
         layout = QVBoxLayout(self)
 
         self.summary_label = QLabel("이미지를 불러오면 여기에 요약이 표시됩니다.")
         layout.addWidget(self.summary_label)
 
-        group = QGroupBox("Dataset")
+        group = QGroupBox(group_title)
         group_layout = QVBoxLayout(group)
 
         self.table = QTableWidget(0, 7)

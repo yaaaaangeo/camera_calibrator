@@ -8,8 +8,8 @@ camera_calibrator.ui.external_compare_view
 
 계산은 전부 calibration/external_compare.py가 한다 - 이 파일은 입력(외부
 파라미터를 어떻게 받을지: OpenCV YAML 파일 또는 수동 입력)과 결과 표시
-(비교표, 한 줄 평, 같은 이미지에 두 파라미터를 각각 적용한 직선성 오버레이
-나란히 보기)만 담당한다 (백엔드/UI 분리 원칙, 다른 view들과 동일).
+(비교표, 한 줄 평, Original/Reference/Candidate undistortion visual comparison)
+만 담당한다 (백엔드/UI 분리 원칙, 다른 view들과 동일).
 """
 
 from __future__ import annotations
@@ -17,18 +17,20 @@ from __future__ import annotations
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -36,23 +38,22 @@ from PySide6.QtWidgets import (
 )
 
 from calibration.types import (
+    CalibrationResult,
     CameraConfig,
     CameraModelType,
     Dataset,
     PatternConfig,
     ValidationResult,
 )
+from calibration.recommender import compute_model_scores
 from calibration.external_compare import (
     ComparisonSide,
     ExternalCameraParams,
     ExternalComparisonResult,
+    compare_reference_candidate_calibrations,
     compare_with_external_params,
 )
-from export.opencv import (
-    detect_model_hint_from_opencv_yaml,
-    load_camera_matrix_and_distortion_from_opencv_yaml,
-)
-from ui.straightness_view import render_straightness_overlay
+from calibration.calibration_io import StandardCalibration, load_standard_calibration
 
 _MODEL_LABELS = {
     CameraModelType.PINHOLE: "Pinhole",
@@ -97,10 +98,14 @@ class ExternalCompareView(QWidget):
         self._dataset: Dataset | None = None
         self._camera_config: CameraConfig | None = None
         self._pattern_config: PatternConfig | None = None
+        self._calibration_results: dict[CameraModelType, CalibrationResult] = {}
         self._validation_results: dict[CameraModelType, ValidationResult] = {}
         self._use_rational_model = False
         self._last_result: ExternalComparisonResult | None = None
         self._loaded_yaml_path: str | None = None
+        self._loaded_calibration: StandardCalibration | None = None
+        self._reference_calibration: StandardCalibration | None = None
+        self._candidate_calibration: StandardCalibration | None = None
 
         layout = QVBoxLayout(self)
 
@@ -115,8 +120,7 @@ class ExternalCompareView(QWidget):
 
         layout.addWidget(self._build_input_group())
         layout.addWidget(self._build_run_row())
-        layout.addWidget(self._build_result_group())
-        layout.addWidget(self._build_visual_group(), stretch=1)
+        layout.addWidget(self._build_benchmark_tabs(), stretch=1)
 
     # ------------------------------------------------------------------
     # 입력 영역
@@ -141,10 +145,12 @@ class ExternalCompareView(QWidget):
         outer.addLayout(form)
 
         yaml_row = QHBoxLayout()
-        self.load_yaml_button = QPushButton("OpenCV YAML 불러오기...")
+        self.load_yaml_button = QPushButton("Calibration 파일 불러오기...")
         self.load_yaml_button.clicked.connect(self._on_load_yaml)
         yaml_row.addWidget(self.load_yaml_button)
-        self.yaml_status_label = QLabel("불러온 파일 없음 - 아래 수동 입력을 쓰거나 YAML을 불러오세요.")
+        self.yaml_status_label = QLabel(
+            "불러온 파일 없음 - 아래 수동 입력을 쓰거나 OpenCV/ROS/Kalibr/JSON calibration 파일을 불러오세요."
+        )
         self.yaml_status_label.setWordWrap(True)
         yaml_row.addWidget(self.yaml_status_label, stretch=1)
         outer.addLayout(yaml_row)
@@ -164,7 +170,35 @@ class ExternalCompareView(QWidget):
         manual_form.addRow("왜곡 계수", self.distortion_edit)
         outer.addWidget(manual_group)
         self._manual_group = manual_group
+        outer.addWidget(self._build_pair_file_group())
 
+        return group
+
+    def _build_pair_file_group(self) -> QGroupBox:
+        group = QGroupBox("Reference / Candidate 파일 비교")
+        v = QVBoxLayout(group)
+
+        ref_row = QHBoxLayout()
+        self.load_reference_button = QPushButton("Reference 불러오기...")
+        self.load_reference_button.clicked.connect(self._on_load_reference_calibration)
+        ref_row.addWidget(self.load_reference_button)
+        self.reference_status_label = QLabel("Reference 파일 없음")
+        self.reference_status_label.setWordWrap(True)
+        ref_row.addWidget(self.reference_status_label, stretch=1)
+        v.addLayout(ref_row)
+
+        cand_row = QHBoxLayout()
+        self.load_candidate_button = QPushButton("Candidate 불러오기...")
+        self.load_candidate_button.clicked.connect(self._on_load_candidate_calibration)
+        cand_row.addWidget(self.load_candidate_button)
+        self.candidate_status_label = QLabel("Candidate 파일 없음")
+        self.candidate_status_label.setWordWrap(True)
+        cand_row.addWidget(self.candidate_status_label, stretch=1)
+        v.addLayout(cand_row)
+
+        self.run_pair_button = QPushButton("Reference vs Candidate 파일 비교 실행")
+        self.run_pair_button.clicked.connect(self._on_run_file_pair_comparison)
+        v.addWidget(self.run_pair_button)
         return group
 
     @staticmethod
@@ -195,14 +229,77 @@ class ExternalCompareView(QWidget):
     # 결과 표시 영역
     # ------------------------------------------------------------------
 
+    def _build_benchmark_tabs(self) -> QTabWidget:
+        self.benchmark_tabs = QTabWidget()
+
+        self.benchmark_tabs.addTab(
+            self._tab_page([self._build_result_group()]),
+            "Overview",
+        )
+        self.benchmark_tabs.addTab(
+            self._tab_page([
+                self._build_spatial_error_group(),
+                self._build_residual_heatmap_group(),
+                self._build_radial_error_group(),
+                self._build_worst_case_group(),
+                self._build_error_distribution_group(),
+            ]),
+            "Error Analysis",
+        )
+        self.benchmark_tabs.addTab(
+            self._tab_page([self._build_visual_group()]),
+            "Visual Comparison",
+        )
+        self.benchmark_tabs.addTab(
+            self._tab_page([
+                self._build_benchmark_validation_group(),
+                self._build_statistical_tests_group(),
+                self._build_bootstrap_comparison_group(),
+            ]),
+            "Statistical Validation",
+        )
+        self.benchmark_tabs.addTab(
+            self._tab_page([self._build_parameter_diff_group(), self._build_parameter_diagnostics_group()]),
+            "Parameter Analysis",
+        )
+        self.benchmark_tabs.addTab(
+            self._tab_page([self._build_model_comparison_group()]),
+            "Model Comparison",
+        )
+        self.benchmark_tabs.addTab(
+            self._tab_page([self._build_final_benchmark_group()]),
+            "Final Report",
+        )
+        return self.benchmark_tabs
+
+    def _tab_page(self, widgets: list[QWidget]) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        for widget in widgets:
+            layout.addWidget(widget)
+        layout.addStretch(1)
+        return page
+
     def _build_result_group(self) -> QGroupBox:
         group = QGroupBox("정량 비교 결과 (Hold-out test 프레임 기준, 동일 조건)")
         v = QVBoxLayout(group)
 
-        self.table = QTableWidget(4, 2)
-        self.table.setHorizontalHeaderLabels(["내 결과", "외부 결과"])
+        self.table = QTableWidget(11, 4)
+        self.table.setHorizontalHeaderLabels(["Reference", "Candidate", "Improvement", "Winner"])
         self.table.setVerticalHeaderLabels(
-            ["Test RMS (px)", "Edge RMS - 외곽 (px)", "Straightness - 직선성 (px)", "프레임별 승 개수"]
+            [
+                "Mean (px)",
+                "Median (px)",
+                "RMSE (px)",
+                "Std (px)",
+                "P90 (px)",
+                "P95 (px)",
+                "P99 (px)",
+                "Max (px)",
+                "Edge RMS - 외곽 (px)",
+                "Straightness - 직선성 (px)",
+                "프레임별 승 개수",
+            ]
         )
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -213,6 +310,11 @@ class ExternalCompareView(QWidget):
         self.verdict_label.setStyleSheet("font-weight: bold;")
         v.addWidget(self.verdict_label)
 
+        self.decision_label = QLabel("Decision: N/A")
+        self.decision_label.setWordWrap(True)
+        self.decision_label.setStyleSheet("color: #333333;")
+        v.addWidget(self.decision_label)
+
         self.caveats_label = QLabel("")
         self.caveats_label.setWordWrap(True)
         self.caveats_label.setStyleSheet("color: #666666; font-size: 11px;")
@@ -221,7 +323,7 @@ class ExternalCompareView(QWidget):
         return group
 
     def _build_visual_group(self) -> QGroupBox:
-        group = QGroupBox("이미지 비교 (같은 사진에 두 파라미터를 각각 적용 - 초록=곧음, 빨강=많이 휨)")
+        group = QGroupBox("Undistortion Visual Comparison")
         v = QVBoxLayout(group)
 
         control_row = QHBoxLayout()
@@ -233,28 +335,358 @@ class ExternalCompareView(QWidget):
         control_row.addWidget(self.refresh_visual_button)
         v.addLayout(control_row)
 
-        images_row = QHBoxLayout()
-        mine_box = QGroupBox("내 결과")
-        mine_layout = QVBoxLayout(mine_box)
-        self.mine_image_label = QLabel("비교를 실행하면 표시됩니다.")
-        self.mine_image_label.setAlignment(Qt.AlignCenter)
-        mine_layout.addWidget(self.mine_image_label)
-        self.mine_caption_label = QLabel("")
-        self.mine_caption_label.setWordWrap(True)
-        mine_layout.addWidget(self.mine_caption_label)
-        images_row.addWidget(mine_box)
+        visual_grid = QGridLayout()
+        visual_grid.setColumnStretch(0, 1)
+        visual_grid.setColumnStretch(1, 1)
+        visual_grid.setColumnStretch(2, 1)
 
-        external_box = QGroupBox("외부 결과")
-        external_layout = QVBoxLayout(external_box)
-        self.external_image_label = QLabel("비교를 실행하면 표시됩니다.")
-        self.external_image_label.setAlignment(Qt.AlignCenter)
-        external_layout.addWidget(self.external_image_label)
-        self.external_caption_label = QLabel("")
-        self.external_caption_label.setWordWrap(True)
-        external_layout.addWidget(self.external_caption_label)
-        images_row.addWidget(external_box)
+        original_box, self.original_image_label, self.original_caption_label = self._make_visual_panel(
+            "Original", "비교를 실행하면 표시됩니다."
+        )
+        reference_box, self.reference_image_label, self.reference_caption_label = self._make_visual_panel(
+            "Reference Undistorted", "비교를 실행하면 표시됩니다."
+        )
+        candidate_box, self.candidate_image_label, self.candidate_caption_label = self._make_visual_panel(
+            "Candidate Undistorted", "비교를 실행하면 표시됩니다."
+        )
+        overlay_box, self.overlay_image_label, self.overlay_caption_label = self._make_visual_panel(
+            "Overlay View", "비교를 실행하면 표시됩니다."
+        )
+        difference_box, self.difference_image_label, self.difference_caption_label = self._make_visual_panel(
+            "Difference View", "비교를 실행하면 표시됩니다."
+        )
 
-        v.addLayout(images_row)
+        # Backward-compatible aliases for older UI tests and integrations.
+        self.external_image_label = self.reference_image_label
+        self.external_caption_label = self.reference_caption_label
+        self.mine_image_label = self.candidate_image_label
+        self.mine_caption_label = self.candidate_caption_label
+
+        visual_grid.addWidget(original_box, 0, 0)
+        visual_grid.addWidget(reference_box, 0, 1)
+        visual_grid.addWidget(candidate_box, 0, 2)
+        visual_grid.addWidget(overlay_box, 1, 0, 1, 2)
+        visual_grid.addWidget(difference_box, 1, 2)
+
+        v.addLayout(visual_grid)
+        return group
+
+    def _make_visual_panel(self, title: str, initial_text: str) -> tuple[QGroupBox, QLabel, QLabel]:
+        box = QGroupBox(title)
+        layout = QVBoxLayout(box)
+        image_label = QLabel(initial_text)
+        image_label.setAlignment(Qt.AlignCenter)
+        image_label.setMinimumHeight(180)
+        image_label.setStyleSheet("background: #f7f7f7; border: 1px solid #dddddd;")
+        layout.addWidget(image_label)
+        caption_label = QLabel("")
+        caption_label.setWordWrap(True)
+        caption_label.setStyleSheet("color: #666666; font-size: 11px;")
+        layout.addWidget(caption_label)
+        return box, image_label, caption_label
+
+    def _build_final_benchmark_group(self) -> QGroupBox:
+        group = QGroupBox("Calibration Benchmark Report")
+        v = QVBoxLayout(group)
+
+        self.final_report_label = QLabel("아직 비교를 실행하지 않았습니다.")
+        self.final_report_label.setWordWrap(True)
+        self.final_report_label.setStyleSheet("font-weight: bold;")
+        v.addWidget(self.final_report_label)
+
+        self.final_report_evidence_table = QTableWidget(0, 2)
+        self.final_report_evidence_table.setHorizontalHeaderLabels(["Section", "Evidence Summary"])
+        self.final_report_evidence_table.horizontalHeader().setStretchLastSection(True)
+        self.final_report_evidence_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.final_report_evidence_table)
+
+        final_table_label = QLabel("Final Benchmark Table")
+        final_table_label.setStyleSheet("font-weight: bold;")
+        v.addWidget(final_table_label)
+
+        self.final_benchmark_table = QTableWidget(0, 5)
+        self.final_benchmark_table.setHorizontalHeaderLabels(
+            ["Metric", "Reference", "Candidate", "Improvement", "Winner"]
+        )
+        self.final_benchmark_table.horizontalHeader().setStretchLastSection(True)
+        self.final_benchmark_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.final_benchmark_table)
+        return group
+
+    def _build_worst_case_group(self) -> QGroupBox:
+        group = QGroupBox("Worst-case Analysis")
+        v = QVBoxLayout(group)
+
+        self.worst_case_table = QTableWidget(0, 6)
+        self.worst_case_table.setHorizontalHeaderLabels(
+            ["Category", "Reference Worst", "Reference Value", "Candidate Worst", "Candidate Value", "Winner"]
+        )
+        self.worst_case_table.horizontalHeader().setStretchLastSection(True)
+        self.worst_case_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.worst_case_table)
+        return group
+
+    def _build_spatial_error_group(self) -> QGroupBox:
+        group = QGroupBox("Spatial Error 3x3 / 5x5")
+        v = QVBoxLayout(group)
+
+        self.spatial_error_table = QTableWidget(0, 13)
+        self.spatial_error_table.setHorizontalHeaderLabels(
+            [
+                "Grid", "Cell", "Ref N", "Cand N",
+                "Ref Mean", "Cand Mean", "Mean Imp.",
+                "Ref RMSE", "Cand RMSE", "RMSE Imp.",
+                "Ref P95", "Cand P95", "P95 Imp.",
+            ]
+        )
+        self.spatial_error_table.horizontalHeader().setStretchLastSection(True)
+        self.spatial_error_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.spatial_error_table)
+        return group
+
+    def _build_residual_heatmap_group(self) -> QGroupBox:
+        group = QGroupBox("Residual Heatmap Reference / Candidate / Difference")
+        v = QVBoxLayout(group)
+
+        control_row = QHBoxLayout()
+        control_row.addWidget(QLabel("Metric:"))
+        self.heatmap_metric_combo = QComboBox()
+        self.heatmap_metric_combo.addItem("RMSE 20x20", userData="rmse_20x20")
+        self.heatmap_metric_combo.addItem("P95 20x20", userData="p95_20x20")
+        self.heatmap_metric_combo.currentIndexChanged.connect(self._render_selected_residual_heatmap)
+        control_row.addWidget(self.heatmap_metric_combo)
+        control_row.addStretch(1)
+        v.addLayout(control_row)
+
+        self.heatmap_summary_label = QLabel("아직 비교를 실행하지 않았습니다.")
+        self.heatmap_summary_label.setWordWrap(True)
+        self.heatmap_summary_label.setStyleSheet("color: #666666; font-size: 11px;")
+        v.addWidget(self.heatmap_summary_label)
+
+        grid = QGridLayout()
+        self.reference_heatmap_table = self._make_heatmap_table()
+        self.candidate_heatmap_table = self._make_heatmap_table()
+        self.difference_heatmap_table = self._make_heatmap_table()
+        grid.addWidget(QLabel("Reference"), 0, 0)
+        grid.addWidget(QLabel("Candidate"), 0, 1)
+        grid.addWidget(QLabel("Difference (Candidate - Reference)"), 0, 2)
+        grid.addWidget(self.reference_heatmap_table, 1, 0)
+        grid.addWidget(self.candidate_heatmap_table, 1, 1)
+        grid.addWidget(self.difference_heatmap_table, 1, 2)
+        v.addLayout(grid)
+        return group
+
+    def _make_heatmap_table(self) -> QTableWidget:
+        table = QTableWidget(0, 0)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.horizontalHeader().setVisible(False)
+        table.verticalHeader().setVisible(False)
+        table.setMinimumHeight(180)
+        return table
+
+    def _build_radial_error_group(self) -> QGroupBox:
+        group = QGroupBox("Radial Error Profile")
+        v = QVBoxLayout(group)
+
+        self.radial_error_table = QTableWidget(0, 12)
+        self.radial_error_table.setHorizontalHeaderLabels(
+            [
+                "Profile", "Band", "Radius", "Ref N", "Cand N",
+                "Ref RMSE", "Cand RMSE", "RMSE Imp.",
+                "Ref P95", "Cand P95", "P95 Imp.", "Max Imp.",
+            ]
+        )
+        self.radial_error_table.horizontalHeader().setStretchLastSection(True)
+        self.radial_error_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.radial_error_table)
+        return group
+
+    def _build_error_distribution_group(self) -> QGroupBox:
+        group = QGroupBox("Error Distribution Comparison")
+        v = QVBoxLayout(group)
+
+        self.error_distribution_summary_label = QLabel("아직 비교를 실행하지 않았습니다.")
+        self.error_distribution_summary_label.setWordWrap(True)
+        self.error_distribution_summary_label.setStyleSheet("color: #666666; font-size: 11px;")
+        v.addWidget(self.error_distribution_summary_label)
+
+        self.error_distribution_table = QTableWidget(0, 7)
+        self.error_distribution_table.setHorizontalHeaderLabels(
+            ["Bin", "Ref Count", "Cand Count", "Ref Density", "Cand Density", "Ref CDF", "Cand CDF"]
+        )
+        self.error_distribution_table.horizontalHeader().setStretchLastSection(True)
+        self.error_distribution_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.error_distribution_table)
+        return group
+
+    def _build_model_comparison_group(self) -> QGroupBox:
+        group = QGroupBox("Model Comparison: Pinhole / Extended Pinhole / Fisheye")
+        v = QVBoxLayout(group)
+
+        note = QLabel(
+            "현재 프로젝트의 3개 calibration model을 hold-out validation과 information criteria 기준으로 비교합니다."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666666; font-size: 11px;")
+        v.addWidget(note)
+
+        self.model_comparison_table = QTableWidget(0, 10)
+        self.model_comparison_table.setHorizontalHeaderLabels(
+            [
+                "Model", "Status", "Train RMS", "Hold-out RMSE", "Hold-out P95",
+                "AIC", "BIC", "Complexity", "Score", "Recommendation",
+            ]
+        )
+        self.model_comparison_table.horizontalHeader().setStretchLastSection(True)
+        self.model_comparison_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.model_comparison_table)
+        return group
+
+    def _build_parameter_diff_group(self) -> QGroupBox:
+        group = QGroupBox("Parameter / FOV Difference")
+        v = QVBoxLayout(group)
+
+        self.parameter_note_label = QLabel(
+            "Parameter similarity ≠ Calibration accuracy. "
+            "파라미터 차이는 진단 신호이고, 최종 판단은 hold-out residual/edge/radial/straightness를 함께 봐야 합니다."
+        )
+        self.parameter_note_label.setWordWrap(True)
+        self.parameter_note_label.setStyleSheet("color: #666666; font-size: 11px;")
+        v.addWidget(self.parameter_note_label)
+
+        self.parameter_table = QTableWidget(0, 5)
+        self.parameter_table.setHorizontalHeaderLabels(
+            ["Parameter", "Reference", "Candidate", "Abs Diff", "Rel Diff"]
+        )
+        self.parameter_table.horizontalHeader().setStretchLastSection(True)
+        self.parameter_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.parameter_table)
+        return group
+
+    def _build_benchmark_validation_group(self) -> QGroupBox:
+        group = QGroupBox("Benchmark Hold-out / K-fold / Generalization")
+        v = QVBoxLayout(group)
+
+        self.benchmark_validation_note_label = QLabel(
+            "Reference/Candidate 파라미터를 고정하고 각 validation subset에서 pose만 다시 추정합니다."
+        )
+        self.benchmark_validation_note_label.setWordWrap(True)
+        self.benchmark_validation_note_label.setStyleSheet("color: #666666; font-size: 11px;")
+        v.addWidget(self.benchmark_validation_note_label)
+
+        self.benchmark_validation_table = QTableWidget(0, 9)
+        self.benchmark_validation_table.setHorizontalHeaderLabels(
+            [
+                "Validation",
+                "Splits",
+                "Ref Train",
+                "Ref Val",
+                "Ref Gap",
+                "Cand Train",
+                "Cand Val",
+                "Cand Gap",
+                "Improvement",
+            ]
+        )
+        self.benchmark_validation_table.horizontalHeader().setStretchLastSection(True)
+        self.benchmark_validation_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.benchmark_validation_table)
+        return group
+
+    def _build_statistical_tests_group(self) -> QGroupBox:
+        group = QGroupBox("Statistical Significance")
+        v = QVBoxLayout(group)
+
+        note = QLabel(
+            "같은 이미지의 Reference/Candidate per-frame RMS를 paired sample로 비교합니다. "
+            "차이는 Candidate - Reference이므로 음수면 Candidate 오차가 더 낮습니다."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666666; font-size: 11px;")
+        v.addWidget(note)
+
+        self.statistical_tests_table = QTableWidget(0, 8)
+        self.statistical_tests_table.setHorizontalHeaderLabels(
+            ["Test", "N", "Statistic", "p-value", "Effect", "Mean Diff", "Median Diff", "Interpretation"]
+        )
+        self.statistical_tests_table.horizontalHeader().setStretchLastSection(True)
+        self.statistical_tests_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.statistical_tests_table)
+        return group
+
+    def _build_bootstrap_comparison_group(self) -> QGroupBox:
+        group = QGroupBox("Bootstrap Comparison")
+        v = QVBoxLayout(group)
+
+        note = QLabel(
+            "공통 프레임 pair를 bootstrap resampling해서 Candidate가 Reference보다 낮은 RMSE를 낼 확률과 CI를 추정합니다."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666666; font-size: 11px;")
+        v.addWidget(note)
+
+        self.bootstrap_table = QTableWidget(0, 2)
+        self.bootstrap_table.setHorizontalHeaderLabels(["Metric", "Value"])
+        self.bootstrap_table.horizontalHeader().setStretchLastSection(True)
+        self.bootstrap_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.bootstrap_table)
+        return group
+
+    def _build_parameter_diagnostics_group(self) -> QGroupBox:
+        group = QGroupBox("Parameter Observability / Stability / Covariance / Sensitivity")
+        v = QVBoxLayout(group)
+
+        note = QLabel(
+            "Reference/Candidate 각각에 대해 validation 프레임 pose를 고정하고 intrinsic/distortion Jacobian을 수치미분으로 근사합니다."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #666666; font-size: 11px;")
+        v.addWidget(note)
+
+        self.parameter_observability_table = QTableWidget(0, 10)
+        self.parameter_observability_table.setHorizontalHeaderLabels(
+            [
+                "Side", "Jacobian", "Rank", "Condition",
+                "Min SV", "Max SV", "Max |Corr|", "Weak Params", "Top Correlations", "Warnings",
+            ]
+        )
+        self.parameter_observability_table.horizontalHeader().setStretchLastSection(True)
+        self.parameter_observability_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.parameter_observability_table)
+
+        self.parameter_singular_table = QTableWidget(0, 3)
+        self.parameter_singular_table.setHorizontalHeaderLabels(["Side", "Index", "Singular Value"])
+        self.parameter_singular_table.horizontalHeader().setStretchLastSection(True)
+        self.parameter_singular_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.parameter_singular_table)
+
+        self.parameter_stability_table = QTableWidget(0, 7)
+        self.parameter_stability_table.setHorizontalHeaderLabels(
+            ["Side", "Parameter", "Value", "Std", "CI Low", "CI High", "Stability"]
+        )
+        self.parameter_stability_table.horizontalHeader().setStretchLastSection(True)
+        self.parameter_stability_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.parameter_stability_table)
+
+        self.parameter_sensitivity_table = QTableWidget(0, 6)
+        self.parameter_sensitivity_table.setHorizontalHeaderLabels(
+            ["Side", "Parameter", "Value", "Perturbation", "RMSE Delta", "Sensitivity / Unit"]
+        )
+        self.parameter_sensitivity_table.horizontalHeader().setStretchLastSection(True)
+        self.parameter_sensitivity_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.parameter_sensitivity_table)
+
+        self.parameter_covariance_table = QTableWidget(0, 4)
+        self.parameter_covariance_table.setHorizontalHeaderLabels(["Side", "Row", "Col", "Covariance"])
+        self.parameter_covariance_table.horizontalHeader().setStretchLastSection(True)
+        self.parameter_covariance_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.parameter_covariance_table)
+
+        self.parameter_correlation_table = QTableWidget(0, 4)
+        self.parameter_correlation_table.setHorizontalHeaderLabels(["Side", "Row", "Col", "Correlation"])
+        self.parameter_correlation_table.horizontalHeader().setStretchLastSection(True)
+        self.parameter_correlation_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        v.addWidget(self.parameter_correlation_table)
         return group
 
     # ------------------------------------------------------------------
@@ -267,13 +699,16 @@ class ExternalCompareView(QWidget):
         camera_config: CameraConfig,
         pattern_config: PatternConfig,
         validation_results: dict[CameraModelType, ValidationResult],
+        calibration_results: dict[CameraModelType, CalibrationResult] | None = None,
         use_rational_model: bool = False,
     ) -> None:
         self._dataset = dataset
         self._camera_config = camera_config
         self._pattern_config = pattern_config
         self._validation_results = validation_results
+        self._calibration_results = calibration_results or {}
         self._use_rational_model = use_rational_model
+        self._render_model_comparison_table()
 
     # ------------------------------------------------------------------
     # 외부 YAML 불러오기
@@ -281,30 +716,89 @@ class ExternalCompareView(QWidget):
 
     def _on_load_yaml(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "OpenCV Camera YAML 선택", "", "YAML (*.yaml *.yml)"
+            self,
+            "Calibration 파일 선택",
+            "",
+            "Calibration Files (*.yaml *.yml *.json);;YAML (*.yaml *.yml);;JSON (*.json)",
         )
         if not path:
             return
         try:
-            load_camera_matrix_and_distortion_from_opencv_yaml(path)  # 유효성만 먼저 확인
+            loaded = load_standard_calibration(path)
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "불러오기 실패", str(e))
             return
 
         self._loaded_yaml_path = path
-        hint = detect_model_hint_from_opencv_yaml(path)
-        if hint is not None:
-            idx = self.external_model_combo.findData(hint)
+        self._loaded_calibration = loaded
+        if loaded.model_name is not None:
+            idx = self.external_model_combo.findData(loaded.model_name)
             if idx >= 0:
                 self.external_model_combo.setCurrentIndex(idx)
+        self.fx_spin.setValue(float(loaded.camera_matrix[0, 0]))
+        self.fy_spin.setValue(float(loaded.camera_matrix[1, 1]))
+        self.cx_spin.setValue(float(loaded.camera_matrix[0, 2]))
+        self.cy_spin.setValue(float(loaded.camera_matrix[1, 2]))
+        self.distortion_edit.setText(", ".join(f"{float(v):.12g}" for v in loaded.distortion.reshape(-1)))
+
+        if loaded.model_name is not None:
             self.yaml_status_label.setText(
-                f"불러옴: {path}\n(이 파일에 저장된 모델 종류 '{_MODEL_LABELS.get(hint, hint)}'를 자동 선택했습니다 - "
+                f"불러옴: {path}\n"
+                f"포맷: {loaded.source_format}, 해상도: {loaded.width or '?'}x{loaded.height or '?'}\n"
+                f"(이 파일에 저장된 모델 종류 '{_MODEL_LABELS.get(loaded.model_name, loaded.model_name)}'를 자동 선택했습니다 - "
                 "실제와 다르면 위에서 바꿔주세요.)"
             )
         else:
             self.yaml_status_label.setText(
-                f"불러옴: {path}\n(이 파일에는 모델 종류 정보가 없습니다 - 위에서 직접 선택해 주세요.)"
+                f"불러옴: {path}\n"
+                f"포맷: {loaded.source_format}, 해상도: {loaded.width or '?'}x{loaded.height or '?'}\n"
+                "(이 파일에는 모델 종류 정보가 없거나 애매합니다 - 위에서 직접 선택해 주세요.)"
             )
+
+    def _load_calibration_file(self) -> tuple[str, StandardCalibration] | None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Calibration 파일 선택",
+            "",
+            "Calibration Files (*.yaml *.yml *.json);;YAML (*.yaml *.yml);;JSON (*.json)",
+        )
+        if not path:
+            return None
+        try:
+            return path, load_standard_calibration(path)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "불러오기 실패", str(e))
+            return None
+
+    @staticmethod
+    def _format_loaded_calibration_status(prefix: str, path: str, cal: StandardCalibration) -> str:
+        model = cal.model_name.value if cal.model_name is not None else "?"
+        return (
+            f"{prefix}: {path}\n"
+            f"포맷: {cal.source_format}, 모델: {model}, 해상도: {cal.width or '?'}x{cal.height or '?'}"
+        )
+
+    def _on_load_reference_calibration(self) -> None:
+        loaded = self._load_calibration_file()
+        if loaded is None:
+            return
+        path, calibration = loaded
+        calibration.label = calibration.label or "Reference"
+        self._reference_calibration = calibration
+        self.reference_status_label.setText(
+            self._format_loaded_calibration_status("Reference", path, calibration)
+        )
+
+    def _on_load_candidate_calibration(self) -> None:
+        loaded = self._load_calibration_file()
+        if loaded is None:
+            return
+        path, calibration = loaded
+        calibration.label = calibration.label or "Candidate"
+        self._candidate_calibration = calibration
+        self.candidate_status_label.setText(
+            self._format_loaded_calibration_status("Candidate", path, calibration)
+        )
 
     def _external_params_from_manual_input(self) -> ExternalCameraParams:
         K = np.array([
@@ -320,17 +814,25 @@ class ExternalCompareView(QWidget):
             camera_matrix=K,
             distortion=D,
             source_note=self.source_note_edit.text().strip(),
+            width=self._camera_config.width if self._camera_config else None,
+            height=self._camera_config.height if self._camera_config else None,
         )
 
     def _external_params_from_yaml(self) -> ExternalCameraParams:
-        K, D = load_camera_matrix_and_distortion_from_opencv_yaml(self._loaded_yaml_path)
+        loaded = self._loaded_calibration or load_standard_calibration(self._loaded_yaml_path)
         model = self.external_model_combo.currentData()
         return ExternalCameraParams(
-            label=self.label_edit.text().strip() or "예전 결과",
+            label=self.label_edit.text().strip() or loaded.label or "예전 결과",
             model_name=model,
-            camera_matrix=K,
-            distortion=D,
-            source_note=self.source_note_edit.text().strip() or self._loaded_yaml_path,
+            camera_matrix=loaded.camera_matrix,
+            distortion=loaded.distortion,
+            source_note=(
+                self.source_note_edit.text().strip()
+                or f"{loaded.source_format}: {loaded.source_path or self._loaded_yaml_path}"
+            ),
+            width=loaded.width,
+            height=loaded.height,
+            distortion_model=loaded.distortion_model,
         )
 
     # ------------------------------------------------------------------
@@ -370,27 +872,693 @@ class ExternalCompareView(QWidget):
         self._render_result(result)
         self._populate_image_combo(result)
 
-    def _render_result(self, result: ExternalComparisonResult) -> None:
-        self.table.setHorizontalHeaderLabels([result.mine.label, result.external.label])
+    def _on_run_file_pair_comparison(self) -> None:
+        if self._dataset is None or self._camera_config is None or self._pattern_config is None:
+            QMessageBox.warning(self, "데이터 없음", "먼저 이미지를 불러오고 캘리브레이션을 실행하세요.")
+            return
+        if self._reference_calibration is None or self._candidate_calibration is None:
+            QMessageBox.warning(self, "파일 부족", "Reference와 Candidate calibration 파일을 모두 불러오세요.")
+            return
 
-        def _set_row(row: int, mine_val, external_val, fmt="{:.3f}"):
-            mine_text = fmt.format(mine_val) if mine_val is not None else "N/A"
-            ext_text = fmt.format(external_val) if external_val is not None else "N/A"
-            self.table.setItem(row, 0, QTableWidgetItem(mine_text))
-            self.table.setItem(row, 1, QTableWidgetItem(ext_text))
+        split_model = self.my_model_combo.currentData()
+        validation = self._validation_results.get(split_model)
+        if validation is None or not validation.success:
+            QMessageBox.warning(
+                self, "Hold-out 결과 없음",
+                "Reference/Candidate 파일 비교에도 동일한 validation split이 필요합니다. "
+                "먼저 [캘리브레이션 실행]을 완료해 주세요.",
+            )
+            return
+
+        result = compare_reference_candidate_calibrations(
+            self._dataset,
+            self._camera_config,
+            self._pattern_config,
+            self._reference_calibration,
+            self._candidate_calibration,
+            validation.test_frame_ids,
+        )
+        self._last_result = result
+        self._render_result(result)
+        self._populate_image_combo(result)
+
+    def _render_result(self, result: ExternalComparisonResult) -> None:
+        self.table.setHorizontalHeaderLabels([result.external.label, result.mine.label, "Improvement", "Winner"])
+
+        def _fmt_value(value, fmt="{:.3f}"):
+            return fmt.format(value) if value is not None else "N/A"
+
+        def _fmt_improvement(value):
+            return f"{value:+.1f}%" if value is not None else "N/A"
+
+        def _set_row(row: int, reference_val, candidate_val, improvement, winner, fmt="{:.3f}"):
+            self.table.setItem(row, 0, QTableWidgetItem(_fmt_value(reference_val, fmt)))
+            self.table.setItem(row, 1, QTableWidgetItem(_fmt_value(candidate_val, fmt)))
+            self.table.setItem(row, 2, QTableWidgetItem(_fmt_improvement(improvement)))
+            self.table.setItem(row, 3, QTableWidgetItem(winner or "N/A"))
 
         if result.mine.success and result.external.success:
-            _set_row(0, result.mine.test_rms, result.external.test_rms)
-            _set_row(1, result.mine.edge_rms, result.external.edge_rms)
-            _set_row(2, result.mine.straightness_residual, result.external.straightness_residual)
-            _set_row(3, result.mine_win_count, result.external_win_count, fmt="{:.0f}")
+            for row, metric in enumerate(result.metric_rows[:10]):
+                _set_row(
+                    row,
+                    metric.reference_value,
+                    metric.candidate_value,
+                    metric.improvement_pct,
+                    metric.winner,
+                )
+            frame_winner = (
+                result.mine.label if result.mine_win_count > result.external_win_count
+                else result.external.label if result.external_win_count > result.mine_win_count
+                else "Tie"
+            )
+            _set_row(10, result.external_win_count, result.mine_win_count, None, frame_winner, fmt="{:.0f}")
         else:
-            for row in range(4):
-                self.table.setItem(row, 0, QTableWidgetItem("-"))
-                self.table.setItem(row, 1, QTableWidgetItem("-"))
+            for row in range(self.table.rowCount()):
+                for col in range(self.table.columnCount()):
+                    self.table.setItem(row, col, QTableWidgetItem("-"))
 
         self.verdict_label.setText(result.verdict)
+        decision = result.winner_decision
+        quality = "OK" if decision.data_quality_ok else "INSUFFICIENT"
+        self.decision_label.setText(
+            f"Decision: {decision.status} "
+            f"(Candidate {decision.candidate_score:.1f} / Reference {decision.reference_score:.1f}, "
+            f"margin {decision.score_margin:.1f}, data quality {quality})"
+        )
         self.caveats_label.setText("\n".join(result.caveats))
+        self._render_final_report_summary(result)
+        self._render_model_comparison_table()
+        self._render_final_benchmark_table(result)
+        self._render_spatial_error_table(result)
+        self._render_radial_error_table(result)
+        self._render_selected_residual_heatmap()
+        self._render_worst_case_table(result)
+        self._render_error_distribution_table(result)
+        self._render_benchmark_validation_table(result)
+        self._render_statistical_tests_table(result)
+        self._render_bootstrap_table(result)
+        self._render_parameter_diff_table(result)
+        self._render_parameter_diagnostics_tables(result)
+
+    def _render_final_benchmark_table(self, result: ExternalComparisonResult) -> None:
+        rows = result.final_benchmark_rows
+        self.final_benchmark_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            self.final_benchmark_table.setItem(row_index, 0, QTableWidgetItem(row.metric))
+            self.final_benchmark_table.setItem(row_index, 1, QTableWidgetItem(row.reference))
+            self.final_benchmark_table.setItem(row_index, 2, QTableWidgetItem(row.candidate))
+            self.final_benchmark_table.setItem(row_index, 3, QTableWidgetItem(row.improvement))
+            self.final_benchmark_table.setItem(row_index, 4, QTableWidgetItem(row.winner))
+
+    def _render_final_report_summary(self, result: ExternalComparisonResult) -> None:
+        decision = result.winner_decision
+        self.final_report_label.setText(
+            f"FINAL VERDICT: {decision.status}\n"
+            f"One-line diagnosis: {result.verdict or decision.status}"
+        )
+
+        def final_value(metric_name: str, attr: str) -> str:
+            row = next((r for r in result.final_benchmark_rows if r.metric == metric_name), None)
+            return getattr(row, attr) if row is not None else "N/A"
+
+        def metric_summary(metric_name: str) -> str:
+            row = next((r for r in result.final_benchmark_rows if r.metric == metric_name), None)
+            if row is None:
+                return f"{metric_name}: N/A"
+            return (
+                f"{metric_name}: Reference {row.reference}, Candidate {row.candidate}, "
+                f"Improvement {row.improvement}, Winner {row.winner}"
+            )
+
+        stats = []
+        for test in result.statistical_tests:
+            p = "N/A" if test.p_value is None else ("<1e-12" if test.p_value < 1e-12 else f"{test.p_value:.3g}")
+            effect = "N/A" if test.effect_size is None else f"{test.effect_size:.3g}"
+            stats.append(f"{test.test_name} p={p}, effect={effect} {test.effect_size_name}".strip())
+        if result.bootstrap_comparison and result.bootstrap_comparison.probability_candidate_better is not None:
+            stats.append(
+                "Bootstrap P(Candidate < Reference)="
+                f"{result.bootstrap_comparison.probability_candidate_better * 100.0:.2f}%"
+            )
+
+        visual_bits = [
+            metric_summary("Edge RMS"),
+            metric_summary("Radial P95"),
+            metric_summary("Straightness"),
+            f"Residual heatmaps: {', '.join(result.residual_heatmaps) or 'N/A'}",
+            f"Worst-case rows: {len(result.worst_case_rows)}",
+        ]
+
+        param_bits = []
+        for key in ("reference", "candidate"):
+            diag = result.parameter_diagnostics.get(key)
+            if diag is None:
+                continue
+            weak = ", ".join(diag.weak_parameters) or "none"
+            corr = "N/A" if diag.max_abs_correlation is None else f"{diag.max_abs_correlation:.3f}"
+            cond = "N/A" if diag.condition_number is None else f"{diag.condition_number:.3g}"
+            param_bits.append(
+                f"{diag.side_label}: rank {diag.rank}/{diag.jacobian_cols}, condition {cond}, "
+                f"max |corr| {corr}, weak {weak}"
+            )
+
+        model_bits = self._model_analysis_summary()
+        sections = [
+            ("Performance Comparison", " / ".join([
+                metric_summary("RMSE"),
+                metric_summary("P95"),
+                metric_summary("Frame wins"),
+            ])),
+            ("Statistical Evidence", "; ".join(stats) or "N/A"),
+            ("Visual Evidence", "; ".join(visual_bits)),
+            ("Parameter Analysis", "; ".join(param_bits) or "N/A"),
+            ("Model Analysis", model_bits),
+            ("FINAL VERDICT", decision.status),
+            ("One-line diagnosis", result.verdict or "N/A"),
+        ]
+
+        self.final_report_evidence_table.setRowCount(len(sections))
+        for row_index, (section, summary) in enumerate(sections):
+            self.final_report_evidence_table.setItem(row_index, 0, QTableWidgetItem(section))
+            self.final_report_evidence_table.setItem(row_index, 1, QTableWidgetItem(summary))
+
+    def _model_analysis_summary(self) -> str:
+        calibration_results = self._calibration_results or {}
+        if not calibration_results:
+            return "N/A"
+        try:
+            scores = compute_model_scores(
+                calibration_results,
+                self._validation_results or {},
+                use_rational_model=self._use_rational_model,
+            )
+        except Exception:  # noqa: BLE001
+            return "Model score unavailable."
+        if not scores:
+            return "N/A"
+        recommended = next((s for s in scores if s.is_recommended), min(scores, key=lambda s: s.score))
+        return (
+            f"Recommended {_MODEL_LABELS.get(recommended.model_name, recommended.model_name.value)} "
+            f"(score {recommended.score:.3f}, AIC "
+            f"{'N/A' if recommended.aic is None else f'{recommended.aic:.3f}'}, BIC "
+            f"{'N/A' if recommended.bic is None else f'{recommended.bic:.3f}'})"
+        )
+
+    def _render_model_comparison_table(self) -> None:
+        calibration_results = self._calibration_results or {}
+        validation_results = self._validation_results or {}
+        if not calibration_results:
+            self.model_comparison_table.setRowCount(0)
+            return
+
+        try:
+            scores = compute_model_scores(
+                calibration_results,
+                validation_results,
+                use_rational_model=self._use_rational_model,
+            )
+        except Exception:  # noqa: BLE001 - UI should still show raw model status if scoring fails.
+            scores = []
+        score_by_model = {s.model_name: s for s in scores}
+
+        rows = [m for m in _MODEL_ORDER if m in calibration_results]
+        self.model_comparison_table.setRowCount(len(rows))
+
+        def _fmt_px(value) -> str:
+            return "N/A" if value is None else f"{value:.3f} px"
+
+        def _fmt_plain(value) -> str:
+            return "N/A" if value is None else f"{value:.3f}"
+
+        for row_index, model in enumerate(rows):
+            cal = calibration_results.get(model)
+            val = validation_results.get(model)
+            score = score_by_model.get(model)
+            test_p95 = None
+            if val and val.test_residual_stats:
+                test_p95 = val.test_residual_stats.p95
+            status = "OK" if cal and cal.success and val and val.success else "Unavailable"
+            if cal and not cal.success:
+                status = "Calibration failed"
+            elif val and not val.success:
+                status = "Hold-out failed"
+            recommendation = "Recommended" if score and score.is_recommended else ""
+            if score and score.selection_confidence_level:
+                recommendation = (
+                    f"{recommendation} ({score.selection_confidence_level})"
+                    if recommendation else score.selection_confidence_level
+                )
+            values = [
+                _MODEL_LABELS.get(model, model.value),
+                status,
+                _fmt_px(cal.rms_error if cal else None),
+                _fmt_px(val.test_rms if val else None),
+                _fmt_px(test_p95),
+                _fmt_plain(score.aic if score else None),
+                _fmt_plain(score.bic if score else None),
+                str(score.parameter_count) if score else "N/A",
+                _fmt_plain(score.score if score else None),
+                recommendation or "N/A",
+            ]
+            for col, value in enumerate(values):
+                self.model_comparison_table.setItem(row_index, col, QTableWidgetItem(value))
+
+    def _render_worst_case_table(self, result: ExternalComparisonResult) -> None:
+        rows = result.worst_case_rows
+        self.worst_case_table.setRowCount(len(rows))
+
+        def _fmt(value) -> str:
+            return "N/A" if value is None else f"{value:.3f} px"
+
+        for row_index, row in enumerate(rows):
+            self.worst_case_table.setItem(row_index, 0, QTableWidgetItem(row.category))
+            self.worst_case_table.setItem(row_index, 1, QTableWidgetItem(row.reference_location))
+            self.worst_case_table.setItem(row_index, 2, QTableWidgetItem(_fmt(row.reference_value)))
+            self.worst_case_table.setItem(row_index, 3, QTableWidgetItem(row.candidate_location))
+            self.worst_case_table.setItem(row_index, 4, QTableWidgetItem(_fmt(row.candidate_value)))
+            winner = row.winner
+            if row.improvement_pct is not None:
+                winner = f"{winner} ({row.improvement_pct:+.1f}%)"
+            self.worst_case_table.setItem(row_index, 5, QTableWidgetItem(winner))
+
+    def _render_spatial_error_table(self, result: ExternalComparisonResult) -> None:
+        rows = []
+        for grid_name in ("3x3", "5x5"):
+            grid = result.spatial_comparisons.get(grid_name)
+            if grid is None:
+                continue
+            for cell in grid.cells:
+                rows.append((grid_name, cell))
+
+        self.spatial_error_table.setRowCount(len(rows))
+
+        def _fmt(value, suffix: str = "") -> str:
+            return "N/A" if value is None else f"{value:.3f}{suffix}"
+
+        for row_index, (grid_name, cell) in enumerate(rows):
+            values = [
+                grid_name,
+                f"R{cell.row + 1} C{cell.col + 1}",
+                str(cell.num_reference_points),
+                str(cell.num_candidate_points),
+                _fmt(cell.reference_mean, " px"),
+                _fmt(cell.candidate_mean, " px"),
+                _fmt(cell.improvement_mean_pct, "%"),
+                _fmt(cell.reference_rmse, " px"),
+                _fmt(cell.candidate_rmse, " px"),
+                _fmt(cell.improvement_rmse_pct, "%"),
+                _fmt(cell.reference_p95, " px"),
+                _fmt(cell.candidate_p95, " px"),
+                _fmt(cell.improvement_p95_pct, "%"),
+            ]
+            for col, value in enumerate(values):
+                self.spatial_error_table.setItem(row_index, col, QTableWidgetItem(value))
+
+    def _render_radial_error_table(self, result: ExternalComparisonResult) -> None:
+        rows = []
+        for profile_name in ("quartiles", "bands"):
+            profile = result.radial_comparisons.get(profile_name)
+            if profile is None:
+                continue
+            for band in profile.bands:
+                rows.append((profile_name, band))
+
+        self.radial_error_table.setRowCount(len(rows))
+
+        def _fmt(value, suffix: str = "") -> str:
+            return "N/A" if value is None else f"{value:.3f}{suffix}"
+
+        for row_index, (profile_name, band) in enumerate(rows):
+            values = [
+                profile_name,
+                band.label,
+                f"{band.radius_min_norm:.2f}-{band.radius_max_norm:.2f}",
+                str(band.num_reference_points),
+                str(band.num_candidate_points),
+                _fmt(band.reference_rmse, " px"),
+                _fmt(band.candidate_rmse, " px"),
+                _fmt(band.improvement_rmse_pct, "%"),
+                _fmt(band.reference_p95, " px"),
+                _fmt(band.candidate_p95, " px"),
+                _fmt(band.improvement_p95_pct, "%"),
+                _fmt(band.improvement_max_pct, "%"),
+            ]
+            for col, value in enumerate(values):
+                self.radial_error_table.setItem(row_index, col, QTableWidgetItem(value))
+
+    def _render_selected_residual_heatmap(self, *_args) -> None:
+        result = self._last_result
+        if result is None:
+            return
+        key = self.heatmap_metric_combo.currentData() or "rmse_20x20"
+        heatmap = result.residual_heatmaps.get(key)
+        if heatmap is None:
+            self.heatmap_summary_label.setText("Residual heatmap is not available.")
+            for table in (self.reference_heatmap_table, self.candidate_heatmap_table, self.difference_heatmap_table):
+                table.setRowCount(0)
+                table.setColumnCount(0)
+            return
+
+        self.heatmap_summary_label.setText(
+            f"{heatmap.metric.upper()} heatmap {heatmap.rows}x{heatmap.cols} / "
+            f"Reference max {self._fmt_heatmap_value(heatmap.reference_max)} px / "
+            f"Candidate max {self._fmt_heatmap_value(heatmap.candidate_max)} px / "
+            f"|Difference| max {self._fmt_heatmap_value(heatmap.difference_abs_max)} px"
+        )
+        self._fill_heatmap_table(
+            self.reference_heatmap_table,
+            heatmap.rows,
+            heatmap.cols,
+            {(c.row, c.col): c.reference_value for c in heatmap.cells},
+            max_abs=heatmap.reference_max,
+            mode="single",
+        )
+        self._fill_heatmap_table(
+            self.candidate_heatmap_table,
+            heatmap.rows,
+            heatmap.cols,
+            {(c.row, c.col): c.candidate_value for c in heatmap.cells},
+            max_abs=heatmap.candidate_max,
+            mode="single",
+        )
+        self._fill_heatmap_table(
+            self.difference_heatmap_table,
+            heatmap.rows,
+            heatmap.cols,
+            {(c.row, c.col): c.difference_value for c in heatmap.cells},
+            max_abs=heatmap.difference_abs_max,
+            mode="difference",
+        )
+
+    @staticmethod
+    def _fmt_heatmap_value(value) -> str:
+        return "N/A" if value is None else f"{value:.3f}"
+
+    def _fill_heatmap_table(
+        self,
+        table: QTableWidget,
+        rows: int,
+        cols: int,
+        values: dict[tuple[int, int], float | None],
+        *,
+        max_abs: float | None,
+        mode: str,
+    ) -> None:
+        table.setRowCount(rows)
+        table.setColumnCount(cols)
+        scale = float(max_abs) if max_abs and max_abs > 0 else 1.0
+        for r in range(rows):
+            table.setRowHeight(r, 16)
+            for c in range(cols):
+                table.setColumnWidth(c, 22)
+                value = values.get((r, c))
+                text = "" if value is None else f"{value:.1f}"
+                item = QTableWidgetItem(text)
+                item.setToolTip("N/A" if value is None else f"{value:.4f} px")
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setBackground(self._heatmap_color(value, scale, mode))
+                table.setItem(r, c, item)
+
+    @staticmethod
+    def _heatmap_color(value: float | None, scale: float, mode: str) -> QColor:
+        if value is None:
+            return QColor(245, 245, 245)
+        if mode == "difference":
+            ratio = min(abs(float(value)) / scale, 1.0)
+            intensity = int(60 + 150 * ratio)
+            if value > 0:
+                return QColor(255, 235 - intensity // 4, 235 - intensity // 3)
+            if value < 0:
+                return QColor(235 - intensity // 3, 245, 255)
+            return QColor(245, 245, 245)
+        ratio = min(max(float(value) / scale, 0.0), 1.0)
+        red = int(255)
+        green = int(255 - 150 * ratio)
+        blue = int(220 - 180 * ratio)
+        return QColor(red, green, max(40, blue))
+
+    def _render_error_distribution_table(self, result: ExternalComparisonResult) -> None:
+        distribution = result.error_distribution
+        if distribution is None:
+            self.error_distribution_summary_label.setText("Error distribution is not available.")
+            self.error_distribution_table.setRowCount(0)
+            return
+
+        def _fmt(value) -> str:
+            return "N/A" if value is None else f"{value:.3f}"
+
+        self.error_distribution_summary_label.setText(
+            "Points: "
+            f"Reference {distribution.num_reference_points}, Candidate {distribution.num_candidate_points} / "
+            f"Median {_fmt(distribution.reference_median)} vs {_fmt(distribution.candidate_median)} px / "
+            f"P95 {_fmt(distribution.reference_p95)} vs {_fmt(distribution.candidate_p95)} px"
+        )
+        self.error_distribution_table.setRowCount(len(distribution.bins))
+        for row_index, row in enumerate(distribution.bins):
+            self.error_distribution_table.setItem(
+                row_index, 0, QTableWidgetItem(f"{row.bin_start:.3f}-{row.bin_end:.3f}")
+            )
+            self.error_distribution_table.setItem(row_index, 1, QTableWidgetItem(str(row.reference_count)))
+            self.error_distribution_table.setItem(row_index, 2, QTableWidgetItem(str(row.candidate_count)))
+            self.error_distribution_table.setItem(row_index, 3, QTableWidgetItem(f"{row.reference_density:.3f}"))
+            self.error_distribution_table.setItem(row_index, 4, QTableWidgetItem(f"{row.candidate_density:.3f}"))
+            self.error_distribution_table.setItem(row_index, 5, QTableWidgetItem(f"{row.reference_cdf:.3f}"))
+            self.error_distribution_table.setItem(row_index, 6, QTableWidgetItem(f"{row.candidate_cdf:.3f}"))
+
+    def _render_benchmark_validation_table(self, result: ExternalComparisonResult) -> None:
+        rows = result.benchmark_validation_rows
+        self.benchmark_validation_table.setRowCount(len(rows))
+
+        def _fmt(value, suffix: str = "") -> str:
+            if value is None:
+                return "N/A"
+            return f"{value:.3f}{suffix}"
+
+        for row_index, row in enumerate(rows):
+            self.benchmark_validation_table.setItem(row_index, 0, QTableWidgetItem(row.name))
+            self.benchmark_validation_table.setItem(row_index, 1, QTableWidgetItem(str(row.num_splits)))
+            self.benchmark_validation_table.setItem(
+                row_index, 2, QTableWidgetItem(_fmt(row.reference_train_rms_mean))
+            )
+            self.benchmark_validation_table.setItem(
+                row_index,
+                3,
+                QTableWidgetItem(
+                    f"{_fmt(row.reference_validation_rms_mean)} ± {_fmt(row.reference_validation_rms_std)}"
+                ),
+            )
+            self.benchmark_validation_table.setItem(
+                row_index, 4, QTableWidgetItem(_fmt(row.reference_train_validation_gap))
+            )
+            self.benchmark_validation_table.setItem(
+                row_index, 5, QTableWidgetItem(_fmt(row.candidate_train_rms_mean))
+            )
+            self.benchmark_validation_table.setItem(
+                row_index,
+                6,
+                QTableWidgetItem(
+                    f"{_fmt(row.candidate_validation_rms_mean)} ± {_fmt(row.candidate_validation_rms_std)}"
+                ),
+            )
+            self.benchmark_validation_table.setItem(
+                row_index, 7, QTableWidgetItem(_fmt(row.candidate_train_validation_gap))
+            )
+            improvement = "N/A" if row.improvement_pct is None else f"{row.improvement_pct:+.1f}%"
+            self.benchmark_validation_table.setItem(row_index, 8, QTableWidgetItem(improvement))
+
+    def _render_statistical_tests_table(self, result: ExternalComparisonResult) -> None:
+        rows = result.statistical_tests
+        self.statistical_tests_table.setRowCount(len(rows))
+
+        def _fmt(value) -> str:
+            return "N/A" if value is None else f"{value:.6g}"
+
+        def _fmt_p(value) -> str:
+            if value is None:
+                return "N/A"
+            return "<1e-12" if value < 1e-12 else f"{value:.6g}"
+
+        for row_index, row in enumerate(rows):
+            effect = _fmt(row.effect_size)
+            if row.effect_size_name and row.effect_size is not None:
+                effect = f"{effect} ({row.effect_size_name})"
+            self.statistical_tests_table.setItem(row_index, 0, QTableWidgetItem(row.test_name))
+            self.statistical_tests_table.setItem(row_index, 1, QTableWidgetItem(str(row.n_pairs)))
+            self.statistical_tests_table.setItem(row_index, 2, QTableWidgetItem(_fmt(row.statistic)))
+            self.statistical_tests_table.setItem(row_index, 3, QTableWidgetItem(_fmt_p(row.p_value)))
+            self.statistical_tests_table.setItem(row_index, 4, QTableWidgetItem(effect))
+            self.statistical_tests_table.setItem(row_index, 5, QTableWidgetItem(_fmt(row.mean_diff)))
+            self.statistical_tests_table.setItem(row_index, 6, QTableWidgetItem(_fmt(row.median_diff)))
+            self.statistical_tests_table.setItem(row_index, 7, QTableWidgetItem(row.interpretation))
+
+    def _render_bootstrap_table(self, result: ExternalComparisonResult) -> None:
+        bootstrap = result.bootstrap_comparison
+        if bootstrap is None:
+            self.bootstrap_table.setRowCount(0)
+            return
+
+        def _fmt(value, suffix: str = "") -> str:
+            return "N/A" if value is None else f"{value:.6g}{suffix}"
+
+        def _fmt_pct(value) -> str:
+            return "N/A" if value is None else f"{value * 100.0:.2f}%"
+
+        def _fmt_ci(low, high, suffix: str = "") -> str:
+            if low is None or high is None:
+                return "N/A"
+            return f"[{low:.6g}, {high:.6g}]{suffix}"
+
+        ci_label = f"{bootstrap.confidence_level * 100:.0f}%"
+        rows = [
+            ("Pairs", str(bootstrap.n_pairs)),
+            ("Bootstrap samples", str(bootstrap.n_bootstrap)),
+            ("P(Candidate Error < Reference Error)", _fmt_pct(bootstrap.probability_candidate_better)),
+            ("Reference RMSE", _fmt(bootstrap.reference_rmse, " px")),
+            (f"Reference RMSE {ci_label} CI", _fmt_ci(bootstrap.reference_rmse_ci_low, bootstrap.reference_rmse_ci_high, " px")),
+            ("Candidate RMSE", _fmt(bootstrap.candidate_rmse, " px")),
+            (f"Candidate RMSE {ci_label} CI", _fmt_ci(bootstrap.candidate_rmse_ci_low, bootstrap.candidate_rmse_ci_high, " px")),
+            ("Improvement", _fmt(bootstrap.improvement_pct, "%")),
+            (f"Improvement {ci_label} CI", _fmt_ci(bootstrap.improvement_ci_low, bootstrap.improvement_ci_high, "%")),
+        ]
+        self.bootstrap_table.setRowCount(len(rows))
+        for row_index, (name, value) in enumerate(rows):
+            self.bootstrap_table.setItem(row_index, 0, QTableWidgetItem(name))
+            self.bootstrap_table.setItem(row_index, 1, QTableWidgetItem(value))
+
+    def _render_parameter_diff_table(self, result: ExternalComparisonResult) -> None:
+        rows = list(result.parameter_diff_rows)
+        if result.fov_diff_rows:
+            rows.append(None)
+            rows.extend(result.fov_diff_rows)
+
+        self.parameter_table.setRowCount(len(rows))
+        self.parameter_table.setHorizontalHeaderLabels(
+            [f"Parameter", result.external.label, result.mine.label, "Abs Diff", "Rel Diff"]
+        )
+
+        def _fmt_value(value, unit: str = "") -> str:
+            if value is None:
+                return "N/A"
+            suffix = f" {unit}" if unit else ""
+            return f"{value:.6g}{suffix}"
+
+        def _fmt_rel(value) -> str:
+            return f"{value:.3f}%" if value is not None else "N/A"
+
+        for row_index, row in enumerate(rows):
+            if row is None:
+                self.parameter_table.setItem(row_index, 0, QTableWidgetItem("FOV"))
+                for col in range(1, self.parameter_table.columnCount()):
+                    self.parameter_table.setItem(row_index, col, QTableWidgetItem(""))
+                continue
+            self.parameter_table.setItem(row_index, 0, QTableWidgetItem(row.name))
+            self.parameter_table.setItem(row_index, 1, QTableWidgetItem(_fmt_value(row.reference_value, row.unit)))
+            self.parameter_table.setItem(row_index, 2, QTableWidgetItem(_fmt_value(row.candidate_value, row.unit)))
+            self.parameter_table.setItem(row_index, 3, QTableWidgetItem(_fmt_value(row.absolute_diff, row.unit)))
+            self.parameter_table.setItem(row_index, 4, QTableWidgetItem(_fmt_rel(row.relative_diff_pct)))
+
+    def _render_parameter_diagnostics_tables(self, result: ExternalComparisonResult) -> None:
+        diagnostics = result.parameter_diagnostics or {}
+
+        def _fmt(value) -> str:
+            return "N/A" if value is None else f"{value:.6g}"
+
+        stability_rows = []
+        sensitivity_rows = []
+        covariance_rows = []
+        observability_rows = []
+        singular_rows = []
+        correlation_rows = []
+        for key in ("reference", "candidate"):
+            diag = diagnostics.get(key)
+            if diag is None:
+                continue
+            observability_rows.append(diag)
+            for i, value in enumerate(diag.singular_values):
+                singular_rows.append((diag.side_label, i + 1, value))
+            for row in diag.stability_rows:
+                stability_rows.append((diag.side_label, row))
+            for row in diag.sensitivity_rows:
+                sensitivity_rows.append((diag.side_label, row))
+            labels = diag.parameter_labels
+            for r, values in enumerate(diag.covariance_matrix):
+                for c, value in enumerate(values):
+                    covariance_rows.append((
+                        diag.side_label,
+                        labels[r] if r < len(labels) else str(r),
+                        labels[c] if c < len(labels) else str(c),
+                        value,
+                    ))
+            for r, values in enumerate(diag.correlation_matrix):
+                for c, value in enumerate(values):
+                    correlation_rows.append((
+                        diag.side_label,
+                        labels[r] if r < len(labels) else str(r),
+                        labels[c] if c < len(labels) else str(c),
+                        value,
+                    ))
+
+        self.parameter_observability_table.setRowCount(len(observability_rows))
+        for row_index, diag in enumerate(observability_rows):
+            top_corr = ", ".join(
+                f"{a}-{b}:{value:.3f}" for a, b, value in diag.top_correlations[:3]
+            ) or "N/A"
+            weak = ", ".join(diag.weak_parameters) or "N/A"
+            warnings = "; ".join(diag.warnings) or "N/A"
+            values = [
+                diag.side_label,
+                f"{diag.jacobian_rows}x{diag.jacobian_cols}",
+                "N/A" if diag.rank is None else f"{diag.rank}/{diag.jacobian_cols}",
+                _fmt(diag.condition_number),
+                _fmt(diag.min_singular_value),
+                _fmt(diag.max_singular_value),
+                _fmt(diag.max_abs_correlation),
+                weak,
+                top_corr,
+                warnings,
+            ]
+            for col, value in enumerate(values):
+                self.parameter_observability_table.setItem(row_index, col, QTableWidgetItem(value))
+
+        self.parameter_singular_table.setRowCount(len(singular_rows))
+        for row_index, (side_label, index, value) in enumerate(singular_rows):
+            self.parameter_singular_table.setItem(row_index, 0, QTableWidgetItem(side_label))
+            self.parameter_singular_table.setItem(row_index, 1, QTableWidgetItem(str(index)))
+            self.parameter_singular_table.setItem(row_index, 2, QTableWidgetItem(_fmt(value)))
+
+        self.parameter_stability_table.setRowCount(len(stability_rows))
+        for row_index, (side_label, row) in enumerate(stability_rows):
+            self.parameter_stability_table.setItem(row_index, 0, QTableWidgetItem(side_label))
+            self.parameter_stability_table.setItem(row_index, 1, QTableWidgetItem(row.parameter))
+            self.parameter_stability_table.setItem(row_index, 2, QTableWidgetItem(_fmt(row.value)))
+            self.parameter_stability_table.setItem(row_index, 3, QTableWidgetItem(_fmt(row.std)))
+            self.parameter_stability_table.setItem(row_index, 4, QTableWidgetItem(_fmt(row.ci_low)))
+            self.parameter_stability_table.setItem(row_index, 5, QTableWidgetItem(_fmt(row.ci_high)))
+            stability = "N/A" if row.stability_score is None else f"{row.stability_score:.1f}/100"
+            self.parameter_stability_table.setItem(row_index, 6, QTableWidgetItem(stability))
+
+        self.parameter_sensitivity_table.setRowCount(len(sensitivity_rows))
+        for row_index, (side_label, row) in enumerate(sensitivity_rows):
+            self.parameter_sensitivity_table.setItem(row_index, 0, QTableWidgetItem(side_label))
+            self.parameter_sensitivity_table.setItem(row_index, 1, QTableWidgetItem(row.parameter))
+            self.parameter_sensitivity_table.setItem(row_index, 2, QTableWidgetItem(_fmt(row.value)))
+            self.parameter_sensitivity_table.setItem(row_index, 3, QTableWidgetItem(_fmt(row.perturbation)))
+            self.parameter_sensitivity_table.setItem(row_index, 4, QTableWidgetItem(_fmt(row.rmse_delta)))
+            self.parameter_sensitivity_table.setItem(row_index, 5, QTableWidgetItem(_fmt(row.sensitivity_per_unit)))
+
+        self.parameter_covariance_table.setRowCount(len(covariance_rows))
+        for row_index, (side_label, row_label, col_label, value) in enumerate(covariance_rows):
+            self.parameter_covariance_table.setItem(row_index, 0, QTableWidgetItem(side_label))
+            self.parameter_covariance_table.setItem(row_index, 1, QTableWidgetItem(row_label))
+            self.parameter_covariance_table.setItem(row_index, 2, QTableWidgetItem(col_label))
+            self.parameter_covariance_table.setItem(row_index, 3, QTableWidgetItem(_fmt(value)))
+
+        self.parameter_correlation_table.setRowCount(len(correlation_rows))
+        for row_index, (side_label, row_label, col_label, value) in enumerate(correlation_rows):
+            self.parameter_correlation_table.setItem(row_index, 0, QTableWidgetItem(side_label))
+            self.parameter_correlation_table.setItem(row_index, 1, QTableWidgetItem(row_label))
+            self.parameter_correlation_table.setItem(row_index, 2, QTableWidgetItem(col_label))
+            self.parameter_correlation_table.setItem(row_index, 3, QTableWidgetItem(_fmt(value)))
 
     def _populate_image_combo(self, result: ExternalComparisonResult) -> None:
         self.image_combo.clear()
@@ -398,14 +1566,17 @@ class ExternalCompareView(QWidget):
             return
         common_ids = sorted(set(result.mine.per_frame_error) & set(result.external.per_frame_error))
         for fid in common_ids:
-            m = result.mine.per_frame_error[fid]
-            e = result.external.per_frame_error[fid]
-            self.image_combo.addItem(f"{fid}  (내 {m:.2f}px / 외부 {e:.2f}px)", userData=fid)
+            candidate_error = result.mine.per_frame_error[fid]
+            reference_error = result.external.per_frame_error[fid]
+            self.image_combo.addItem(
+                f"{fid}  (Reference {reference_error:.2f}px / Candidate {candidate_error:.2f}px)",
+                userData=fid,
+            )
         if common_ids:
             self._update_visual()
 
     # ------------------------------------------------------------------
-    # 이미지 비교 (직선성 오버레이) - 같은 프레임에 두 파라미터를 각각 적용
+    # 이미지 비교 - Original / Reference / Candidate / Overlay / Difference
     # ------------------------------------------------------------------
 
     def _update_visual(self) -> None:
@@ -423,16 +1594,50 @@ class ExternalCompareView(QWidget):
 
         img = cv2.imread(frame.image_info.path)
         if img is None:
-            self.mine_caption_label.setText(f"이미지를 읽을 수 없습니다: {frame.image_info.path}")
-            self.external_caption_label.setText("")
+            message = f"이미지를 읽을 수 없습니다: {frame.image_info.path}"
+            for label in (
+                self.original_caption_label,
+                self.reference_caption_label,
+                self.candidate_caption_label,
+                self.overlay_caption_label,
+                self.difference_caption_label,
+            ):
+                label.setText(message)
             return
 
-        self._render_one_side(img, frame, result.mine, self.mine_image_label, self.mine_caption_label)
-        self._render_one_side(img, frame, result.external, self.external_image_label, self.external_caption_label)
+        reference = self._undistort_side(img, result.external, self.reference_caption_label)
+        candidate = self._undistort_side(img, result.mine, self.candidate_caption_label)
+        if reference is None or candidate is None:
+            return
 
-    def _render_one_side(
-        self, img: np.ndarray, frame, side: ComparisonSide, image_label: QLabel, caption_label: QLabel,
-    ) -> None:
+        reference, candidate = self._align_visual_pair(reference, candidate)
+        overlay = cv2.addWeighted(reference, 0.5, candidate, 0.5, 0.0)
+        difference, mean_diff, max_diff = self._build_difference_view(reference, candidate)
+
+        frame_id = frame.image_info.image_id
+        self.original_image_label.setPixmap(_cv_to_qpixmap(img))
+        self.reference_image_label.setPixmap(_cv_to_qpixmap(reference))
+        self.candidate_image_label.setPixmap(_cv_to_qpixmap(candidate))
+        self.overlay_image_label.setPixmap(_cv_to_qpixmap(overlay))
+        self.difference_image_label.setPixmap(_cv_to_qpixmap(difference))
+
+        ref_error = result.external.per_frame_error.get(frame_id)
+        cand_error = result.mine.per_frame_error.get(frame_id)
+        self.original_caption_label.setText(f"원본 프레임: {frame_id}")
+        self.reference_caption_label.setText(
+            self._side_caption(result.external, ref_error, prefix="Reference")
+        )
+        self.candidate_caption_label.setText(
+            self._side_caption(result.mine, cand_error, prefix="Candidate")
+        )
+        self.overlay_caption_label.setText("Reference/Candidate undistorted image 50:50 overlay")
+        self.difference_caption_label.setText(
+            f"절대 차분 heatmap - 평균 {mean_diff:.2f}, 최대 {max_diff:.1f} intensity"
+        )
+
+    def _undistort_side(
+        self, img: np.ndarray, side: ComparisonSide, caption_label: QLabel,
+    ) -> np.ndarray | None:
         from calibration.models.common import undistort_image
         from calibration.types import CalibrationResult
 
@@ -441,29 +1646,33 @@ class ExternalCompareView(QWidget):
             distortion=side.distortion, success=True,
         )
         try:
-            undistorted = undistort_image(img, fake_result, self._camera_config)
+            return undistort_image(img, fake_result, self._camera_config)
         except ValueError as e:
             caption_label.setText(str(e))
-            return
+            return None
 
-        if side.model_name == CameraModelType.FISHEYE:
-            size = (self._camera_config.width, self._camera_config.height)
-            target_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-                side.camera_matrix, side.distortion, size, np.eye(3), balance=0.0
-            )
+    def _align_visual_pair(self, reference: np.ndarray, candidate: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if reference.shape[:2] == candidate.shape[:2]:
+            return reference, candidate
+        h, w = reference.shape[:2]
+        return reference, cv2.resize(candidate, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    def _build_difference_view(
+        self, reference: np.ndarray, candidate: np.ndarray,
+    ) -> tuple[np.ndarray, float, float]:
+        diff = cv2.absdiff(reference, candidate)
+        gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        max_diff = float(np.max(gray)) if gray.size else 0.0
+        mean_diff = float(np.mean(gray)) if gray.size else 0.0
+        if max_diff > 0:
+            normalized = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
         else:
-            target_K = side.camera_matrix
+            normalized = np.zeros_like(gray)
+        heatmap_code = getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET)
+        heatmap = cv2.applyColorMap(normalized.astype(np.uint8), heatmap_code)
+        return heatmap, mean_diff, max_diff
 
-        canvas, lines = render_straightness_overlay(
-            undistorted, frame, self._pattern_config,
-            side.camera_matrix, side.distortion, side.model_name, target_K,
-        )
-        image_label.setPixmap(_cv_to_qpixmap(canvas))
-
-        frame_id = frame.image_info.image_id
-        per_frame = side.per_frame_error.get(frame_id)
-        detail = f"{side.label} - 이 프레임 재투영 오차: {per_frame:.3f}px" if per_frame is not None else side.label
-        if lines:
-            avg_residual = float(np.mean([l.residual for l in lines]))
-            detail += f" / 직선성 평균 {avg_residual:.3f}px ({len(lines)}개 줄)"
-        caption_label.setText(detail)
+    def _side_caption(self, side: ComparisonSide, per_frame_error: float | None, prefix: str) -> str:
+        if per_frame_error is None:
+            return f"{prefix}: {side.label}"
+        return f"{prefix}: {side.label} - 이 프레임 재투영 오차 {per_frame_error:.3f}px"

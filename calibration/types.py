@@ -71,6 +71,12 @@ class ExportFormat(str, Enum):
     HTML_REPORT = "html_report"
 
 
+class DiagnosisSeverity(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
 # ---------------------------------------------------------------------------
 # Config (촬영 조건 / 패턴 정의)
 # ---------------------------------------------------------------------------
@@ -506,6 +512,54 @@ class ResidualStats:
 
 
 @dataclass
+class ParameterCorrelation:
+    """Observability 진단에서 강하게 얽힌 파라미터 쌍."""
+    param_a: str
+    param_b: str
+    correlation: float
+
+
+@dataclass
+class ObservabilityReport:
+    """Jacobian 기반 관측가능성 진단 요약.
+
+    Jacobian 원본은 커질 수 있으므로 저장하지 않고, SVD/condition/correlation
+    요약만 CalibrationResult에 붙인다.
+    """
+    parameter_labels: list[str] = field(default_factory=list)
+    jacobian_rows: int = 0
+    jacobian_cols: int = 0
+    num_points: int = 0
+    singular_values: list[float] = field(default_factory=list)
+    rank: int = 0
+    condition_number: Optional[float] = None
+    min_singular_value: Optional[float] = None
+    max_singular_value: Optional[float] = None
+    max_abs_correlation: Optional[float] = None
+    correlation_matrix: list[list[float]] = field(default_factory=list)
+    observability_score: Optional[float] = None  # 0~100, 높을수록 좋음
+    observability_grade: Optional[str] = None  # "GOOD" | "WARNING" | "POOR"
+    top_correlations: list[ParameterCorrelation] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class UndistortionQualityReport:
+    """Undistort 결과에서 실제로 쓸 수 있는 영상 영역 품질 요약."""
+    image_width: int = 0
+    image_height: int = 0
+    valid_pixel_ratio: float = 0.0       # 0~1, remap 결과가 원본 이미지 안을 참조하는 비율
+    black_border_ratio: float = 0.0      # 0~1, remap 기준 border로 채워질 픽셀 비율
+    roi_loss_ratio: float = 0.0          # 0~1, all-valid ROI로 crop할 때 잃는 면적 비율
+    valid_roi: tuple[int, int, int, int] = (0, 0, 0, 0)  # x, y, w, h
+    undistorted_black_pixel_ratio: Optional[float] = None  # 실제 샘플 undistort 이미지 기반
+    sample_frame_id: Optional[str] = None
+    quality_score: float = 0.0           # 0~100, 높을수록 좋음
+    quality_grade: QualityGrade = QualityGrade.WARNING
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
 class CalibrationResult:
     """설계 문서 17번 Step4 CalibrationResult 그대로 + 영역별/반경별 오차 확장"""
     model_name: CameraModelType
@@ -522,6 +576,8 @@ class CalibrationResult:
     param_uncertainty: Optional[ParameterUncertainty] = None
     param_uncertainty_bootstrap: Optional[ParameterUncertainty] = None  # 설계 문서 20번 - 전 모델 공통 bootstrap
     residual_stats: Optional[ResidualStats] = None  # 설계 문서 11/12번 - 코너 포인트 단위 오차 분포
+    observability: Optional[ObservabilityReport] = None  # Jacobian/SVD/condition/correlation 진단
+    undistortion_quality: Optional[UndistortionQualityReport] = None  # valid pixel/black border/ROI loss
     success: bool = False
     error_message: Optional[str] = None
 
@@ -630,6 +686,24 @@ class ValidationResult:
     failed_test_frame_ids: list[str] = field(default_factory=list)
 
 
+@dataclass
+class CrossDatasetValidationResult:
+    """Dataset A에서 학습한 calibration을 Dataset B/C에 고정 평가한 결과."""
+    source_dataset_id: str
+    target_dataset_id: str
+    model_name: CameraModelType
+    train_rms: Optional[float] = None
+    test_rms: Optional[float] = None
+    test_p95: Optional[float] = None
+    edge_rms: Optional[float] = None
+    straightness_residual: Optional[float] = None
+    generalization_gap: Optional[float] = None
+    num_test_frames: int = 0
+    failed_test_frame_ids: list[str] = field(default_factory=list)
+    success: bool = True
+    error_message: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # 설계 문서 18/19번 - K-Fold / Repeated K-Fold Cross Validation
 # ---------------------------------------------------------------------------
@@ -685,6 +759,11 @@ class RepeatabilityResult:
     """
     n_runs: int = 5
     n_successful: int = 0
+    order_runs: int = 0
+    order_successful: int = 0
+    initial_condition_runs: int = 0
+    initial_condition_successful: int = 0
+    initial_condition_perturbation: float = 0.0
     fx_cv: Optional[float] = None  # 변동계수(표준편차/평균) - 작을수록 안정적
     fy_cv: Optional[float] = None
     cx_cv: Optional[float] = None
@@ -699,18 +778,24 @@ class RepeatabilityResult:
 
 @dataclass
 class ModelScoreWeights:
-    """Score = w1*E_train + w2*E_test + w3*E_edge + w4*E_line + w5*P
+    """Model selection score weights. 낮을수록 좋은 weighted penalty.
 
     합성 데이터로 튜닝을 시도해봤지만(scripts/tune_model_score_weights.py),
-    held-out 검증에서 기본값 대비 뚜렷한 개선을 재현하지 못해 기본값을
-    그대로 유지하고 있다. 자세한 과정과 발견한 한계는
-    scripts/TUNING_RESULTS.md 참고.
+    held-out 검증에서 과적합 위험이 커서 Test/P95/Edge 중심의 보수적
+    기본값을 둔다. AIC/BIC/Stability/Observability는 tie-breaker 성격의
+    보조 신호로 실제 score에 포함한다.
     """
-    w_train: float = 0.15
-    w_test: float = 0.35
-    w_edge: float = 0.25
-    w_line: float = 0.10
-    w_complexity: float = 0.15
+    w_train: float = 0.08
+    w_test: float = 0.22
+    w_edge: float = 0.16
+    w_line: float = 0.06
+    w_complexity: float = 0.08
+    w_p95: float = 0.14
+    w_radial: float = 0.08
+    w_aic: float = 0.04
+    w_bic: float = 0.04
+    w_stability: float = 0.05
+    w_observability: float = 0.05
 
 
 @dataclass
@@ -719,6 +804,61 @@ class ModelScore:
     score: float
     components: dict[str, float] = field(default_factory=dict)  # 항목별 기여도 (디버깅/설명용)
     is_recommended: bool = False
+    # 설계 문서 24/25번 - AIC/BIC. score 공식에는 아직 직접 섞지 않고
+    # 모델 비교/리포트가 원본 값을 그대로 보여줄 수 있게 함께 보관한다.
+    parameter_count: int = 0
+    residual_sum_squares: Optional[float] = None
+    num_observations: int = 0
+    aic: Optional[float] = None
+    bic: Optional[float] = None
+    # 설계 문서 28/29번 - 추천 자체의 신뢰도. 1위와 2위가 score/test/P95/edge
+    # 기준으로 거의 같으면 LOW로 낮춰 "모델 차이가 작다"는 경고를 함께 보여준다.
+    selection_confidence: Optional[float] = None  # 0~100, 추천 모델에 주로 채움
+    selection_confidence_level: Optional[str] = None  # "HIGH" | "MEDIUM" | "LOW"
+    selection_confidence_reason: Optional[str] = None
+    selection_reasons: list[str] = field(default_factory=list)
+
+
+@dataclass
+class FailurePattern:
+    """Metric 조합을 사람이 읽을 수 있는 failure pattern으로 바꾼 결과."""
+    code: str
+    severity: DiagnosisSeverity
+    title: str
+    evidence: list[str] = field(default_factory=list)
+    recommendation: str = ""
+
+
+@dataclass
+class CaptureRecommendation:
+    """다음 촬영에서 어떤 보드를 어떻게 추가하면 좋은지에 대한 실행 항목."""
+    code: str
+    priority: str
+    title: str
+    action: str
+    reason: str = ""
+
+
+@dataclass
+class DiagnosisReport:
+    """최종 모델 기준 diagnosis/recommendation 묶음."""
+    model_name: CameraModelType
+    patterns: list[FailurePattern] = field(default_factory=list)
+    capture_recommendations: list[CaptureRecommendation] = field(default_factory=list)
+
+    @property
+    def has_warnings(self) -> bool:
+        return any(p.severity in (DiagnosisSeverity.WARNING, DiagnosisSeverity.ERROR) for p in self.patterns)
+
+
+@dataclass
+class CalibrationConfidenceReport:
+    """최종 calibration 신뢰도를 0~100 점수와 근거 분해로 표현."""
+    score: float = 0.0
+    level: str = "LOW"  # "HIGH" | "MEDIUM" | "LOW" | "REJECT"
+    components: dict[str, float] = field(default_factory=dict)
+    reasons: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +874,9 @@ class FinalResult:
     corner_outlier: Optional[CornerOutlierResult] = None  # 설계 문서 16번 - corner-level 제거 결과
     dataset_coverage_pct: Optional[float] = None
     overall_grade: QualityGrade = QualityGrade.WARNING
+    confidence: Optional[CalibrationConfidenceReport] = None
     model_scores: list[ModelScore] = field(default_factory=list)  # 참고용 3개 모델 비교 스냅샷
+    diagnosis: Optional[DiagnosisReport] = None
 
 
 # ---------------------------------------------------------------------------
@@ -761,6 +903,7 @@ class CalibrationProject:
     dataset: Dataset = field(default_factory=Dataset)
     calibration_results: dict[CameraModelType, CalibrationResult] = field(default_factory=dict)
     validation_results: dict[CameraModelType, ValidationResult] = field(default_factory=dict)
+    cross_dataset_results: list[CrossDatasetValidationResult] = field(default_factory=list)
     model_scores: list[ModelScore] = field(default_factory=list)
     outlier_result: Optional[OutlierResult] = None
     final_result: Optional[FinalResult] = None

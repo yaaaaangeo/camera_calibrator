@@ -36,23 +36,31 @@ from calibration.json_utils import json_safe
 from calibration.types import (
     CalibrationProject,
     CalibrationResult,
+    CalibrationConfidenceReport,
     CameraConfig,
     CameraModelType,
+    CaptureRecommendation,
     CoverageCell,
     CornerOutlierResult,
+    CrossDatasetValidationResult,
     Dataset,
     DatasetQualityScore,
     DetectionResult,
+    DiagnosisReport,
+    DiagnosisSeverity,
     DiversityScores,
     ExportFormat,
     FinalResult,
+    FailurePattern,
     Frame,
     FrameQuality,
     FrameStatus,
     ImageInfo,
     ModelScore,
+    ObservabilityReport,
     OutlierResult,
     ParameterUncertainty,
+    ParameterCorrelation,
     PatternConfig,
     PatternType,
     QualityGrade,
@@ -63,6 +71,7 @@ from calibration.types import (
     SpatialErrorCell,
     SpatialErrorMap,
     StraightnessBreakdown,
+    UndistortionQualityReport,
     ValidationResult,
 )
 
@@ -292,6 +301,53 @@ def _spatial_error_map_from_dict(d) -> SpatialErrorMap | None:
     return SpatialErrorMap(cells=cells, rows=d.get("rows", 4), cols=d.get("cols", 4))
 
 
+def _observability_report_from_dict(d) -> ObservabilityReport | None:
+    if d is None:
+        return None
+    return ObservabilityReport(
+        parameter_labels=d.get("parameter_labels", []),
+        jacobian_rows=d.get("jacobian_rows", 0),
+        jacobian_cols=d.get("jacobian_cols", 0),
+        num_points=d.get("num_points", 0),
+        singular_values=d.get("singular_values", []),
+        rank=d.get("rank", 0),
+        condition_number=d.get("condition_number"),
+        min_singular_value=d.get("min_singular_value"),
+        max_singular_value=d.get("max_singular_value"),
+        max_abs_correlation=d.get("max_abs_correlation"),
+        correlation_matrix=d.get("correlation_matrix", []),
+        observability_score=d.get("observability_score"),
+        observability_grade=d.get("observability_grade"),
+        top_correlations=[
+            ParameterCorrelation(
+                param_a=c["param_a"],
+                param_b=c["param_b"],
+                correlation=c["correlation"],
+            )
+            for c in d.get("top_correlations", [])
+        ],
+        warnings=d.get("warnings", []),
+    )
+
+
+def _undistortion_quality_from_dict(d) -> UndistortionQualityReport | None:
+    if d is None:
+        return None
+    return UndistortionQualityReport(
+        image_width=d.get("image_width", 0),
+        image_height=d.get("image_height", 0),
+        valid_pixel_ratio=d.get("valid_pixel_ratio", 0.0),
+        black_border_ratio=d.get("black_border_ratio", 0.0),
+        roi_loss_ratio=d.get("roi_loss_ratio", 0.0),
+        valid_roi=tuple(d.get("valid_roi", (0, 0, 0, 0))),
+        undistorted_black_pixel_ratio=d.get("undistorted_black_pixel_ratio"),
+        sample_frame_id=d.get("sample_frame_id"),
+        quality_score=d.get("quality_score", 0.0),
+        quality_grade=QualityGrade(d.get("quality_grade", "warning")),
+        warnings=d.get("warnings", []),
+    )
+
+
 def _calibration_result_from_dict(d: dict) -> CalibrationResult:
     return CalibrationResult(
         model_name=CameraModelType(d["model_name"]),
@@ -308,6 +364,8 @@ def _calibration_result_from_dict(d: dict) -> CalibrationResult:
         param_uncertainty=_param_uncertainty_from_dict(d.get("param_uncertainty")),
         param_uncertainty_bootstrap=_param_uncertainty_from_dict(d.get("param_uncertainty_bootstrap")),
         residual_stats=_residual_stats_from_dict(d.get("residual_stats")),
+        observability=_observability_report_from_dict(d.get("observability")),
+        undistortion_quality=_undistortion_quality_from_dict(d.get("undistortion_quality")),
         success=d.get("success", False),
         error_message=d.get("error_message"),
     )
@@ -354,10 +412,77 @@ def _validation_result_from_dict(d: dict) -> ValidationResult:
     )
 
 
+def _cross_dataset_result_from_dict(d: dict) -> CrossDatasetValidationResult:
+    return CrossDatasetValidationResult(
+        source_dataset_id=d.get("source_dataset_id", "A"),
+        target_dataset_id=d.get("target_dataset_id", "B"),
+        model_name=CameraModelType(d["model_name"]),
+        train_rms=d.get("train_rms"),
+        test_rms=d.get("test_rms"),
+        test_p95=d.get("test_p95"),
+        edge_rms=d.get("edge_rms"),
+        straightness_residual=d.get("straightness_residual"),
+        generalization_gap=d.get("generalization_gap"),
+        num_test_frames=d.get("num_test_frames", 0),
+        failed_test_frame_ids=d.get("failed_test_frame_ids", []),
+        success=d.get("success", True),
+        error_message=d.get("error_message"),
+    )
+
+
 def _model_score_from_dict(d: dict) -> ModelScore:
     return ModelScore(
         model_name=CameraModelType(d["model_name"]), score=d["score"],
         components=d.get("components", {}), is_recommended=d.get("is_recommended", False),
+        parameter_count=d.get("parameter_count", 0),
+        residual_sum_squares=d.get("residual_sum_squares"),
+        num_observations=d.get("num_observations", 0),
+        aic=d.get("aic"),
+        bic=d.get("bic"),
+        selection_confidence=d.get("selection_confidence"),
+        selection_confidence_level=d.get("selection_confidence_level"),
+        selection_confidence_reason=d.get("selection_confidence_reason"),
+        selection_reasons=d.get("selection_reasons", []),
+    )
+
+
+def _diagnosis_report_from_dict(d) -> DiagnosisReport | None:
+    if d is None:
+        return None
+    return DiagnosisReport(
+        model_name=CameraModelType(d["model_name"]),
+        patterns=[
+            FailurePattern(
+                code=p["code"],
+                severity=DiagnosisSeverity(p.get("severity", "warning")),
+                title=p["title"],
+                evidence=p.get("evidence", []),
+                recommendation=p.get("recommendation", ""),
+            )
+            for p in d.get("patterns", [])
+        ],
+        capture_recommendations=[
+            CaptureRecommendation(
+                code=r["code"],
+                priority=r.get("priority", "medium"),
+                title=r["title"],
+                action=r["action"],
+                reason=r.get("reason", ""),
+            )
+            for r in d.get("capture_recommendations", [])
+        ],
+    )
+
+
+def _confidence_report_from_dict(d) -> CalibrationConfidenceReport | None:
+    if d is None:
+        return None
+    return CalibrationConfidenceReport(
+        score=d.get("score", 0.0),
+        level=d.get("level", "LOW"),
+        components=d.get("components", {}),
+        reasons=d.get("reasons", []),
+        warnings=d.get("warnings", []),
     )
 
 
@@ -388,7 +513,9 @@ def _final_result_from_dict(d) -> FinalResult | None:
         corner_outlier=_corner_outlier_result_from_dict(d.get("corner_outlier")),
         dataset_coverage_pct=d.get("dataset_coverage_pct"),
         overall_grade=QualityGrade(d.get("overall_grade", "warning")),
+        confidence=_confidence_report_from_dict(d.get("confidence")),
         model_scores=[_model_score_from_dict(s) for s in d.get("model_scores", [])],
+        diagnosis=_diagnosis_report_from_dict(d.get("diagnosis")),
     )
 
 
@@ -418,6 +545,10 @@ def project_from_dict(payload: dict) -> CalibrationProject:
         dataset=_dataset_from_dict(d.get("dataset", {})),
         calibration_results=calibration_results,
         validation_results=validation_results,
+        cross_dataset_results=[
+            _cross_dataset_result_from_dict(r)
+            for r in d.get("cross_dataset_results", [])
+        ],
         model_scores=[_model_score_from_dict(s) for s in d.get("model_scores", [])],
         outlier_result=_outlier_result_from_dict(d.get("outlier_result")),
         final_result=_final_result_from_dict(d.get("final_result")),

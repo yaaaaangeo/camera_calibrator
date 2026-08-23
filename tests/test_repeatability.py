@@ -7,6 +7,8 @@ tests/test_repeatability.py
 
 from __future__ import annotations
 
+import pytest
+
 from calibration.repeatability import compute_repeatability, format_repeatability
 from calibration.types import CameraModelType, Dataset
 
@@ -19,7 +21,9 @@ class TestComputeRepeatability:
         result = compute_repeatability(
             synthetic_dataset, camera_config, CameraModelType.PINHOLE, n_runs=5, seed=1,
         )
-        assert result.n_successful == 5
+        assert result.order_successful == 5
+        assert result.initial_condition_successful == 5
+        assert result.n_successful == 10
         assert result.repeatability_pct is not None
         assert result.repeatability_pct > 90.0
 
@@ -35,6 +39,8 @@ class TestComputeRepeatability:
             Dataset(frames=[]), camera_config, CameraModelType.PINHOLE, n_runs=3, seed=1,
         )
         assert result.n_successful == 0
+        assert result.order_successful == 0
+        assert result.initial_condition_successful == 0
         assert result.repeatability_pct is None
 
     def test_frame_content_unchanged_across_runs(self, synthetic_dataset, camera_config):
@@ -43,6 +49,46 @@ class TestComputeRepeatability:
         compute_repeatability(synthetic_dataset, camera_config, CameraModelType.PINHOLE, n_runs=3, seed=1)
         after_ids = {f.image_info.image_id for f in synthetic_dataset.frames}
         assert original_ids == after_ids
+
+    def test_parallel_matches_sequential_for_same_seed(self, synthetic_dataset, camera_config):
+        sequential = compute_repeatability(
+            synthetic_dataset, camera_config, CameraModelType.PINHOLE, n_runs=4, seed=7, n_jobs=1,
+        )
+        parallel = compute_repeatability(
+            synthetic_dataset, camera_config, CameraModelType.PINHOLE, n_runs=4, seed=7, n_jobs=2,
+        )
+        assert parallel.n_successful == sequential.n_successful
+        assert parallel.repeatability_pct == pytest.approx(sequential.repeatability_pct, rel=1e-5)
+        assert parallel.fx_cv == pytest.approx(sequential.fx_cv, rel=1e-5, abs=1e-10)
+
+    def test_can_run_order_only_for_backward_compatibility(self, synthetic_dataset, camera_config):
+        result = compute_repeatability(
+            synthetic_dataset,
+            camera_config,
+            CameraModelType.PINHOLE,
+            n_runs=4,
+            seed=5,
+            vary_initial_conditions=False,
+        )
+        assert result.n_runs == 4
+        assert result.n_successful == 4
+        assert result.order_successful == 4
+        assert result.initial_condition_runs == 0
+
+    def test_initial_condition_perturbation_is_recorded(self, synthetic_dataset, camera_config):
+        result = compute_repeatability(
+            synthetic_dataset,
+            camera_config,
+            CameraModelType.EXTENDED_PINHOLE,
+            n_runs=3,
+            seed=8,
+            initial_condition_perturbation=0.03,
+        )
+        assert result.order_runs == 3
+        assert result.initial_condition_runs == 3
+        assert result.initial_condition_successful > 0
+        assert result.initial_condition_perturbation == pytest.approx(0.03)
+        assert result.repeatability_pct is not None
 
 
 class TestFormatRepeatability:
@@ -53,6 +99,7 @@ class TestFormatRepeatability:
         text = format_repeatability(result)
         assert "Repeatability" in text
         assert "CV" in text
+        assert "initial condition" in text
 
     def test_handles_insufficient_runs(self):
         from calibration.types import RepeatabilityResult

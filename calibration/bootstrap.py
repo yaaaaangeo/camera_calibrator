@@ -26,16 +26,119 @@ Fisheye 전용이 아니라 세 모델 전부에서 쓸 수 있게 일반화한 
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
 
 import cv2
 import numpy as np
 
-from calibration.types import CameraModelType, ParameterUncertainty
+from calibration.models.common import distortion_coeff_labels
+from calibration.performance import resolve_worker_count
+from calibration.types import CameraModelType, DistortionCoeffStat, ParameterUncertainty
 
 logger = logging.getLogger(__name__)
 
 _MIN_SUCCESSFUL_SAMPLES = 5
+_STABILITY_EPS = 1e-9
+
+
+def _run_bootstrap_sample(args: tuple) -> tuple[float, float, float, float, list[float]] | None:
+    (
+        object_points,
+        image_points,
+        image_size,
+        idx,
+        is_fisheye,
+        K_init,
+        D_init,
+        flags,
+    ) = args
+    obj_sample = [object_points[int(i)] for i in idx]
+    img_sample = [image_points[int(i)] for i in idx]
+    try:
+        if is_fisheye:
+            _, K_i, D_i, _, _ = cv2.fisheye.calibrate(
+                obj_sample, img_sample, image_size,
+                K_init.copy(), D_init.copy(), flags=flags,
+            )
+        else:
+            _, K_i, D_i, _, _ = cv2.calibrateCamera(
+                obj_sample, img_sample, image_size,
+                K_init.copy(), D_init.copy(), flags=flags,
+            )
+    except cv2.error:
+        return None
+
+    return (
+        float(K_i[0, 0]),
+        float(K_i[1, 1]),
+        float(K_i[0, 2]),
+        float(K_i[1, 2]),
+        [float(v) for v in D_i.ravel().tolist()],
+    )
+
+
+def _stability_score(samples: list[float], reference: float | None = None) -> float | None:
+    if len(samples) < 2:
+        return None
+    mean = float(np.mean(samples))
+    std = float(np.std(samples, ddof=1))
+    return _stability_from_std(mean, std, reference)
+
+
+def _stability_from_std(mean: float, std: float, reference: float | None = None) -> float:
+    scale = max(abs(mean), abs(reference or 0.0), _STABILITY_EPS)
+    cv = std / scale
+    return float(max(0.0, min(100.0, 100.0 * (1.0 - cv))))
+
+
+def _distribution(samples: list[float], reference: float | None = None) -> dict[str, float | None]:
+    if not samples:
+        return {
+            "mean": None, "std": None, "median": None, "min": None, "max": None,
+            "ci_low": None, "ci_high": None, "stability": None,
+        }
+    return {
+        "mean": float(np.mean(samples)),
+        "std": float(np.std(samples, ddof=1)) if len(samples) > 1 else 0.0,
+        "median": float(np.median(samples)),
+        "min": float(np.min(samples)),
+        "max": float(np.max(samples)),
+        "ci_low": float(np.percentile(samples, 2.5)),
+        "ci_high": float(np.percentile(samples, 97.5)),
+        "stability": _stability_score(samples, reference),
+    }
+
+
+def _distortion_stats(
+    distortion_samples: list[list[float]],
+    model: CameraModelType,
+    D_ref: np.ndarray,
+) -> list[DistortionCoeffStat]:
+    if not distortion_samples:
+        return []
+    max_len = max(len(sample) for sample in distortion_samples)
+    labels = distortion_coeff_labels(model, max_len)
+    ref = [float(v) for v in D_ref.ravel().tolist()]
+    stats: list[DistortionCoeffStat] = []
+    for i in range(max_len):
+        values = [sample[i] for sample in distortion_samples if i < len(sample)]
+        d = _distribution(values, reference=ref[i] if i < len(ref) else None)
+        stats.append(
+            DistortionCoeffStat(
+                index=i,
+                label=labels[i],
+                mean=d["mean"],
+                std=d["std"],
+                median=d["median"],
+                min=d["min"],
+                max=d["max"],
+                ci_low=d["ci_low"],
+                ci_high=d["ci_high"],
+                stability_score=d["stability"],
+            )
+        )
+    return stats
 
 
 def compute_parameter_bootstrap(
@@ -48,6 +151,7 @@ def compute_parameter_bootstrap(
     flags: int,
     n_bootstrap: int = 20,
     rng_seed: int = 42,
+    n_jobs: int = 1,
 ) -> ParameterUncertainty | None:
     """세 모델 공용 bootstrap 불확실성 추정.
 
@@ -72,32 +176,33 @@ def compute_parameter_bootstrap(
     fy_samples: list[float] = []
     cx_samples: list[float] = []
     cy_samples: list[float] = []
+    distortion_samples: list[list[float]] = []
 
     K_init = K_ref.copy().astype(np.float64)
     D_init = D_ref.copy().astype(np.float64)
 
-    for _ in range(n_bootstrap):
-        idx = rng.integers(0, n_frames, size=n_frames)
-        obj_sample = [object_points[i] for i in idx]
-        img_sample = [image_points[i] for i in idx]
-        try:
-            if is_fisheye:
-                _, K_i, D_i, _, _ = cv2.fisheye.calibrate(
-                    obj_sample, img_sample, image_size,
-                    K_init.copy(), D_init.copy(), flags=flags,
-                )
-            else:
-                _, K_i, D_i, _, _ = cv2.calibrateCamera(
-                    obj_sample, img_sample, image_size,
-                    K_init.copy(), D_init.copy(), flags=flags,
-                )
-        except cv2.error:
-            continue  # 이 재표본은 발산 - 조용히 건너뛴다
+    indices = [rng.integers(0, n_frames, size=n_frames) for _ in range(n_bootstrap)]
+    tasks = [
+        (object_points, image_points, image_size, idx, is_fisheye, K_init, D_init, flags)
+        for idx in indices
+    ]
+    workers = resolve_worker_count(n_jobs, len(tasks))
+    if workers > 1:
+        logger.info("%s bootstrap 병렬 실행: %d samples, %d workers", model.value, n_bootstrap, workers)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            sample_results = list(executor.map(_run_bootstrap_sample, tasks))
+    else:
+        sample_results = [_run_bootstrap_sample(task) for task in tasks]
 
-        fx_samples.append(float(K_i[0, 0]))
-        fy_samples.append(float(K_i[1, 1]))
-        cx_samples.append(float(K_i[0, 2]))
-        cy_samples.append(float(K_i[1, 2]))
+    for sample in sample_results:
+        if sample is None:
+            continue
+        fx, fy, cx, cy, distortion = sample
+        fx_samples.append(fx)
+        fy_samples.append(fy)
+        cx_samples.append(cx)
+        cy_samples.append(cy)
+        distortion_samples.append(distortion)
 
     if len(fx_samples) < _MIN_SUCCESSFUL_SAMPLES:
         logger.warning(
@@ -106,29 +211,43 @@ def compute_parameter_bootstrap(
         )
         return None
 
-    def _ci(samples: list[float]) -> tuple[float, float]:
-        return float(np.percentile(samples, 2.5)), float(np.percentile(samples, 97.5))
-
-    fx_lo, fx_hi = _ci(fx_samples)
-    fy_lo, fy_hi = _ci(fy_samples)
-    cx_lo, cx_hi = _ci(cx_samples)
-    cy_lo, cy_hi = _ci(cy_samples)
+    fx = _distribution(fx_samples, reference=float(K_ref[0, 0]))
+    fy = _distribution(fy_samples, reference=float(K_ref[1, 1]))
+    cx = _distribution(cx_samples, reference=float(K_ref[0, 2]))
+    cy = _distribution(cy_samples, reference=float(K_ref[1, 2]))
+    d_stats = _distortion_stats(distortion_samples, model, D_ref)
+    stability_values = [
+        value for value in (fx["stability"], fy["stability"], cx["stability"], cy["stability"])
+        if value is not None
+    ]
+    stability_values.extend(
+        stat.stability_score for stat in d_stats if stat.stability_score is not None
+    )
+    overall_stability = float(np.mean(stability_values)) if stability_values else None
 
     logger.info(
         "%s bootstrap 불확실성 추정 완료: %d/%d개 재표본 성공",
         model.value, len(fx_samples), n_bootstrap,
     )
     return ParameterUncertainty(
-        fx_std=float(np.std(fx_samples, ddof=1)),
-        fy_std=float(np.std(fy_samples, ddof=1)),
-        cx_std=float(np.std(cx_samples, ddof=1)),
-        cy_std=float(np.std(cy_samples, ddof=1)),
+        fx_std=fx["std"],
+        fy_std=fy["std"],
+        cx_std=cx["std"],
+        cy_std=cy["std"],
         method="bootstrap",
         n_bootstrap_success=len(fx_samples),
-        fx_ci_low=fx_lo, fx_ci_high=fx_hi,
-        fy_ci_low=fy_lo, fy_ci_high=fy_hi,
-        cx_ci_low=cx_lo, cx_ci_high=cx_hi,
-        cy_ci_low=cy_lo, cy_ci_high=cy_hi,
+        fx_ci_low=fx["ci_low"], fx_ci_high=fx["ci_high"],
+        fy_ci_low=fy["ci_low"], fy_ci_high=fy["ci_high"],
+        cx_ci_low=cx["ci_low"], cx_ci_high=cx["ci_high"],
+        cy_ci_low=cy["ci_low"], cy_ci_high=cy["ci_high"],
+        fx_mean=fx["mean"], fy_mean=fy["mean"], cx_mean=cx["mean"], cy_mean=cy["mean"],
+        fx_median=fx["median"], fy_median=fy["median"], cx_median=cx["median"], cy_median=cy["median"],
+        fx_min=fx["min"], fx_max=fx["max"], fy_min=fy["min"], fy_max=fy["max"],
+        cx_min=cx["min"], cx_max=cx["max"], cy_min=cy["min"], cy_max=cy["max"],
+        fx_stability=fx["stability"], fy_stability=fy["stability"],
+        cx_stability=cx["stability"], cy_stability=cy["stability"],
+        overall_stability=overall_stability,
+        distortion_stats=d_stats,
     )
 
 
@@ -158,6 +277,23 @@ def add_normal_approximation_ci(uncertainty: ParameterUncertainty, camera_matrix
     if uncertainty.cy_std is not None:
         uncertainty.cy_ci_low, uncertainty.cy_ci_high = cy - z * uncertainty.cy_std, cy + z * uncertainty.cy_std
 
+    uncertainty.fx_mean = fx
+    uncertainty.fy_mean = fy
+    uncertainty.cx_mean = cx
+    uncertainty.cy_mean = cy
+    uncertainty.fx_stability = _stability_from_std(fx, uncertainty.fx_std, fx) if uncertainty.fx_std is not None else None
+    uncertainty.fy_stability = _stability_from_std(fy, uncertainty.fy_std, fy) if uncertainty.fy_std is not None else None
+    uncertainty.cx_stability = _stability_from_std(cx, uncertainty.cx_std, cx) if uncertainty.cx_std is not None else None
+    uncertainty.cy_stability = _stability_from_std(cy, uncertainty.cy_std, cy) if uncertainty.cy_std is not None else None
+    stability_values = [
+        v for v in (
+            uncertainty.fx_stability, uncertainty.fy_stability,
+            uncertainty.cx_stability, uncertainty.cy_stability,
+        )
+        if v is not None
+    ]
+    uncertainty.overall_stability = float(np.mean(stability_values)) if stability_values else None
+
     return uncertainty
 
 
@@ -185,4 +321,34 @@ def format_parameter_uncertainty(uncertainty: ParameterUncertainty | None) -> st
     lines.append(fmt_line("cy", uncertainty.cy_std, uncertainty.cy_ci_low, uncertainty.cy_ci_high))
     if uncertainty.method == "bootstrap" and uncertainty.n_bootstrap_success is not None:
         lines.append(f"(성공한 재표본 {uncertainty.n_bootstrap_success}개 기준)")
+    if uncertainty.method == "bootstrap":
+        def fmt_dist(name: str, mean, median, lo, hi, stability) -> str:
+            if mean is None:
+                return f"{name}: N/A"
+            ci = f", 95% CI {lo:.1f} ~ {hi:.1f}" if lo is not None and hi is not None else ""
+            stable = f", stability {stability:.1f}/100" if stability is not None else ""
+            med = f", median {median:.1f}" if median is not None else ""
+            return f"{name}: mean {mean:.1f}{med}{ci}{stable}"
+
+        lines.append("Bootstrap parameter distribution:")
+        lines.append(fmt_dist("fx", uncertainty.fx_mean, uncertainty.fx_median, uncertainty.fx_ci_low, uncertainty.fx_ci_high, uncertainty.fx_stability))
+        lines.append(fmt_dist("fy", uncertainty.fy_mean, uncertainty.fy_median, uncertainty.fy_ci_low, uncertainty.fy_ci_high, uncertainty.fy_stability))
+        lines.append(fmt_dist("cx", uncertainty.cx_mean, uncertainty.cx_median, uncertainty.cx_ci_low, uncertainty.cx_ci_high, uncertainty.cx_stability))
+        lines.append(fmt_dist("cy", uncertainty.cy_mean, uncertainty.cy_median, uncertainty.cy_ci_low, uncertainty.cy_ci_high, uncertainty.cy_stability))
+    if uncertainty.overall_stability is not None:
+        lines.append(f"Parameter Stability = {uncertainty.overall_stability:.1f}/100")
+    if uncertainty.distortion_stats:
+        lines.append("Distortion coefficient stability:")
+        for stat in uncertainty.distortion_stats:
+            std = f"{stat.std:.4g}" if stat.std is not None else "N/A"
+            median = f"{stat.median:.4g}" if stat.median is not None else "N/A"
+            stability = f"{stat.stability_score:.1f}/100" if stat.stability_score is not None else "N/A"
+            ci = (
+                f", 95% CI {stat.ci_low:.4g} ~ {stat.ci_high:.4g}"
+                if stat.ci_low is not None and stat.ci_high is not None else ""
+            )
+            lines.append(
+                f"  {stat.label or f'd{stat.index}'}: std={std} "
+                f"median={median} stability={stability}{ci}"
+            )
     return "\n".join(lines)

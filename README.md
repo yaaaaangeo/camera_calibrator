@@ -95,11 +95,14 @@ camera-calibrator
 
 창이 뜨면:
 1. 상단에서 해상도(Width/Height)와 패턴 정보를 입력. **Pattern type**을
-   ChArUco(기본, 권장) 또는 Chessboard(일반 체스보드) 중 고를 수 있다 -
+   ChArUco(기본, 권장), Chessboard(일반 체스보드), AprilGrid 중 고를 수 있다.
    Chessboard를 고르면 Marker size/Dictionary 입력칸이 자동으로 숨겨진다
-   (체스보드엔 필요 없으므로). ChArUco는 사각형 개수/한 칸 크기(mm)/마커
-   크기(mm)/dictionary가 필요하고, Chessboard는 사각형 개수/한 칸 크기(mm)만
-   있으면 된다.
+   (체스보드엔 필요 없으므로). ChArUco/AprilGrid는 사각형 개수/한 칸
+   크기(mm)/마커 크기(mm)/dictionary가 필요하고, Chessboard는 사각형 개수/
+   한 칸 크기(mm)만 있으면 된다. AprilGrid는 Kalibr과 같은 row-major ID
+   배치(왼쪽 위 0번부터 오른쪽으로 증가, 다음 줄로 이동)를 가정한다.
+   앱 내부에서는 OpenCV `DICT_APRILTAG_*` dictionary로 기본 검출을 수행할 수
+   있고, `--export kalibr`로 Kalibr 공식 `aprilgrid` target YAML도 만들 수 있다.
 
    > ⚠️ **Chessboard를 쓸 때 주의**: 일반 체스보드는 대칭 패턴이라 ChArUco와
    > 달리 (1) 보드 전체가 이미지 안에 다 보여야 검출되고, (2) "어느 쪽이
@@ -118,22 +121,20 @@ camera-calibrator
    컴퓨터에 설치되어 있어야 함 - rospy/rclpy는 pip로 설치되지 않음)
 3. **[캘리브레이션 실행]** 클릭 → 검출 → 3모델 계산 → Hold-out → 추천까지 자동 진행
 4. 탭을 넘기며 결과 확인:
-   - **① Dataset**: 이미지별 검출 상태/코너 수/재투영 오차/**품질 점수(Frame Quality Score)·등급**
-   - **② Coverage**: 4×4 커버리지 맵 + 데이터셋 다양성 점수 + 경고
-   - **③ Model / Validation / Export**: 3모델 비교표(Train/Test/Edge RMS + **Line Straightness**) +
-     추천 + 이상치 제거 + OpenCV/ROS YAML export + **HTML 종합 리포트 export** +
-     **JSON export**(구조화된 전체 결과, 외부 도구 연동용) +
-     **CSV export**(이미지별 상세 데이터, 스프레드시트 분석용)
-   - **④ Undistort Preview**: 원본 vs 보정 이미지 비교 + Line Straightness Residual
-     정량 비교(보정 전 → 보정 후 px, 개선율 %) - "직선이 얼마나 곧아졌는지 눈으로
-     확인하세요"에서 그치지 않고, 사후 리포트(⑥번 탭, Model Score)와 동일한
-     지표로 실제 숫자를 함께 보여준다
-   - **⑤ Edge Error Map**: 이미지 중심으로부터의 거리(반지름)별 재투영 오차 막대그래프
-     (Radial Error Profile) — 렌즈 외곽에서 모델이 잘 맞는지 한눈에 확인
-   - **⑥ Straightness Map**: 체스보드의 각 행/열을 실제 이미지 위에 선으로
-     그려서, 얼마나 휘었는지 초록(곧음)~빨강(많이 휨)으로 색칠해 보여준다.
-     숫자 하나(Line Straightness)로만 보던 걸 "어느 부분이 특히 안 맞는지"
-     직관적으로 확인할 수 있다 - 이미지/모델을 바꿔가며 비교 가능
+   - **① Dataset**: 이미지별 상태/코너 수/재투영 오차/**품질 점수(Frame Quality Score)·등급**
+   - **② Detection**: 검출 성공/실패와 실패 이유를 독립 탭에서 확인
+   - **③ Coverage**: 4×4 커버리지 맵 + 데이터셋 다양성 점수 + 경고
+   - **④ Calibration**: 선택 모델 기준 이상치 제거·재계산
+   - **⑤ Validation**: sanity check + Dataset B/C cross-dataset validation
+   - **⑥ Error Analysis**: Undistort Preview, Edge Error Map, Straightness Map, 외부 결과 비교
+     (OpenCV YAML / ROS CameraInfo YAML / Kalibr camchain YAML / 표준 JSON import)
+     + benchmark compatibility 검사(width/height, model, distortion model, 계수 개수,
+     NaN/Inf, matrix shape, 파라미터 범위)
+     + Reference/Candidate를 둘 다 파일로 로드하는 독립 benchmark 비교
+   - **⑦ Stability**: bootstrap/repeatability 기반 파라미터 안정성
+   - **⑧ Model Comparison**: 3모델 비교표(Train/Test/P95/Edge/Radial/AIC/BIC/Stability/Observability) + 추천 이유
+   - **⑨ Diagnosis**: failure pattern, 원인 분석, 다음 촬영 추천
+   - **⑩ Export**: OpenCV/ROS YAML, **HTML 종합 리포트**, **JSON**, **CSV** export
 5. 상단 메뉴 **파일 → 프로젝트 저장(Ctrl+S)** 으로 지금까지의 전체 상태(데이터셋,
    3모델 결과, 검증, 추천)를 `.ccproj` 파일로 저장할 수 있다. **파일 → 프로젝트
    불러오기(Ctrl+O)** 로 나중에 이어서 작업 가능 — 원본 이미지 파일이 없어져도
@@ -162,6 +163,8 @@ camera_calibrator/
 │   ├── rosbag_reader.py      # ROS1(.bag)/ROS2(.db3, .mcap)에서 이미지 추출
 │   ├── ros_live.py           # 실시간 ROS1(rospy)/ROS2(rclpy) 토픽 구독 (자동 감지)
 │   ├── ros_image_codec.py    # sensor_msgs/Image·CompressedImage 디코딩 (위 둘이 공유)
+│   ├── calibration_io.py     # 외부 calibration 포맷을 benchmark용 표준 schema로 정규화
+│   ├── benchmark_compatibility.py # Reference/Candidate 비교 전 compatibility 검사
 │   ├── project_io.py         # .ccproj 프로젝트 저장/불러오기 (JSON, pickle 미사용)
 │   ├── json_utils.py         # dataclass/numpy -> JSON 안전 변환 (project_io.py, export/json_export.py 공유)
 │   └── recommender.py        # Model Score 기반 추천 + 최종 결과(FinalResult) 조립
@@ -281,20 +284,41 @@ python -m app.cli \
   --json-summary ./out/summary.json
 ```
 
+종합 진단 리포트가 필요하면 문서형 옵션을 그대로 쓰면 된다:
+
+```bash
+python -m app.cli \
+  --images ./photos \
+  --squares-x 7 --squares-y 5 --square-size 0.04 --marker-size 0.03 \
+  --diagnostic \
+  --cross-validation 5 \
+  --bootstrap 100 \
+  --jobs 0 \
+  --output-dir ./out
+```
+
+`--diagnostic`은 별도 지정이 없으면 5-fold cross validation과 100회 bootstrap을
+켜고, `report/json/csv` 산출물을 함께 만든다.
+
 주요 옵션:
 
 | 옵션 | 설명 |
 |---|---|
 | `--config PATH` | 패턴/카메라/파이프라인 옵션을 담은 `.yaml`/`.yml`/`.json` 파일 (아래 예시 참고). 같은 옵션을 커맨드라인에 또 주면 커맨드라인이 우선 |
 | `--images` | 이미지 파일/디렉토리/glob 패턴 (여러 개 가능) |
-| `--pattern {charuco,chessboard}` | 패턴 타입 (기본 charuco). chessboard는 `--marker-size`/`--dictionary` 불필요 |
+| `--pattern {charuco,chessboard,apriltag_grid}` | 패턴 타입 (기본 charuco). `aprilgrid` alias도 허용. AprilGrid는 `DICT_APRILTAG_*` dictionary와 Kalibr-compatible row-major marker ID 배치를 사용 |
 | `--bag`, `--topic`, `--bag-interval` | rosbag에서 이미지 추출 (`--images` 대신) |
 | `--list-topics BAG_PATH` | bag의 이미지 토픽 목록만 보고 종료 |
 | `--model {pinhole,extended_pinhole,fisheye}` | 자동 추천 대신 강제로 이 모델 선택 |
 | `--outlier` | 이상치 탐지 + 재계산까지 수행 |
 | `--rational` | Extended Pinhole에 8계수(rational) 모델 사용 |
-| `--jobs N` | 이미지 검출을 N개 프로세스로 병렬화 (기본 1=순차, 0=CPU 코어 수만큼 자동) |
-| `--export {opencv,ros,report,json,csv}` | 내보낼 형식 선택 (기본: opencv/ros/report - json/csv는 명시해야 포함됨) |
+| `--diagnostic` | 종합 진단 preset. 기본 5-fold CV + 100회 bootstrap + report/json/csv export |
+| `--cross-validation K` | K-Fold Cross Validation 수행 (`--kfold K`와 동일) |
+| `--bootstrap N` | 최종 선택 모델의 bootstrap 기반 Parameter CI를 N회 재표본으로 계산 |
+| `--repeatability N` | 최종 선택 모델을 N회 반복 재계산해 파라미터 안정성 측정 |
+| `--jobs N` | 이미지 검출과 heavy analysis(K-fold/repeatability/bootstrap)를 N개 worker로 병렬화 (기본 1=순차, 0=자동) |
+| `--export {opencv,ros,report,json,csv,kalibr}` | 내보낼 형식 선택 (기본: opencv/ros/report - json/csv/kalibr는 명시해야 포함됨). `kalibr`는 AprilGrid target YAML을 생성 |
+| `--kalibr-camera-model MODEL` | `--export kalibr`에서 command hint를 만들 때 쓸 Kalibr camera model. 기본 `pinhole-radtan` |
 | `--json-summary PATH` | 기계가 읽는 JSON 요약 저장 (CI 스크립팅용) |
 | `--quiet` | 진행상황 출력 최소화 |
 | `-v`/`--verbose`, `--log-file PATH` | 진단 로그 상세도/파일 저장 (버그 재현 시 유용) |

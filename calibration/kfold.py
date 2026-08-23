@@ -20,11 +20,20 @@ Train/Test leakage 방지 원칙(test로 파라미터를 수정하지 않음)이
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import random
 
 import numpy as np
 
+from calibration.cache import (
+    KFOLD_VALIDATION_CACHE,
+    ValidationCache,
+    camera_fingerprint,
+    dataset_fingerprint,
+    pattern_fingerprint,
+)
 from calibration.models.common import MIN_FRAMES_REQUIRED, infer_image_size
+from calibration.performance import resolve_worker_count
 from calibration.types import (
     CameraConfig,
     CameraModelType,
@@ -34,6 +43,56 @@ from calibration.types import (
     PatternConfig,
     RepeatedKFoldResult,
 )
+
+
+def _fold_cache_key(
+    dataset: Dataset,
+    camera_config: CameraConfig,
+    pattern_config: PatternConfig,
+    model: CameraModelType,
+    train_ids: list[str],
+    test_ids: list[str],
+    use_rational_model: bool,
+) -> tuple:
+    return (
+        "kfold_validation",
+        dataset_fingerprint(dataset),
+        camera_fingerprint(camera_config),
+        pattern_fingerprint(pattern_config),
+        model.value,
+        tuple(train_ids),
+        tuple(test_ids),
+        bool(use_rational_model),
+    )
+
+
+def _validate_fold(args: tuple):
+    (
+        dataset,
+        camera_config,
+        pattern_config,
+        model,
+        train_ids,
+        test_ids,
+        use_rational_model,
+        cache,
+    ) = args
+    from calibration.validation import validate_holdout  # 순환 참조 회피
+
+    key = _fold_cache_key(
+        dataset, camera_config, pattern_config, model, train_ids, test_ids, use_rational_model
+    )
+    cached = cache.get(key) if cache is not None else None
+    if cached is not None:
+        return cached
+
+    result = validate_holdout(
+        dataset, camera_config, pattern_config, model, train_ids, test_ids,
+        use_rational_model=use_rational_model,
+    )
+    if cache is not None:
+        cache.set(key, result)
+    return result
 
 
 def split_k_folds(
@@ -93,26 +152,40 @@ def compute_kfold_validation(
     k: int = 5,
     seed: int = 42,
     use_rational_model: bool = False,
+    n_jobs: int = 1,
+    cache: ValidationCache | None = KFOLD_VALIDATION_CACHE,
 ) -> KFoldResult:
     """단일 K-Fold 실행. 각 fold를 정확히 한 번 test로 써서 validate_holdout()으로
     평가하고, fold별 test_rms/test_residual_stats.p95를 모아 mean/std/min/max로
     요약한다.
     """
-    from calibration.validation import validate_holdout  # 순환 참조 회피
-
     folds = split_k_folds(dataset, camera_config, k=k, seed=seed)
-    fold_results = []
+    tasks = []
 
     for i in range(k):
         test_ids = folds[i]
         train_ids = [fid for j in range(k) if j != i for fid in folds[j]]
         if len(train_ids) < MIN_FRAMES_REQUIRED or not test_ids:
             continue
-        vr = validate_holdout(
-            dataset, camera_config, pattern_config, model, train_ids, test_ids,
-            use_rational_model=use_rational_model,
+        tasks.append(
+            (
+                dataset,
+                camera_config,
+                pattern_config,
+                model,
+                train_ids,
+                test_ids,
+                use_rational_model,
+                cache,
+            )
         )
-        fold_results.append(vr)
+
+    workers = resolve_worker_count(n_jobs, len(tasks))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            fold_results = list(executor.map(_validate_fold, tasks))
+    else:
+        fold_results = [_validate_fold(task) for task in tasks]
 
     test_rmses = [vr.test_rms for vr in fold_results if vr.success and vr.test_rms is not None]
     test_p95s = [
@@ -142,6 +215,8 @@ def compute_repeated_kfold(
     n_repeats: int = 5,
     base_seed: int = 42,
     use_rational_model: bool = False,
+    n_jobs: int = 1,
+    cache: ValidationCache | None = KFOLD_VALIDATION_CACHE,
 ) -> RepeatedKFoldResult:
     """설계 문서 19번 - K-Fold를 n_repeats번(각기 다른 seed로 다시 분할) 반복.
 
@@ -149,16 +224,25 @@ def compute_repeated_kfold(
     mean/std/min/max를 낸다 - 개별 KFoldResult(1회 분할 기준 평균)도 참고용으로
     보존한다.
     """
-    kfold_results: list[KFoldResult] = []
+    def _run_repeat(repeat_index: int) -> KFoldResult:
+        return compute_kfold_validation(
+            dataset, camera_config, pattern_config, model,
+            k=k, seed=base_seed + repeat_index, use_rational_model=use_rational_model,
+            n_jobs=1, cache=cache,
+        )
+
+    repeat_indices = list(range(n_repeats))
+    workers = resolve_worker_count(n_jobs, len(repeat_indices))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            kfold_results = list(executor.map(_run_repeat, repeat_indices))
+    else:
+        kfold_results = [_run_repeat(r) for r in repeat_indices]
+
     all_rmses: list[float] = []
     all_p95s: list[float] = []
 
-    for r in range(n_repeats):
-        kf = compute_kfold_validation(
-            dataset, camera_config, pattern_config, model,
-            k=k, seed=base_seed + r, use_rational_model=use_rational_model,
-        )
-        kfold_results.append(kf)
+    for kf in kfold_results:
         for vr in kf.fold_validation_results:
             if vr.success and vr.test_rms is not None:
                 all_rmses.append(vr.test_rms)

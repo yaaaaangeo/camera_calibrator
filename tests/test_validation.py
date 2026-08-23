@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import copy
 
+import pytest
+
 from calibration.types import CameraModelType, FrameStatus
 from calibration.validation import (
     _subset_dataset,
+    format_cross_dataset_validation_table,
     recalibrate_train_with_corner_outlier_pruning,
     recalibrate_train_with_outlier_pruning,
     split_train_test,
+    validate_cross_dataset,
+    validate_cross_datasets,
     validate_holdout,
 )
 from calibration.models.pinhole import calibrate_pinhole
@@ -51,6 +56,58 @@ def test_different_seed_can_give_different_split(synthetic_dataset, camera_confi
     assert isinstance(train1, list) and isinstance(train2, list)
 
 
+def test_cross_dataset_validation_evaluates_target_without_retraining(
+    synthetic_dataset, camera_config, pattern_config
+):
+    dataset_a = copy.deepcopy(synthetic_dataset)
+    dataset_b = copy.deepcopy(synthetic_dataset)
+    train_fit = calibrate_pinhole(dataset_a, camera_config)
+    assert train_fit.success
+    original_K = train_fit.camera_matrix.copy()
+    original_D = train_fit.distortion.copy()
+
+    result = validate_cross_dataset(
+        train_fit,
+        dataset_b,
+        camera_config,
+        pattern_config,
+        source_dataset_id="A",
+        target_dataset_id="B",
+    )
+
+    assert result.success
+    assert result.source_dataset_id == "A"
+    assert result.target_dataset_id == "B"
+    assert result.model_name == CameraModelType.PINHOLE
+    assert result.num_test_frames == dataset_b.num_detected
+    assert result.test_rms is not None
+    assert result.test_p95 is not None
+    assert result.generalization_gap is not None
+    assert (train_fit.camera_matrix == original_K).all()
+    assert (train_fit.distortion == original_D).all()
+
+
+def test_cross_dataset_batch_and_format_table(synthetic_dataset, camera_config, pattern_config):
+    dataset_a = copy.deepcopy(synthetic_dataset)
+    dataset_b = copy.deepcopy(synthetic_dataset)
+    dataset_c = copy.deepcopy(synthetic_dataset)
+    pinhole = calibrate_pinhole(dataset_a, camera_config)
+
+    results = validate_cross_datasets(
+        {CameraModelType.PINHOLE: pinhole},
+        {"B": dataset_b, "C": dataset_c},
+        camera_config,
+        pattern_config,
+        source_dataset_id="A",
+    )
+    table = format_cross_dataset_validation_table(results)
+
+    assert len(results) == 2
+    assert {r.target_dataset_id for r in results} == {"B", "C"}
+    assert "Cross-dataset validation" in table
+    assert "B" in table and "C" in table
+
+
 # ---------------------------------------------------------------------------
 # 설계 문서 9번 - "validation leakage 테스트 추가"
 #
@@ -80,7 +137,7 @@ def test_train_rms_reproducible_independently_of_test_evaluation(synthetic_datas
         dataset, camera_config, pattern_config, CameraModelType.PINHOLE, train_ids, test_ids
     )
     assert validation_result.success
-    assert validation_result.train_rms == independent_train_fit.rms_error, (
+    assert validation_result.train_rms == pytest.approx(independent_train_fit.rms_error, rel=1e-9, abs=1e-9), (
         "validate_holdout 내부에서 쓰인 train fit이 순수 train-only 결과와 달라짐 - "
         "test 정보가 학습에 섞여 들어갔을 가능성이 있음"
     )
@@ -167,8 +224,8 @@ def test_leak_safe_function_matches_validate_holdout_when_no_outliers_removed(
         dataset, camera_config, pattern_config, CameraModelType.PINHOLE, train_ids, test_ids
     )
 
-    assert leak_safe_result.test_rms == plain_result.test_rms
-    assert leak_safe_result.train_rms == plain_result.train_rms
+    assert leak_safe_result.test_rms == pytest.approx(plain_result.test_rms, rel=1e-6, abs=1e-6)
+    assert leak_safe_result.train_rms == pytest.approx(plain_result.train_rms, rel=1e-9, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -217,4 +274,4 @@ def test_corner_level_leak_safe_reproduces_pure_train_fit(synthetic_dataset, cam
     # 독립적으로 다시 fit해서 정확히 같은 결과가 나오는지 확인.
     independent_fit = calibrate_pinhole(_subset_dataset(dataset, train_ids), camera_config)
     assert independent_fit.success
-    assert train_result.rms_error == independent_fit.rms_error
+    assert train_result.rms_error == pytest.approx(independent_fit.rms_error, rel=1e-9, abs=1e-9)

@@ -11,11 +11,18 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
 import pytest
 
-from app.cli import main
+from calibration.calibration_io import StandardCalibration, export_standard_json
+from calibration.types import CameraModelType
+from app.cli import _normalize_cli_args, build_arg_parser, main
 
 pytestmark = pytest.mark.slow
+
+IMG_W, IMG_H = 1920, 1080
+TRUE_K = np.array([[1100.0, 0.0, IMG_W / 2], [0.0, 1100.0, IMG_H / 2], [0.0, 0.0, 1.0]])
+TRUE_D = np.array([-0.28, 0.10, 0.0, 0.0, 0.0])
 
 
 def _base_pattern_args() -> list[str]:
@@ -267,6 +274,236 @@ def test_cli_export_json_and_csv(synthetic_distorted_dataset_dir, tmp_path):
     csv_content = (out_dir / "dataset.csv").read_text(encoding="utf-8")
     assert "image_id" in csv_content.splitlines()[0]
     assert len(csv_content.splitlines()) == 17  # 헤더 1줄 + 16장
+
+
+def test_cli_cross_dataset_validation_workflow(synthetic_distorted_dataset_dir, tmp_path):
+    out_dir = tmp_path / "out"
+    summary_path = tmp_path / "summary.json"
+    project_path = tmp_path / "session.ccproj"
+
+    exit_code = main([
+        "--images", synthetic_distorted_dataset_dir,
+        *_base_pattern_args(),
+        "--source-dataset-id", "DatasetA",
+        "--cross-dataset", f"DatasetB={synthetic_distorted_dataset_dir}",
+        "--export", "json", "report",
+        "--json-summary", str(summary_path),
+        "--save-project", str(project_path),
+        "--output-dir", str(out_dir),
+        "--quiet",
+    ])
+
+    assert exit_code == 0
+
+    payload = json.loads((out_dir / "calibration.json").read_text(encoding="utf-8"))
+    assert payload["cross_dataset_validation"]
+    assert {r["target_dataset_id"] for r in payload["cross_dataset_validation"]} == {"DatasetB"}
+    assert {r["source_dataset_id"] for r in payload["cross_dataset_validation"]} == {"DatasetA"}
+
+    html = (out_dir / "report.html").read_text(encoding="utf-8")
+    assert "Cross-Dataset Generalization" in html
+    assert "DatasetB" in html
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["cross_dataset_validation"]
+    assert summary["cross_dataset_validation"][0]["target_dataset_id"] == "DatasetB"
+
+    saved = json.loads(project_path.read_text(encoding="utf-8"))
+    assert saved["project"]["cross_dataset_results"]
+
+
+def test_cli_diagnostic_preset_enables_document_style_defaults():
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        "--images", "imgs",
+        *_base_pattern_args(),
+        "--diagnostic",
+    ])
+    args = _normalize_cli_args(args, parser)
+
+    assert args.kfold == 5
+    assert args.bootstrap_ci is True
+    assert args.n_bootstrap == 100
+    assert {"report", "json", "csv"}.issubset(set(args.export))
+
+
+def test_cli_document_style_aliases_map_to_internal_options():
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        "--input", "imgs",
+        *_base_pattern_args(),
+        "--models", "pinhole", "extended", "fisheye",
+        "--validate",
+        "--report",
+        "--cross-validation", "4",
+        "--bootstrap", "12",
+    ])
+    args = _normalize_cli_args(args, parser)
+
+    assert args.images == ["imgs"]
+    assert args.models == ["pinhole", "extended", "fisheye"]
+    assert args.validate is True
+    assert args.kfold == 4
+    assert args.bootstrap_ci is True
+    assert args.n_bootstrap == 12
+    assert "report" in args.export
+
+
+def test_cli_benchmark_aliases_activate_reference_candidate_mode():
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        "--reference", "ref.yaml",
+        "--candidate", "cand.yaml",
+        "--validation-dataset", "validation",
+        *_base_pattern_args(),
+        "--benchmark-report",
+        "--bootstrap", "12",
+    ])
+    args = _normalize_cli_args(args, parser)
+
+    assert args.benchmark_mode is True
+    assert args.reference == "ref.yaml"
+    assert args.candidate == "cand.yaml"
+    assert args.validation_dataset == ["validation"]
+    assert args.benchmark_report is True
+    assert args.bootstrap_ci is True
+    assert args.n_bootstrap == 12
+
+
+def test_cli_benchmark_reference_candidate_workflow_writes_outputs(
+    synthetic_distorted_dataset_dir, tmp_path,
+):
+    ref_path = tmp_path / "reference.json"
+    cand_path = tmp_path / "candidate.json"
+    out_dir = tmp_path / "benchmark_out"
+    summary_path = tmp_path / "benchmark_summary.json"
+
+    export_standard_json(
+        StandardCalibration(
+            label="Reference",
+            camera_matrix=TRUE_K.copy(),
+            distortion=TRUE_D.copy() * 0.0,
+            model_name=CameraModelType.EXTENDED_PINHOLE,
+            distortion_model="plumb_bob",
+            width=IMG_W,
+            height=IMG_H,
+        ),
+        str(ref_path),
+    )
+    export_standard_json(
+        StandardCalibration(
+            label="Candidate",
+            camera_matrix=TRUE_K.copy(),
+            distortion=TRUE_D.copy(),
+            model_name=CameraModelType.EXTENDED_PINHOLE,
+            distortion_model="plumb_bob",
+            width=IMG_W,
+            height=IMG_H,
+        ),
+        str(cand_path),
+    )
+
+    exit_code = main([
+        "--reference", str(ref_path),
+        "--candidate", str(cand_path),
+        "--validation-dataset", synthetic_distorted_dataset_dir,
+        *_base_pattern_args(),
+        "--output-dir", str(out_dir),
+        "--benchmark-report",
+        "--bootstrap", "10",
+        "--json-summary", str(summary_path),
+        "--quiet",
+    ])
+
+    assert exit_code == 0
+    result_path = out_dir / "benchmark_result.json"
+    report_path = out_dir / "benchmark_report.html"
+    assert result_path.exists()
+    assert report_path.exists()
+    assert summary_path.exists()
+
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    assert payload["benchmark_format_version"] == 1
+    assert payload["external"]["label"] == "Reference"
+    assert payload["mine"]["label"] == "Candidate"
+    assert payload["dataset"]["num_detected"] >= 10
+    assert payload["final_benchmark_rows"]
+    assert payload["winner_decision"]["status"] in {
+        "Candidate Preferred",
+        "Reference Preferred",
+        "Inconclusive",
+        "Insufficient Evidence",
+    }
+
+    html = report_path.read_text(encoding="utf-8")
+    assert "Calibration Benchmark Report" in html
+    assert "Final Report Summary" in html
+    assert "Performance Comparison" in html
+    assert "Statistical Evidence" in html
+    assert "Visual Evidence" in html
+    assert "Parameter Analysis" in html
+    assert "Model Analysis" in html
+    assert "FINAL VERDICT" in html
+    assert "One-line diagnosis" in html
+    assert "Final Benchmark Table" in html
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["mode"] == "benchmark"
+    assert summary["benchmark_result_json"] == str(result_path)
+
+
+def test_cli_models_single_alias_becomes_final_model():
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        "--input", "imgs",
+        *_base_pattern_args(),
+        "--models", "extended",
+    ])
+    args = _normalize_cli_args(args, parser)
+
+    assert args.model == "extended"
+
+
+def test_cli_model_must_be_inside_models_list():
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        "--images", "imgs",
+        *_base_pattern_args(),
+        "--models", "pinhole",
+        "--model", "fisheye",
+    ])
+
+    with pytest.raises(SystemExit):
+        _normalize_cli_args(args, parser)
+
+
+def test_cli_document_example_aliases_run_pipeline(synthetic_distorted_dataset_dir, tmp_path):
+    out_dir = tmp_path / "out"
+    exit_code = main([
+        "--input", synthetic_distorted_dataset_dir,
+        *_base_pattern_args(),
+        "--models", "pinhole", "extended", "fisheye",
+        "--validate",
+        "--report",
+        "--output-dir", str(out_dir),
+        "--quiet",
+    ])
+
+    assert exit_code == 0
+    assert (out_dir / "report.html").exists()
+
+
+def test_cli_cross_validation_alias_conflicts_with_different_kfold():
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        "--images", "imgs",
+        *_base_pattern_args(),
+        "--kfold", "3",
+        "--cross-validation", "5",
+    ])
+
+    with pytest.raises(SystemExit):
+        _normalize_cli_args(args, parser)
 
 
 def test_cli_glob_pattern_resolves_images(synthetic_distorted_dataset_dir, tmp_path):

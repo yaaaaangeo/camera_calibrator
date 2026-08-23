@@ -46,6 +46,7 @@ def calibrate_extended_pinhole(
     estimate_uncertainty_bootstrap: bool = False,
     n_bootstrap: int = 20,
     bootstrap_seed: int = 42,
+    bootstrap_jobs: int = 1,
 ) -> CalibrationResult:
     """Extended Pinhole (Brown-Conrady) 캘리브레이션 실행.
 
@@ -150,7 +151,7 @@ def calibrate_extended_pinhole(
         param_uncertainty_bootstrap = compute_parameter_bootstrap(
             object_points, image_points, image_size, CameraModelType.EXTENDED_PINHOLE,
             camera_matrix, dist_coeffs, flags=flags | cv2.CALIB_USE_INTRINSIC_GUESS,
-            n_bootstrap=n_bootstrap, rng_seed=bootstrap_seed,
+            n_bootstrap=n_bootstrap, rng_seed=bootstrap_seed, n_jobs=bootstrap_jobs,
         )
 
     return CalibrationResult(

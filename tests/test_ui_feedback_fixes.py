@@ -91,10 +91,14 @@ def test_result_view_table_has_no_complexity_row(qapp):
     from ui.result_view import ResultView
 
     view = ResultView()
-    assert view.table.rowCount() == 6
+    assert view.table.rowCount() == 14
     labels = [view.table.verticalHeaderItem(i).text() for i in range(view.table.rowCount())]
     assert "Complexity" not in labels
-    assert labels == ["Train RMS", "Test RMS", "Edge RMS", "Straightness", "Score", "Recommend"]
+    assert labels == [
+        "Train RMS", "Test RMS", "Test P95", "Edge RMS", "Straightness",
+        "Radial Edge", "AIC", "BIC", "Stability", "Observability",
+        "Undistortion", "Model Score", "Selection Conf.", "Recommend",
+    ]
     view.close()
 
 
@@ -112,6 +116,28 @@ def test_pattern_size_widgets_use_mm_and_convert_to_meters(qapp):
 
         assert abs(pattern_config.square_size - 0.04) < 1e-9
         assert abs(pattern_config.marker_size - 0.03) < 1e-9
+    finally:
+        win.close()
+
+
+def test_main_window_uses_documented_top_level_tabs(qapp):
+    from ui.main_window import MainWindow
+
+    win = MainWindow()
+    try:
+        labels = [win.tabs.tabText(i) for i in range(win.tabs.count())]
+        assert labels == [
+            "① Dataset",
+            "② Detection",
+            "③ Coverage",
+            "④ Calibration",
+            "⑤ Validation",
+            "⑥ Error Analysis",
+            "⑦ Stability",
+            "⑧ Model Comparison",
+            "⑨ Diagnosis",
+            "⑩ Export",
+        ]
     finally:
         win.close()
 
@@ -135,11 +161,13 @@ def test_model_status_label_warns_on_failed_model(qapp):
         assert not view.export_opencv_button.isEnabled()
         assert not view.export_ros_button.isEnabled()
         assert not view.export_report_button.isEnabled()
+        assert not view.cross_dataset_button.isEnabled()
         assert not view.outlier_button.isEnabled()
 
         view.select_model(CameraModelType.PINHOLE)
         assert "사용 가능" in view.model_status_label.text()
         assert view.export_opencv_button.isEnabled()
+        assert view.cross_dataset_button.isEnabled()
         assert view.outlier_button.isEnabled()
     finally:
         view.close()

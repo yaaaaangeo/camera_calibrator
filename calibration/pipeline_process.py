@@ -57,6 +57,7 @@ def run_models_and_validation(
     pattern_config: PatternConfig,
     test_ratio: float,
     use_rational_model: bool,
+    model_jobs: int = 2,
 ) -> tuple[dict[CameraModelType, CalibrationResult], dict[CameraModelType, ValidationResult]]:
     """3모델 계산(run_all_models) + Hold-out 검증(validate_all_models)을
     자식 프로세스 하나에서 이어서 실행한다.
@@ -69,7 +70,12 @@ def run_models_and_validation(
     from calibration.compare import run_all_models
     from calibration.validation import validate_all_models
 
-    results_list = run_all_models(dataset, camera_config, use_rational_model=use_rational_model)
+    results_list = run_all_models(
+        dataset,
+        camera_config,
+        use_rational_model=use_rational_model,
+        model_jobs=model_jobs,
+    )
     calibration_results = {r.model_name: r for r in results_list}
 
     validation_results = validate_all_models(
@@ -124,7 +130,7 @@ def run_outlier_pruning_and_validation(
     compute_frame_quality_scores(dataset, pattern_config, image_size, use_reprojection=False)
 
     calibration_results, validation_results = run_models_and_validation(
-        dataset, camera_config, pattern_config, test_ratio, use_rational_model,
+        dataset, camera_config, pattern_config, test_ratio, use_rational_model, model_jobs=2,
     )
 
     compute_frame_quality_scores(dataset, pattern_config, image_size, use_reprojection=True)

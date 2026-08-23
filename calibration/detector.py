@@ -2,7 +2,8 @@
 camera_calibrator.calibration.detector
 ========================================
 
-설계 문서 17번 Step2 - ChArUco Detection + 일반 체스보드(Chessboard) 검출.
+설계 문서 17번 Step2 - ChArUco Detection + 일반 체스보드(Chessboard) +
+AprilGrid(AprilTag grid) 검출.
 
 이미지(경로 또는 배열)를 받아 코너를 검출하고 DetectionResult를 채운다.
 UI 없이 이 모듈만으로 터미널에서 다음처럼 확인 가능해야 한다:
@@ -37,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
@@ -59,6 +61,44 @@ logger = logging.getLogger(__name__)
 
 # ChArUco 코너가 이 개수 미만이면 검출 성공이어도 경고 취급 (캘리브레이션에는 사용 가능)
 MIN_RECOMMENDED_CORNERS = 6
+
+_preprocess_cache_lock = threading.Lock()
+_preprocess_cache: dict[tuple[str, int, int], tuple[int, int, float, float, float, float, float, str]] = {}
+
+
+def _image_file_fingerprint(path: Path) -> tuple[str, int, int]:
+    try:
+        stat = path.stat()
+        return str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size)
+    except OSError:
+        return str(path), 0, -1
+
+
+def clear_image_preprocess_cache() -> None:
+    """테스트/장기 실행 UI에서 이미지 전처리 캐시를 명시적으로 비운다."""
+    with _preprocess_cache_lock:
+        _preprocess_cache.clear()
+
+
+def _preprocess_image_metadata(path: Path, img: np.ndarray) -> tuple[int, int, float, float, float, float, float, str]:
+    key = _image_file_fingerprint(path)
+    with _preprocess_cache_lock:
+        cached = _preprocess_cache.get(key)
+    if cached is not None:
+        return cached
+
+    h, w = img.shape[:2]
+    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    sharpness = float(cv2.Laplacian(gray_img, cv2.CV_64F).var())
+    brightness = float(gray_img.mean())
+    contrast = compute_contrast(gray_img)
+    saturation = compute_saturation(gray_img)
+    motion_blur_score = compute_motion_blur_score(gray_img)
+    phash = compute_phash(gray_img)
+    value = (w, h, sharpness, brightness, contrast, saturation, motion_blur_score, phash)
+    with _preprocess_cache_lock:
+        _preprocess_cache[key] = value
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +157,51 @@ def build_charuco_detector(
         detectorParams=detector_params,
         refineParams=refine_params,
     )
+
+
+def build_aprilgrid_dictionary(pattern: PatternConfig) -> cv2.aruco.Dictionary:
+    """PatternConfig -> AprilGrid용 OpenCV AprilTag dictionary.
+
+    이 프로젝트의 AprilGrid는 Kalibr 계열 보드처럼 marker ID가 row-major
+    순서(왼쪽 위 0번, 오른쪽으로 증가, 다음 줄로 이동)로 배치된다는 관례를
+    따른다. squares_x/y는 태그 개수, square_size는 태그 origin 사이 간격,
+    marker_size는 실제 태그 한 변 길이다.
+    """
+    if pattern.type != PatternType.APRILGRID:
+        raise ValueError(
+            f"build_aprilgrid_dictionary는 APRILGRID 패턴만 지원합니다. 입력: {pattern.type}"
+        )
+    if not pattern.marker_size:
+        raise ValueError("AprilGrid 패턴은 marker_size가 반드시 필요합니다.")
+    if pattern.marker_size >= pattern.square_size:
+        raise ValueError("AprilGrid marker_size는 square_size보다 작아야 합니다.")
+    if not pattern.dictionary:
+        raise ValueError("AprilGrid 패턴은 dictionary가 반드시 필요합니다. 예: 'DICT_APRILTAG_36h11'")
+    if not str(pattern.dictionary).startswith("DICT_APRILTAG_"):
+        raise ValueError(
+            "AprilGrid 패턴은 OpenCV AprilTag dictionary가 필요합니다 "
+            "(예: DICT_APRILTAG_36h11)."
+        )
+
+    dict_id = getattr(cv2.aruco, pattern.dictionary, None)
+    if dict_id is None:
+        raise ValueError(f"알 수 없는 AprilTag dictionary: {pattern.dictionary}")
+    return cv2.aruco.getPredefinedDictionary(dict_id)
+
+
+def build_aprilgrid_detector(
+    aruco_dict: cv2.aruco.Dictionary,
+) -> Optional[cv2.aruco.ArucoDetector]:
+    """AprilGrid 마커 검출기 생성.
+
+    OpenCV 4.7+는 ArucoDetector를 제공한다. 혹시 더 오래된 API로 실행되는
+    환경에서는 detect_aprilgrid()에서 cv2.aruco.detectMarkers fallback을 쓴다.
+    """
+    if not hasattr(cv2.aruco, "ArucoDetector"):
+        return None
+    detector_params = cv2.aruco.DetectorParameters()
+    detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    return cv2.aruco.ArucoDetector(aruco_dict, detector_params)
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +307,7 @@ def detect_image_file(
     """파일 경로를 받아 ImageInfo + DetectionResult를 함께 반환.
 
     detect_fn(image_array, image_id) -> DetectionResult 형태의 콜백을 받는다 -
-    ChArUco든 체스보드든(또는 나중에 추가될 다른 패턴이든) 이 함수는 몰라도
+    ChArUco든 체스보드든 AprilGrid든 이 함수는 몰라도
     되게 분리했다. 파일이 없거나 읽을 수 없는 경우에도 예외를 던지지 않고
     success=False DetectionResult를 반환한다 (파이프라인이 한 장 때문에 죽지 않도록).
     """
@@ -240,16 +325,12 @@ def detect_image_file(
         )
         return info, result
 
-    h, w = img.shape[:2]
-    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    sharpness = float(cv2.Laplacian(gray_img, cv2.CV_64F).var())
-    brightness = float(gray_img.mean())
-    # 설계 문서 3-1번 - contrast/saturation(clipping)/motion blur/phash 추가 계산.
-    # 전부 image_quality.py에 정의된 순수 함수라 이 파일은 "어디서 부르는지"만 안다.
-    contrast = compute_contrast(gray_img)
-    saturation = compute_saturation(gray_img)
-    motion_blur_score = compute_motion_blur_score(gray_img)
-    phash = compute_phash(gray_img)
+    # 설계 문서 3-1번 이미지 품질 전처리는 같은 파일을 반복 검출할 때
+    # 재사용한다. 검출 자체는 pattern/알고리즘에 따라 달라질 수 있어 캐시하지
+    # 않고, 파일 내용에만 의존하는 이미지 메타만 캐시한다.
+    w, h, sharpness, brightness, contrast, saturation, motion_blur_score, phash = (
+        _preprocess_image_metadata(path, img)
+    )
 
     info = ImageInfo(
         image_id=image_id,
@@ -377,6 +458,101 @@ def detect_chessboard(
     )
 
 
+def detect_aprilgrid(
+    image: np.ndarray,
+    pattern: PatternConfig,
+    image_id: str,
+    aruco_dict: Optional[cv2.aruco.Dictionary] = None,
+    detector: Optional[cv2.aruco.ArucoDetector] = None,
+) -> DetectionResult:
+    """이미 메모리에 로드된 이미지에 대해 AprilGrid(AprilTag grid) 검출 수행.
+
+    OpenCV의 AprilTag dictionary 기반 ArUco detector를 사용하고, 검출된 marker
+    ID를 row-major AprilGrid 좌표로 변환한다. marker ID가 보드 범위를 벗어나면
+    해당 태그는 무시한다.
+    """
+    if aruco_dict is None:
+        aruco_dict = build_aprilgrid_dictionary(pattern)
+
+    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if detector is not None:
+        marker_corners, marker_ids, _rejected = detector.detectMarkers(gray)
+    else:
+        marker_corners, marker_ids, _rejected = cv2.aruco.detectMarkers(gray, aruco_dict)
+
+    if marker_ids is None or len(marker_ids) == 0:
+        return DetectionResult(
+            image_id=image_id,
+            success=False,
+            num_corners=0,
+            failure_reason=(
+                "AprilTag 마커가 하나도 검출되지 않음 "
+                "(dictionary/조명/초점/보드 크기 확인 필요)"
+            ),
+        )
+
+    total_tags = pattern.squares_x * pattern.squares_y
+    image_points: list[np.ndarray] = []
+    object_points: list[np.ndarray] = []
+    corner_ids: list[int] = []
+    valid_marker_count = 0
+
+    for corners, raw_id in zip(marker_corners, marker_ids.reshape(-1)):
+        marker_id = int(raw_id)
+        if marker_id < 0 or marker_id >= total_tags:
+            continue
+
+        row = marker_id // pattern.squares_x
+        col = marker_id % pattern.squares_x
+        x0 = col * pattern.square_size
+        y0 = row * pattern.square_size
+        size = float(pattern.marker_size)
+        marker_obj = np.array(
+            [
+                [x0, y0, 0.0],
+                [x0 + size, y0, 0.0],
+                [x0 + size, y0 + size, 0.0],
+                [x0, y0 + size, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        image_points.append(corners.reshape(4, 2).astype(np.float32))
+        object_points.append(marker_obj)
+        corner_ids.extend(marker_id * 4 + i for i in range(4))
+        valid_marker_count += 1
+
+    if not image_points:
+        return DetectionResult(
+            image_id=image_id,
+            success=False,
+            num_corners=0,
+            failure_reason=(
+                f"AprilTag는 검출됐지만 보드 범위 ID(0~{total_tags - 1})에 해당하는 "
+                "마커가 없습니다. AprilGrid ID 배치를 확인하세요."
+            ),
+        )
+
+    corners = np.concatenate(image_points, axis=0).reshape(-1, 1, 2)
+    obj = np.concatenate(object_points, axis=0).reshape(-1, 1, 3)
+    ids = np.asarray(corner_ids, dtype=np.int32).reshape(-1, 1)
+    area_ratio, center_px, tilt_deg, min_edge_margin_px = _compute_board_geometry(corners, gray.shape[:2])
+    corner_confidence = float(min(1.0, valid_marker_count / max(1, total_tags)))
+
+    return DetectionResult(
+        image_id=image_id,
+        success=True,
+        corners=corners,
+        object_points=obj,
+        ids=ids,
+        num_corners=int(corners.shape[0]),
+        board_area_ratio=area_ratio,
+        board_center_px=center_px,
+        board_tilt_deg=tilt_deg,
+        corner_confidence=corner_confidence,
+        min_edge_margin_px=min_edge_margin_px,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 데이터셋 전체 검출
 # ---------------------------------------------------------------------------
@@ -394,11 +570,13 @@ def build_detect_fn(pattern: PatternConfig) -> Callable[[np.ndarray, str], Detec
         return lambda img, image_id: detect_charuco(img, board, image_id=image_id, detector=detector)
     if pattern.type == PatternType.CHESSBOARD:
         return lambda img, image_id: detect_chessboard(img, pattern, image_id=image_id)
-    # PatternType에는 향후 확장을 위해 미리 정의만 해 둔 값이 있을 수 있다
-    # (예: APRILGRID) - 실제 검출 로직이 붙기 전까지는 특정 이름을 언급하지
-    # 않고 여기서 일괄적으로 막는다. 특정 패턴 이름을 하드코딩해서 언급하면
-    # PatternType이 바뀔 때 메시지가 실제와 어긋나기 쉽다.
-    supported = (PatternType.CHARUCO, PatternType.CHESSBOARD)
+    if pattern.type == PatternType.APRILGRID:
+        aruco_dict = build_aprilgrid_dictionary(pattern)
+        detector = build_aprilgrid_detector(aruco_dict)
+        return lambda img, image_id: detect_aprilgrid(
+            img, pattern, image_id=image_id, aruco_dict=aruco_dict, detector=detector
+        )
+    supported = (PatternType.CHARUCO, PatternType.CHESSBOARD, PatternType.APRILGRID)
     raise ValueError(
         f"현재 지원하는 패턴 타입은 {', '.join(p.value for p in supported)}뿐입니다 "
         f"(입력: {pattern.type.value}). 검출 로직이 아직 구현되지 않았습니다."
@@ -415,7 +593,7 @@ def detect_dataset(
     """이미지 경로 리스트 전체를 검출해 Dataset(Frame 리스트)으로 반환.
 
     UI 없이 이 함수 하나로 2단계 목표(검출 파이프라인 안정화)를 검증할 수 있다.
-    패턴 타입(ChArUco/체스보드)에 따라 알맞은 검출 함수로 분기한다 - 이 함수
+    패턴 타입(ChArUco/체스보드/AprilGrid)에 따라 알맞은 검출 함수로 분기한다 - 이 함수
     호출부(quality.py, compare.py 등)는 어느 패턴이었는지 몰라도 된다.
 
     기본은 순차 처리다(기존 동작과 완전히 동일, 테스트 결과도 그대로 재현됨).
