@@ -163,7 +163,7 @@ def test_ground_truth_external_params_beat_a_deliberately_underfit_model(
 
     train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio=0.3, seed=42)
     test_frames = _subset_dataset(dataset, test_ids).enabled_frames
-    per_frame_error, _ = _test_reprojection_errors(test_frames, K_bad, D_bad, CameraModelType.PINHOLE)
+    per_frame_error, _, _ = _test_reprojection_errors(test_frames, K_bad, D_bad, CameraModelType.PINHOLE)
     bad_test_rms = float(np.sqrt(np.mean(np.array(list(per_frame_error.values())) ** 2)))
 
     fake_my_validation = ValidationResult(

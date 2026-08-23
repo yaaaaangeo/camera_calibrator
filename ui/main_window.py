@@ -48,6 +48,7 @@ from calibration.types import (
     ValidationResult,
 )
 from calibration.recommender import compute_final_result
+from calibration.sanity_check import run_sanity_checks
 from calibration.quality import coverage_percentage
 from calibration.rosbag_reader import list_image_topics
 from calibration.ros_live import ROS_LIVE_BACKEND
@@ -468,6 +469,7 @@ class MainWindow(QMainWindow):
     def _on_dataset_ready(self, dataset: Dataset) -> None:
         self.dataset = dataset
         self.dataset_view.set_dataset(dataset)
+        self.coverage_view.set_dataset_quality_score(dataset.quality_score)
 
     def _on_quality_ready(self, warnings: list[str]) -> None:
         if self.dataset is None:
@@ -481,6 +483,10 @@ class MainWindow(QMainWindow):
             self.dataset_view.set_dataset(self.dataset)  # per_frame_error 채워졌으니 갱신
             if self.pattern_config is not None:
                 self.straightness_view.set_context(self.dataset, self.camera_config, results, self.pattern_config)
+            # 설계 문서 8번 - 3모델 계산이 끝날 때마다 sanity check도 함께 갱신한다
+            # (RMS가 낮아 보여도 결과가 물리적으로 이상할 수 있으므로 항상 확인).
+            checks = run_sanity_checks(list(results.values()), self.camera_config)
+            self.result_view.set_sanity_checks(checks)
         self.radial_profile_view.set_results(results)
         self._refresh_result_view()
 
@@ -657,6 +663,7 @@ class MainWindow(QMainWindow):
         """
         self.dataset = dataset
         self.dataset_view.set_dataset(dataset)
+        self.coverage_view.set_dataset_quality_score(dataset.quality_score)
 
     # ------------------------------------------------------------------
     # Export

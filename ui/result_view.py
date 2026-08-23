@@ -71,6 +71,14 @@ class ResultView(QWidget):
         compare_layout.addWidget(self.recommendation_label)
         layout.addWidget(compare_group)
 
+        # --- Sanity Check (설계 문서 8번) ---
+        sanity_group = QGroupBox("Sanity Check")
+        sanity_layout = QVBoxLayout(sanity_group)
+        self.sanity_label = QLabel("아직 계산되지 않았습니다.")
+        self.sanity_label.setWordWrap(True)
+        sanity_layout.addWidget(self.sanity_label)
+        layout.addWidget(sanity_group)
+
         # --- Outlier ---
         outlier_group = QGroupBox("Outlier")
         outlier_layout = QVBoxLayout(outlier_group)
@@ -210,6 +218,32 @@ class ResultView(QWidget):
                 self.table.setItem(row, col, QTableWidgetItem(value))
 
         self._update_model_status()
+
+    def set_sanity_checks(self, checks: list) -> None:
+        """설계 문서 8번 - 모델별 sanity check 결과를 요약해서 보여준다.
+        checks: list[calibration.sanity_check.SanityCheckResult]
+        """
+        if not checks:
+            self.sanity_label.setText("아직 계산되지 않았습니다.")
+            self.sanity_label.setStyleSheet("")
+            return
+        if not any(c.issues for c in checks):
+            self.sanity_label.setText("✓ 모든 모델 이상 없음 (fx/fy, principal point, aspect ratio, distortion, FOV, RMS)")
+            self.sanity_label.setStyleSheet("color: #2e7d32;")
+            return
+        lines = []
+        has_error = False
+        for c in checks:
+            if not c.issues:
+                continue
+            if c.has_errors:
+                has_error = True
+            label = c.model_name.value if hasattr(c.model_name, "value") else str(c.model_name)
+            for issue in c.issues:
+                mark = "✖" if issue.severity.value == "error" else "⚠"
+                lines.append(f"{mark} [{label}] {issue.message}")
+        self.sanity_label.setText("\n".join(lines))
+        self.sanity_label.setStyleSheet("color: #c62828;" if has_error else "color: #ef6c00;")
 
     def set_recommendation_message(self, message: str) -> None:
         self.recommendation_label.setText(message)

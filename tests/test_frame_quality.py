@@ -15,7 +15,10 @@ import numpy as np
 import pytest
 
 from calibration.frame_quality import (
+    compute_dataset_quality_score,
     compute_frame_quality_scores,
+    format_dataset_quality_score,
+    format_frame_quality_breakdown,
     format_frame_quality_table,
     max_possible_corners,
 )
@@ -150,3 +153,83 @@ def test_format_frame_quality_table_no_crash(quality_test_frames, pattern_config
     compute_frame_quality_scores(dataset, pattern_config, (W, H), use_reprojection=False)
     table = format_frame_quality_table(dataset)
     assert "Score" in table or "Excellent" in table or len(table) > 0
+
+
+# ---------------------------------------------------------------------------
+# 설계 문서 4번 - breakdown 필드 + Overall Dataset Score
+# ---------------------------------------------------------------------------
+
+def test_frame_quality_breakdown_fields_are_populated(quality_test_frames, pattern_config):
+    dataset = Dataset(frames=quality_test_frames)
+    compute_frame_quality_scores(dataset, pattern_config, (W, H), use_reprojection=False)
+
+    for f in quality_test_frames:
+        q = f.quality
+        assert q.blur_score is not None
+        assert q.exposure_score is not None
+        assert q.corner_quality_score is not None
+        assert q.board_area_score is not None
+        assert q.edge_coverage_score is not None
+        assert 0 <= q.blur_score <= 100
+        assert 0 <= q.exposure_score <= 100
+
+
+def test_blurry_frame_has_low_blur_score(quality_test_frames, pattern_config):
+    dataset = Dataset(frames=quality_test_frames)
+    compute_frame_quality_scores(dataset, pattern_config, (W, H), use_reprojection=False)
+    by_id = {f.image_info.image_id: f.quality for f in quality_test_frames}
+    assert by_id["blurry"].blur_score < by_id["good_01"].blur_score
+
+
+def test_dark_frame_has_low_exposure_score(quality_test_frames, pattern_config):
+    dataset = Dataset(frames=quality_test_frames)
+    compute_frame_quality_scores(dataset, pattern_config, (W, H), use_reprojection=False)
+    by_id = {f.image_info.image_id: f.quality for f in quality_test_frames}
+    assert by_id["dark"].exposure_score < by_id["good_01"].exposure_score
+
+
+def test_format_frame_quality_breakdown_matches_doc_example_shape(quality_test_frames, pattern_config):
+    dataset = Dataset(frames=quality_test_frames)
+    compute_frame_quality_scores(dataset, pattern_config, (W, H), use_reprojection=False)
+    text = format_frame_quality_breakdown(quality_test_frames[0])
+    for label in ("Blur", "Exposure", "Corner Quality", "Board Area", "Edge Coverage", "Total"):
+        assert label in text
+
+
+def test_format_frame_quality_breakdown_handles_missing_quality():
+    frame = Frame(image_info=ImageInfo(image_id="none", path="-", width=W, height=H))
+    text = format_frame_quality_breakdown(frame)
+    assert "none" in text
+
+
+def test_compute_dataset_quality_score_reflects_frame_quality(quality_test_frames, pattern_config):
+    dataset = Dataset(frames=quality_test_frames)
+    compute_frame_quality_scores(dataset, pattern_config, (W, H), use_reprojection=False)
+
+    score = compute_dataset_quality_score(dataset, coverage_pct=80.0, duplicate_ratio=0.0)
+    assert 0 <= score.overall <= 100
+    assert score.avg_frame_quality > 0
+    assert score.detection_success_rate == 100.0  # 전부 성공 프레임
+
+
+def test_duplicate_penalty_lowers_overall_score(quality_test_frames, pattern_config):
+    dataset = Dataset(frames=quality_test_frames)
+    compute_frame_quality_scores(dataset, pattern_config, (W, H), use_reprojection=False)
+
+    no_dup = compute_dataset_quality_score(dataset, coverage_pct=80.0, duplicate_ratio=0.0)
+    with_dup = compute_dataset_quality_score(dataset, coverage_pct=80.0, duplicate_ratio=0.5)
+    assert with_dup.overall < no_dup.overall
+
+
+def test_empty_dataset_quality_score_is_zero():
+    score = compute_dataset_quality_score(Dataset(frames=[]))
+    assert score.overall == 0.0
+    assert score.avg_frame_quality == 0.0
+
+
+def test_format_dataset_quality_score_no_crash(quality_test_frames, pattern_config):
+    dataset = Dataset(frames=quality_test_frames)
+    compute_frame_quality_scores(dataset, pattern_config, (W, H), use_reprojection=False)
+    score = compute_dataset_quality_score(dataset, coverage_pct=80.0)
+    text = format_dataset_quality_score(score)
+    assert "Total" in text

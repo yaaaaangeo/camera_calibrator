@@ -55,8 +55,9 @@ def test_html_report_contains_all_sections(camera_config, pattern_config):
         "2. Dataset",
         "3. Model Comparison",
         "4. Chosen Model Detail",
-        "5. Outlier",
-        "6. Overall Quality",
+        "5. Sanity Check",
+        "6. Outlier",
+        "7. Overall Quality",
         "Extended Pinhole",
     ]:
         assert expected in html, f"리포트에 '{expected}' 섹션이 없음"

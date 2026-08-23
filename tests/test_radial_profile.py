@@ -12,7 +12,14 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from calibration.radial_profile import compute_radial_error_profile, format_radial_profile
+from calibration.radial_profile import (
+    compute_radial_error_bands,
+    compute_radial_error_profile,
+    format_radial_bands,
+    format_radial_curve,
+    format_radial_profile,
+    radial_error_curve,
+)
 from calibration.types import CameraModelType, DetectionResult, Frame, FrameStatus, ImageInfo
 
 W, H = 1920, 1080
@@ -97,3 +104,99 @@ def test_format_radial_profile_no_crash():
     )
     text = format_radial_profile(profile)
     assert len(text) > 0
+
+
+# ---------------------------------------------------------------------------
+# 설계 문서 14번 - Radial Error 분석 강화 (Center~Corner 6단계 대역)
+# ---------------------------------------------------------------------------
+
+def test_bins_have_full_statistics():
+    """compute_radial_error_profile()의 각 bin이 mean/median/rms/p95/max를
+    전부 채워야 한다 - 이제 mean_error 하나만 계산하던 시절과 다르다."""
+    frames, K_est, D_est, rvecs_est, tvecs_est = _build_synthetic_pinhole_mismatch_frames()
+    profile = compute_radial_error_profile(
+        frames, rvecs_est, tvecs_est, K_est, D_est, (W, H), CameraModelType.PINHOLE, num_bins=6
+    )
+    populated = [b for b in profile.bins if b.num_points > 0]
+    assert populated
+    for b in populated:
+        assert b.mean_error is not None
+        assert b.median_error is not None
+        assert b.rms_error is not None
+        assert b.p95_error is not None
+        assert b.max_error is not None
+        # RMS는 항상 mean 이상이어야 한다 (RMS >= |mean| 부등식, 오차가 모두 양수이므로)
+        assert b.rms_error >= b.mean_error - 1e-9
+
+
+def test_compute_radial_error_bands_has_six_named_bands():
+    frames, K_est, D_est, rvecs_est, tvecs_est = _build_synthetic_pinhole_mismatch_frames()
+    bands = compute_radial_error_bands(frames, rvecs_est, tvecs_est, K_est, D_est, (W, H), CameraModelType.PINHOLE)
+    assert len(bands.bins) == 6
+    assert [b.label for b in bands.bins] == ["Center", "Inner", "Middle", "Outer", "Edge", "Corner"]
+
+
+def test_radial_error_bands_boundaries_are_contiguous_and_increasing():
+    frames, K_est, D_est, rvecs_est, tvecs_est = _build_synthetic_pinhole_mismatch_frames()
+    bands = compute_radial_error_bands(frames, rvecs_est, tvecs_est, K_est, D_est, (W, H), CameraModelType.PINHOLE)
+    for prev, cur in zip(bands.bins, bands.bins[1:]):
+        assert prev.radius_max == cur.radius_min
+    assert bands.bins[0].radius_min == 0.0
+    assert bands.bins[-1].radius_max == bands.max_radius
+
+
+def test_radial_error_bands_empty_input_returns_empty():
+    bands = compute_radial_error_bands([], [], [], TRUE_K, TRUE_D, (W, H), CameraModelType.PINHOLE)
+    assert bands.bins == []
+
+
+def test_format_radial_bands_includes_all_band_names():
+    frames, K_est, D_est, rvecs_est, tvecs_est = _build_synthetic_pinhole_mismatch_frames()
+    bands = compute_radial_error_bands(frames, rvecs_est, tvecs_est, K_est, D_est, (W, H), CameraModelType.PINHOLE)
+    text = format_radial_bands(bands)
+    for label in ("Center", "Inner", "Middle", "Outer", "Edge", "Corner", "Mean", "Median", "RMS", "P95", "Max"):
+        assert label in text
+
+
+def test_format_radial_bands_handles_empty():
+    text = format_radial_bands(compute_radial_error_bands([], [], [], TRUE_K, TRUE_D, (W, H), CameraModelType.PINHOLE))
+    assert "없습니다" in text
+
+
+def test_radial_error_curve_returns_points_sorted_by_radius():
+    frames, K_est, D_est, rvecs_est, tvecs_est = _build_synthetic_pinhole_mismatch_frames()
+    profile = compute_radial_error_profile(
+        frames, rvecs_est, tvecs_est, K_est, D_est, (W, H), CameraModelType.PINHOLE, num_bins=6
+    )
+    points = radial_error_curve(profile)
+    assert points
+    radii = [r for r, _ in points]
+    assert radii == sorted(radii)
+
+
+def test_radial_error_curve_supports_alternate_metrics():
+    frames, K_est, D_est, rvecs_est, tvecs_est = _build_synthetic_pinhole_mismatch_frames()
+    profile = compute_radial_error_profile(
+        frames, rvecs_est, tvecs_est, K_est, D_est, (W, H), CameraModelType.PINHOLE, num_bins=6
+    )
+    p95_points = radial_error_curve(profile, metric="p95_error")
+    mean_points = radial_error_curve(profile, metric="mean_error")
+    assert len(p95_points) == len(mean_points)
+    # P95는 정의상 mean보다 항상 크거나 같아야 한다
+    for (_, p95v), (_, meanv) in zip(p95_points, mean_points):
+        assert p95v >= meanv - 1e-9
+
+
+def test_format_radial_curve_no_crash():
+    frames, K_est, D_est, rvecs_est, tvecs_est = _build_synthetic_pinhole_mismatch_frames()
+    profile = compute_radial_error_profile(
+        frames, rvecs_est, tvecs_est, K_est, D_est, (W, H), CameraModelType.PINHOLE, num_bins=6
+    )
+    text = format_radial_curve(profile)
+    assert "Radius -> Error Curve" in text
+
+
+def test_format_radial_curve_handles_empty():
+    from calibration.types import RadialErrorProfile
+    text = format_radial_curve(RadialErrorProfile(bins=[], max_radius=0.0))
+    assert "없습니다" in text

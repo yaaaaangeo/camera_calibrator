@@ -42,7 +42,9 @@ from calibration.types import (
 )
 from calibration.detector import detect_dataset
 from calibration.quality import analyze_dataset_quality
-from calibration.frame_quality import compute_frame_quality_scores
+from calibration.frame_quality import compute_frame_quality_scores, compute_dataset_quality_score
+from calibration.image_quality import evaluate_dataset_image_quality
+from calibration.quality import coverage_percentage
 from calibration.models.common import infer_image_size
 from calibration.recommender import compute_model_scores, build_recommendation_message
 from calibration.self_check import run_all_self_checks
@@ -143,6 +145,19 @@ class PipelineWorker(QObject):
             compute_frame_quality_scores(
                 dataset, self.pattern_config, image_size, use_reprojection=True
             )
+            # 설계 문서 4번 - Overall Dataset Score. 개별 프레임 점수(방금 갱신됨)
+            # + coverage + 다양성 + 중복 이미지 비율을 하나로 요약해 Dataset에 저장한다.
+            _, duplicate_groups = evaluate_dataset_image_quality(dataset)
+            dup_ratio = (
+                sum(len(g.image_ids) for g in duplicate_groups) / dataset.num_total
+                if dataset.num_total > 0 else 0.0
+            )
+            dataset.quality_score = compute_dataset_quality_score(
+                dataset,
+                coverage_pct=coverage_percentage(dataset.coverage_grid) if dataset.coverage_grid else None,
+                duplicate_ratio=dup_ratio,
+            )
+            self.dataset_ready.emit(dataset)
             self.models_ready.emit(calibration_results)
             self.validation_ready.emit(validation_results)
 
@@ -229,6 +244,17 @@ class OutlierPruneWorker(QObject):
 
             self.progress.emit("Coverage Map 재분석 중...")
             self.quality_ready.emit(warnings)
+            # 설계 문서 4번 - 이상치 제거로 데이터셋이 바뀌었으니 Dataset Score도 재계산.
+            _, duplicate_groups = evaluate_dataset_image_quality(self.dataset)
+            dup_ratio = (
+                sum(len(g.image_ids) for g in duplicate_groups) / self.dataset.num_total
+                if self.dataset.num_total > 0 else 0.0
+            )
+            self.dataset.quality_score = compute_dataset_quality_score(
+                self.dataset,
+                coverage_pct=coverage_percentage(self.dataset.coverage_grid) if self.dataset.coverage_grid else None,
+                duplicate_ratio=dup_ratio,
+            )
             self.dataset_updated.emit(self.dataset)
 
             self.models_ready.emit(calibration_results)

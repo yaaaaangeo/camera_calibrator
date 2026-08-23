@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from calibration.types import CoverageCell, DiversityScores
+from calibration.types import CoverageCell, DatasetQualityScore, DiversityScores
 
 
 def _score_to_color(score: float) -> QColor:
@@ -148,6 +148,14 @@ class CoverageView(QWidget):
         diversity_layout.addWidget(self.diversity_widget)
         layout.addWidget(diversity_group)
 
+        # 설계 문서 4번 - Overall Dataset Score
+        score_group = QGroupBox("Overall Dataset Score")
+        score_layout = QVBoxLayout(score_group)
+        self.dataset_score_label = QLabel("아직 계산되지 않았습니다.")
+        self.dataset_score_label.setWordWrap(True)
+        score_layout.addWidget(self.dataset_score_label)
+        layout.addWidget(score_group)
+
         warning_group = QGroupBox("경고")
         warning_layout = QVBoxLayout(warning_group)
         self.warning_list = QListWidget()
@@ -169,3 +177,16 @@ class CoverageView(QWidget):
             self.warning_list.addItems(warnings)
         else:
             self.warning_list.addItem("경고 없음 (커버리지 양호)")
+
+    def set_dataset_quality_score(self, score: DatasetQualityScore | None) -> None:
+        if score is None:
+            self.dataset_score_label.setText("아직 계산되지 않았습니다.")
+            return
+        self.dataset_score_label.setText(
+            f"Total: {score.overall:.1f} ({score.grade.value})\n"
+            f"Avg Frame Quality {score.avg_frame_quality:.1f}  |  "
+            f"Detection Rate {score.detection_success_rate:.1f}%  |  "
+            f"Coverage {score.coverage_score:.1f}  |  "
+            f"Pose Diversity {score.diversity_score:.1f}  |  "
+            f"Duplicate Penalty -{score.duplicate_penalty:.1f}"
+        )

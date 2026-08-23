@@ -11,8 +11,15 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import pytest
 
-from calibration.straightness import compute_straightness_residual, format_straightness_summary
+from calibration.straightness import (
+    compute_straightness_breakdown,
+    compute_straightness_residual,
+    format_straightness_breakdown,
+    format_straightness_summary,
+    _classify_position,
+)
 from calibration.types import CameraModelType, DetectionResult, Frame, FrameStatus, ImageInfo
 
 W, H = 1920, 1080
@@ -103,3 +110,80 @@ def test_insufficient_points_returns_none(pattern_config):
 def test_format_straightness_summary_no_crash():
     assert "px" in format_straightness_summary(0.42, 10)
     assert format_straightness_summary(None, 0) is not None
+
+
+# ---------------------------------------------------------------------------
+# 설계 문서 15번 - Line Straightness 평가 강화 (방향/위치별 분해)
+# ---------------------------------------------------------------------------
+
+class TestClassifyPosition:
+    def test_middle_index_is_center(self):
+        assert _classify_position(3, 7) == "center"
+
+    def test_first_index_is_edge(self):
+        assert _classify_position(0, 7) == "edge"
+
+    def test_last_index_is_edge(self):
+        assert _classify_position(6, 7) == "edge"
+
+    def test_tiny_total_is_always_edge(self):
+        assert _classify_position(0, 2) == "edge"
+        assert _classify_position(1, 1) == "edge"
+
+
+class TestComputeStraightnessBreakdown:
+    def test_overall_matches_scalar_residual(self, pattern_config):
+        """breakdown.overall_error는 항상 compute_straightness_residual()과
+        정확히 같아야 한다 - 두 함수가 같은 라인 수집 로직을 공유하기 때문."""
+        frame = _synthetic_charuco_frame(pattern_config)
+        scalar_residual, n_lines = compute_straightness_residual(
+            [frame], pattern_config, TRUE_K, TRUE_D, CameraModelType.PINHOLE
+        )
+        breakdown = compute_straightness_breakdown(
+            [frame], pattern_config, TRUE_K, TRUE_D, CameraModelType.PINHOLE
+        )
+        assert breakdown.overall_error == pytest.approx(scalar_residual)
+        assert breakdown.num_lines == n_lines
+
+    def test_breakdown_has_horizontal_and_vertical(self, pattern_config):
+        frame = _synthetic_charuco_frame(pattern_config)
+        breakdown = compute_straightness_breakdown(
+            [frame], pattern_config, TRUE_K, TRUE_D, CameraModelType.PINHOLE
+        )
+        assert breakdown.horizontal_error is not None
+        assert breakdown.vertical_error is not None
+        assert breakdown.num_lines > 0
+
+    def test_empty_frames_returns_zero_lines(self, pattern_config):
+        breakdown = compute_straightness_breakdown([], pattern_config, TRUE_K, TRUE_D, CameraModelType.PINHOLE)
+        assert breakdown.num_lines == 0
+        assert breakdown.overall_error is None
+
+    def test_wrong_distortion_gives_worse_edge_than_correct_distortion(self, pattern_config):
+        """왜곡 계수를 아예 0으로 두고(보정 안 한 것과 같음) 계산하면, 실제
+        계수로 계산했을 때보다 edge_line_error가 더 나빠야(커야) 한다 -
+        방사 왜곡은 외곽에서 더 심하게 나타나기 때문."""
+        frame = _synthetic_charuco_frame(pattern_config)
+        correct = compute_straightness_breakdown(
+            [frame], pattern_config, TRUE_K, TRUE_D, CameraModelType.PINHOLE
+        )
+        wrong = compute_straightness_breakdown(
+            [frame], pattern_config, TRUE_K, ZERO_D, CameraModelType.PINHOLE
+        )
+        assert wrong.edge_line_error > correct.edge_line_error
+
+
+class TestFormatStraightnessBreakdown:
+    def test_includes_all_categories(self, pattern_config):
+        frame = _synthetic_charuco_frame(pattern_config)
+        breakdown = compute_straightness_breakdown(
+            [frame], pattern_config, TRUE_K, TRUE_D, CameraModelType.PINHOLE
+        )
+        text = format_straightness_breakdown(breakdown)
+        for label in ("Horizontal", "Vertical", "Diagonal", "Center line", "Edge line", "Corner line", "Overall"):
+            assert label in text
+
+    def test_handles_empty(self):
+        from calibration.types import StraightnessBreakdown
+        text = format_straightness_breakdown(StraightnessBreakdown(num_lines=0))
+        assert "부족합니다" in text
