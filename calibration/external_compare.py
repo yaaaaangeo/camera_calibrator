@@ -132,7 +132,7 @@ def _evaluate_side(
             success=False, error_message="비교할 프레임이 없습니다.",
         )
 
-    per_frame_error, failed = _test_reprojection_errors(frames, camera_matrix, distortion, model)
+    per_frame_error, failed, _point_errors = _test_reprojection_errors(frames, camera_matrix, distortion, model)
     if not per_frame_error:
         return ComparisonSide(
             label=label, model_name=model, camera_matrix=camera_matrix, distortion=distortion,

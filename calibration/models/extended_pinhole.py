@@ -26,11 +26,16 @@ from calibration.types import (
 )
 from calibration.models.common import (
     MIN_FRAMES_REQUIRED,
+    DEFAULT_TERM_CRITERIA,
     collect_calibration_inputs,
     infer_image_size,
     compute_regional_error,
+    validate_finite_calibration_output,
 )
-from calibration.radial_profile import compute_radial_error_profile
+from calibration.radial_profile import compute_radial_error_profile, compute_radial_error_bands
+from calibration.spatial_error_map import compute_spatial_error_map
+from calibration.bootstrap import compute_parameter_bootstrap, add_normal_approximation_ci
+from calibration.residual_stats import compute_residual_stats_for_calibration
 
 
 def calibrate_extended_pinhole(
@@ -38,6 +43,9 @@ def calibrate_extended_pinhole(
     camera_config: CameraConfig,
     use_rational_model: bool = False,
     fix_tangent_dist: bool = False,
+    estimate_uncertainty_bootstrap: bool = False,
+    n_bootstrap: int = 20,
+    bootstrap_seed: int = 42,
 ) -> CalibrationResult:
     """Extended Pinhole (Brown-Conrady) 캘리브레이션 실행.
 
@@ -47,6 +55,9 @@ def calibrate_extended_pinhole(
         fix_tangent_dist: True면 접선 왜곡(p1,p2)을 0으로 고정.
             제조 공차가 좋은 렌즈는 접선 왜곡이 거의 없어 자유도를 줄이는 게
             오히려 안정적일 수 있다 (UI 고급 옵션으로 노출 예정).
+        estimate_uncertainty_bootstrap: 설계 문서 20번 - pinhole.py와 동일한
+            개념. covariance 기반 std(항상 계산)와 별개로 bootstrap 기반
+            std/CI를 param_uncertainty_bootstrap에 추가로 채운다.
     """
     frames, object_points, image_points = collect_calibration_inputs(dataset)
 
@@ -85,12 +96,19 @@ def calibrate_extended_pinhole(
             None,
             None,
             flags=flags,
+            criteria=DEFAULT_TERM_CRITERIA,
         )
     except cv2.error as e:
         return CalibrationResult(
             model_name=CameraModelType.EXTENDED_PINHOLE,
             success=False,
             error_message=f"cv2.calibrateCameraExtended 실패: {e}",
+        )
+
+    invalid_reason = validate_finite_calibration_output(camera_matrix, dist_coeffs)
+    if invalid_reason:
+        return CalibrationResult(
+            model_name=CameraModelType.EXTENDED_PINHOLE, success=False, error_message=invalid_reason,
         )
 
     per_frame_error = {
@@ -105,13 +123,35 @@ def calibrate_extended_pinhole(
         frames, list(rvecs), list(tvecs), camera_matrix, dist_coeffs, image_size,
         CameraModelType.EXTENDED_PINHOLE,
     )
+    radial_bands = compute_radial_error_bands(
+        frames, list(rvecs), list(tvecs), camera_matrix, dist_coeffs, image_size,
+        CameraModelType.EXTENDED_PINHOLE,
+    )
+    residual_stats = compute_residual_stats_for_calibration(
+        frames, list(rvecs), list(tvecs), camera_matrix, dist_coeffs, image_size,
+        CameraModelType.EXTENDED_PINHOLE,
+    )
+    spatial_error_map = compute_spatial_error_map(
+        frames, list(rvecs), list(tvecs), camera_matrix, dist_coeffs, image_size,
+        CameraModelType.EXTENDED_PINHOLE,
+    )
 
     param_uncertainty = ParameterUncertainty(
         fx_std=float(std_intrinsics[0][0]),
         fy_std=float(std_intrinsics[1][0]),
         cx_std=float(std_intrinsics[2][0]),
         cy_std=float(std_intrinsics[3][0]),
+        method="covariance",
     )
+    add_normal_approximation_ci(param_uncertainty, camera_matrix)
+
+    param_uncertainty_bootstrap = None
+    if estimate_uncertainty_bootstrap:
+        param_uncertainty_bootstrap = compute_parameter_bootstrap(
+            object_points, image_points, image_size, CameraModelType.EXTENDED_PINHOLE,
+            camera_matrix, dist_coeffs, flags=flags | cv2.CALIB_USE_INTRINSIC_GUESS,
+            n_bootstrap=n_bootstrap, rng_seed=bootstrap_seed,
+        )
 
     return CalibrationResult(
         model_name=CameraModelType.EXTENDED_PINHOLE,
@@ -123,6 +163,10 @@ def calibrate_extended_pinhole(
         per_frame_error=per_frame_error,
         regional_error=regional_error,
         radial_profile=radial_profile,
+        radial_bands=radial_bands,
         param_uncertainty=param_uncertainty,
+        param_uncertainty_bootstrap=param_uncertainty_bootstrap,
+        residual_stats=residual_stats,
+        spatial_error_map=spatial_error_map,
         success=True,
     )

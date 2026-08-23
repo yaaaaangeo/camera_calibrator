@@ -265,6 +265,57 @@ def format_score_table(
     return "\n".join(lines)
 
 
+def compare_model_rankings(
+    scores_before: list[ModelScore],
+    scores_after: list[ModelScore],
+) -> str:
+    """설계 문서 17번 - "Outlier 제거 전후 효과 측정"의 마지막 항목,
+    "model ranking 변화". outlier 제거 전/후 각각 compute_model_scores()로
+    나온 두 ModelScore 리스트를 비교해, 추천 모델이 바뀌었는지와 각 모델의
+    순위/점수가 어떻게 움직였는지 보여준다.
+
+    주의: 이 프로젝트의 Score는 "낮을수록 좋다"(오차 성격의 가중합, docstring
+    compute_model_scores 참고) - 그래서 오름차순(reverse=False)으로 정렬해야
+    1위가 실제로 가장 좋은(점수가 가장 낮은) 모델이 된다.
+
+        Model Ranking: Before -> After
+        1위  Fisheye (0.612)  ->  Extended Pinhole (0.598)
+        2위  Extended Pinhole (0.588)  ->  Fisheye (0.571)
+        3위  Pinhole (0.301)  ->  Pinhole (0.295)
+
+        ⚠ 추천 모델이 바뀌었습니다: Fisheye -> Extended Pinhole
+    """
+    if not scores_before or not scores_after:
+        return "비교할 순위 정보가 없습니다."
+
+    ranked_before = sorted(scores_before, key=lambda s: s.score)
+    ranked_after = sorted(scores_after, key=lambda s: s.score)
+
+    rec_before = next((s.model_name for s in scores_before if s.is_recommended), None)
+    rec_after = next((s.model_name for s in scores_after if s.is_recommended), None)
+
+    lines = ["Model Ranking: Before -> After"]
+    n = max(len(ranked_before), len(ranked_after))
+    for i in range(n):
+        before_str = (
+            f"{_LABELS[ranked_before[i].model_name]} ({ranked_before[i].score:.3f})"
+            if i < len(ranked_before) else "N/A"
+        )
+        after_str = (
+            f"{_LABELS[ranked_after[i].model_name]} ({ranked_after[i].score:.3f})"
+            if i < len(ranked_after) else "N/A"
+        )
+        lines.append(f"{i+1}위  {before_str:<28} -> {after_str}")
+
+    lines.append("")
+    if rec_before is not None and rec_after is not None and rec_before != rec_after:
+        lines.append(f"\u26a0 추천 모델이 바뀌었습니다: {_LABELS[rec_before]} -> {_LABELS[rec_after]}")
+    else:
+        lines.append("추천 모델은 바뀌지 않았습니다.")
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # 최종 결과 조립 (설계 문서 12번, 18번 - FinalResult)
 # ---------------------------------------------------------------------------
@@ -312,6 +363,7 @@ def compute_final_result(
     validation_results: dict[CameraModelType, ValidationResult],
     dataset_coverage_pct: float | None = None,
     outlier_result: OutlierResult | None = None,
+    corner_outlier_result: "CornerOutlierResult | None" = None,
     scores: list[ModelScore] | None = None,
 ) -> FinalResult:
     """사용자가 최종적으로 선택한 모델을 기준으로 FinalResult를 조립한다.
@@ -337,6 +389,7 @@ def compute_final_result(
         calibration=cal,
         validation=val,
         outlier=outlier_result,
+        corner_outlier=corner_outlier_result,
         dataset_coverage_pct=dataset_coverage_pct,
         overall_grade=overall_grade,
         model_scores=scores or [],

@@ -21,6 +21,7 @@ camera_calibrator.app.cli
 from __future__ import annotations
 
 import argparse
+import copy
 import glob as globmod
 import json
 import logging
@@ -32,12 +33,30 @@ import cv2
 from calibration.compare import run_all_models, format_comparison_table
 from calibration.detector import detect_dataset, summarize_dataset
 from calibration.frame_quality import compute_frame_quality_scores
+from calibration.frame_quality import compute_dataset_quality_score, format_dataset_quality_score
+from calibration.image_quality import evaluate_dataset_image_quality, format_image_quality_summary, find_duplicate_groups
 from calibration.log_utils import setup_logging
-from calibration.models.common import infer_image_size
-from calibration.outlier import recalibrate_with_outlier_pruning
-from calibration.quality import analyze_dataset_quality, coverage_percentage
+from calibration.models.common import infer_image_size, collect_calibration_inputs
+from calibration.kfold import compute_kfold_validation, compute_repeated_kfold, format_kfold_result, format_repeated_kfold_result
+from calibration.repeatability import compute_repeatability, format_repeatability
+from calibration.bootstrap import compute_parameter_bootstrap, format_parameter_uncertainty
+from calibration.models.pinhole import calibrate_pinhole
+from calibration.outlier import recalibrate_with_outlier_pruning, format_outlier_before_after
+from calibration.outlier import recalibrate_with_corner_outlier_pruning, format_corner_outlier_before_after
+from calibration.quality import (
+    analyze_dataset_quality,
+    coverage_percentage,
+    compute_pose_distribution_stats,
+    format_pose_distribution_stats,
+)
+from calibration.target_quality import evaluate_dataset_target_quality, format_target_quality_summary
+from calibration.sanity_check import run_sanity_checks, format_sanity_checks
+from calibration.residual_stats import format_residual_stats, format_residual_boxplot, format_cdf
+from calibration.spatial_error_map import format_spatial_error_map
+from calibration.radial_profile import format_radial_bands
 from calibration.recommender import (
     build_recommendation_message,
+    compare_model_rankings,
     compute_final_result,
     compute_model_scores,
 )
@@ -49,7 +68,17 @@ from calibration.types import (
     PatternType,
 )
 from calibration.project_io import load_project, save_project
-from calibration.validation import format_validation_table, validate_all_models
+from calibration.validation import (
+    format_validation_table,
+    format_train_test_residual_comparison,
+    format_straightness_comparison,
+    validate_all_models,
+    validate_holdout,
+    split_train_test,
+    _subset_dataset,
+    recalibrate_train_with_outlier_pruning,
+    recalibrate_train_with_corner_outlier_pruning,
+)
 from export.opencv import export_opencv_yaml
 from export.report import export_html_report
 from export.ros import export_ros_camera_info
@@ -290,13 +319,31 @@ def run_pipeline(args) -> int:
         print("오류: 어떤 이미지에서도 ChArUco 패턴이 검출되지 않았습니다.", file=sys.stderr)
         return 1
 
-    # --- 3. Quality Gate (Coverage/Diversity) ---
+    # --- 3. Quality Gate (이미지 품질 / Target 품질 / Coverage / Diversity) ---
+    # 설계 문서 3-1/3-2번 - 캘리브레이션 계산 전에 데이터 자체가 괜찮은지 먼저 본다.
+    image_reports, duplicate_groups = evaluate_dataset_image_quality(dataset)
+    if not quiet:
+        summary = format_image_quality_summary(image_reports, duplicate_groups)
+        if summary.strip() and "발견되지 않았습니다" not in summary.split("\n")[0]:
+            print(summary)
+
+    target_reports = evaluate_dataset_target_quality(dataset.frames, pattern_config)
+    if not quiet:
+        target_summary = format_target_quality_summary(target_reports)
+        if "경고 없음" not in target_summary:
+            print(target_summary)
+
     _log(quiet, "Coverage Map / 데이터셋 품질 분석 중...")
     warnings = analyze_dataset_quality(dataset, camera_config)
     for w in warnings:
         _log(quiet, f"  \u26a0 {w}")
 
     image_size = infer_image_size(dataset, camera_config)
+
+    # 설계 문서 6번 - Pose Diversity 확장 (X/Y/면적/yaw/pitch/roll/거리 분포)
+    if not quiet:
+        pose_stats = compute_pose_distribution_stats(dataset, camera_config)
+        print(format_pose_distribution_stats(pose_stats))
     compute_frame_quality_scores(dataset, pattern_config, image_size, use_reprojection=False)
 
     # --- 4. 3모델 계산 ---
@@ -304,6 +351,21 @@ def run_pipeline(args) -> int:
     results = run_all_models(dataset, camera_config, use_rational_model=args.rational)
     calibration_results = {r.model_name: r for r in results}
     compute_frame_quality_scores(dataset, pattern_config, image_size, use_reprojection=True)
+
+    # 설계 문서 4번 - Overall Dataset Score. 개별 프레임 점수(방금 갱신됨) +
+    # coverage(quality.analyze_dataset_quality가 이미 채워둔 dataset.coverage_grid/
+    # diversity) + 중복 이미지 비율을 한 번에 요약한다.
+    dup_ratio = (
+        sum(len(g.image_ids) for g in duplicate_groups) / dataset.num_total
+        if dataset.num_total > 0 else 0.0
+    )
+    dataset.quality_score = compute_dataset_quality_score(
+        dataset,
+        coverage_pct=coverage_percentage(dataset.coverage_grid) if dataset.coverage_grid else None,
+        duplicate_ratio=dup_ratio,
+    )
+    if not quiet:
+        print(format_dataset_quality_score(dataset.quality_score))
 
     if not any(r.success for r in results):
         print("오류: 3개 모델 모두 캘리브레이션에 실패했습니다.", file=sys.stderr)
@@ -314,6 +376,27 @@ def run_pipeline(args) -> int:
 
     if not quiet:
         print(format_comparison_table(results))
+        # 설계 문서 11/12번 - Reprojection Error 지표 확장 / Residual Distribution.
+        # Train RMS 하나만 보지 않는다는 원칙을 코너 포인트 단위 오차에도 적용.
+        for r in results:
+            if r.success and r.residual_stats and r.residual_stats.n > 0:
+                print()
+                print(f"[{r.model_name.value}]")
+                print(format_residual_stats(r.residual_stats))
+                print(format_residual_boxplot(r.residual_stats))
+                print(format_cdf(r.residual_stats))
+                if r.spatial_error_map:
+                    print()
+                    print(format_spatial_error_map(r.spatial_error_map))
+                if r.radial_bands and r.radial_bands.bins:
+                    print()
+                    print(format_radial_bands(r.radial_bands))
+        # 설계 문서 8번 - Calibration 결과 sanity check. RMS가 낮다고 결과가
+        # 물리적으로 정상인 건 아니므로, 이 자리에서 항상 함께 보여준다.
+        sanity_checks = run_sanity_checks(results, camera_config, image_size)
+        if any(c.issues for c in sanity_checks):
+            print()
+            print(format_sanity_checks(sanity_checks))
 
     return _validate_choose_and_export(
         args, dataset, camera_config, pattern_config, calibration_results
@@ -387,6 +470,10 @@ def _validate_choose_and_export(
         )
         if not quiet:
             print(format_validation_table(validation_results))
+            print()
+            print(format_train_test_residual_comparison(validation_results))
+            print()
+            print(format_straightness_comparison(validation_results))
 
         # --- 6. 추천 ---
         scores = compute_model_scores(calibration_results, validation_results, use_rational_model=args.rational)
@@ -405,34 +492,204 @@ def _validate_choose_and_export(
         chosen_model = recommended.model_name
 
     outlier_result = None
+    corner_outlier_result = None
+    scores_before_outlier = list(scores)
 
-    # --- 7. (옵션) Outlier 제거 + 재계산 ---
-    if args.outlier:
+    # --- 7. (옵션) Outlier 제거 + 재계산 (프레임 단위/코너 단위, 둘 다 가능) ---
+    if args.outlier or args.corner_outlier:
         _log(quiet, f"{chosen_model.value} 기준 이상치 탐지 및 재계산 중...")
-        ref_result, outlier_result = recalibrate_with_outlier_pruning(
-            dataset, camera_config, chosen_model,
-            max_iterations=args.max_iterations, use_rational_model=args.rational,
-        )
+
+        # 설계 문서 9번 - 아래 Hold-out Validation은 leak-safe해야 한다. 이
+        # 시점의 dataset은 아직 어떤 outlier 판단도 반영 안 된 상태이므로,
+        # 지금 복사본을 떠 두고 그 복사본 안에서만 "split -> train-only
+        # outlier -> test 평가" 순서를 밟는다. 바로 아래에서 하는 전체
+        # 데이터 기준 outlier 제거(최종 배포용 계산, 이 프로젝트의 의도적
+        # 설계: 배포용 파라미터는 train/test 구분 없이 좋은 데이터를 전부
+        # 쓴다)와는 완전히 분리해야 서로의 상태 변경이 섞이지 않는다.
+        validation_dataset = copy.deepcopy(dataset)
+
+        # --- 7-1. 최종 배포용 계산: 전체 데이터 기준 이상치 제거 ---
+        ref_result = calibration_results[chosen_model]
+
+        if args.outlier:
+            ref_result, outlier_result = recalibrate_with_outlier_pruning(
+                dataset, camera_config, chosen_model,
+                max_iterations=args.max_iterations, use_rational_model=args.rational,
+            )
+            if outlier_result.removed_frame_ids:
+                _log(quiet, f"  제외된 프레임: {outlier_result.removed_frame_ids}")
+                if not quiet:
+                    print(format_outlier_before_after(outlier_result))
+
+        if args.corner_outlier:
+            # 설계 문서 16번 - 프레임 전체가 아니라 문제 코너만 골라 뺀다.
+            # --outlier와 함께 쓰면 이미 프레임 단위로 정리된 dataset 위에서
+            # 한 번 더(코너 단위로 더 세밀하게) 정리한다.
+            ref_result, corner_outlier_result = recalibrate_with_corner_outlier_pruning(
+                dataset, camera_config, chosen_model,
+                max_iterations=args.max_iterations, use_rational_model=args.rational,
+            )
+            if corner_outlier_result.removed_corners:
+                _log(quiet, f"  제외된 코너: {corner_outlier_result.removed_corners}")
+                if not quiet:
+                    print(format_corner_outlier_before_after(corner_outlier_result))
+
         calibration_results[chosen_model] = ref_result
-        if outlier_result.removed_frame_ids:
-            _log(quiet, f"  제외된 프레임: {outlier_result.removed_frame_ids}")
         # 나머지 두 모델도 정제된 데이터셋 기준으로 재계산해야 비교표/리포트가 일관됨
         results = run_all_models(dataset, camera_config, use_rational_model=args.rational)
         calibration_results = {r.model_name: r for r in results}
         calibration_results[chosen_model] = ref_result
-        validation_results = validate_all_models(
-            dataset, camera_config, pattern_config, test_ratio=args.test_ratio,
-            seed=args.seed, use_rational_model=args.rational,
+
+        # --- 7-2. Leak-safe Hold-out Validation (평가 전용, 복사본에서만) ---
+        _log(quiet, "Leak-safe Hold-out Validation 재계산 중 (Train-only Outlier Detection)...")
+        train_ids, test_ids = split_train_test(
+            validation_dataset, camera_config, args.test_ratio, args.seed
         )
+
+        ref_validation = None
+        if args.outlier:
+            _, ref_val_outlier, ref_validation = recalibrate_train_with_outlier_pruning(
+                validation_dataset, camera_config, pattern_config, chosen_model, train_ids, test_ids,
+                max_iterations=args.max_iterations, use_rational_model=args.rational,
+            )
+            if ref_val_outlier.removed_frame_ids:
+                _log(
+                    quiet,
+                    f"  [Validation 전용] Train에서만 제외된 프레임: {ref_val_outlier.removed_frame_ids} "
+                    "(Test는 절대 건드리지 않음)",
+                )
+
+        if args.corner_outlier:
+            _, ref_val_corner_outlier, ref_validation = recalibrate_train_with_corner_outlier_pruning(
+                validation_dataset, camera_config, pattern_config, chosen_model, train_ids, test_ids,
+                max_iterations=args.max_iterations, use_rational_model=args.rational,
+            )
+            if ref_val_corner_outlier.removed_corners:
+                _log(
+                    quiet,
+                    f"  [Validation 전용] Train에서만 제외된 코너: {ref_val_corner_outlier.removed_corners} "
+                    "(Test는 절대 건드리지 않음)",
+                )
+
+        if ref_validation is None:
+            # 이 분기는 이론상 도달하지 않는다(바깥 if에서 outlier/corner_outlier
+            # 둘 중 하나는 참이어야만 여기로 옴) - 그래도 방어적으로 처리.
+            ref_validation = validate_holdout(
+                validation_dataset, camera_config, pattern_config, chosen_model, train_ids, test_ids,
+                use_rational_model=args.rational,
+            )
+
+        validation_results = {chosen_model: ref_validation}
+
+        # chosen_model이 이미 위에서 이상치를 제거했으므로, dataset의 frame
+        # status가 공유되어(같은 validation_dataset 객체) 나머지 두 모델도
+        # 그 결과를 그대로 물려받는다 - 여기서 이상치 탐지를 또 하지 않는다.
+        train_subset = _subset_dataset(validation_dataset, train_ids)
+        pinhole_init = calibrate_pinhole(train_subset, camera_config)
+        for m in (CameraModelType.PINHOLE, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE):
+            if m == chosen_model:
+                continue
+            fisheye_guess = pinhole_init if m == CameraModelType.FISHEYE else None
+            validation_results[m] = validate_holdout(
+                validation_dataset, camera_config, pattern_config, m, train_ids, test_ids,
+                use_rational_model=args.rational, fisheye_initial_guess=fisheye_guess,
+            )
+
+        if not quiet:
+            print(format_validation_table(validation_results))
+            print()
+            print(format_train_test_residual_comparison(validation_results))
+            print()
+            print(format_straightness_comparison(validation_results))
+
         scores = compute_model_scores(calibration_results, validation_results, use_rational_model=args.rational)
+
+        # 설계 문서 17번 - "model ranking 변화" 기록. outlier 제거 전(scores_before_outlier)과
+        # 후(scores) 두 순위표를 비교해 추천 모델이 바뀌었는지 보여준다.
+        if not quiet:
+            print()
+            print(compare_model_rankings(scores_before_outlier, scores))
 
     # --- 8. Final Result ---
     coverage_pct = coverage_percentage(dataset.coverage_grid) if dataset.coverage_grid else None
     final_result = compute_final_result(
         chosen_model, calibration_results, validation_results,
-        dataset_coverage_pct=coverage_pct, outlier_result=outlier_result, scores=scores,
+        dataset_coverage_pct=coverage_pct, outlier_result=outlier_result,
+        corner_outlier_result=corner_outlier_result, scores=scores,
     )
     _log(quiet, f"\n선택된 모델: {chosen_model.value}  종합 등급: {final_result.overall_grade.value}")
+
+    # 설계 문서 8번 - 최종 선택된 모델은 outlier 제거 등으로 값이 바뀌었을 수
+    # 있으므로 export 직전에 한 번 더 sanity check를 실행해 보여준다.
+    image_size = infer_image_size(dataset, camera_config)
+    final_sanity = run_sanity_checks([calibration_results[chosen_model]], camera_config, image_size)[0]
+    if final_sanity.issues and not quiet:
+        print()
+        print(final_sanity.format())
+
+    # --- 8-1. (옵션) K-Fold / Repeated K-Fold Cross Validation ---
+    # 설계 문서 18/19번. Hold-out(1회 분할)보다 데이터를 더 알뜰하게 쓰고
+    # "운 좋은/나쁜 분할" 효과를 줄인 검증이 필요할 때만 켠다 - 비용이 크므로
+    # (모델 하나당 k번 또는 k*repeats번 전체 재계산) 기본은 꺼져 있다.
+    if args.kfold:
+        if args.kfold_repeats > 1:
+            _log(quiet, f"Repeated {args.kfold}-Fold x {args.kfold_repeats} 계산 중 ({chosen_model.value})...")
+            repeated_kfold_result = compute_repeated_kfold(
+                dataset, camera_config, pattern_config, chosen_model,
+                k=args.kfold, n_repeats=args.kfold_repeats, base_seed=args.seed,
+                use_rational_model=args.rational,
+            )
+            if not quiet:
+                print()
+                print(format_repeated_kfold_result(repeated_kfold_result))
+        else:
+            _log(quiet, f"{args.kfold}-Fold Cross Validation 계산 중 ({chosen_model.value})...")
+            kfold_result = compute_kfold_validation(
+                dataset, camera_config, pattern_config, chosen_model,
+                k=args.kfold, seed=args.seed, use_rational_model=args.rational,
+            )
+            if not quiet:
+                print()
+                print(format_kfold_result(kfold_result))
+
+    # --- 8-2. (옵션) Repeatability 측정 ---
+    # 설계 문서 40번. 프레임 순서를 바꿔가며 최종 모델을 반복 재계산해
+    # fx/fy/cx/cy가 얼마나 일관되게 나오는지 확인한다.
+    if args.repeatability:
+        _log(quiet, f"Repeatability 측정 중 ({chosen_model.value}, {args.repeatability}회)...")
+        repeatability_result = compute_repeatability(
+            dataset, camera_config, chosen_model,
+            n_runs=args.repeatability, seed=args.seed, use_rational_model=args.rational,
+        )
+        if not quiet:
+            print()
+            print(format_repeatability(repeatability_result))
+
+    # --- 8-3. (옵션) Bootstrap 기반 Parameter 95% CI ---
+    # 설계 문서 20/21/22번. Pinhole/Extended는 covariance 기반 std가 이미
+    # param_uncertainty에 있으므로, 이 옵션은 그것과 교차검증할 독립적인
+    # bootstrap 추정치를 추가로 계산한다. Fisheye는 애초에 bootstrap이
+    # 유일한 방법이라(calibrate_fisheye의 estimate_uncertainty로 이미 계산됨)
+    # 여기서 다시 계산하지 않고 기존 param_uncertainty를 그대로 보여준다.
+    if args.bootstrap_ci:
+        chosen_result = calibration_results[chosen_model]
+        if chosen_model == CameraModelType.FISHEYE:
+            uncertainty_to_show = chosen_result.param_uncertainty
+        else:
+            _log(quiet, f"Bootstrap 기반 Parameter CI 계산 중 ({chosen_model.value}, {args.n_bootstrap}회)...")
+            frames_for_bootstrap, obj_pts, img_pts = collect_calibration_inputs(dataset)
+            uncertainty_to_show = compute_parameter_bootstrap(
+                obj_pts, img_pts, image_size, chosen_model,
+                chosen_result.camera_matrix, chosen_result.distortion,
+                flags=(cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3
+                       if chosen_model == CameraModelType.PINHOLE else 0) | cv2.CALIB_USE_INTRINSIC_GUESS,
+                n_bootstrap=args.n_bootstrap, rng_seed=args.seed,
+            )
+            # 계산 결과를 CalibrationResult에도 남겨서 export/report에 그대로 반영되게 한다.
+            chosen_result.param_uncertainty_bootstrap = uncertainty_to_show
+        if not quiet:
+            print()
+            print(format_parameter_uncertainty(uncertainty_to_show))
 
     # --- 9. Export ---
     out_dir = Path(args.output_dir)
@@ -492,6 +749,7 @@ def _validate_choose_and_export(
             "num_images_used": dataset.num_enabled,
             "coverage_pct": coverage_pct,
             "outlier_removed": outlier_result.removed_frame_ids if outlier_result else [],
+            "corner_outlier_removed": corner_outlier_result.removed_corners if corner_outlier_result else {},
             "exported_files": exported,
         }
         _write_json_summary(args.json_summary, summary)
@@ -546,11 +804,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
     pipe.add_argument("--test-ratio", type=float, default=0.25, help="Hold-out validation test 비율, 기본 0.25")
     pipe.add_argument("--seed", type=int, default=42, help="train/test 분할 시드, 기본 42")
     pipe.add_argument("--rational", action="store_true", help="Extended Pinhole에 rational model(k1~k6, 8계수) 사용")
-    pipe.add_argument("--outlier", action="store_true", help="추천된 모델 기준으로 이상치 탐지+재계산까지 수행")
+    pipe.add_argument("--outlier", action="store_true", help="추천된 모델 기준으로 이상치 탐지+재계산까지 수행 (프레임 단위)")
+    pipe.add_argument(
+        "--corner-outlier", action="store_true",
+        help="프레임 전체가 아니라 개별 코너 단위로 이상치를 탐지+제거 (--outlier와 함께 쓸 수 있음, 그 뒤에 적용됨)",
+    )
     pipe.add_argument("--max-iterations", type=int, default=3, help="이상치 제거 최대 반복 횟수, 기본 3")
     pipe.add_argument(
         "--model", choices=sorted(_MODEL_BY_NAME), default=None,
         help="자동 추천 대신 이 모델을 강제로 최종 선택 (export/report 기준)",
+    )
+    pipe.add_argument(
+        "--kfold", type=int, default=None, metavar="K",
+        help="설계 문서 18번 - Hold-out 대신(추가로) K-Fold Cross Validation 수행 (예: --kfold 5)",
+    )
+    pipe.add_argument(
+        "--kfold-repeats", type=int, default=1, metavar="N",
+        help="설계 문서 19번 - K-Fold를 N번 반복(다른 분할로) - --kfold와 함께 사용, 기본 1(반복 없음)",
+    )
+    pipe.add_argument(
+        "--repeatability", type=int, default=None, metavar="N",
+        help="설계 문서 40번 - 최종 선택된 모델로 데이터 순서를 N번 바꿔가며 재계산해 반복 재현성 측정",
+    )
+    pipe.add_argument(
+        "--bootstrap-ci", action="store_true",
+        help="설계 문서 20/22번 - 최종 선택된 모델의 fx/fy/cx/cy에 대해 bootstrap 기반 95% CI를 추가로 계산 (비용이 큼)",
+    )
+    pipe.add_argument(
+        "--n-bootstrap", type=int, default=20, metavar="N",
+        help="--bootstrap-ci 또는 Fisheye 기본 불확실성 추정에 쓸 재표본 횟수, 기본 20",
     )
 
     out = p.add_argument_group("출력")

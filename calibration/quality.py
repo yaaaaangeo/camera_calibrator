@@ -11,11 +11,16 @@ camera_calibrator.calibration.quality
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 
-from calibration.types import CameraConfig, CoverageCell, Dataset, DiversityScores, Frame
+from calibration.types import (
+    CameraConfig, CoverageCell, Dataset, DistributionStat, DiversityScores, Frame,
+    PoseDistributionStats,
+)
 from calibration.models.common import infer_image_size
 
 
@@ -360,3 +365,155 @@ def analyze_dataset_quality(
     return coverage_warnings(
         cells, rows=rows, cols=cols, low_threshold=low_threshold, avg_corners_per_frame=avg_corners
     )
+
+
+# ---------------------------------------------------------------------------
+# 설계 문서 5번(분포 확장) / 6번(Pose Diversity 평가 강화)
+# ---------------------------------------------------------------------------
+# 기존 DiversityScores(0~1 점수 4개)는 "다양한가/아닌가"만 보여줬다. 여기서는
+# X/Y 위치, board 크기, yaw/pitch/roll, 거리를 각각 mean/std/variance +
+# coverage 점수로 분해해서 "정확히 어느 축이 부족한지" 보여준다.
+
+def _estimate_rough_pose(
+    object_points: np.ndarray, image_points: np.ndarray, image_size: tuple[int, int]
+) -> tuple[float, float, float, float] | None:
+    """cv2.solvePnP로 (yaw, pitch, roll, distance)를 거칠게 추정한다.
+
+    아직 실제 카메라 파라미터를 모르는 단계(캘리브레이션 전)이므로 K를
+    "focal length = max(w,h)"라는 흔한 경험적 근사로 가정한다 - 절대값은
+    부정확할 수 있지만, 데이터셋 안에서 "자세가 얼마나 다양했는가"를 상대
+    비교하는 진단 목적에는 이 정도 근사로 충분하다 (실제 캘리브레이션
+    결과와는 무관하고, 오직 이 함수만을 위한 임시 가정).
+
+    회전 각도는 표준 R->Euler(XYZ) 분해를 쓴다: pitch=X축, yaw=Y축, roll=Z축
+    회전. distance는 tvec의 노름(카메라 원점에서 보드 원점까지 거리, object
+    points와 같은 단위=보통 미터)이다.
+    """
+    if object_points is None or image_points is None or len(object_points) < 4:
+        return None
+
+    w, h = image_size
+    f_guess = float(max(w, h))
+    K_guess = np.array(
+        [[f_guess, 0, w / 2.0], [0, f_guess, h / 2.0], [0, 0, 1]], dtype=np.float64
+    )
+    obj = object_points.reshape(-1, 1, 3).astype(np.float64)
+    img = image_points.reshape(-1, 1, 2).astype(np.float64)
+
+    try:
+        ok, rvec, tvec = cv2.solvePnP(obj, img, K_guess, None)
+    except cv2.error:
+        return None
+    if not ok:
+        return None
+
+    R, _ = cv2.Rodrigues(rvec)
+    sy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    if sy > 1e-6:
+        pitch = math.atan2(R[2, 1], R[2, 2])
+        yaw = math.atan2(-R[2, 0], sy)
+        roll = math.atan2(R[1, 0], R[0, 0])
+    else:
+        # 짐벌락 근접 - roll을 0으로 두고 pitch만으로 근사 (드문 극단 케이스)
+        pitch = math.atan2(-R[1, 2], R[1, 1])
+        yaw = math.atan2(-R[2, 0], sy)
+        roll = 0.0
+
+    distance = float(np.linalg.norm(tvec))
+    return math.degrees(yaw), math.degrees(pitch), math.degrees(roll), distance
+
+
+def _stat_absolute(values: list[float], full_spread: float) -> DistributionStat:
+    """표준편차가 full_spread에 도달하면 만점(1.0)인 절대 기준 coverage 점수.
+    (x/y 위치 - 픽셀, yaw/pitch/roll - 도(度) 처럼 스케일이 프로젝트마다
+    크게 안 변하는 값에 적합.)
+    """
+    if len(values) < 2:
+        return DistributionStat(
+            mean=float(values[0]) if values else None, sample_count=len(values)
+        )
+    arr = np.array(values, dtype=float)
+    std = float(arr.std())
+    coverage = float(min(1.0, std / full_spread)) if full_spread > 0 else 0.0
+    return DistributionStat(
+        mean=float(arr.mean()), std=std, variance=float(std ** 2),
+        coverage_score=coverage, sample_count=len(values),
+    )
+
+
+def _stat_relative(values: list[float], full_cv: float) -> DistributionStat:
+    """변동계수(CV=표준편차/평균) 기준 coverage 점수. board 면적비/거리처럼
+    "절대 스케일이 보드 크기·단위계에 따라 달라지는" 값에 적합
+    (_distance_diversity_from_area_ratios와 동일한 철학).
+    """
+    if len(values) < 2:
+        return DistributionStat(
+            mean=float(values[0]) if values else None, sample_count=len(values)
+        )
+    arr = np.array(values, dtype=float)
+    mean, std = float(arr.mean()), float(arr.std())
+    cv = std / mean if mean > 1e-9 else 0.0
+    coverage = float(min(1.0, cv / full_cv)) if full_cv > 0 else 0.0
+    return DistributionStat(
+        mean=mean, std=std, variance=float(std ** 2),
+        coverage_score=coverage, sample_count=len(values),
+    )
+
+
+def compute_pose_distribution_stats(
+    dataset: Dataset, camera_config: CameraConfig
+) -> PoseDistributionStats:
+    """설계 문서 6번 - 7개 축(X/Y위치, board 면적, yaw/pitch/roll, 거리) 각각의
+    분포(mean/std/variance/coverage)를 계산한다. compute_diversity_scores()가
+    주는 0~1 요약 점수 4개보다 더 세분화된 진단용 지표다.
+    """
+    image_size = infer_image_size(dataset, camera_config)
+    w, h = image_size
+    frames = [f for f in dataset.enabled_frames if f.detection and f.detection.success]
+
+    xs = [f.detection.board_center_px[0] for f in frames if f.detection.board_center_px]
+    ys = [f.detection.board_center_px[1] for f in frames if f.detection.board_center_px]
+    areas = [f.detection.board_area_ratio for f in frames if f.detection.board_area_ratio is not None]
+
+    yaws, pitches, rolls, distances = [], [], [], []
+    for f in frames:
+        pose = _estimate_rough_pose(f.detection.object_points, f.detection.corners, image_size)
+        if pose is None:
+            continue
+        yaw, pitch, roll, distance = pose
+        yaws.append(yaw)
+        pitches.append(pitch)
+        rolls.append(roll)
+        distances.append(distance)
+
+    return PoseDistributionStats(
+        x_position=_stat_absolute(xs, full_spread=w * 0.25),
+        y_position=_stat_absolute(ys, full_spread=h * 0.25),
+        board_area=_stat_relative(areas, full_cv=0.5),
+        yaw=_stat_absolute(yaws, full_spread=20.0),
+        pitch=_stat_absolute(pitches, full_spread=20.0),
+        roll=_stat_absolute(rolls, full_spread=20.0),
+        distance=_stat_relative(distances, full_cv=0.5),
+    )
+
+
+def format_pose_distribution_stats(stats: PoseDistributionStats) -> str:
+    rows = [
+        ("X Position (px)", stats.x_position),
+        ("Y Position (px)", stats.y_position),
+        ("Board Area (ratio)", stats.board_area),
+        ("Yaw (deg, 근사)", stats.yaw),
+        ("Pitch (deg, 근사)", stats.pitch),
+        ("Roll (deg, 근사)", stats.roll),
+        ("Distance (m, 근사)", stats.distance),
+    ]
+    lines = ["Pose Distribution (mean ± std, coverage)"]
+    for label, s in rows:
+        if s.sample_count == 0 or s.mean is None:
+            lines.append(f"{label:<20} N/A")
+            continue
+        std_str = f"{s.std:.2f}" if s.std is not None else "N/A"
+        lines.append(
+            f"{label:<20} {s.mean:8.2f} ± {std_str:<8} coverage={s.coverage_score*100:.0f}%  (n={s.sample_count})"
+        )
+    return "\n".join(lines)

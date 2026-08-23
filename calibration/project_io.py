@@ -39,7 +39,9 @@ from calibration.types import (
     CameraConfig,
     CameraModelType,
     CoverageCell,
+    CornerOutlierResult,
     Dataset,
+    DatasetQualityScore,
     DetectionResult,
     DiversityScores,
     ExportFormat,
@@ -57,6 +59,10 @@ from calibration.types import (
     RadialBin,
     RadialErrorProfile,
     RegionalError,
+    ResidualStats,
+    SpatialErrorCell,
+    SpatialErrorMap,
+    StraightnessBreakdown,
     ValidationResult,
 )
 
@@ -125,6 +131,8 @@ def _image_info_from_dict(d: dict) -> ImageInfo:
     return ImageInfo(
         image_id=d["image_id"], path=d["path"], width=d["width"], height=d["height"],
         sharpness=d.get("sharpness"), brightness=d.get("brightness"), exposure=d.get("exposure"),
+        contrast=d.get("contrast"), saturation=d.get("saturation"),
+        motion_blur_score=d.get("motion_blur_score"), phash=d.get("phash"),
     )
 
 
@@ -141,6 +149,10 @@ def _detection_result_from_dict(d) -> DetectionResult | None:
         board_center_px=tuple(d["board_center_px"]) if d.get("board_center_px") else None,
         board_tilt_deg=d.get("board_tilt_deg"),
         failure_reason=d.get("failure_reason"),
+        corner_confidence=d.get("corner_confidence"),
+        min_edge_margin_px=d.get("min_edge_margin_px"),
+        likely_cut_off=d.get("likely_cut_off"),
+        excluded_corner_indices=d.get("excluded_corner_indices", []),
     )
 
 
@@ -152,6 +164,12 @@ def _frame_quality_from_dict(d) -> FrameQuality | None:
         geometric_score=d.get("geometric_score", 0.0),
         overall_score=d.get("overall_score", 0.0),
         grade=QualityGrade(d.get("grade", "poor")),
+        blur_score=d.get("blur_score"),
+        exposure_score=d.get("exposure_score"),
+        corner_quality_score=d.get("corner_quality_score"),
+        board_area_score=d.get("board_area_score"),
+        edge_coverage_score=d.get("edge_coverage_score"),
+        pose_diversity_score=d.get("pose_diversity_score"),
     )
 
 
@@ -182,11 +200,26 @@ def _diversity_scores_from_dict(d) -> DiversityScores | None:
     )
 
 
+def _dataset_quality_score_from_dict(d) -> "DatasetQualityScore | None":
+    if d is None:
+        return None
+    return DatasetQualityScore(
+        avg_frame_quality=d.get("avg_frame_quality", 0.0),
+        detection_success_rate=d.get("detection_success_rate", 0.0),
+        coverage_score=d.get("coverage_score", 0.0),
+        diversity_score=d.get("diversity_score", 0.0),
+        duplicate_penalty=d.get("duplicate_penalty", 0.0),
+        overall=d.get("overall", 0.0),
+        grade=QualityGrade(d.get("grade", "poor")),
+    )
+
+
 def _dataset_from_dict(d: dict) -> Dataset:
     return Dataset(
         frames=[_frame_from_dict(f) for f in d.get("frames", [])],
         coverage_grid=[_coverage_cell_from_dict(c) for c in d.get("coverage_grid", [])],
         diversity=_diversity_scores_from_dict(d.get("diversity")),
+        quality_score=_dataset_quality_score_from_dict(d.get("quality_score")),
     )
 
 
@@ -196,6 +229,12 @@ def _param_uncertainty_from_dict(d) -> ParameterUncertainty | None:
     return ParameterUncertainty(
         fx_std=d.get("fx_std"), fy_std=d.get("fy_std"),
         cx_std=d.get("cx_std"), cy_std=d.get("cy_std"),
+        method=d.get("method", "covariance"),
+        n_bootstrap_success=d.get("n_bootstrap_success"),
+        fx_ci_low=d.get("fx_ci_low"), fx_ci_high=d.get("fx_ci_high"),
+        fy_ci_low=d.get("fy_ci_low"), fy_ci_high=d.get("fy_ci_high"),
+        cx_ci_low=d.get("cx_ci_low"), cx_ci_high=d.get("cx_ci_high"),
+        cy_ci_low=d.get("cy_ci_low"), cy_ci_high=d.get("cy_ci_high"),
     )
 
 
@@ -215,10 +254,42 @@ def _radial_profile_from_dict(d) -> RadialErrorProfile | None:
         RadialBin(
             radius_min=b["radius_min"], radius_max=b["radius_max"],
             mean_error=b.get("mean_error"), num_points=b.get("num_points", 0),
+            median_error=b.get("median_error"), rms_error=b.get("rms_error"),
+            p95_error=b.get("p95_error"), max_error=b.get("max_error"), label=b.get("label"),
         )
         for b in d.get("bins", [])
     ]
     return RadialErrorProfile(bins=bins, max_radius=d.get("max_radius", 0.0))
+
+
+def _residual_stats_from_dict(d) -> ResidualStats | None:
+    if d is None:
+        return None
+    return ResidualStats(
+        n=d.get("n", 0),
+        rmse=d.get("rmse"), mae=d.get("mae"), median=d.get("median"), std=d.get("std"),
+        min=d.get("min"), q1=d.get("q1"), q3=d.get("q3"),
+        p90=d.get("p90"), p95=d.get("p95"), p99=d.get("p99"), max=d.get("max"),
+        outlier_count=d.get("outlier_count", 0),
+        histogram_bin_edges=d.get("histogram_bin_edges", []),
+        histogram_counts=d.get("histogram_counts", []),
+        sample_residuals=d.get("sample_residuals", []),
+    )
+
+
+def _spatial_error_map_from_dict(d) -> SpatialErrorMap | None:
+    if d is None:
+        return None
+    cells = [
+        SpatialErrorCell(
+            row=c["row"], col=c["col"], num_points=c.get("num_points", 0),
+            rms=c.get("rms"), p95=c.get("p95"),
+            mean_dx=c.get("mean_dx"), mean_dy=c.get("mean_dy"),
+            direction_deg=c.get("direction_deg"),
+        )
+        for c in d.get("cells", [])
+    ]
+    return SpatialErrorMap(cells=cells, rows=d.get("rows", 4), cols=d.get("cols", 4))
 
 
 def _calibration_result_from_dict(d: dict) -> CalibrationResult:
@@ -232,7 +303,11 @@ def _calibration_result_from_dict(d: dict) -> CalibrationResult:
         per_frame_error=d.get("per_frame_error", {}),
         regional_error=_regional_error_from_dict(d.get("regional_error")),
         radial_profile=_radial_profile_from_dict(d.get("radial_profile")),
+        radial_bands=_radial_profile_from_dict(d.get("radial_bands")),
+        spatial_error_map=_spatial_error_map_from_dict(d.get("spatial_error_map")),
         param_uncertainty=_param_uncertainty_from_dict(d.get("param_uncertainty")),
+        param_uncertainty_bootstrap=_param_uncertainty_from_dict(d.get("param_uncertainty_bootstrap")),
+        residual_stats=_residual_stats_from_dict(d.get("residual_stats")),
         success=d.get("success", False),
         error_message=d.get("error_message"),
     )
@@ -246,6 +321,22 @@ def _outlier_result_from_dict(d) -> OutlierResult | None:
         removed_frame_ids=d.get("removed_frame_ids", []),
         rms_before=d.get("rms_before"), rms_after=d.get("rms_after"),
         iterations=d.get("iterations", 0), max_iterations=d.get("max_iterations", 3),
+        p95_before=d.get("p95_before"), p95_after=d.get("p95_after"),
+        camera_matrix_before=_arr(d.get("camera_matrix_before"), np.float64),
+        camera_matrix_after=_arr(d.get("camera_matrix_after"), np.float64),
+        distortion_before=_arr(d.get("distortion_before"), np.float64),
+        distortion_after=_arr(d.get("distortion_after"), np.float64),
+    )
+
+
+def _straightness_breakdown_from_dict(d) -> StraightnessBreakdown | None:
+    if d is None:
+        return None
+    return StraightnessBreakdown(
+        horizontal_error=d.get("horizontal_error"), vertical_error=d.get("vertical_error"),
+        diagonal_error=d.get("diagonal_error"), center_line_error=d.get("center_line_error"),
+        edge_line_error=d.get("edge_line_error"), corner_line_error=d.get("corner_line_error"),
+        overall_error=d.get("overall_error"), num_lines=d.get("num_lines", 0),
     )
 
 
@@ -255,6 +346,9 @@ def _validation_result_from_dict(d: dict) -> ValidationResult:
         test_frame_ids=d.get("test_frame_ids", []),
         train_rms=d.get("train_rms"), test_rms=d.get("test_rms"), edge_rms=d.get("edge_rms"),
         straightness_residual=d.get("straightness_residual"),
+        straightness_breakdown=_straightness_breakdown_from_dict(d.get("straightness_breakdown")),
+        train_residual_stats=_residual_stats_from_dict(d.get("train_residual_stats")),
+        test_residual_stats=_residual_stats_from_dict(d.get("test_residual_stats")),
         success=d.get("success", True), error_message=d.get("error_message"),
         failed_test_frame_ids=d.get("failed_test_frame_ids", []),
     )
@@ -267,6 +361,22 @@ def _model_score_from_dict(d: dict) -> ModelScore:
     )
 
 
+def _corner_outlier_result_from_dict(d) -> CornerOutlierResult | None:
+    if d is None:
+        return None
+    return CornerOutlierResult(
+        threshold_used=d.get("threshold_used", 0.0),
+        removed_corners=d.get("removed_corners", {}),
+        rms_before=d.get("rms_before"), rms_after=d.get("rms_after"),
+        iterations=d.get("iterations", 0), max_iterations=d.get("max_iterations", 3),
+        p95_before=d.get("p95_before"), p95_after=d.get("p95_after"),
+        camera_matrix_before=_arr(d.get("camera_matrix_before"), np.float64),
+        camera_matrix_after=_arr(d.get("camera_matrix_after"), np.float64),
+        distortion_before=_arr(d.get("distortion_before"), np.float64),
+        distortion_after=_arr(d.get("distortion_after"), np.float64),
+    )
+
+
 def _final_result_from_dict(d) -> FinalResult | None:
     if d is None:
         return None
@@ -275,6 +385,7 @@ def _final_result_from_dict(d) -> FinalResult | None:
         calibration=_calibration_result_from_dict(d["calibration"]),
         validation=_validation_result_from_dict(d["validation"]) if d.get("validation") else None,
         outlier=_outlier_result_from_dict(d.get("outlier")),
+        corner_outlier=_corner_outlier_result_from_dict(d.get("corner_outlier")),
         dataset_coverage_pct=d.get("dataset_coverage_pct"),
         overall_grade=QualityGrade(d.get("overall_grade", "warning")),
         model_scores=[_model_score_from_dict(s) for s in d.get("model_scores", [])],

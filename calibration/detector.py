@@ -44,6 +44,7 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
+from calibration.image_quality import compute_contrast, compute_motion_blur_score, compute_phash, compute_saturation
 from calibration.types import (
     Dataset,
     DetectionResult,
@@ -124,13 +125,15 @@ def build_charuco_detector(
 
 def _compute_board_geometry(
     corners: np.ndarray, image_shape: tuple[int, int]
-) -> tuple[float, tuple[float, float], float]:
+) -> tuple[float, tuple[float, float], float, float]:
     """검출된 코너들로부터 보드의 대략적인 기하 정보를 계산한다.
 
     Returns:
         board_area_ratio: 코너 convex hull 면적 / 전체 이미지 면적
         board_center_px: 코너 중심 (cx, cy)
         board_tilt_deg: minAreaRect 기준 회전각 (절대값, 0=정면에 가까움 판단용은 아님)
+        min_edge_margin_px: 코너 중 이미지 경계에 가장 가까운 코너까지의 거리(px)
+            (설계 문서 3-2번 - "corner가 이미지 경계에 너무 가까운지" 판정용)
     """
     h, w = image_shape
     pts = corners.reshape(-1, 2).astype(np.float32)
@@ -144,7 +147,11 @@ def _compute_board_geometry(
     rect = cv2.minAreaRect(pts)
     tilt_deg = float(rect[-1])
 
-    return board_area_ratio, (cx, cy), tilt_deg
+    # 각 코너에서 가장 가까운 이미지 경계(상하좌우 4개)까지의 거리 중 최솟값.
+    margins = np.minimum.reduce([pts[:, 0], w - pts[:, 0], pts[:, 1], h - pts[:, 1]])
+    min_edge_margin_px = float(np.min(margins)) if margins.size > 0 else 0.0
+
+    return board_area_ratio, (cx, cy), tilt_deg, min_edge_margin_px
 
 
 def detect_charuco(
@@ -180,7 +187,17 @@ def detect_charuco(
     num_corners = int(len(charuco_ids))
     object_points, image_points = board.matchImagePoints(charuco_corners, charuco_ids)
 
-    area_ratio, center_px, tilt_deg = _compute_board_geometry(charuco_corners, gray.shape[:2])
+    area_ratio, center_px, tilt_deg, min_edge_margin_px = _compute_board_geometry(
+        charuco_corners, gray.shape[:2]
+    )
+
+    # 설계 문서 3-2번 "corner detection confidence" - ChArUco API는 개별 코너
+    # 단위 confidence를 직접 주지 않으므로(대화 중 확인된 OpenCV API 한계),
+    # 이론상 검출 가능한 코너 수 대비 실제 검출 수의 비율을 대리 지표로 쓴다.
+    # 예: 7x5 보드는 내부 교차점이 6x4=24개인데 18개만 검출됐으면 confidence=0.75.
+    squares_x, squares_y = board.getChessboardSize()
+    max_possible = max(1, (squares_x - 1) * (squares_y - 1))
+    corner_confidence = float(min(1.0, num_corners / max_possible))
 
     return DetectionResult(
         image_id=image_id,
@@ -192,6 +209,8 @@ def detect_charuco(
         board_area_ratio=area_ratio,
         board_center_px=center_px,
         board_tilt_deg=tilt_deg,
+        corner_confidence=corner_confidence,
+        min_edge_margin_px=min_edge_margin_px,
     )
 
 
@@ -222,8 +241,15 @@ def detect_image_file(
         return info, result
 
     h, w = img.shape[:2]
-    sharpness = float(cv2.Laplacian(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
-    brightness = float(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).mean())
+    gray_img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    sharpness = float(cv2.Laplacian(gray_img, cv2.CV_64F).var())
+    brightness = float(gray_img.mean())
+    # 설계 문서 3-1번 - contrast/saturation(clipping)/motion blur/phash 추가 계산.
+    # 전부 image_quality.py에 정의된 순수 함수라 이 파일은 "어디서 부르는지"만 안다.
+    contrast = compute_contrast(gray_img)
+    saturation = compute_saturation(gray_img)
+    motion_blur_score = compute_motion_blur_score(gray_img)
+    phash = compute_phash(gray_img)
 
     info = ImageInfo(
         image_id=image_id,
@@ -232,6 +258,10 @@ def detect_image_file(
         height=h,
         sharpness=sharpness,
         brightness=brightness,
+        contrast=contrast,
+        saturation=saturation,
+        motion_blur_score=motion_blur_score,
+        phash=phash,
     )
     result = detect_fn(img, image_id)
     return info, result
@@ -328,7 +358,7 @@ def detect_chessboard(
     ids = np.arange(num_corners, dtype=np.int32).reshape(-1, 1)
     object_points = build_chessboard_object_points(pattern)
 
-    area_ratio, center_px, tilt_deg = _compute_board_geometry(corners, gray.shape[:2])
+    area_ratio, center_px, tilt_deg, min_edge_margin_px = _compute_board_geometry(corners, gray.shape[:2])
 
     return DetectionResult(
         image_id=image_id,
@@ -340,6 +370,10 @@ def detect_chessboard(
         board_area_ratio=area_ratio,
         board_center_px=center_px,
         board_tilt_deg=tilt_deg,
+        # 체스보드는 findChessboardCorners*가 "전부 찾거나 아예 실패"만 하므로
+        # (ChArUco처럼 일부만 검출되는 경우가 없음) confidence는 항상 1.0.
+        corner_confidence=1.0,
+        min_edge_margin_px=min_edge_margin_px,
     )
 
 

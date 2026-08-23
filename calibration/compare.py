@@ -77,7 +77,13 @@ def format_comparison_table(results: list[CalibrationResult]) -> str:
         Mean Error       0.91      0.38     0.34
         Edge Error       2.13      0.61     0.42
         Max Error        3.21      1.82     1.31
+        P95 (pt)         2.05      0.98     0.81
+        P99 (pt)         2.98      1.55     1.20
         Complexity          *        **      ***
+
+    P95/P99(pt)는 설계 문서 11번 - 코너 포인트 단위 재투영 오차의 percentile
+    (residual_stats.py). Mean/Max Error는 프레임 단위 RMS의 평균/최댓값이라
+    성격이 다르다 - 코너 단위 분포에서 "꼬리"가 얼마나 긴지는 P95/P99만 보여준다.
     """
     labels = [_model_label(r.model_name) for r in results]
     col_w = max(10, max(len(l) for l in labels) + 2)
@@ -106,6 +112,16 @@ def format_comparison_table(results: list[CalibrationResult]) -> str:
             return "N/A"
         return fmt_optional(regional_edge_average(r.regional_error))
 
+    def p95_pt(r: CalibrationResult) -> str:
+        if not r.success or r.residual_stats is None or r.residual_stats.n == 0:
+            return "N/A"
+        return fmt_optional(r.residual_stats.p95)
+
+    def p99_pt(r: CalibrationResult) -> str:
+        if not r.success or r.residual_stats is None or r.residual_stats.n == 0:
+            return "N/A"
+        return fmt_optional(r.residual_stats.p99)
+
     def complexity(r: CalibrationResult) -> str:
         return _COMPLEXITY_STARS.get(r.model_name, "")
 
@@ -115,6 +131,8 @@ def format_comparison_table(results: list[CalibrationResult]) -> str:
         row("Mean Error", [mean_error(r) for r in results]),
         row("Edge Error", [edge_error(r) for r in results]),
         row("Max Error", [max_error(r) for r in results]),
+        row("P95 (pt)", [p95_pt(r) for r in results]),
+        row("P99 (pt)", [p99_pt(r) for r in results]),
         row("Complexity", [complexity(r) for r in results]),
     ]
 

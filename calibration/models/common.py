@@ -30,23 +30,96 @@ from calibration.types import (
 MIN_FRAMES_REQUIRED = 3
 MIN_CORNERS_PER_FRAME = 4  # cv2.calibrateCamera 계열 최소 요구사항
 
+# 설계 문서 7번 "calibration termination criteria 통일" - 세 모델
+# (calibrateCameraExtended / calibrateCameraExtended+RATIONAL / fisheye.calibrate)이
+# 전부 같은 반복 종료 조건을 쓰도록 여기 하나로 고정한다. OpenCV 기본값
+# (30회, DBL_EPSILON)보다 반복 횟수를 늘리고 종료 오차는 느슨하게 잡았다 -
+# Fisheye처럼 파라미터가 많고 비선형성이 강한 모델은 30회 안에 못 끝나는
+# 경우가 실측에서 있었기 때문에(대화 중 확인), 세 모델 모두 여유를 준다.
+DEFAULT_TERM_CRITERIA = (
+    cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6
+)
+
+
+def expected_free_param_count(
+    model_name: CameraModelType,
+    use_rational_model: bool = False,
+    fix_tangent_dist: bool = False,
+) -> int:
+    """설계 문서 7번 "각 모델의 parameter 수 명확화" - fx/fy/cx/cy 4개를 뺀,
+    distortion 계수 중 실제로 "자유도"(추정 대상)인 개수를 모델/옵션별로
+    명시한다. self_check.py가 이미 실측 기반으로 검증해둔 값과 반드시 일치해야
+    한다 - free_param_count(=np.count_nonzero(D))와 이 값이 다르면 계산이나
+    플래그 설정이 잘못됐다는 신호다 (OpenCV 4.13이 rational model에서 배열을
+    8이 아니라 14로 주는 것도 이 값이 아니라 배열 길이가 다른 것뿐이라는 점에
+    유의 - self_check.py docstring 참고).
+    """
+    if model_name == CameraModelType.PINHOLE:
+        return 0  # k1,k2,p1,p2,k3 전부 0으로 고정
+    if model_name == CameraModelType.FISHEYE:
+        return 4  # k1,k2,k3,k4 (Kannala-Brandt, 항상 4개)
+    # Extended Pinhole
+    count = 8 if use_rational_model else 5  # k1,k2,p1,p2,k3 [,k4,k5,k6]
+    if fix_tangent_dist:
+        count -= 2  # p1, p2 제외
+    return count
+
+
+def validate_finite_calibration_output(
+    camera_matrix: np.ndarray, distortion: np.ndarray
+) -> str | None:
+    """설계 문서 7번 "numerical error 처리 / NaN/Inf 결과 검사" - cv2가
+    예외 없이 "성공"으로 리턴해도 결과에 NaN/Inf가 섞여 있을 수 있으므로,
+    각 모델의 calibrate_*() 함수가 CalibrationResult를 만들기 직전에 항상
+    이 함수를 거치게 한다. 여기서 걸러지면 success=False로 조기 반환하고,
+    (sanity_check.py의 사후 검사는 "성공했지만 이상한 결과"까지 잡아내는
+    두 번째 방어선이다 - 이 함수는 더 근본적인 "숫자 자체가 깨진" 경우를
+    아예 파이프라인 뒤로 못 넘어가게 막는 첫 번째 방어선).
+    """
+    if camera_matrix is None or not np.all(np.isfinite(camera_matrix)):
+        return "camera_matrix에 NaN 또는 Inf가 포함되어 있습니다 (계산 발산)."
+    if distortion is None or not np.all(np.isfinite(distortion)):
+        return "distortion 계수에 NaN 또는 Inf가 포함되어 있습니다 (계산 발산)."
+    if camera_matrix[0, 0] <= 0 or camera_matrix[1, 1] <= 0:
+        return f"fx/fy가 양수가 아닙니다 (fx={camera_matrix[0,0]}, fy={camera_matrix[1,1]})."
+    return None
+
 
 def collect_calibration_inputs(
     dataset: Dataset,
 ) -> tuple[list[Frame], list[np.ndarray], list[np.ndarray]]:
     """검출 성공 + 활성화(enabled) + 최소 코너 수를 만족하는 프레임만 골라
     calibrateCamera 입력 형태(object_points 리스트, image_points 리스트)로 변환.
-    """
-    usable_frames = [
-        f
-        for f in dataset.enabled_frames
-        if f.detection
-        and f.detection.success
-        and f.detection.num_corners >= MIN_CORNERS_PER_FRAME
-    ]
 
-    object_points = [f.detection.object_points for f in usable_frames]
-    image_points = [f.detection.corners for f in usable_frames]
+    설계 문서 16번 - corner-level outlier가 표시해둔 excluded_corner_indices가
+    있으면, 프레임 자체는 살리되 그 인덱스에 해당하는 코너만 입력에서 뺀다.
+    제외하고 남은 코너가 MIN_CORNERS_PER_FRAME 밑으로 떨어지면 그 프레임은
+    통째로 빠진다 (calibrateCamera가 애초에 요구하는 최소 조건).
+    """
+    usable_frames: list[Frame] = []
+    object_points: list[np.ndarray] = []
+    image_points: list[np.ndarray] = []
+
+    for f in dataset.enabled_frames:
+        det = f.detection
+        if not det or not det.success:
+            continue
+
+        obj, img = det.object_points, det.corners
+        excluded = det.excluded_corner_indices
+        if excluded:
+            mask = np.ones(obj.shape[0], dtype=bool)
+            valid_idx = [i for i in excluded if 0 <= i < obj.shape[0]]
+            mask[valid_idx] = False
+            obj, img = obj[mask], img[mask]
+
+        if obj.shape[0] < MIN_CORNERS_PER_FRAME:
+            continue
+
+        usable_frames.append(f)
+        object_points.append(obj)
+        image_points.append(img)
+
     return usable_frames, object_points, image_points
 
 
@@ -200,3 +273,26 @@ def undistort_image(
         return cv2.remap(image, map1, map2, interpolation=cv2.INTER_LINEAR)
 
     return cv2.undistort(image, K, D)
+
+
+def compute_mad_threshold(errors: list[float], k: float = 3.0, mad_scale: float = 1.0) -> float:
+    """threshold = median(error) + k * MAD
+
+    원래 outlier.py에 있던 함수를 여기(models/common.py)로 옮겼다 - outlier.py는
+    pinhole/extended_pinhole/fisheye 세 모델 함수를 import하는 "상위" 모듈이라,
+    residual_stats.py(모델 함수들이 CalibrationResult를 만들 때 바로 호출)가
+    outlier.py를 다시 import하면 순환 참조가 생긴다. common.py는 모델 함수들의
+    "하위" 의존성이라 이 방향의 순환이 생기지 않는다 - outlier.py는 하위
+    호환을 위해 이 함수를 그대로 재노출(import)한다.
+
+    mad_scale: 정규분포 가정 하에서 MAD를 표준편차와 비슷한 스케일로 맞추려면
+    1.4826을 곱하는 게 통계적으로 흔한 관례다. 문서 원문 공식은 스케일링 없이
+    그대로("median + 3*MAD")이므로 기본값은 1.0으로 두되, 필요하면
+    UI 고급 옵션에서 1.4826으로 바꿀 수 있게 열어둔다.
+    """
+    if not errors:
+        return 0.0
+    arr = np.asarray(errors, dtype=float)
+    median = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - median)))
+    return median + k * mad_scale * mad

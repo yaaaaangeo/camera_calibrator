@@ -113,6 +113,25 @@ def _exposure_score(brightness: float, ideal: float = 127.0) -> float:
     return max(0.0, 1.0 - abs(brightness - ideal) / ideal)
 
 
+def _pose_diversity_contribution(
+    tilt: float | None, area: float | None,
+    mean_tilt: float, std_tilt: float, mean_area: float, std_area: float,
+) -> float | None:
+    """설계 문서 4번 예시 표의 "Pose Diversity" 항목 - 프레임 단위 근사치.
+
+    데이터셋 전체의 다양성(quality.DiversityScores)과는 다른 층위다: 여기서는
+    "이 프레임 한 장이 dataset 평균 자세에서 얼마나 벗어나 있는가"를 본다 -
+    평균에서 많이 벗어난(=드문 자세) 프레임일수록 다양성에 기여도가 높다고
+    보고 점수를 높게 준다. std가 2만큼 벗어나면 만점(1.0)으로 포화시키는
+    V1 근사치 - _normalized_spread류 휴리스틱과 같은 성격이다.
+    """
+    if tilt is None or area is None:
+        return None
+    z_tilt = abs(tilt - mean_tilt) / std_tilt if std_tilt > 1e-6 else 0.0
+    z_area = abs(area - mean_area) / std_area if std_area > 1e-6 else 0.0
+    return float(min(1.0, ((z_tilt + z_area) / 2.0) / 2.0))
+
+
 # ---------------------------------------------------------------------------
 # Coverage 기여도 (기존 데이터와의 중복 정도의 반대 개념)
 # ---------------------------------------------------------------------------
@@ -218,6 +237,14 @@ def compute_frame_quality_scores(
         }
         reprojection_scores = _relative_scores(reproj_raw, higher_is_better=False)
 
+    # 설계 문서 4번 "Pose Diversity" per-frame 기여도 계산용 데이터셋 통계
+    tilts = [f.detection.board_tilt_deg for f in frames if f.detection.board_tilt_deg is not None]
+    areas = [f.detection.board_area_ratio for f in frames if f.detection.board_area_ratio is not None]
+    mean_tilt = float(np.mean(tilts)) if tilts else 0.0
+    std_tilt = float(np.std(tilts)) if tilts else 0.0
+    mean_area = float(np.mean(areas)) if areas else 0.0
+    std_area = float(np.std(areas)) if areas else 0.0
+
     for frame in frames:
         fid = frame.image_info.image_id
         det = frame.detection
@@ -252,6 +279,10 @@ def compute_frame_quality_scores(
         contribution = _coverage_contribution(frame, dataset.coverage_grid, image_size, rows, cols)
         geometric_score = contribution if contribution is not None else 0.5
 
+        pose_diversity = _pose_diversity_contribution(
+            det.board_tilt_deg, det.board_area_ratio, mean_tilt, std_tilt, mean_area, std_area
+        )
+
         overall = 100.0 * (
             _W_DETECTION_OVERALL * detection_score + _W_GEOMETRIC_OVERALL * geometric_score
         )
@@ -261,6 +292,13 @@ def compute_frame_quality_scores(
             geometric_score=round(geometric_score * 100.0, 1),
             overall_score=round(overall, 1),
             grade=_grade_from_score(overall),
+            # 설계 문서 4번 - "예시 표"의 각 행에 정확히 대응하는 분해값
+            blur_score=round(sharp_score * 100.0, 1),
+            exposure_score=round(exposure_score * 100.0, 1),
+            corner_quality_score=round(corner_score * 100.0, 1),
+            board_area_score=round(area_score * 100.0, 1),
+            edge_coverage_score=round(geometric_score * 100.0, 1),
+            pose_diversity_score=round(pose_diversity * 100.0, 1) if pose_diversity is not None else None,
         )
 
 
@@ -293,3 +331,116 @@ def format_frame_quality_table(dataset: Dataset) -> str:
         label = _GRADE_SYMBOL.get(q.grade, q.grade.value)
         lines.append(f"{frame.image_info.image_id:<16} Score {q.overall_score:5.1f}   {label}")
     return "\n".join(lines) if lines else "품질 점수가 계산된 프레임이 없습니다."
+
+
+def format_frame_quality_breakdown(frame: Frame) -> str:
+    """설계 문서 4번 예시 그대로의 개별 이미지 breakdown.
+
+        Image Quality Score
+        Blur             90
+        Exposure         95
+        Corner Quality   93
+        Board Area       80
+        Edge Coverage    92
+        Pose Diversity   85
+        --------------------
+        Total            89
+    """
+    if frame.quality is None:
+        return f"{frame.image_info.image_id}: 품질 점수가 계산되지 않았습니다."
+    q = frame.quality
+    rows = [
+        ("Blur", q.blur_score),
+        ("Exposure", q.exposure_score),
+        ("Corner Quality", q.corner_quality_score),
+        ("Board Area", q.board_area_score),
+        ("Edge Coverage", q.edge_coverage_score),
+        ("Pose Diversity", q.pose_diversity_score),
+    ]
+    lines = [f"Image Quality Score ({frame.image_info.image_id})"]
+    for label, value in rows:
+        value_str = f"{value:.0f}" if value is not None else "N/A"
+        lines.append(f"{label:<16} {value_str}")
+    lines.append("-" * 20)
+    lines.append(f"{'Total':<16} {q.overall_score:.0f}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 설계 문서 4번 - Overall Dataset Score
+# ---------------------------------------------------------------------------
+
+# 각 구성요소가 최종 점수에 기여하는 가중치. avg_frame_quality가 가장 크다 -
+# 결국 개별 프레임 품질의 평균이 데이터셋 전체 품질의 뼈대이고, 나머지는
+# "품질은 괜찮은데 특정 측면(검출률/커버리지/다양성/중복)이 부족한" 경우를
+# 보정하는 역할이다.
+_DATASET_W_FRAME_QUALITY = 0.40
+_DATASET_W_DETECTION_RATE = 0.15
+_DATASET_W_COVERAGE = 0.20
+_DATASET_W_DIVERSITY = 0.20
+_DATASET_W_DUPLICATE_PENALTY = 0.05  # 감점 항목이라 가중치는 작게, 하지만 0은 아님
+
+
+def compute_dataset_quality_score(
+    dataset: Dataset,
+    coverage_pct: float | None = None,
+    duplicate_ratio: float = 0.0,
+) -> "DatasetQualityScore":
+    """설계 문서 4번 "Overall Dataset Score" - Dataset 전체를 하나의 점수로
+    요약한다. FrameQuality(개별 프레임)와 DiversityScores(자세 다양성)를
+    이미 계산해둔 뒤(quality.analyze_dataset_quality, 이 모듈의
+    compute_frame_quality_scores) 마지막에 한 번 호출한다.
+
+    duplicate_ratio: image_quality.find_duplicate_groups() 결과로 계산한
+    "중복/거의 동일 이미지 비율" (0~1). 이 함수는 계산하지 않고 인자로만
+    받는다 - image_quality.py가 계산 책임을 지고, 여기는 집계만 한다
+    (모듈 간 역할 분리 원칙, 파일 상단 docstring 참고).
+    """
+    from calibration.types import DatasetQualityScore  # 순환 import 회피
+
+    frames_with_quality = [f for f in dataset.frames if f.quality is not None]
+    avg_frame_quality = (
+        float(np.mean([f.quality.overall_score for f in frames_with_quality]))
+        if frames_with_quality else 0.0
+    )
+
+    detection_success_rate = (
+        dataset.num_detected / dataset.num_total * 100.0 if dataset.num_total > 0 else 0.0
+    )
+
+    coverage_score = coverage_pct if coverage_pct is not None else 0.0
+    diversity_score = dataset.diversity.overall * 100.0 if dataset.diversity else 0.0
+    duplicate_penalty = float(min(1.0, max(0.0, duplicate_ratio))) * 100.0
+
+    overall = (
+        _DATASET_W_FRAME_QUALITY * avg_frame_quality
+        + _DATASET_W_DETECTION_RATE * detection_success_rate
+        + _DATASET_W_COVERAGE * coverage_score
+        + _DATASET_W_DIVERSITY * diversity_score
+        - _DATASET_W_DUPLICATE_PENALTY * duplicate_penalty
+    )
+    overall = float(max(0.0, min(100.0, overall)))
+
+    return DatasetQualityScore(
+        avg_frame_quality=round(avg_frame_quality, 1),
+        detection_success_rate=round(detection_success_rate, 1),
+        coverage_score=round(coverage_score, 1),
+        diversity_score=round(diversity_score, 1),
+        duplicate_penalty=round(duplicate_penalty, 1),
+        overall=round(overall, 1),
+        grade=_grade_from_score(overall),
+    )
+
+
+def format_dataset_quality_score(score: "DatasetQualityScore") -> str:
+    lines = [
+        "Overall Dataset Score",
+        f"{'Avg Frame Quality':<22} {score.avg_frame_quality:.1f}",
+        f"{'Detection Success Rate':<22} {score.detection_success_rate:.1f}",
+        f"{'Coverage':<22} {score.coverage_score:.1f}",
+        f"{'Pose Diversity':<22} {score.diversity_score:.1f}",
+        f"{'Duplicate Penalty':<22} -{score.duplicate_penalty:.1f}",
+        "-" * 28,
+        f"{'Total':<22} {score.overall:.1f}  ({score.grade.value})",
+    ]
+    return "\n".join(lines)

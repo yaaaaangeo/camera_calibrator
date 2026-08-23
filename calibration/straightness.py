@@ -31,7 +31,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from calibration.types import CameraModelType, Frame, PatternConfig
+from calibration.types import CameraModelType, Frame, PatternConfig, StraightnessBreakdown
 
 # 한 줄(행 또는 열)을 직선으로 피팅하려면 최소 이 정도 점은 있어야 신뢰할 만하다.
 # 3점이면 이미 "무조건 거의 직선"에 가까워 잔차가 과소평가되기 쉽다.
@@ -40,14 +40,19 @@ MIN_POINTS_PER_LINE = 4
 
 @dataclass
 class StraightnessLine:
-    """보드의 한 행 또는 열 - 시각화(ui/straightness_view.py)를 위한
+    """보드의 한 행 또는 열(또는 대각선) - 시각화(ui/straightness_view.py)를 위한
     프레임 단위 상세 정보. compute_straightness_residual()의 집계용
     스칼라와 달리, "어느 줄이 얼마나 휘었는지"를 그대로 유지한다.
     """
-    line_type: str  # "row" 또는 "col"
-    line_index: int  # board 상의 행/열 번호
+    line_type: str  # "row", "col", "diag_main"(좌상->우하), "diag_anti"(우상->좌하)
+    line_index: int  # board 상의 행/열/대각선 번호
     points: np.ndarray  # undistort된 픽셀 좌표, shape (N, 2)
     residual: float  # 이 줄만의 평균 점-직선 거리(px)
+    # 설계 문서 15번 - Line Straightness 평가 강화. direction은 "row"/"col"을
+    # horizontal/vertical/diagonal이라는 사람이 읽기 쉬운 이름으로, position은
+    # 보드 안에서 이 줄이 중앙 쪽인지 가장자리 쪽인지를 나타낸다.
+    direction: str = "horizontal"   # "horizontal" | "vertical" | "diagonal"
+    position: str = "center"        # "center" | "edge" | "corner"
 
 
 def _undistort_points_pixel_space(
@@ -179,38 +184,74 @@ def compute_frame_raw_straightness_lines(
     return _lines_from_points(det, pattern, raw_points, min_points_per_line)
 
 
+def _classify_position(index: int, total: int) -> str:
+    """설계 문서 15번 - "center line" vs "edge line" 판정.
+
+    common.classify_regions()가 이미지 좌표를 3등분(1/3, 2/3 경계)해서
+    center/edge/corner를 나누는 것과 같은 사고방식을 보드의 행/열 인덱스에
+    적용한 것 - 인덱스가 양 끝 1/3 구간에 있으면 "edge", 가운데 1/3이면
+    "center"로 본다. total이 아주 작으면(1~2줄) 전부 "edge"로 보수적으로
+    분류한다 - 그런 보드는 애초에 "중앙"이라 부를 만한 여유가 없다.
+    """
+    if total <= 2:
+        return "edge"
+    low, high = total / 3.0, total * 2.0 / 3.0
+    return "edge" if (index < low or index >= high) else "center"
+
+
 def _lines_from_points(
     det, pattern: PatternConfig, points: np.ndarray, min_points_per_line: int,
 ) -> list[StraightnessLine]:
-    """검출 결과(det)의 board id로 점들을 행/열로 묶어 직선을 피팅.
+    """검출 결과(det)의 board id로 점들을 행/열/대각선으로 묶어 직선을 피팅.
 
     compute_frame_straightness_lines()(보정 후)와
     compute_frame_raw_straightness_lines()(보정 전) 둘 다 이 함수를 공유한다 -
     "points가 어디서 왔는지"만 다르고 그 뒤 grouping/fitting 로직은 완전히
     동일해야, 전/후 숫자를 공정하게 비교할 수 있다 (로직이 갈라지면 차이가
     실제 개선 때문인지 계산 방식 차이 때문인지 알 수 없게 된다).
+
+    설계 문서 15번 - row/col(수평/수직)에 더해 두 방향의 대각선(diag_main:
+    좌상->우하, diag_anti: 우상->좌하)도 같은 board id 격자에서 뽑아낸다 -
+    대각선은 정의상 보드의 반대편 코너를 잇기 때문에 position="corner"로
+    분류한다(코드 내 상세 이유는 _classify_position 근처 주석 참고).
     """
-    cols_per_row = pattern.squares_x - 1  # id -> row/col 역산에 필요
+    n_cols = pattern.squares_x - 1  # id -> row/col 역산에 필요
+    n_rows = pattern.squares_y - 1
     ids_flat = det.ids.reshape(-1)
     rows: dict[int, list[np.ndarray]] = {}
     cols: dict[int, list[np.ndarray]] = {}
+    diag_main: dict[int, list[np.ndarray]] = {}
+    diag_anti: dict[int, list[np.ndarray]] = {}
+
     for idx, cid in enumerate(ids_flat):
         cid = int(cid)
-        row_key = cid // cols_per_row
-        col_key = cid % cols_per_row
+        row_key = cid // n_cols
+        col_key = cid % n_cols
         rows.setdefault(row_key, []).append(points[idx])
         cols.setdefault(col_key, []).append(points[idx])
+        # 두 종류 모두 "row_key - col_key"류 불변식으로 대각선을 묶는다 -
+        # 격자 위의 좌표에서 이 값이 일정한 점들이 정확히 한 대각선을 이룬다.
+        diag_main.setdefault(row_key - col_key, []).append(points[idx])
+        diag_anti.setdefault(row_key + col_key, []).append(points[idx])
 
     lines: list[StraightnessLine] = []
-    for line_type, groups in (("row", rows), ("col", cols)):
+    group_specs = (
+        ("row", rows, "horizontal", n_rows),
+        ("col", cols, "vertical", n_cols),
+        ("diag_main", diag_main, "diagonal", None),
+        ("diag_anti", diag_anti, "diagonal", None),
+    )
+    for line_type, groups, direction, total_for_position in group_specs:
         for line_index, group in groups.items():
             if len(group) < min_points_per_line:
                 continue
             pts = np.array(group)
+            position = "corner" if total_for_position is None else _classify_position(line_index, total_for_position)
             lines.append(
                 StraightnessLine(
                     line_type=line_type, line_index=line_index,
                     points=pts, residual=_fit_line_residual(pts),
+                    direction=direction, position=position,
                 )
             )
     return lines
@@ -279,3 +320,87 @@ def format_straightness_summary(residual: float | None, num_lines: int) -> str:
         "Poor"
     )
     return f"Line Straightness: {residual:.3f}px ({num_lines}개 라인 기준, {grade})"
+
+
+# ---------------------------------------------------------------------------
+# 설계 문서 15번 - Line Straightness 평가 강화 (방향/위치별 분해)
+# ---------------------------------------------------------------------------
+
+def compute_straightness_breakdown(
+    frames: list[Frame],
+    pattern: PatternConfig,
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray,
+    model: CameraModelType,
+    min_points_per_line: int = MIN_POINTS_PER_LINE,
+) -> StraightnessBreakdown:
+    """모든 프레임의 모든 줄(행/열/대각선)을 모아 방향별(horizontal/vertical/
+    diagonal)·위치별(center/edge/corner) 평균 잔차를 계산한다.
+
+    compute_straightness_residual()과 동일한 라인 수집(compute_frame_straightness_lines)을
+    재사용하므로, overall_error는 항상 compute_straightness_residual()의 결과와
+    정확히 같다 - 두 함수가 서로 다른 숫자를 내는 일이 없도록 보장한다.
+    """
+    all_lines: list[StraightnessLine] = []
+    for frame in frames:
+        all_lines.extend(
+            compute_frame_straightness_lines(frame, pattern, camera_matrix, distortion, model, min_points_per_line)
+        )
+
+    if not all_lines:
+        return StraightnessBreakdown(num_lines=0)
+
+    def _mean_or_none(residuals: list[float]) -> float | None:
+        return float(np.mean(residuals)) if residuals else None
+
+    by_direction: dict[str, list[float]] = {"horizontal": [], "vertical": [], "diagonal": []}
+    by_position: dict[str, list[float]] = {"center": [], "edge": [], "corner": []}
+    for line in all_lines:
+        by_direction.setdefault(line.direction, []).append(line.residual)
+        by_position.setdefault(line.position, []).append(line.residual)
+
+    return StraightnessBreakdown(
+        horizontal_error=_mean_or_none(by_direction["horizontal"]),
+        vertical_error=_mean_or_none(by_direction["vertical"]),
+        diagonal_error=_mean_or_none(by_direction["diagonal"]),
+        center_line_error=_mean_or_none(by_position["center"]),
+        edge_line_error=_mean_or_none(by_position["edge"]),
+        corner_line_error=_mean_or_none(by_position["corner"]),
+        overall_error=_mean_or_none([l.residual for l in all_lines]),
+        num_lines=len(all_lines),
+    )
+
+
+def format_straightness_breakdown(breakdown: StraightnessBreakdown) -> str:
+    """설계 문서 15번 출력 형식.
+
+        Line Straightness Breakdown (n=142 lines)
+        Horizontal        0.185 px
+        Vertical          0.203 px
+        Diagonal          0.241 px
+        --------------------------
+        Center line       0.171 px
+        Edge line         0.235 px
+        Corner line       0.241 px
+        --------------------------
+        Overall           0.198 px
+    """
+    if breakdown.num_lines == 0:
+        return "Line Straightness Breakdown: 계산할 수 있는 직선이 부족합니다."
+
+    def fmt(v: float | None) -> str:
+        return f"{v:.3f} px" if v is not None else "N/A"
+
+    lines = [
+        f"Line Straightness Breakdown (n={breakdown.num_lines} lines)",
+        f"{'Horizontal':<16}{fmt(breakdown.horizontal_error):>10}",
+        f"{'Vertical':<16}{fmt(breakdown.vertical_error):>10}",
+        f"{'Diagonal':<16}{fmt(breakdown.diagonal_error):>10}",
+        "-" * 26,
+        f"{'Center line':<16}{fmt(breakdown.center_line_error):>10}",
+        f"{'Edge line':<16}{fmt(breakdown.edge_line_error):>10}",
+        f"{'Corner line':<16}{fmt(breakdown.corner_line_error):>10}",
+        "-" * 26,
+        f"{'Overall':<16}{fmt(breakdown.overall_error):>10}",
+    ]
+    return "\n".join(lines)

@@ -44,11 +44,16 @@ from calibration.types import (
 )
 from calibration.models.common import (
     MIN_FRAMES_REQUIRED,
+    DEFAULT_TERM_CRITERIA,
     collect_calibration_inputs,
     infer_image_size,
     compute_regional_error,
+    validate_finite_calibration_output,
 )
-from calibration.radial_profile import compute_radial_error_profile
+from calibration.radial_profile import compute_radial_error_profile, compute_radial_error_bands
+from calibration.spatial_error_map import compute_spatial_error_map
+from calibration.residual_stats import compute_residual_stats_for_calibration
+from calibration.bootstrap import compute_parameter_bootstrap
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +62,6 @@ logger = logging.getLogger(__name__)
 # 데이터셋이 클수록 애초에 각 파라미터 추정 자체가 이미 안정적이라 불확실성
 # 추정의 한계효용도 낮다).
 _BOOTSTRAP_MAX_FRAMES = 150
-_BOOTSTRAP_MIN_SUCCESSFUL_SAMPLES = 5
 
 # fisheye는 파라미터가 적어도(k1~k4) Brown-Conrady보다 화각 전역에서 비선형성이
 # 강해, 뷰 개수가 부족하면 발산 위험이 pinhole/extended보다 크다.
@@ -153,76 +157,17 @@ def _bootstrap_fisheye_uncertainty(
     n_bootstrap: int,
     rng_seed: int,
 ) -> ParameterUncertainty | None:
-    """전체 데이터로 얻은 K_ref/D_ref를 초기값 삼아 프레임을 복원추출(bootstrap)로
-    재표본화해 n_bootstrap번 재캘리브레이션하고, fx/fy/cx/cy의 표준편차를 구한다.
-
-    cv2.fisheye는 stdDeviations를 안 준다(모듈 docstring 참고) - Pinhole/Extended처럼
-    "공짜로" 얻을 수 없다. 대신 통계학의 표준 기법인 bootstrap resampling으로
-    우회한다: 원래 N장짜리 데이터셋에서 매번 N장을 복원추출(같은 프레임이 여러 번
-    뽑히거나 아예 안 뽑힐 수 있음)해서 별도의 데이터셋을 만들고, 그걸로 다시
-    캘리브레이션한다. 이 과정을 여러 번 반복해서 나온 파라미터들이 흩어진 정도
-    (표준편차)가 곧 "이 데이터셋으로 추정한 파라미터가 얼마나 안정적인가"의
-    척도가 된다 - OpenCV가 못 주는 covariance를 흉내 내는 셈이다.
-
-    한계(정직하게 명시): 각 재표본은 전체 데이터의 K_ref를 초기값
-    (CALIB_USE_INTRINSIC_GUESS)으로 재사용한다. Fisheye는 초기값이 나쁘면
-    발산하기 쉬운데(모듈 docstring 1번), 매번 처음부터 추정하게 두면 실패율이
-    너무 높아 재표본 대부분을 못 쓰게 된다. 대신 이러면 "전체 데이터 추정치
-    근방에서의 국소적 분산"을 재는 셈이라, 완전히 독립적인 (초기값 없이 매번
-    새로 추정하는) 붓스트랩보다 분산을 다소 과소평가할 수 있다 - 그래도 "전혀
-    모른다"보다는 훨씬 유용한 근사치이며, Pinhole/Extended의 표준편차와 나란히
-    놓고 볼 상대적 비교 지표로는 충분하다.
-
-    일부 재표본은 그래도 발산하거나 예외를 던질 수 있다 - 조용히 건너뛰고 성공한
-    것만으로 표준편차를 계산한다. 성공한 재표본이 너무 적으면(기본 5개 미만)
-    통계적으로 의미가 없으므로 None을 반환한다(호출부는 이걸 "계산 안 됨"으로
-    표시해야지, 0으로 표시하면 안 된다).
+    """설계 문서 20번 - bootstrap 불확실성 추정 로직 자체는 이제
+    calibration/bootstrap.py로 옮겨져 세 모델이 공유한다(중복 로직을 한
+    곳으로 합침). 이 함수는 fisheye 전용 안전장치 하나만 더해서 그 공용
+    함수를 감싸는 얇은 래퍼다: cv2.fisheye.CALIB_USE_INTRINSIC_GUESS는
+    OpenCV 빌드에 따라 없을 수 있어(모듈 상단 docstring 1번) _fisheye_flag()로
+    안전하게 조회한 뒤에 넘긴다.
     """
-    n_frames = len(object_points)
-    rng = np.random.default_rng(rng_seed)
-
-    fx_samples: list[float] = []
-    fy_samples: list[float] = []
-    cx_samples: list[float] = []
-    cy_samples: list[float] = []
-
     bootstrap_flags = flags | _fisheye_flag("CALIB_USE_INTRINSIC_GUESS")
-    K_init = K_ref.copy().astype(np.float64)
-    D_init = D_ref.copy().astype(np.float64)
-
-    for _ in range(n_bootstrap):
-        idx = rng.integers(0, n_frames, size=n_frames)
-        obj_sample = [object_points[i] for i in idx]
-        img_sample = [image_points[i] for i in idx]
-        try:
-            _, K_i, D_i, _, _ = cv2.fisheye.calibrate(
-                obj_sample, img_sample, image_size,
-                K_init.copy(), D_init.copy(),
-                flags=bootstrap_flags,
-            )
-        except cv2.error:
-            continue  # 이 재표본은 발산 - 조용히 건너뛴다 (아래에서 성공 개수로 판단)
-        fx_samples.append(float(K_i[0, 0]))
-        fy_samples.append(float(K_i[1, 1]))
-        cx_samples.append(float(K_i[0, 2]))
-        cy_samples.append(float(K_i[1, 2]))
-
-    if len(fx_samples) < _BOOTSTRAP_MIN_SUCCESSFUL_SAMPLES:
-        logger.warning(
-            "Fisheye bootstrap 재표본 %d/%d개만 성공해 불확실성 추정을 건너뜁니다.",
-            len(fx_samples), n_bootstrap,
-        )
-        return None
-
-    logger.info(
-        "Fisheye bootstrap 불확실성 추정 완료: %d/%d개 재표본 성공",
-        len(fx_samples), n_bootstrap,
-    )
-    return ParameterUncertainty(
-        fx_std=float(np.std(fx_samples, ddof=1)),
-        fy_std=float(np.std(fy_samples, ddof=1)),
-        cx_std=float(np.std(cx_samples, ddof=1)),
-        cy_std=float(np.std(cy_samples, ddof=1)),
+    return compute_parameter_bootstrap(
+        object_points, image_points, image_size, CameraModelType.FISHEYE,
+        K_ref, D_ref, bootstrap_flags, n_bootstrap=n_bootstrap, rng_seed=rng_seed,
     )
 
 
@@ -284,6 +229,7 @@ def calibrate_fisheye(
             K_init,
             D_init,
             flags=flags,
+            criteria=DEFAULT_TERM_CRITERIA,
         )
     except cv2.error as e:
         # CALIB_CHECK_COND는 조건수가 나쁜(발산 위험) 프레임이 있으면 예외를 던진다.
@@ -299,6 +245,7 @@ def calibrate_fisheye(
                 K_init,
                 D_init,
                 flags=relaxed_flags,
+                criteria=DEFAULT_TERM_CRITERIA,
             )
         except cv2.error as e2:
             return CalibrationResult(
@@ -310,6 +257,12 @@ def calibrate_fisheye(
                 ),
             )
 
+    invalid_reason = validate_finite_calibration_output(K, D)
+    if invalid_reason:
+        return CalibrationResult(
+            model_name=CameraModelType.FISHEYE, success=False, error_message=invalid_reason,
+        )
+
     per_frame_error = _per_frame_errors_fisheye(
         frames, object_points, image_points, rvecs, tvecs, K, D
     )
@@ -318,6 +271,15 @@ def calibrate_fisheye(
 
     regional_error = compute_regional_error(frames, per_frame_error, image_size)
     radial_profile = compute_radial_error_profile(
+        frames, list(rvecs), list(tvecs), K, D, image_size, CameraModelType.FISHEYE
+    )
+    radial_bands = compute_radial_error_bands(
+        frames, list(rvecs), list(tvecs), K, D, image_size, CameraModelType.FISHEYE
+    )
+    residual_stats = compute_residual_stats_for_calibration(
+        frames, list(rvecs), list(tvecs), K, D, image_size, CameraModelType.FISHEYE
+    )
+    spatial_error_map = compute_spatial_error_map(
         frames, list(rvecs), list(tvecs), K, D, image_size, CameraModelType.FISHEYE
     )
 
@@ -344,6 +306,9 @@ def calibrate_fisheye(
         per_frame_error=per_frame_error,
         regional_error=regional_error,
         radial_profile=radial_profile,
+        radial_bands=radial_bands,
         param_uncertainty=param_uncertainty,
+        residual_stats=residual_stats,
+        spatial_error_map=spatial_error_map,
         success=True,
     )
