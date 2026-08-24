@@ -555,6 +555,9 @@ def project_from_dict(payload: dict) -> CalibrationProject:
         created_at=_dt(d.get("created_at")),
         updated_at=_dt(d.get("updated_at")),
         export_paths=export_paths,
+        stereo_result=d.get("stereo_result"),
+        stereo_pairs=d.get("stereo_pairs", []),
+        stereo_export_paths=d.get("stereo_export_paths", {}),
     )
 
 

@@ -264,7 +264,7 @@ class ResultView(QWidget):
         self.export_ros_button.setEnabled(usable)
         self.export_report_button.setEnabled(usable)
         self.export_json_button.setEnabled(usable)
-        self.cross_dataset_button.setEnabled(any(r.success for r in self._calibration_results.values()))
+        self.cross_dataset_button.setEnabled(usable)
         # CSV는 이미지별 데이터셋 통계라 특정 모델의 성공 여부와 무관하다 -
         # 계산이 아예 안 됐을 때만 막고, 어떤 모델이 실패했는지는 상관없다.
         self.export_csv_button.setEnabled(bool(self._calibration_results))

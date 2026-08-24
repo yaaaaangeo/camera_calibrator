@@ -109,6 +109,7 @@ def test_mouse_wheel_does_not_change_numbers_combos_or_tabs(qapp, monkeypatch):
     monkeypatch.setattr(MainWindow, "_offer_autosave_recovery", lambda self: None)
     win = MainWindow()
     try:
+        win._show_intrinsic_workspace()
         win.show()
         QApplication.processEvents()
         targets = [
@@ -168,6 +169,7 @@ def test_camera_setup_panel_can_collapse_and_expand(qapp, monkeypatch):
     monkeypatch.setattr(MainWindow, "_offer_autosave_recovery", lambda self: None)
     win = MainWindow()
     try:
+        win._show_intrinsic_workspace()
         win.show()
         QApplication.processEvents()
         expanded_height = win.settings_group.height()
@@ -209,9 +211,69 @@ def test_main_window_uses_documented_top_level_tabs(qapp):
             "⑦ Model Comparison",
             "⑧ Diagnosis",
             "⑨ Export",
+            "⑩ External Compare",
+            "⑪ Model Refitting",
         ]
     finally:
         win.close()
+
+
+def test_main_window_has_help_menu_next_to_file_menu(qapp):
+    from ui.main_window import MainWindow
+
+    win = MainWindow()
+    try:
+        labels = [action.text() for action in win.menuBar().actions()]
+        assert labels[:3] == ["파일", "설명", "도구"]
+    finally:
+        win.close()
+
+
+def test_main_window_starts_on_calibration_home_and_keeps_intrinsic_tabs(qapp):
+    from ui.main_window import MainWindow
+
+    win = MainWindow()
+    try:
+        assert win.workspace_stack.currentWidget() is win.home_view
+        win._show_intrinsic_workspace()
+        assert win.workspace_stack.currentWidget() is win.intrinsic_workspace
+        assert win.tabs.tabText(0) == "① Dataset"
+        win._show_stereo_workspace()
+        assert win.workspace_stack.currentWidget() is win.stereo_workspace
+    finally:
+        win.close()
+
+
+def test_stereo_workspace_exposes_wizard_change_unmatched_and_kalibr_controls(qapp):
+    from ui.stereo_workspace import StereoWorkspace
+
+    view = StereoWorkspace()
+    try:
+        assert view.step_back_button.text() == "← Back"
+        assert view.step_next_button.text() == "Next →"
+        assert view.step_label.text() == "① Intrinsics 단계"
+        assert view.unmatched_preview_button.text() == "Unmatched 보기"
+        assert view.manual_pair_button.text() == "Manual Pair..."
+        assert view.export_kalibr_button.text() == "Export Kalibr Camchain"
+        assert "evidence" in view.section_groups
+        assert view.section_groups["evidence"].title() == "⑩ Evidence Report / Export"
+        buttons = [button.text() for button in view.findChildren(type(view.step_next_button))]
+        assert "Camera 1 Change" in buttons
+        assert "Camera 2 Change" in buttons
+        assert "Delete Selected Pair" in buttons
+        assert "Sort by Sync Δt" in buttons
+        assert not view.section_groups["intrinsics"].isCheckable()
+        assert not view.section_groups["pairs"].isCheckable()
+        assert "▼" not in view.section_groups["intrinsics"].title()
+        assert "▶" not in view.section_groups["intrinsics"].title()
+        assert not view.section_groups["intrinsics"].isHidden()
+        assert view.section_groups["pairs"].isHidden()
+        view._focus_section("pairs")
+        assert view.step_label.text() == "② Pair/Coach 단계"
+        assert not view.section_groups["pairs"].isHidden()
+        assert view.section_groups["intrinsics"].isHidden()
+    finally:
+        view.close()
 
 
 def test_model_status_label_warns_on_failed_model(qapp):

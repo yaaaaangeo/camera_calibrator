@@ -41,7 +41,9 @@ RMS 숫자 하나로 승패를 가르지 않는다("RMS가 가장 낮은 모델 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import math
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -411,6 +413,13 @@ class ExternalComparisonResult:
     statistical_tests: list[StatisticalTestResult] = field(default_factory=list)
     bootstrap_comparison: BenchmarkBootstrapResult | None = None
     parameter_diagnostics: dict[str, BenchmarkParameterDiagnostics] = field(default_factory=dict)
+    evaluation_source: str = "internal_holdout"  # internal_holdout | independent_benchmark
+    confidence: str = "limited"                 # limited | high
+    evaluation_mode: str = "auto"
+    benchmark_image_count: int = 0
+    benchmark_usable_frames: int = 0
+    benchmark_overlap_count: int = 0
+    benchmark_status: str = "not_provided"
 
 
 def _metric_value(side: ComparisonSide, metric_key: str) -> float | None:
@@ -2293,6 +2302,131 @@ def _compatibility_caveats(reference: StandardCalibration, candidate: StandardCa
     return caveats
 
 
+_MIN_INDEPENDENT_BENCHMARK_USABLE_FRAMES = 10
+
+
+def _safe_sha256(path: str) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _dataset_paths_and_hashes(dataset: Dataset) -> tuple[set[str], set[str]]:
+    paths: set[str] = set()
+    hashes: set[str] = set()
+    for frame in dataset.frames:
+        path = frame.image_info.path
+        if path:
+            try:
+                paths.add(str(Path(path).resolve()))
+            except OSError:
+                paths.add(str(Path(path).absolute()))
+            digest = _safe_sha256(path)
+            if digest:
+                hashes.add(digest)
+    return paths, hashes
+
+
+def _benchmark_overlap_count(calibration_dataset: Dataset, benchmark_dataset: Dataset) -> int:
+    calibration_paths, calibration_hashes = _dataset_paths_and_hashes(calibration_dataset)
+    count = 0
+    seen: set[str] = set()
+    for frame in benchmark_dataset.frames:
+        path = frame.image_info.path
+        resolved = ""
+        if path:
+            try:
+                resolved = str(Path(path).resolve())
+            except OSError:
+                resolved = str(Path(path).absolute())
+        digest = _safe_sha256(path) if path else None
+        key = digest or resolved or frame.image_info.image_id
+        if key in seen:
+            continue
+        if (resolved and resolved in calibration_paths) or (digest and digest in calibration_hashes):
+            count += 1
+            seen.add(key)
+    return count
+
+
+def _select_evaluation_dataset(
+    calibration_dataset: Dataset,
+    internal_test_frame_ids: list[str],
+    independent_benchmark_dataset: Dataset | None,
+    evaluation_mode: str,
+    caveats: list[str],
+) -> tuple[Dataset, list[str], str, str, str, int, int, int]:
+    """Return dataset/test ids/source/confidence/status/counts for pair comparison.
+
+    Independent Benchmark is an optional confidence upgrade. It never blocks the
+    internal hold-out path; invalid benchmark data falls back to hold-out.
+    """
+    benchmark_count = len(independent_benchmark_dataset.frames) if independent_benchmark_dataset else 0
+    benchmark_ids = _usable_frame_ids(independent_benchmark_dataset) if independent_benchmark_dataset else []
+    benchmark_usable = len(benchmark_ids)
+    overlap = (
+        _benchmark_overlap_count(calibration_dataset, independent_benchmark_dataset)
+        if independent_benchmark_dataset is not None
+        else 0
+    )
+
+    wants_benchmark = evaluation_mode == "independent_benchmark" or (
+        evaluation_mode == "auto" and independent_benchmark_dataset is not None
+    )
+    if wants_benchmark and independent_benchmark_dataset is not None:
+        if overlap > 0:
+            caveats.append(
+                "Independent Benchmark Leakage Detected: "
+                f"{overlap} benchmark images overlap with the calibration dataset. "
+                "HIGH confidence is not allowed; falling back to Internal Hold-out."
+            )
+        elif benchmark_usable < _MIN_INDEPENDENT_BENCHMARK_USABLE_FRAMES:
+            caveats.append(
+                "Insufficient Benchmark Evidence: "
+                f"{benchmark_usable} usable benchmark frames "
+                f"(< {_MIN_INDEPENDENT_BENCHMARK_USABLE_FRAMES}). "
+                "Falling back to Internal Hold-out."
+            )
+        else:
+            caveats.append(
+                "Evaluation Source: Independent Benchmark. Reference/Candidate K,D are fixed; "
+                "only board pose is re-estimated per benchmark frame."
+            )
+            return (
+                independent_benchmark_dataset,
+                benchmark_ids,
+                "independent_benchmark",
+                "high",
+                "ok",
+                benchmark_count,
+                benchmark_usable,
+                overlap,
+            )
+
+    caveats.append(
+        "Evaluation Source: Internal Hold-out. Reference and Candidate were compared using held-out images "
+        "from the Candidate calibration acquisition session. These images were not used for parameter "
+        "estimation, but they originate from the same acquisition distribution. Provide an Independent "
+        "Benchmark Dataset for higher-confidence comparison."
+    )
+    status = "not_provided" if independent_benchmark_dataset is None else "fallback"
+    return (
+        calibration_dataset,
+        internal_test_frame_ids,
+        "internal_holdout",
+        "limited",
+        status,
+        benchmark_count,
+        benchmark_usable,
+        overlap,
+    )
+
+
 def compare_reference_candidate_calibrations(
     dataset: Dataset,
     camera_config: CameraConfig,
@@ -2300,6 +2434,8 @@ def compare_reference_candidate_calibrations(
     reference: StandardCalibration,
     candidate: StandardCalibration,
     test_frame_ids: list[str],
+    independent_benchmark_dataset: Dataset | None = None,
+    evaluation_mode: str = "auto",
     benchmark_kfold: int = 5,
     benchmark_bootstrap: int = 1000,
     generalization_datasets: dict[str, Dataset] | None = None,
@@ -2319,7 +2455,7 @@ def compare_reference_candidate_calibrations(
     로 채운다.
     """
     caveats = _compatibility_caveats(reference, candidate, camera_config)
-    if not test_frame_ids:
+    if not test_frame_ids and independent_benchmark_dataset is None:
         return ExternalComparisonResult(
             mine=ComparisonSide(label=candidate.label, success=False, error_message="비교 기준(test 프레임)이 없습니다."),
             external=ComparisonSide(label=reference.label, success=False, error_message="비교 기준(test 프레임)이 없습니다."),
@@ -2328,6 +2464,7 @@ def compare_reference_candidate_calibrations(
                 "validation split을 먼저 만들거나 이미지를 더 추가해 주세요."
             ),
             caveats=caveats,
+            evaluation_mode=evaluation_mode,
         )
 
     compatibility_has_errors = any(c.startswith("[ERROR]") for c in caveats)
@@ -2337,6 +2474,7 @@ def compare_reference_candidate_calibrations(
             external=ComparisonSide(label=reference.label, success=False, error_message="compatibility 검사 실패"),
             verdict="Reference/Candidate calibration이 호환되지 않아 공정한 비교를 중단했습니다.",
             caveats=caveats,
+            evaluation_mode=evaluation_mode,
         )
 
     if reference.model_name is None or candidate.model_name is None:
@@ -2345,14 +2483,32 @@ def compare_reference_candidate_calibrations(
             external=ComparisonSide(label=reference.label, success=False, error_message="camera model 누락"),
             verdict="Reference/Candidate 중 camera model이 없는 파일이 있어 비교할 수 없습니다.",
             caveats=caveats,
+            evaluation_mode=evaluation_mode,
         )
 
+    (
+        evaluation_dataset,
+        evaluation_frame_ids,
+        evaluation_source,
+        confidence,
+        benchmark_status,
+        benchmark_image_count,
+        benchmark_usable_frames,
+        benchmark_overlap_count,
+    ) = _select_evaluation_dataset(
+        dataset,
+        test_frame_ids,
+        independent_benchmark_dataset,
+        evaluation_mode,
+        caveats,
+    )
+
     reference_side = _evaluate_side(
-        dataset, camera_config, pattern_config, test_frame_ids,
+        evaluation_dataset, camera_config, pattern_config, evaluation_frame_ids,
         reference.camera_matrix, reference.distortion, reference.model_name, reference.label,
     )
     candidate_side = _evaluate_side(
-        dataset, camera_config, pattern_config, test_frame_ids,
+        evaluation_dataset, camera_config, pattern_config, evaluation_frame_ids,
         candidate.camera_matrix, candidate.distortion, candidate.model_name, candidate.label,
     )
 
@@ -2374,12 +2530,12 @@ def compare_reference_candidate_calibrations(
     metric_rows = build_metric_comparison_rows(reference_side, candidate_side)
     worst_case_rows = build_worst_case_rows(reference_side, candidate_side, spatial_comparisons)
     benchmark_validation_rows = build_benchmark_validation_rows(
-        dataset,
+        evaluation_dataset,
         camera_config,
         pattern_config,
         reference_side,
         candidate_side,
-        test_frame_ids,
+        evaluation_frame_ids,
         kfold=benchmark_kfold,
         generalization_datasets=generalization_datasets,
     )
@@ -2428,8 +2584,15 @@ def compare_reference_candidate_calibrations(
         statistical_tests=statistical_tests,
         bootstrap_comparison=bootstrap_comparison,
         parameter_diagnostics=build_parameter_diagnostics_pair(
-            dataset, test_frame_ids, reference_side, candidate_side
+            evaluation_dataset, evaluation_frame_ids, reference_side, candidate_side
         ),
+        evaluation_source=evaluation_source,
+        confidence=confidence,
+        evaluation_mode=evaluation_mode,
+        benchmark_image_count=benchmark_image_count,
+        benchmark_usable_frames=benchmark_usable_frames,
+        benchmark_overlap_count=benchmark_overlap_count,
+        benchmark_status=benchmark_status,
     )
 
 

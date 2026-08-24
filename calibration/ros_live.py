@@ -31,6 +31,8 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from dataclasses import field
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -82,6 +84,156 @@ def _require_backend() -> None:
 class LiveTopic:
     name: str
     msg_type: str
+
+
+@dataclass
+class StereoLivePair:
+    image_cam1: np.ndarray
+    image_cam2: np.ndarray
+    timestamp_cam1: float
+    timestamp_cam2: float
+
+    @property
+    def sync_delta_ms(self) -> float:
+        return abs(self.timestamp_cam1 - self.timestamp_cam2) * 1000.0
+
+
+@dataclass
+class LiveDualCaptureQAReport:
+    backend: str | None
+    topic_count: int
+    selected_topic1: str | None
+    selected_topic2: str | None
+    max_sync_delta_ms: float
+    output_dir: str
+    status: str
+    subscribed: bool = False
+    captured_pair_count: int = 0
+    last_sync_delta_ms: float | None = None
+    subscribe_elapsed_sec: float | None = None
+    checks: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def format(self) -> str:
+        lines = [
+            f"Backend: {self.backend or 'not found'}",
+            f"Image topics: {self.topic_count}",
+            f"Camera 1 topic: {self.selected_topic1 or 'not selected'}",
+            f"Camera 2 topic: {self.selected_topic2 or 'not selected'}",
+            f"Sync threshold: {self.max_sync_delta_ms:.1f} ms",
+            f"Output: {self.output_dir}",
+            f"Subscribed: {'yes' if self.subscribed else 'no'}",
+            f"Captured pairs: {self.captured_pair_count}",
+            f"Last sync delta: {'N/A' if self.last_sync_delta_ms is None else f'{self.last_sync_delta_ms:.1f} ms'}",
+            f"Subscribe elapsed: {'N/A' if self.subscribe_elapsed_sec is None else f'{self.subscribe_elapsed_sec:.1f} sec'}",
+            f"Status: {self.status}",
+        ]
+        if self.checks:
+            lines.append("Checks:")
+            lines.extend(f"- {item}" for item in self.checks)
+        if self.warnings:
+            lines.append("Warnings:")
+            lines.extend(f"- {item}" for item in self.warnings)
+        return "\n".join(lines)
+
+
+def build_live_dual_capture_qa_report(
+    *,
+    topics: list[LiveTopic],
+    selected_topic1: LiveTopic | None,
+    selected_topic2: LiveTopic | None,
+    output_dir: str,
+    max_sync_delta_ms: float = 30.0,
+    subscribed: bool = False,
+    captured_pair_count: int = 0,
+    last_sync_delta_ms: float | None = None,
+    subscribe_elapsed_sec: float | None = None,
+) -> LiveDualCaptureQAReport:
+    checks: list[str] = []
+    warnings: list[str] = []
+    if ROS_LIVE_BACKEND is None:
+        warnings.append("ROS1/ROS2 Python runtime was not found. Source the ROS environment before launching the app.")
+    else:
+        checks.append(f"ROS backend detected: {ROS_LIVE_BACKEND}")
+    if len(topics) >= 2:
+        checks.append("At least two image topics are visible.")
+    else:
+        warnings.append("Fewer than two image topics are visible.")
+    if selected_topic1 is None or selected_topic2 is None:
+        warnings.append("Camera 1/2 topics are not both selected.")
+    elif selected_topic1.name == selected_topic2.name:
+        warnings.append("Camera 1 and Camera 2 topics must be different.")
+    else:
+        checks.append("Camera 1/2 topics are distinct.")
+    out = Path(output_dir)
+    if out.exists():
+        checks.append("Output directory exists.")
+    else:
+        warnings.append("Output directory does not exist yet.")
+    if subscribed:
+        checks.append("Dual topic subscription is running.")
+        if last_sync_delta_ms is None:
+            warnings.append("No synchronized stereo pair has been received yet.")
+        elif last_sync_delta_ms <= max_sync_delta_ms:
+            checks.append(f"Last synchronized pair is within threshold ({last_sync_delta_ms:.1f} ms).")
+        else:
+            warnings.append(f"Last synchronized pair exceeds threshold ({last_sync_delta_ms:.1f} ms).")
+    else:
+        warnings.append("Dual topic subscription is not running.")
+    if captured_pair_count >= 50:
+        checks.append("Captured pair count meets the 50-pair recommendation.")
+    elif captured_pair_count > 0:
+        warnings.append(f"Only {captured_pair_count} stereo pairs captured; 50+ pairs are recommended.")
+    status = "ready" if not warnings else "needs_attention"
+    return LiveDualCaptureQAReport(
+        backend=ROS_LIVE_BACKEND,
+        topic_count=len(topics),
+        selected_topic1=selected_topic1.name if selected_topic1 else None,
+        selected_topic2=selected_topic2.name if selected_topic2 else None,
+        max_sync_delta_ms=float(max_sync_delta_ms),
+        output_dir=str(out),
+        status=status,
+        subscribed=bool(subscribed),
+        captured_pair_count=int(captured_pair_count),
+        last_sync_delta_ms=last_sync_delta_ms,
+        subscribe_elapsed_sec=subscribe_elapsed_sec,
+        checks=checks,
+        warnings=warnings,
+    )
+
+
+class StereoFrameSynchronizer:
+    """Keep the latest frame from each camera and emit near-synchronous pairs."""
+
+    def __init__(self, max_sync_delta_ms: float = 30.0) -> None:
+        self.max_sync_delta_ms = float(max_sync_delta_ms)
+        self._latest_cam1: tuple[np.ndarray, float] | None = None
+        self._latest_cam2: tuple[np.ndarray, float] | None = None
+
+    def submit(self, camera_index: int, image: np.ndarray, timestamp_sec: float) -> StereoLivePair | None:
+        item = (image, float(timestamp_sec))
+        if camera_index == 1:
+            self._latest_cam1 = item
+        elif camera_index == 2:
+            self._latest_cam2 = item
+        else:
+            raise ValueError("camera_index must be 1 or 2")
+        if self._latest_cam1 is None or self._latest_cam2 is None:
+            return None
+
+        img1, t1 = self._latest_cam1
+        img2, t2 = self._latest_cam2
+        delta_ms = abs(t1 - t2) * 1000.0
+        if delta_ms <= self.max_sync_delta_ms:
+            self._latest_cam1 = None
+            self._latest_cam2 = None
+            return StereoLivePair(img1, img2, t1, t2)
+
+        if t1 < t2:
+            self._latest_cam1 = None
+        else:
+            self._latest_cam2 = None
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -295,3 +447,60 @@ class LiveTopicSubscriber:
             if self._ros2_node is not None:
                 self._ros2_node.destroy_node()
                 self._ros2_node = None
+
+
+class DualLiveTopicSubscriber:
+    """Subscribe to two ROS image topics and emit synchronized stereo frames."""
+
+    def __init__(self, *, max_sync_delta_ms: float = 30.0) -> None:
+        _require_backend()
+        self._sync = StereoFrameSynchronizer(max_sync_delta_ms=max_sync_delta_ms)
+        self._lock = threading.Lock()
+        self._sub1: LiveTopicSubscriber | None = None
+        self._sub2: LiveTopicSubscriber | None = None
+        self._on_pair: Callable[[StereoLivePair], None] | None = None
+
+    def list_image_topics(self) -> list[LiveTopic]:
+        sub = LiveTopicSubscriber()
+        try:
+            return sub.list_image_topics()
+        finally:
+            sub.stop()
+
+    def start(
+        self,
+        topic1: str,
+        msg_type1: str,
+        topic2: str,
+        msg_type2: str,
+        on_pair: Callable[[StereoLivePair], None],
+        on_error: Callable[[str], None] | None = None,
+    ) -> None:
+        if self._sub1 is not None or self._sub2 is not None:
+            raise RuntimeError("이미 dual topic 구독 중입니다. 먼저 stop()을 호출하세요.")
+        self._on_pair = on_pair
+        self._sub1 = LiveTopicSubscriber()
+        self._sub2 = LiveTopicSubscriber()
+
+        def handle(camera_index: int, image: np.ndarray, timestamp: float) -> None:
+            with self._lock:
+                pair = self._sync.submit(camera_index, image, timestamp)
+            if pair is not None and self._on_pair is not None:
+                self._on_pair(pair)
+
+        self._sub1.start(topic1, msg_type1, lambda img, ts: handle(1, img, ts), on_error)
+        try:
+            self._sub2.start(topic2, msg_type2, lambda img, ts: handle(2, img, ts), on_error)
+        except Exception:
+            self._sub1.stop()
+            self._sub1 = None
+            self._sub2 = None
+            raise
+
+    def stop(self) -> None:
+        for sub in (self._sub1, self._sub2):
+            if sub is not None:
+                sub.stop()
+        self._sub1 = None
+        self._sub2 = None
+        self._on_pair = None

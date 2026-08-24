@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -30,8 +31,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QStackedWidget,
     QSpinBox,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -49,6 +50,7 @@ from calibration.types import (
     PatternType,
     ValidationResult,
 )
+from calibration.calibration_io import StandardCalibration
 from calibration.recommender import compute_final_result
 from calibration.sanity_check import run_sanity_checks
 from calibration.quality import coverage_percentage
@@ -59,22 +61,19 @@ from export.ros import export_ros_camera_info
 from export.report import export_html_report
 from export.json_export import export_json
 from export.csv_export import export_csv
+from export.stereo import stereo_pairs_to_dict, stereo_result_to_dict
 
-from ui.dataset_view import DatasetView
-from ui.coverage_view import CoverageView
-from ui.result_view import ResultView
-from ui.preview import PreviewView
-from ui.radial_profile_view import RadialProfileView
-from ui.straightness_view import StraightnessView
-from ui.external_compare_view import ExternalCompareView
-from ui.diagnosis_view import DiagnosisView
-from ui.stability_view import StabilityView
+from ui.calibration_home_view import CalibrationHomeView
+from ui.help_view import HelpView
+from ui.intrinsic_workspace import IntrinsicWorkspace
+from ui.stereo_workspace import StereoWorkspace
 from ui.live_capture_dialog import LiveCaptureDialog
 from ui.wheel_guard import WheelChangeGuard
 from ui.worker import (
     PipelineWorker,
     OutlierPruneWorker,
     CrossDatasetValidationWorker,
+    ModelRefittingWorker,
     SelfCheckWorker,
     BagTopicDiscoveryWorker,
     BagExtractionWorker,
@@ -101,6 +100,86 @@ _IMAGE_EXTENSIONS = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
 
 
 class MainWindow(QMainWindow):
+    @property
+    def image_paths(self):
+        return self.intrinsic_state.image_paths
+
+    @image_paths.setter
+    def image_paths(self, value):
+        self.intrinsic_state.image_paths = value
+
+    @property
+    def dataset(self):
+        return self.intrinsic_state.dataset
+
+    @dataset.setter
+    def dataset(self, value):
+        self.intrinsic_state.dataset = value
+
+    @property
+    def camera_config(self):
+        return self.intrinsic_state.camera_config
+
+    @camera_config.setter
+    def camera_config(self, value):
+        self.intrinsic_state.camera_config = value
+
+    @property
+    def pattern_config(self):
+        return self.intrinsic_state.pattern_config
+
+    @pattern_config.setter
+    def pattern_config(self, value):
+        self.intrinsic_state.pattern_config = value
+
+    @property
+    def calibration_results(self):
+        return self.intrinsic_state.calibration_results
+
+    @calibration_results.setter
+    def calibration_results(self, value):
+        self.intrinsic_state.calibration_results = value
+
+    @property
+    def validation_results(self):
+        return self.intrinsic_state.validation_results
+
+    @validation_results.setter
+    def validation_results(self, value):
+        self.intrinsic_state.validation_results = value
+
+    @property
+    def cross_dataset_results(self):
+        return self.intrinsic_state.cross_dataset_results
+
+    @cross_dataset_results.setter
+    def cross_dataset_results(self, value):
+        self.intrinsic_state.cross_dataset_results = value
+
+    @property
+    def scores(self):
+        return self.intrinsic_state.scores
+
+    @scores.setter
+    def scores(self, value):
+        self.intrinsic_state.scores = value
+
+    @property
+    def outlier_result(self):
+        return self.intrinsic_state.outlier_result
+
+    @outlier_result.setter
+    def outlier_result(self, value):
+        self.intrinsic_state.outlier_result = value
+
+    @property
+    def use_rational_model(self):
+        return self.intrinsic_state.use_rational_model
+
+    @use_rational_model.setter
+    def use_rational_model(self, value):
+        self.intrinsic_state.use_rational_model = value
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Camera Calibration Tool")
@@ -136,16 +215,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(800, 600)
 
         # --- 상태 ---
-        self.image_paths: list[str] = []
-        self.dataset: Dataset | None = None
-        self.camera_config: CameraConfig | None = None
-        self.pattern_config: PatternConfig | None = None
-        self.calibration_results: dict[CameraModelType, CalibrationResult] = {}
-        self.validation_results: dict[CameraModelType, ValidationResult] = {}
-        self.cross_dataset_results: list[CrossDatasetValidationResult] = []
-        self.scores: list[ModelScore] = []
-        self.outlier_result: OutlierResult | None = None
-        self.use_rational_model: bool = False
+        IntrinsicWorkspace.initialize_owner_state(self)
         self._thread: QThread | None = None
         self._worker = None  # QThread가 살아있는 동안 GC 방지용 강한 참조
         self._self_check_thread: QThread | None = None
@@ -156,6 +226,9 @@ class MainWindow(QMainWindow):
         self._bag_topic_worker = None
         self._bag_topic_progress_dialog: QProgressDialog | None = None
         self._self_check_worker = None  # 위와 동일한 이유로 별도 워커도 강한 참조 보관
+        self._model_refit_thread: QThread | None = None
+        self._model_refit_worker = None
+        self._pending_stereo_intrinsic_slot: str | None = None
 
         self._build_menu_bar()
 
@@ -163,46 +236,25 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        layout.addWidget(self._build_settings_panel())
+        self.workspace_stack = QStackedWidget()
+        self.home_view = CalibrationHomeView()
+        settings_panel = self._build_settings_panel()
 
-        self.tabs = QTabWidget()
-        # 이전엔 "Dataset"과 "Detection" 탭이 완전히 동일한 DatasetView를
-        # group_title만 바꿔 두 번 보여줬다(내용이 100% 중복) - 실사용자 피드백으로
-        # Detection 탭을 없애고 Dataset 탭 하나로 합쳤다.
-        self.dataset_view = DatasetView(group_title="Dataset")
-        self.coverage_view = CoverageView()
-        self.result_view = ResultView(standalone=False)
-        self.preview_view = PreviewView()
-        self.radial_profile_view = RadialProfileView()
-        self.straightness_view = StraightnessView()
-        self.external_compare_view = ExternalCompareView()
-        self.diagnosis_view = DiagnosisView()
-        self.stability_view = StabilityView()
-        self.error_analysis_tab = self._build_error_analysis_tab()
-        self.tabs.addTab(self.dataset_view, "① Dataset")
-        self.tabs.addTab(self.coverage_view, "② Coverage")
-        # 탭 제목만 "Outlier"로 바꿨다 - 실제 내용(모델 선택/실행 + 이상치 제거)은
-        # 그대로다. 사용자 피드백: "Calibration"이라는 이름이 이 탭에서 실제로
-        # 제일 눈에 띄는 기능(이상치 제거)과 안 맞아 헷갈렸다.
-        self.tabs.addTab(self.result_view.calibration_widget, "③ Outlier")
-        self.tabs.addTab(self.result_view.validation_widget, "④ Validation")
-        self.tabs.addTab(self.error_analysis_tab, "⑤ Error Analysis")
-        self.tabs.addTab(self.stability_view, "⑥ Stability")
-        self.tabs.addTab(self.result_view.model_comparison_widget, "⑦ Model Comparison")
-        self.tabs.addTab(self.diagnosis_view, "⑧ Diagnosis")
-        self.tabs.addTab(self.result_view.export_widget, "⑨ Export")
-        layout.addWidget(self.tabs, stretch=1)
+        self.intrinsic_workspace = IntrinsicWorkspace.create_for_main_window(self, settings_panel)
+        self.intrinsic_workspace.back_requested.connect(self._show_home)
+        self.stereo_workspace = StereoWorkspace()
+        self.workspace_stack.addWidget(self.home_view)
+        self.workspace_stack.addWidget(self.intrinsic_workspace)
+        self.workspace_stack.addWidget(self.stereo_workspace)
+        layout.addWidget(self.workspace_stack, stretch=1)
 
         self.status_label = QLabel("이미지를 불러온 뒤 [캘리브레이션 실행]을 누르세요.")
         self.statusBar().addWidget(self.status_label, stretch=1)
 
-        self.result_view.outlier_prune_requested.connect(self._on_outlier_prune_requested)
-        self.result_view.export_opencv_requested.connect(self._on_export_opencv)
-        self.result_view.export_ros_requested.connect(self._on_export_ros)
-        self.result_view.export_report_requested.connect(self._on_export_report)
-        self.result_view.export_json_requested.connect(self._on_export_json)
-        self.result_view.export_csv_requested.connect(self._on_export_csv)
-        self.result_view.cross_dataset_requested.connect(self._on_cross_dataset_requested)
+        self.home_view.intrinsic_requested.connect(self._show_intrinsic_workspace)
+        self.home_view.stereo_requested.connect(self._show_stereo_workspace)
+        self.stereo_workspace.back_requested.connect(self._show_home)
+        self.stereo_workspace.calibrate_intrinsic_requested.connect(self._on_stereo_intrinsic_requested)
 
         # 앱이 응답 없음/강제 종료 등으로 꺼져도 마지막으로 완료된 계산
         # 결과는 자동 저장본에서 복구할 수 있게, 창이 뜨자마자 한 번 확인한다.
@@ -213,16 +265,47 @@ class MainWindow(QMainWindow):
         # Export만큼은 다시 할 수 있다.)
         QTimer.singleShot(0, self._offer_autosave_recovery)
 
-    def _build_error_analysis_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        sub_tabs = QTabWidget()
-        sub_tabs.addTab(self.preview_view, "Undistort Preview")
-        sub_tabs.addTab(self.radial_profile_view, "Edge Error Map")
-        sub_tabs.addTab(self.straightness_view, "Straightness Map")
-        sub_tabs.addTab(self.external_compare_view, "External Compare")
-        layout.addWidget(sub_tabs)
-        return tab
+    def _show_home(self) -> None:
+        self.workspace_stack.setCurrentWidget(self.home_view)
+        self.status_label.setText("Calibration Type을 선택하세요.")
+
+    def _show_intrinsic_workspace(self) -> None:
+        self.workspace_stack.setCurrentWidget(self.intrinsic_workspace)
+        self.status_label.setText("Camera Intrinsic Workspace")
+
+    def _show_stereo_workspace(self) -> None:
+        self.stereo_workspace.set_pattern_config(self.pattern_config or self._current_pattern_config())
+        self.workspace_stack.setCurrentWidget(self.stereo_workspace)
+        self.status_label.setText("Camera-to-Camera Stereo Workspace")
+
+    def _on_stereo_intrinsic_requested(self, slot: str) -> None:
+        self._pending_stereo_intrinsic_slot = slot
+        if self.calibration_results and self.camera_config is not None:
+            chosen = next((s.model_name for s in self.scores if s.is_recommended), None)
+            if chosen is None:
+                chosen = self.result_view.model_combo.currentData()
+            result = self.calibration_results.get(chosen)
+            if result is not None and result.success:
+                self.stereo_workspace.set_previous_intrinsic(slot, self._standard_from_result(result))
+                self._show_stereo_workspace()
+                return
+        self._show_intrinsic_workspace()
+        self.status_label.setText(
+            f"{slot} Intrinsic이 필요합니다. 기존 Intrinsic Workspace에서 캘리브레이션을 완료하면 자동으로 연결됩니다."
+        )
+
+    def _standard_from_result(self, result: CalibrationResult) -> StandardCalibration:
+        return StandardCalibration(
+            label=result.model_name.value,
+            camera_matrix=result.camera_matrix,
+            distortion=result.distortion,
+            model_name=result.model_name,
+            distortion_model=None,
+            width=self.camera_config.width if self.camera_config else None,
+            height=self.camera_config.height if self.camera_config else None,
+            camera_name=self.camera_config.sensor_name if self.camera_config else None,
+            source_format="camera_calibrator_result",
+        )
 
     # ------------------------------------------------------------------
     # 설정 패널 (설계 문서 14번 ① Camera Setup, ③ Calibration Pattern)
@@ -242,6 +325,12 @@ class MainWindow(QMainWindow):
         load_action.triggered.connect(self._on_load_project)
         file_menu.addAction(load_action)
 
+        help_menu = menu_bar.addMenu("설명")
+        guide_action = QAction("사용 설명서 열기", self)
+        guide_action.setShortcut("F1")
+        guide_action.triggered.connect(self._on_show_help)
+        help_menu.addAction(guide_action)
+
         tools_menu = menu_bar.addMenu("도구")
         self.self_check_action = QAction("자체 진단 (합성 데이터로 정확도 확인)...", self)
         self.self_check_action.setToolTip(
@@ -251,6 +340,14 @@ class MainWindow(QMainWindow):
         )
         self.self_check_action.triggered.connect(self._on_run_self_check)
         tools_menu.addAction(self.self_check_action)
+
+    def _on_show_help(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Camera Calibration Tool 사용 설명서")
+        dialog.resize(980, 720)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(HelpView(dialog))
+        dialog.exec()
 
     def _build_settings_panel(self) -> QWidget:
         group = QGroupBox("▼ Camera Setup / Pattern")
@@ -358,10 +455,11 @@ class MainWindow(QMainWindow):
         return group
 
     def _on_settings_panel_toggled(self, expanded: bool) -> None:
-        self.settings_content.setVisible(expanded)
+        self.settings_group.setMaximumHeight(16777215 if expanded else 42)
         self.settings_group.setTitle(
             "▼ Camera Setup / Pattern" if expanded else "▶ Camera Setup / Pattern"
         )
+        self.settings_content.setVisible(expanded)
 
     # ------------------------------------------------------------------
     # 이미지 로드 / 파이프라인 실행
@@ -639,6 +737,7 @@ class MainWindow(QMainWindow):
             checks = run_sanity_checks(list(results.values()), self.camera_config)
             self.result_view.set_sanity_checks(checks)
         self.radial_profile_view.set_results(results)
+        self.model_refitting_view.set_context(results, self.camera_config)
         self._refresh_result_view()
 
     def _on_validation_ready(self, results: dict[CameraModelType, ValidationResult]) -> None:
@@ -665,6 +764,15 @@ class MainWindow(QMainWindow):
         # 계산이 완전히 끝난 시점(추천까지 나온 시점)이라 여기서 조용히
         # 자동 저장한다 - 다음에 앱이 비정상 종료돼도 이 결과는 남는다.
         self._autosave()
+        if self._pending_stereo_intrinsic_slot is not None and recommended is not None:
+            result = self.calibration_results.get(recommended)
+            if result is not None and result.success:
+                self.stereo_workspace.set_previous_intrinsic(
+                    self._pending_stereo_intrinsic_slot,
+                    self._standard_from_result(result),
+                )
+                self._pending_stereo_intrinsic_slot = None
+                self._show_stereo_workspace()
 
     def _autosave(self) -> None:
         """마지막으로 완료된 계산 결과를 홈 디렉터리의 고정 파일에 저장한다.
@@ -679,6 +787,7 @@ class MainWindow(QMainWindow):
         """
         if self.dataset is None or self.camera_config is None or self.pattern_config is None:
             return
+        IntrinsicWorkspace.sync_owner_state(self)
         try:
             _AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
             project = CalibrationProject(
@@ -691,6 +800,11 @@ class MainWindow(QMainWindow):
                 cross_dataset_results=self.cross_dataset_results,
                 model_scores=self.scores,
                 outlier_result=self.outlier_result,
+                stereo_result=(
+                    stereo_result_to_dict(self.stereo_workspace.result)
+                    if self.stereo_workspace.result is not None else None
+                ),
+                stereo_pairs=stereo_pairs_to_dict(self.stereo_workspace.pairs),
             )
             save_project(project, str(_AUTOSAVE_PATH))
             logger.debug("자동 저장 완료: %s", _AUTOSAVE_PATH)
@@ -825,6 +939,55 @@ class MainWindow(QMainWindow):
         ok = sum(1 for r in results if r.success)
         self.status_label.setText(f"Cross-dataset validation 완료: {ok}/{len(results)} 성공")
         self._autosave()
+
+    # ------------------------------------------------------------------
+    # Model Refitting
+    # ------------------------------------------------------------------
+
+    def _on_model_refit_requested(self, options: dict) -> None:
+        result = self.calibration_results.get(CameraModelType.EXTENDED_PINHOLE)
+        if (
+            result is None or not result.success or result.camera_matrix is None
+            or result.distortion is None or self.camera_config is None
+        ):
+            QMessageBox.warning(
+                self,
+                "Model Refitting 불가",
+                "먼저 Rational model 사용(k4~k6 포함)으로 Extended Pinhole 캘리브레이션을 실행하세요.",
+            )
+            return
+
+        worker = ModelRefittingWorker(
+            result.camera_matrix,
+            result.distortion,
+            (self.camera_config.width, self.camera_config.height),
+            options,
+        )
+        thread = run_worker_in_thread(worker, self)
+        worker.progress.connect(self.status_label.setText)
+        worker.progress.connect(lambda _msg: self.model_refitting_view.set_running())
+        worker.result_ready.connect(self._on_model_refit_ready)
+        worker.error.connect(self._on_model_refit_error)
+        worker.finished.connect(self._on_model_refit_finished)
+
+        self._model_refit_thread = thread
+        self._model_refit_worker = worker
+        thread.start()
+
+    def _on_model_refit_ready(self, result) -> None:
+        self.model_refitting_view.set_result(result)
+        self.status_label.setText(
+            f"Model Refitting 완료: RMSE={result.error.rmse_px:.4f}px, "
+            f"Edge RMSE={result.region_error['edge'].rmse_px:.4f}px"
+        )
+
+    def _on_model_refit_error(self, message: str) -> None:
+        self.model_refitting_view.set_error(message)
+        QMessageBox.critical(self, "Model Refitting 실패", message)
+
+    def _on_model_refit_finished(self) -> None:
+        self._model_refit_thread = None
+        self._model_refit_worker = None
 
     # ------------------------------------------------------------------
     # Outlier 재계산
@@ -1017,6 +1180,7 @@ class MainWindow(QMainWindow):
         if self.dataset is None or self.camera_config is None or self.pattern_config is None:
             QMessageBox.warning(self, "저장할 내용 없음", "먼저 이미지를 불러오고 캘리브레이션을 실행하세요.")
             return
+        IntrinsicWorkspace.sync_owner_state(self)
 
         path, _ = QFileDialog.getSaveFileName(
             self, "프로젝트 저장", f"project{PROJECT_EXTENSION}", f"Camera Calibrator Project (*{PROJECT_EXTENSION})"
@@ -1036,6 +1200,11 @@ class MainWindow(QMainWindow):
             cross_dataset_results=self.cross_dataset_results,
             model_scores=self.scores,
             outlier_result=self.outlier_result,
+            stereo_result=(
+                stereo_result_to_dict(self.stereo_workspace.result)
+                if self.stereo_workspace.result is not None else None
+            ),
+            stereo_pairs=stereo_pairs_to_dict(self.stereo_workspace.pairs),
         )
         try:
             saved_path = save_project(project, path)
@@ -1068,6 +1237,15 @@ class MainWindow(QMainWindow):
         self.scores = project.model_scores
         self.outlier_result = project.outlier_result
         self.image_paths = [f.image_info.path for f in project.dataset.frames]
+        IntrinsicWorkspace.sync_owner_state(self)
+        if project.stereo_result or project.stereo_pairs:
+            try:
+                self.stereo_workspace.restore_project_payload(
+                    result_payload=project.stereo_result,
+                    pair_payload=project.stereo_pairs,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Stereo 결과 복원 실패: %s", exc)
 
         # --- 설정 패널 위젯도 불러온 값으로 맞춰준다 (재계산/이어서 작업 시 일관성) ---
         self.width_spin.setValue(self.camera_config.width)
@@ -1093,6 +1271,7 @@ class MainWindow(QMainWindow):
             self.straightness_view.set_context(
                 self.dataset, self.camera_config, self.calibration_results, self.pattern_config
             )
+            self.model_refitting_view.set_context(self.calibration_results, self.camera_config)
         if self.validation_results:
             self.external_compare_view.set_context(
                 self.dataset, self.camera_config, self.pattern_config,

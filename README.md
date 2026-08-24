@@ -125,29 +125,40 @@ camera-calibrator
    > 자체의 잘 알려진 한계다 (설계 문서 2번이 애초에 ChArUco를 우선한 이유이기도
    > 하다). 가능하면 ChArUco를 쓰고, 꼭 체스보드를 써야 한다면 촬영 내내
    > 보드 방향을 일관되게 유지할 것.
-2. **[이미지 불러오기]** 로 촬영한 사진 여러 장 선택 (jpg/png/bmp), 또는
+2. 프로그램 실행 후 **Calibration Home**에서 작업 종류 선택:
+   - **Camera Intrinsic**: 기존 K/D 캘리브레이션 workspace로 진입
+   - **Camera ↔ Camera**: 두 카메라의 상대 R/T, rectification, validation을 계산하는 Stereo workspace로 진입
+3. Camera Intrinsic에서는 **[이미지 불러오기]** 로 촬영한 사진 여러 장 선택 (jpg/png/bmp), 또는
    **[rosbag에서 불러오기]** 로 ROS1(.bag)/ROS2(.db3, .mcap) 로그에서 이미지 토픽을
    골라 자동 추출 (rospy/rclpy 설치 불필요, 순수 Python `rosbags` 라이브러리 사용), 또는
    **[실시간 카메라 구독]** 으로 ROS1/ROS2 이미지 토픽을 실시간 구독해서 라이브
    프리뷰를 보며 원하는 자세에서 직접 캡처 (이 기능은 실제 ROS1 또는 ROS2가
    컴퓨터에 설치되어 있어야 함 - rospy/rclpy는 pip로 설치되지 않음)
-3. **[캘리브레이션 실행]** 클릭 → 검출 → 3모델 계산 → Hold-out → 추천까지 자동 진행
-4. 탭을 넘기며 결과 확인:
+4. **[캘리브레이션 실행]** 클릭 → 검출 → 3모델 계산 → Hold-out → 추천까지 자동 진행
+5. 탭을 넘기며 결과 확인:
    - **① Dataset**: 이미지별 상태/코너 수/재투영 오차/**품질 점수(Frame Quality Score)·등급**
-   - **② Detection**: 검출 성공/실패와 실패 이유를 독립 탭에서 확인
-   - **③ Coverage**: 4×4 커버리지 맵 + 데이터셋 다양성 점수 + 경고
-   - **④ Calibration**: 선택 모델 기준 이상치 제거·재계산
-   - **⑤ Validation**: sanity check + Dataset B/C cross-dataset validation
-   - **⑥ Error Analysis**: Undistort Preview, Edge Error Map, Straightness Map, 외부 결과 비교
+   - **② Coverage**: 4×4 커버리지 맵 + 데이터셋 다양성 점수 + 경고
+   - **③ Outlier**: 선택 모델 기준 이상치 제거·재계산
+   - **④ Validation**: sanity check + Dataset B/C cross-dataset validation
+   - **⑤ Error Analysis**: Undistort Preview, Edge Error Map, Straightness Map
+   - **⑥ Stability**: bootstrap/repeatability 기반 파라미터 안정성
+   - **⑦ Model Comparison**: 3모델 비교표(Train/Test/P95/Edge/Radial/AIC/BIC/Stability/Observability) + 추천 이유
+   - **⑧ Diagnosis**: failure pattern, 원인 분석, 다음 촬영 추천
+   - **⑨ Export**: OpenCV/ROS YAML, **HTML 종합 리포트**, **JSON**, **CSV** export
+   - **⑩ External Compare**: 외부 결과 비교
      (OpenCV YAML / ROS CameraInfo YAML / Kalibr camchain YAML / 표준 JSON import)
      + benchmark compatibility 검사(width/height, model, distortion model, 계수 개수,
      NaN/Inf, matrix shape, 파라미터 범위)
      + Reference/Candidate를 둘 다 파일로 로드하는 독립 benchmark 비교
-   - **⑦ Stability**: bootstrap/repeatability 기반 파라미터 안정성
-   - **⑧ Model Comparison**: 3모델 비교표(Train/Test/P95/Edge/Radial/AIC/BIC/Stability/Observability) + 추천 이유
-   - **⑨ Diagnosis**: failure pattern, 원인 분석, 다음 촬영 추천
-   - **⑩ Export**: OpenCV/ROS YAML, **HTML 종합 리포트**, **JSON**, **CSV** export
-5. 상단 메뉴 **파일 → 프로젝트 저장(Ctrl+S)** 으로 지금까지의 전체 상태(데이터셋,
+   - **⑪ Model Refitting**: Rational/Extended Pinhole 8계수 모델을 이미지 전체
+     projection 기준으로 OpenCV Pinhole 5계수 모델에 최적화 근사
+6. Camera ↔ Camera workspace:
+   - Camera 1/2 Intrinsic을 기존 calibration 파일로 불러오거나 최근 Intrinsic 결과를 재사용
+   - Camera 1/2 이미지 폴더를 stereo pair로 불러와 공통 ChArUco ID만 매칭
+   - 기본 정책은 `cv2.CALIB_FIX_INTRINSIC`: K1/D1/K2/D2는 고정하고 R/T만 최적화
+   - 결과에는 `R_cam2_from_cam1`, `t_cam2_from_cam1`, 양방향 4x4 transform,
+     baseline, roll/pitch/yaw, rectification, epipolar/vertical validation, YAML/JSON export 포함
+7. 상단 메뉴 **파일 → 프로젝트 저장(Ctrl+S)** 으로 지금까지의 전체 상태(데이터셋,
    3모델 결과, 검증, 추천)를 `.ccproj` 파일로 저장할 수 있다. **파일 → 프로젝트
    불러오기(Ctrl+O)** 로 나중에 이어서 작업 가능 — 원본 이미지 파일이 없어져도
    재계산/이상치 제거/export는 그대로 된다 (자세한 내용은 4번 폴더 구조의
@@ -177,6 +188,7 @@ camera_calibrator/
 │   ├── ros_image_codec.py    # sensor_msgs/Image·CompressedImage 디코딩 (위 둘이 공유)
 │   ├── calibration_io.py     # 외부 calibration 포맷을 benchmark용 표준 schema로 정규화
 │   ├── benchmark_compatibility.py # Reference/Candidate 비교 전 compatibility 검사
+│   ├── stereo.py             # Camera↔Camera pair matching, stereoCalibrate, rectification, validation
 │   ├── project_io.py         # .ccproj 프로젝트 저장/불러오기 (JSON, pickle 미사용)
 │   ├── json_utils.py         # dataclass/numpy -> JSON 안전 변환 (project_io.py, export/json_export.py 공유)
 │   └── recommender.py        # Model Score 기반 추천 + 최종 결과(FinalResult) 조립
@@ -185,7 +197,8 @@ camera_calibrator/
 │   ├── ros.py
 │   ├── report.py             # 종합 HTML 리포트 (브라우저 인쇄로 PDF 변환 가능)
 │   ├── json_export.py        # 구조화된 JSON (카메라 행렬·오차 지표·최종 등급, 외부 도구 연동용)
-│   └── csv_export.py         # 이미지별 상세 데이터 CSV (스프레드시트 분석용)
+│   ├── csv_export.py         # 이미지별 상세 데이터 CSV (스프레드시트 분석용)
+│   └── stereo.py             # Stereo YAML/JSON export (K1/D1/K2/D2/R/T/4x4/rectification/validation)
 ├── ui/                       # PySide6 화면 (계산 로직 없음, calibration/*만 호출)
 │   ├── radial_profile_view.py   # Edge Error Map 그래프 (QPainter 커스텀 위젯)
 │   ├── straightness_view.py     # Straightness Map (행/열 라인을 이미지 위에 색으로 오버레이)

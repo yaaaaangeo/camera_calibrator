@@ -170,7 +170,12 @@ def _check_model_and_distortion(cal: StandardCalibration, side: str, issues: lis
     elif model == CameraModelType.PINHOLE and count not in (1, 4, 5):
         _issue(issues, "distortion_count_pinhole", CompatibilitySeverity.WARNING, side, f"Pinhole 계수 개수가 일반적이지 않습니다: {count}개")
 
-    if model == CameraModelType.PINHOLE and D.size and not np.allclose(D, 0.0, atol=1e-12):
+    if (
+        model == CameraModelType.PINHOLE
+        and distortion_model in {"none", "no_distortion"}
+        and D.size
+        and not np.allclose(D, 0.0, atol=1e-12)
+    ):
         _issue(issues, "pinhole_distortion_nonzero", CompatibilitySeverity.ERROR, side, "Pinhole 모델인데 distortion 계수가 0이 아닙니다.")
 
     limit = _DISTORTION_WARN_ABS.get(model)

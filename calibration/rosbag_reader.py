@@ -24,6 +24,8 @@ AnyReader가 흡수해주므로, 이 모듈은 두 포맷을 구분하는 코드
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -47,6 +49,12 @@ except ImportError:  # rosbags는 선택적 의존성 - 설치 안 해도 나머
 _IMAGE_MSG_TYPES = {"sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage"}
 
 
+def _portable_output_path(path: str) -> Path:
+    if os.name == "nt" and path.replace("\\", "/").startswith("/tmp/"):
+        return Path(tempfile.gettempdir()) / path.replace("\\", "/").removeprefix("/tmp/")
+    return Path(path)
+
+
 @dataclass
 class BagImageTopic:
     """UI에서 사용자가 고를 이미지 토픽 하나."""
@@ -56,7 +64,7 @@ class BagImageTopic:
 
 
 def _require_rosbags() -> None:
-    if not ROSBAGS_AVAILABLE:
+    if AnyReader is None or get_typestore is None:
         raise ImportError(
             "rosbag 읽기 기능을 쓰려면 'rosbags' 패키지가 필요합니다.\n"
             "    pip install rosbags\n"
@@ -79,7 +87,8 @@ def _open_reader(bag_path: str) -> AnyReader:
     bag 안의 정의가 우선 사용됨) 이 문제를 해결할 수 있다.
     """
     logger.debug("AnyReader 열기 (default_typestore=Stores.LATEST): %s", bag_path)
-    return AnyReader([Path(bag_path)], default_typestore=get_typestore(Stores.LATEST))
+    latest_store = Stores.LATEST if Stores is not None else "LATEST"
+    return AnyReader([Path(bag_path)], default_typestore=get_typestore(latest_store))
 
 
 def list_image_topics(bag_path: str) -> list[BagImageTopic]:
@@ -148,7 +157,7 @@ def extract_images_from_bag(
         bag_path, topic, min_interval_sec, max_images,
     )
 
-    out_dir = Path(output_dir)
+    out_dir = _portable_output_path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     saved_paths: list[str] = []

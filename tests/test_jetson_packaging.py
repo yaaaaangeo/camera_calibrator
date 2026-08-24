@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+import pytest
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -25,10 +28,17 @@ def test_jetson_installer_preserves_ros_apt_packages_and_avoids_core_deps():
 
 
 def test_jetson_installer_has_valid_bash_syntax():
+    if shutil.which("bash") is None:
+        pytest.skip("bash is not available on this test host")
     result = subprocess.run(
         ["bash", "-n", str(ROOT / "scripts" / "install_jetson.sh")],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
+    output = ((result.stderr or "") + (result.stdout or "")).replace("\x00", "")
+    if os.name == "nt" and "E_ACCESSDENIED" in output:
+        pytest.skip("bash/WSL is present but inaccessible on this Windows test host")
     assert result.returncode == 0, result.stderr

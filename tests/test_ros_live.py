@@ -13,6 +13,7 @@ tests/test_ros_live.py
 from __future__ import annotations
 
 import pytest
+import numpy as np
 
 import calibration.ros_live as ros_live
 
@@ -49,3 +50,61 @@ def test_require_backend_message_mentions_pip_is_not_the_fix():
     with pytest.raises(ImportError) as exc_info:
         ros_live._require_backend()
     assert "pip" in str(exc_info.value)
+
+
+def test_stereo_frame_synchronizer_emits_near_timestamp_pairs():
+    sync = ros_live.StereoFrameSynchronizer(max_sync_delta_ms=25.0)
+    img1 = np.zeros((2, 2, 3), dtype=np.uint8)
+    img2 = np.ones((2, 2, 3), dtype=np.uint8)
+
+    assert sync.submit(1, img1, 10.000) is None
+    pair = sync.submit(2, img2, 10.020)
+
+    assert pair is not None
+    assert pair.sync_delta_ms == pytest.approx(20.0)
+    assert pair.image_cam1 is img1
+    assert pair.image_cam2 is img2
+
+
+def test_stereo_frame_synchronizer_drops_old_unsynced_frame():
+    sync = ros_live.StereoFrameSynchronizer(max_sync_delta_ms=10.0)
+    old_cam1 = np.zeros((1, 1, 3), dtype=np.uint8)
+    fresh_cam1 = np.full((1, 1, 3), 2, dtype=np.uint8)
+    cam2 = np.ones((1, 1, 3), dtype=np.uint8)
+
+    assert sync.submit(1, old_cam1, 1.000) is None
+    assert sync.submit(2, cam2, 1.100) is None
+    pair = sync.submit(1, fresh_cam1, 1.105)
+
+    assert pair is not None
+    assert pair.image_cam1 is fresh_cam1
+    assert pair.image_cam2 is cam2
+
+
+def test_live_dual_capture_qa_report_summarizes_topics_and_output(tmp_path):
+    topics = [
+        ros_live.LiveTopic("/cam1/image_raw", "sensor_msgs/Image"),
+        ros_live.LiveTopic("/cam2/image_raw", "sensor_msgs/Image"),
+    ]
+    report = ros_live.build_live_dual_capture_qa_report(
+        topics=topics,
+        selected_topic1=topics[0],
+        selected_topic2=topics[1],
+        output_dir=str(tmp_path),
+        max_sync_delta_ms=25.0,
+        subscribed=True,
+        captured_pair_count=51,
+        last_sync_delta_ms=12.0,
+        subscribe_elapsed_sec=3.5,
+    )
+
+    text = report.format()
+    assert report.topic_count == 2
+    assert report.selected_topic1 == "/cam1/image_raw"
+    assert report.selected_topic2 == "/cam2/image_raw"
+    assert "Sync threshold: 25.0 ms" in text
+    assert "Camera 1/2 topics are distinct." in text
+    assert "Subscribed: yes" in text
+    assert "Captured pairs: 51" in text
+    assert "Last sync delta: 12.0 ms" in text
+    assert "Captured pair count meets the 50-pair recommendation." in text

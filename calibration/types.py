@@ -915,3 +915,6 @@ class CalibrationProject:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     export_paths: dict[ExportFormat, str] = field(default_factory=dict)
+    stereo_result: Optional[dict] = None
+    stereo_pairs: list[dict] = field(default_factory=list)
+    stereo_export_paths: dict[str, str] = field(default_factory=dict)

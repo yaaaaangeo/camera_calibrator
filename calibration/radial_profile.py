@@ -41,8 +41,9 @@ def _project(
     (calibration.models.fisheye와 동일한 주의사항).
     """
     if model == CameraModelType.FISHEYE:
-        obj = object_points.astype(np.float64)
-        projected, _ = cv2.fisheye.projectPoints(obj, rvec, tvec, camera_matrix, distortion)
+        obj = object_points.astype(np.float64).reshape(1, -1, 3)
+        D = np.asarray(distortion, dtype=np.float64).reshape(-1, 1)
+        projected, _ = cv2.fisheye.projectPoints(obj, rvec, tvec, camera_matrix, D)
     else:
         projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, distortion)
     return projected.reshape(-1, 2)

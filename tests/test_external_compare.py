@@ -16,6 +16,7 @@ calibration/external_compare.py - "예전 파라미터 vs 지금 구한 파라�
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import cv2
@@ -318,6 +319,129 @@ def test_reference_candidate_file_calibrations_are_compared_symmetrically(
     assert final_p95.winner == "Candidate"
     assert final_p95.reference.endswith(" px")
     assert final_p95.candidate.endswith(" px")
+
+
+def _standard_pair() -> tuple[StandardCalibration, StandardCalibration]:
+    reference = StandardCalibration(
+        label="Reference",
+        model_name=CameraModelType.PINHOLE,
+        distortion_model="plumb_bob",
+        camera_matrix=TRUE_K.copy(),
+        distortion=np.zeros(5),
+        width=W,
+        height=H,
+    )
+    candidate = StandardCalibration(
+        label="Candidate",
+        model_name=CameraModelType.PINHOLE,
+        distortion_model="plumb_bob",
+        camera_matrix=TRUE_K.copy(),
+        distortion=TRUE_D.copy(),
+        width=W,
+        height=H,
+    )
+    return reference, candidate
+
+
+def _independent_copy(dataset: Dataset, *, n: int | None = None) -> Dataset:
+    clone = copy.deepcopy(dataset)
+    if n is not None:
+        clone.frames = clone.frames[:n]
+    for i, frame in enumerate(clone.frames):
+        frame.image_info.path = f"C:/independent_benchmark/frame_{i:03d}.png"
+        frame.image_info.image_id = f"benchmark_{i:03d}"
+        if frame.detection is not None:
+            frame.detection.image_id = frame.image_info.image_id
+    return clone
+
+
+def test_reference_candidate_without_benchmark_uses_internal_holdout(
+    dataset, camera_config, pattern_config, my_validation,
+):
+    reference, candidate = _standard_pair()
+    result = compare_reference_candidate_calibrations(
+        dataset,
+        camera_config,
+        pattern_config,
+        reference,
+        candidate,
+        my_validation.test_frame_ids,
+    )
+
+    assert result.mine.success and result.external.success
+    assert result.evaluation_source == "internal_holdout"
+    assert result.confidence == "limited"
+    assert result.benchmark_status == "not_provided"
+
+
+def test_reference_candidate_with_valid_benchmark_upgrades_to_high_confidence(
+    dataset, camera_config, pattern_config, my_validation,
+):
+    reference, candidate = _standard_pair()
+    benchmark = _independent_copy(dataset)
+    result = compare_reference_candidate_calibrations(
+        dataset,
+        camera_config,
+        pattern_config,
+        reference,
+        candidate,
+        my_validation.test_frame_ids,
+        independent_benchmark_dataset=benchmark,
+        evaluation_mode="auto",
+    )
+
+    assert result.mine.success and result.external.success
+    assert result.evaluation_source == "independent_benchmark"
+    assert result.confidence == "high"
+    assert result.benchmark_status == "ok"
+    assert result.benchmark_usable_frames >= 10
+    assert result.num_common_frames == result.benchmark_usable_frames
+
+
+def test_reference_candidate_benchmark_leakage_falls_back_to_internal_holdout(
+    dataset, camera_config, pattern_config, my_validation,
+):
+    reference, candidate = _standard_pair()
+    result = compare_reference_candidate_calibrations(
+        dataset,
+        camera_config,
+        pattern_config,
+        reference,
+        candidate,
+        my_validation.test_frame_ids,
+        independent_benchmark_dataset=dataset,
+        evaluation_mode="auto",
+    )
+
+    assert result.evaluation_source == "internal_holdout"
+    assert result.confidence == "limited"
+    assert result.benchmark_status == "fallback"
+    assert result.benchmark_overlap_count > 0
+    assert any("Leakage" in caveat for caveat in result.caveats)
+
+
+def test_reference_candidate_insufficient_benchmark_falls_back_without_blocking(
+    dataset, camera_config, pattern_config, my_validation,
+):
+    reference, candidate = _standard_pair()
+    benchmark = _independent_copy(dataset, n=4)
+    result = compare_reference_candidate_calibrations(
+        dataset,
+        camera_config,
+        pattern_config,
+        reference,
+        candidate,
+        my_validation.test_frame_ids,
+        independent_benchmark_dataset=benchmark,
+        evaluation_mode="auto",
+    )
+
+    assert result.mine.success and result.external.success
+    assert result.evaluation_source == "internal_holdout"
+    assert result.confidence == "limited"
+    assert result.benchmark_status == "fallback"
+    assert result.benchmark_usable_frames == 4
+    assert any("Insufficient Benchmark Evidence" in caveat for caveat in result.caveats)
     assert {r.category for r in result.worst_case_rows} == {"Worst image", "Worst region", "Worst corner"}
     worst_corner = next(r for r in result.worst_case_rows if r.category == "Worst corner")
     assert "corner" in worst_corner.reference_location

@@ -540,6 +540,36 @@ def compute_model_scores(
             )
         )
 
+    extended_score = next((s for s in scores if s.model_name == CameraModelType.EXTENDED_PINHOLE), None)
+    fisheye_score = next((s for s in scores if s.model_name == CameraModelType.FISHEYE), None)
+    if (
+        extended_score is not None
+        and fisheye_score is not None
+        and calibration_results[CameraModelType.EXTENDED_PINHOLE].success
+        and calibration_results[CameraModelType.FISHEYE].success
+        and extended_score.score < fisheye_score.score
+    ):
+        extended_p95 = raw_p95.get(CameraModelType.EXTENDED_PINHOLE)
+        fisheye_p95 = raw_p95.get(CameraModelType.FISHEYE)
+        fisheye_test = e_test.get(CameraModelType.FISHEYE)
+        extended_test = e_test.get(CameraModelType.EXTENDED_PINHOLE)
+        score_gap = fisheye_score.score - extended_score.score
+        validation_tied = (
+            score_gap <= max(weights.w_stability, 0.05)
+            and fisheye_test is not None
+            and extended_test is not None
+            and fisheye_test <= extended_test + 0.03
+            and (
+                extended_p95 is None
+                or fisheye_p95 is None
+                or fisheye_p95 <= extended_p95 + 0.03
+            )
+        )
+        if validation_tied:
+            adjustment = -(score_gap + 1e-6)
+            fisheye_score.components["fisheye_validation_tie_break"] = adjustment
+            fisheye_score.score += adjustment
+
     # 학습 자체가 실패한 모델은 추천 후보에서 제외
     eligible = [s for s in scores if calibration_results[s.model_name].success]
     if eligible:

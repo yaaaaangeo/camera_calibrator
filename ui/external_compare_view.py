@@ -48,6 +48,8 @@ from calibration.types import (
     ValidationResult,
 )
 from calibration.recommender import compute_model_scores
+from calibration.detector import detect_dataset, summarize_dataset
+from calibration.quality import analyze_dataset_quality
 from calibration.external_compare import (
     ComparisonSide,
     ExternalCameraParams,
@@ -114,6 +116,8 @@ class ExternalCompareView(QWidget):
         self._loaded_calibration: StandardCalibration | None = None
         self._reference_calibration: StandardCalibration | None = None
         self._candidate_calibration: StandardCalibration | None = None
+        self._benchmark_dataset: Dataset | None = None
+        self._benchmark_image_paths: list[str] = []
         self._comparison_thread = None
         self._comparison_worker = None
 
@@ -124,14 +128,14 @@ class ExternalCompareView(QWidget):
         layout = QVBoxLayout(content)
 
         intro = QLabel(
-            "예전에 구한 카메라 파라미터(다른 사람/다른 툴 결과)를 입력하면, "
-            "내가 캘리브레이션 학습에 전혀 쓰지 않은 이미지들(Hold-out test 프레임)에서 "
-            "두 파라미터를 완전히 동일한 방식으로 재평가해 비교합니다. "
+            "두 calibration 파일을 직접 비교하거나, 외부 파라미터와 현재 선택한 내 모델을 "
+            "Hold-out test 프레임에서 같은 조건으로 재평가해 비교합니다. "
             "어느 한쪽에 유리한 조건을 주지 않는 정량 비교입니다."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
+        layout.addWidget(self._build_pair_file_group())
         layout.addWidget(self._build_input_group())
         layout.addWidget(self._build_run_row())
         legend = QLabel(
@@ -152,9 +156,42 @@ class ExternalCompareView(QWidget):
     # 입력 영역
     # ------------------------------------------------------------------
 
+    def _make_collapsible_group(self, title: str, body: QWidget, *, checked: bool = True) -> QWidget:
+        group = QWidget()
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        header = QPushButton()
+        header.setCheckable(True)
+        header.setChecked(checked)
+        header.setFlat(True)
+        header.setCursor(Qt.PointingHandCursor)
+        header.setStyleSheet(
+            f"text-align: left; font-weight: 600; padding: 6px; "
+            f"border: 1px solid {Theme.BORDER}; background: {Theme.BG_SECONDARY};"
+        )
+
+        def update_header(expanded: bool) -> None:
+            header.setText(f"{'▼' if expanded else '▶'} {title}")
+            body.setVisible(expanded)
+
+        header.toggled.connect(update_header)
+        update_header(checked)
+
+        body.setObjectName("collapsibleBody")
+        body.setStyleSheet(
+            f"QWidget#collapsibleBody {{ border-left: 1px solid {Theme.BORDER}; "
+            f"border-right: 1px solid {Theme.BORDER}; "
+            f"border-bottom: 1px solid {Theme.BORDER}; }}"
+        )
+        layout.addWidget(header)
+        layout.addWidget(body)
+        return group
+
     def _build_input_group(self) -> QGroupBox:
-        group = QGroupBox("비교할 외부 파라미터")
-        outer = QVBoxLayout(group)
+        body = QWidget()
+        outer = QVBoxLayout(body)
 
         form = QFormLayout()
         self.label_edit = QLineEdit("예전 결과")
@@ -196,37 +233,65 @@ class ExternalCompareView(QWidget):
         manual_form.addRow("왜곡 계수", self.distortion_edit)
         outer.addWidget(manual_group)
         self._manual_group = manual_group
-        outer.addWidget(self._build_pair_file_group())
 
-        return group
+        return self._make_collapsible_group("비교할 외부 파라미터", body)
 
     def _build_pair_file_group(self) -> QGroupBox:
-        group = QGroupBox("Reference / Candidate 파일 비교")
-        v = QVBoxLayout(group)
+        body = QWidget()
+        v = QVBoxLayout(body)
 
-        ref_row = QHBoxLayout()
+        file_row = QGridLayout()
+        file_row.setColumnStretch(1, 1)
+        file_row.setColumnStretch(3, 1)
         self.load_reference_button = QPushButton("Reference 불러오기...")
         self.load_reference_button.clicked.connect(self._on_load_reference_calibration)
-        ref_row.addWidget(self.load_reference_button)
+        file_row.addWidget(self.load_reference_button, 0, 0)
         self.reference_status_label = QLabel("Reference 파일 없음")
         self.reference_status_label.setWordWrap(True)
-        ref_row.addWidget(self.reference_status_label, stretch=1)
-        v.addLayout(ref_row)
+        file_row.addWidget(self.reference_status_label, 0, 1)
 
-        cand_row = QHBoxLayout()
         self.load_candidate_button = QPushButton("Candidate 불러오기...")
         self.load_candidate_button.clicked.connect(self._on_load_candidate_calibration)
-        cand_row.addWidget(self.load_candidate_button)
+        file_row.addWidget(self.load_candidate_button, 0, 2)
         self.candidate_status_label = QLabel("Candidate 파일 없음")
         self.candidate_status_label.setWordWrap(True)
-        cand_row.addWidget(self.candidate_status_label, stretch=1)
-        v.addLayout(cand_row)
+        file_row.addWidget(self.candidate_status_label, 0, 3)
+        v.addLayout(file_row)
 
         self.run_pair_button = QPushButton("Reference vs Candidate 파일 비교 실행")
         self.run_pair_button.setProperty("role", "primary")
         self.run_pair_button.clicked.connect(self._on_run_file_pair_comparison)
+        v.addWidget(self._build_evaluation_dataset_widget())
         v.addWidget(self.run_pair_button)
-        return group
+        return self._make_collapsible_group("Reference / Candidate 파일 비교", body)
+
+    def _build_evaluation_dataset_widget(self) -> QWidget:
+        body = QWidget()
+        layout = QGridLayout(body)
+        layout.setColumnStretch(1, 1)
+
+        layout.addWidget(QLabel("Evaluation Source"), 0, 0)
+        self.evaluation_source_combo = QComboBox()
+        self.evaluation_source_combo.addItem("Auto [Recommended]", userData="auto")
+        self.evaluation_source_combo.addItem("Internal Hold-out", userData="internal_holdout")
+        self.evaluation_source_combo.addItem("Independent Benchmark", userData="independent_benchmark")
+        self.evaluation_source_combo.currentIndexChanged.connect(self._update_benchmark_status)
+        layout.addWidget(self.evaluation_source_combo, 0, 1, 1, 2)
+
+        self.select_benchmark_button = QPushButton("Select Benchmark Images...")
+        self.select_benchmark_button.clicked.connect(self._on_select_benchmark_images)
+        layout.addWidget(self.select_benchmark_button, 1, 0)
+
+        self.clear_benchmark_button = QPushButton("Clear Benchmark Dataset")
+        self.clear_benchmark_button.clicked.connect(self._on_clear_benchmark_dataset)
+        layout.addWidget(self.clear_benchmark_button, 1, 1)
+
+        self.benchmark_status_label = QLabel()
+        self.benchmark_status_label.setWordWrap(True)
+        self.benchmark_status_label.setProperty("tone", "muted")
+        layout.addWidget(self.benchmark_status_label, 2, 0, 1, 3)
+        self._update_benchmark_status()
+        return body
 
     @staticmethod
     def _make_double_spin(default: float) -> QDoubleSpinBox:
@@ -237,13 +302,14 @@ class ExternalCompareView(QWidget):
         return spin
 
     def _build_run_row(self) -> QWidget:
-        row = QWidget()
-        h = QHBoxLayout(row)
+        body = QWidget()
+        h = QHBoxLayout(body)
         h.setContentsMargins(0, 0, 0, 0)
-        h.addWidget(QLabel("비교할 내 모델:"))
+        h.addWidget(QLabel("모델:"))
         self.my_model_combo = QComboBox()
         for m in _MODEL_ORDER:
             self.my_model_combo.addItem(_MODEL_LABELS[m], userData=m)
+        self.my_model_combo.currentIndexChanged.connect(self._update_benchmark_status)
         h.addWidget(self.my_model_combo)
 
         self.run_button = QPushButton("비교 실행")
@@ -256,7 +322,7 @@ class ExternalCompareView(QWidget):
         self.comparison_status_label.setWordWrap(True)
         h.addWidget(self.comparison_status_label, stretch=1)
         h.addStretch(1)
-        return row
+        return self._make_collapsible_group("비교할 내모델", body)
 
     # ------------------------------------------------------------------
     # 결과 표시 영역
@@ -292,6 +358,10 @@ class ExternalCompareView(QWidget):
             "Statistical Validation",
         )
         self.benchmark_tabs.addTab(
+            self._tab_page([self._build_model_comparison_group()]),
+            "Model Analysis",
+        )
+        self.benchmark_tabs.addTab(
             self._tab_page([self._build_parameter_diff_group(), self._build_parameter_diagnostics_group()]),
             "Parameter Analysis",
         )
@@ -309,6 +379,10 @@ class ExternalCompareView(QWidget):
             page = self.benchmark_tabs.widget(tab_index)
             header_color = _TAB_HEADER_COLORS[tab_index % len(_TAB_HEADER_COLORS)]
             for table in page.findChildren(QTableWidget):
+                if table is self.parameter_table:
+                    header_color = _TAB_HEADER_COLORS[4]
+                elif table is self.final_benchmark_table or table is self.final_report_evidence_table:
+                    header_color = _TAB_HEADER_COLORS[5]
                 table.setAlternatingRowColors(True)
                 table.setStyleSheet(
                     f"QTableView {{ font-size: 10pt; color: {Theme.TEXT_PRIMARY}; "
@@ -848,6 +922,7 @@ class ExternalCompareView(QWidget):
         self._validation_results = validation_results
         self._calibration_results = calibration_results or {}
         self._use_rational_model = use_rational_model
+        self._update_benchmark_status()
 
     # ------------------------------------------------------------------
     # 외부 YAML 불러오기
@@ -946,6 +1021,78 @@ class ExternalCompareView(QWidget):
             self._format_loaded_calibration_status("Candidate", path, calibration)
         )
 
+    def _evaluation_mode(self) -> str:
+        if not hasattr(self, "evaluation_source_combo"):
+            return "auto"
+        return self.evaluation_source_combo.currentData() or "auto"
+
+    def _update_benchmark_status(self) -> None:
+        if not hasattr(self, "benchmark_status_label"):
+            return
+        mode = self._evaluation_mode()
+        internal_count = 0
+        if self._validation_results:
+            model = self.my_model_combo.currentData() if hasattr(self, "my_model_combo") else None
+            validation = self._validation_results.get(model) if model is not None else None
+            internal_count = len(validation.test_frame_ids) if validation is not None else 0
+
+        if self._benchmark_dataset is None:
+            selected = (
+                "Current evaluation: Internal Hold-out"
+                if mode != "independent_benchmark"
+                else "Current evaluation: Independent Benchmark requested, but no benchmark images are loaded."
+            )
+            self.benchmark_status_label.setText(
+                f"{selected}\n"
+                f"Internal Hold-out: {internal_count} images\n"
+                "Independent Benchmark: not provided (optional). "
+                "Providing a separate benchmark dataset enables higher-confidence comparison."
+            )
+            return
+
+        detected = self._benchmark_dataset.num_detected
+        total = self._benchmark_dataset.num_total
+        current = "Independent Benchmark [Recommended]" if mode in ("auto", "independent_benchmark") else "Internal Hold-out"
+        self.benchmark_status_label.setText(
+            f"Current evaluation: {current}\n"
+            f"Dataset: benchmark\n"
+            f"Images: {total}\n"
+            f"Detected: {detected}\n"
+            f"Usable paired frames: {detected}\n"
+            "Evaluation confidence: HIGH if there is no calibration/benchmark overlap and enough usable frames."
+        )
+
+    def _on_select_benchmark_images(self) -> None:
+        if self._pattern_config is None or self._camera_config is None:
+            QMessageBox.warning(self, "패턴 설정 없음", "먼저 Camera Setup / Pattern을 설정하고 이미지를 불러오세요.")
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Independent Benchmark 이미지 선택",
+            "",
+            "Images (*.jpg *.jpeg *.png *.bmp)",
+        )
+        if not paths:
+            return
+        try:
+            self.benchmark_status_label.setText(f"Benchmark 이미지 검출 중... ({len(paths)}장)")
+            dataset = detect_dataset(paths, self._pattern_config, parallel=len(paths) > 8)
+            if dataset.num_detected > 0:
+                analyze_dataset_quality(dataset, self._camera_config)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Benchmark 불러오기 실패", str(e))
+            return
+
+        self._benchmark_dataset = dataset
+        self._benchmark_image_paths = list(paths)
+        self._update_benchmark_status()
+        QMessageBox.information(self, "Benchmark 불러오기 완료", summarize_dataset(dataset))
+
+    def _on_clear_benchmark_dataset(self) -> None:
+        self._benchmark_dataset = None
+        self._benchmark_image_paths = []
+        self._update_benchmark_status()
+
     def _external_params_from_manual_input(self) -> ExternalCameraParams:
         K = np.array([
             [self.fx_spin.value(), 0.0, self.cx_spin.value()],
@@ -970,12 +1117,16 @@ class ExternalCompareView(QWidget):
         # 파일 값은 입력 위젯에 채워 넣되, 사용자가 그 값을 보정한 경우 화면에
         # 보이는 값이 실제 비교에도 쓰여야 한다. 이전 구현은 위젯 편집을 무시하고
         # 원본 YAML 배열을 다시 사용해 '직접 입력이 막힌' 것처럼 보였다.
-        K = np.array([
-            [self.fx_spin.value(), 0.0, self.cx_spin.value()],
-            [0.0, self.fy_spin.value(), self.cy_spin.value()],
-            [0.0, 0.0, 1.0],
-        ])
-        D = _parse_distortion_text(self.distortion_edit.text())
+        if self.distortion_edit.text().strip():
+            K = np.array([
+                [self.fx_spin.value(), 0.0, self.cx_spin.value()],
+                [0.0, self.fy_spin.value(), self.cy_spin.value()],
+                [0.0, 0.0, 1.0],
+            ])
+            D = _parse_distortion_text(self.distortion_edit.text())
+        else:
+            K = np.asarray(loaded.camera_matrix, dtype=np.float64).reshape(3, 3)
+            D = np.asarray(loaded.distortion, dtype=np.float64).reshape(-1)
         return ExternalCameraParams(
             label=self.label_edit.text().strip() or loaded.label or "예전 결과",
             model_name=model,
@@ -1093,13 +1244,18 @@ class ExternalCompareView(QWidget):
 
         split_model = self.my_model_combo.currentData()
         validation = self._validation_results.get(split_model)
-        if validation is None or not validation.success:
+        benchmark_requested = self._benchmark_dataset is not None and self._evaluation_mode() in (
+            "auto",
+            "independent_benchmark",
+        )
+        if (validation is None or not validation.success) and not benchmark_requested:
             QMessageBox.warning(
                 self, "Hold-out 결과 없음",
                 "Reference/Candidate 파일 비교에도 동일한 validation split이 필요합니다. "
                 "먼저 [캘리브레이션 실행]을 완료해 주세요.",
             )
             return
+        test_frame_ids = validation.test_frame_ids if validation is not None and validation.success else []
 
         result = compare_reference_candidate_calibrations(
             self._dataset,
@@ -1107,11 +1263,14 @@ class ExternalCompareView(QWidget):
             self._pattern_config,
             self._reference_calibration,
             self._candidate_calibration,
-            validation.test_frame_ids,
+            test_frame_ids,
+            independent_benchmark_dataset=self._benchmark_dataset,
+            evaluation_mode=self._evaluation_mode(),
         )
         self._last_result = result
         self._render_result(result)
         self._populate_image_combo(result)
+        self._update_benchmark_status()
 
     def _render_result(self, result: ExternalComparisonResult) -> None:
         self.table.setHorizontalHeaderLabels([result.external.label, result.mine.label, "Improvement", "Winner"])
@@ -1154,10 +1313,16 @@ class ExternalCompareView(QWidget):
         self.verdict_label.setText(result.verdict)
         decision = result.winner_decision
         quality = "OK" if decision.data_quality_ok else "INSUFFICIENT"
+        source_label = (
+            "Independent Benchmark"
+            if result.evaluation_source == "independent_benchmark"
+            else "Internal Hold-out"
+        )
         self.decision_label.setText(
             f"Decision: {decision.status} "
             f"(Candidate {decision.candidate_score:.1f} / Reference {decision.reference_score:.1f}, "
-            f"margin {decision.score_margin:.1f}, data quality {quality})"
+            f"margin {decision.score_margin:.1f}, data quality {quality})\n"
+            f"Evaluation Source: {source_label}, Confidence: {result.confidence.upper()}"
         )
         self.caveats_label.setText("\n".join(result.caveats))
         self._render_final_report_summary(result)
@@ -1195,8 +1360,24 @@ class ExternalCompareView(QWidget):
 
     def _render_final_report_summary(self, result: ExternalComparisonResult) -> None:
         decision = result.winner_decision
+        source_label = (
+            "Independent Benchmark"
+            if result.evaluation_source == "independent_benchmark"
+            else "Internal Hold-out"
+        )
+        confidence_label = result.confidence.upper()
+        benchmark_line = ""
+        if result.benchmark_image_count:
+            benchmark_line = (
+                f"\nBenchmark images: {result.benchmark_image_count}"
+                f"\nUsable paired frames: {result.benchmark_usable_frames}"
+                f"\nCalibration/Benchmark overlap: {result.benchmark_overlap_count}"
+            )
         self.final_report_label.setText(
             f"FINAL VERDICT: {decision.status}\n"
+            f"Evaluation Source: {source_label}\n"
+            f"Confidence: {confidence_label}"
+            f"{benchmark_line}\n"
             f"One-line diagnosis: {result.verdict or decision.status}"
         )
 
@@ -1246,6 +1427,7 @@ class ExternalCompareView(QWidget):
             )
 
         sections = [
+            ("Evaluation Source", f"{source_label} / Confidence {confidence_label}"),
             ("Performance Comparison", " / ".join([
                 metric_summary("RMSE"),
                 metric_summary("P95"),
@@ -1932,3 +2114,4 @@ class ExternalCompareView(QWidget):
         if per_frame_error is None:
             return f"{prefix}: {side.label}"
         return f"{prefix}: {side.label} - 이 프레임 재투영 오차 {per_frame_error:.3f}px"
+

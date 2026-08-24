@@ -53,6 +53,8 @@ from calibration.self_check import run_all_self_checks
 from calibration.rosbag_reader import extract_images_from_bag, list_image_topics
 from calibration.validation import validate_cross_datasets
 from calibration.external_compare import compare_with_external_params
+from calibration.model_refitting import refit_extended_pinhole_to_pinhole
+from calibration.stereo_controller import StereoController
 from calibration.pipeline_process import (
     run_models_and_validation,
     run_outlier_pruning_and_validation,
@@ -526,6 +528,113 @@ class ExternalComparisonWorker(QObject):
             self.result_ready.emit(result)
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"External Compare 계산 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
+class ModelRefittingWorker(QObject):
+    """8계수 Rational Pinhole -> 5계수 Pinhole 근사 최적화를 GUI 밖에서 수행."""
+
+    progress = Signal(str)
+    result_ready = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        camera_matrix,
+        distortion,
+        image_size: tuple[int, int],
+        options: dict,
+    ):
+        super().__init__()
+        self.camera_matrix = camera_matrix
+        self.distortion = distortion
+        self.image_size = image_size
+        self.options = options
+
+    def run(self) -> None:
+        try:
+            self.progress.emit("Model Refitting 계산 중...")
+            result = refit_extended_pinhole_to_pinhole(
+                self.camera_matrix,
+                self.distortion,
+                self.image_size,
+                mode=self.options.get("mode", "full"),
+                grid_size=self.options.get("grid_size", (80, 50)),
+                edge_weighting=bool(self.options.get("edge_weighting", False)),
+                loss=self.options.get("loss", "linear"),
+            )
+            self.result_ready.emit(result)
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
+class StereoPairDetectionWorker(QObject):
+    """Camera 1/2 image folders를 검출하고 common ChArUco pair를 만든다."""
+
+    progress = Signal(str)
+    pairs_ready = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, camera1_paths: list[str], camera2_paths: list[str], pattern_config):
+        super().__init__()
+        self.camera1_paths = camera1_paths
+        self.camera2_paths = camera2_paths
+        self.pattern_config = pattern_config
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(f"Camera 1 pair 이미지 검출 중... ({len(self.camera1_paths)}장)")
+            self.progress.emit(f"Camera 2 pair 이미지 검출 중... ({len(self.camera2_paths)}장)")
+            self.progress.emit("Common ChArUco ID matching 중...")
+            pairs, ds1, ds2 = StereoController().detect_pairs(
+                self.camera1_paths,
+                self.camera2_paths,
+                self.pattern_config,
+            )
+            self.pairs_ready.emit((pairs, ds1, ds2))
+            self.progress.emit(f"Stereo pair detection 완료: {len(pairs)} usable pairs")
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"Stereo pair detection 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
+class StereoCalibrationWorker(QObject):
+    """Stereo calibration/rectification/validation을 GUI 스레드 밖에서 수행."""
+
+    progress = Signal(str)
+    result_ready = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, pairs, camera1, camera2, image_size: tuple[int, int], audit_mode: str = "full"):
+        super().__init__()
+        self.pairs = pairs
+        self.camera1 = camera1
+        self.camera2 = camera2
+        self.image_size = image_size
+        self.audit_mode = audit_mode
+
+    def run(self) -> None:
+        try:
+            audit_text = "Full audit/bootstrap" if self.audit_mode == "full" else "Fast audit"
+            self.progress.emit(f"Stereo calibration 계산 중... (K1/D1/K2/D2 고정, R/T 최적화, {audit_text})")
+            result = StereoController().calibrate(
+                self.pairs,
+                self.camera1,
+                self.camera2,
+                self.image_size,
+                audit_mode=self.audit_mode,
+            )
+            self.result_ready.emit(result)
+            self.progress.emit("Stereo calibration 완료.")
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"Stereo calibration 중 오류: {e}")
         finally:
             self.finished.emit()
 
