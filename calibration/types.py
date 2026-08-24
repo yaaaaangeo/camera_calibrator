@@ -580,6 +580,11 @@ class CalibrationResult:
     undistortion_quality: Optional[UndistortionQualityReport] = None  # valid pixel/black border/ROI loss
     success: bool = False
     error_message: Optional[str] = None
+    # success=True인데도 사용자에게 알려야 할 게 있을 때(예: Fisheye가 특정
+    # 프레임을 캘리브레이션에서 자동 제외했을 때) 쓰는 비-치명적 경고.
+    # error_message와 분리한 이유: error_message는 "실패"를 의미하는 필드라
+    # success=True와 함께 쓰면 UI 로직이 헷갈린다.
+    warning_message: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

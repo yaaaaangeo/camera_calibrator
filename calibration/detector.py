@@ -609,14 +609,20 @@ def detect_dataset(
         parallel: True면 프로세스 풀 사용. 이미지 1장뿐이거나 os.cpu_count()가
             1인 환경에서는 parallel=True여도 자동으로 순차 처리로 내려간다
             (프로세스 생성 비용이 이득보다 커서).
-        max_workers: 프로세스 개수. None이면 os.cpu_count() 그대로 사용.
+        max_workers: 프로세스 개수. None이면 os.cpu_count()-1(코어 하나는 GUI 몫으로
+            남겨둠 - 실사용자 버그: 코어를 전부 쓰면 이미지 수백 장 검출 중에
+            GUI 프로세스가 OS 스케줄링을 못 받아 "python3 is not responding"
+            창이 뜬다. QThread/별도 프로세스로 계산을 분리해도, OS가 CPU 자체를
+            GUI에 배분 못 하면 소용없다).
     """
-    if parallel and len(image_paths) > 1 and (os.cpu_count() or 1) > 1:
+    cpu_count = os.cpu_count() or 1
+    if parallel and len(image_paths) > 1 and cpu_count > 1:
+        effective_workers = max_workers if max_workers is not None else max(1, cpu_count - 1)
         logger.info(
             "병렬 검출 시작: 이미지 %d장, max_workers=%s",
-            len(image_paths), max_workers or os.cpu_count(),
+            len(image_paths), effective_workers,
         )
-        pairs = _detect_dataset_parallel(image_paths, pattern, max_workers)
+        pairs = _detect_dataset_parallel(image_paths, pattern, effective_workers)
     else:
         logger.debug("순차 검출: 이미지 %d장", len(image_paths))
         detect_fn = build_detect_fn(pattern)
