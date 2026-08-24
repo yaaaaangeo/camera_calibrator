@@ -250,11 +250,21 @@ def export_standard_json(calibration: StandardCalibration, path: str) -> str:
 def load_opencv_calibration(path: str) -> StandardCalibration:
     fs = cv2.FileStorage(path, cv2.FILE_STORAGE_READ)
     try:
-        cm_node = fs.getNode("camera_matrix")
-        d_node = fs.getNode("distortion_coefficients")
+        cm_node = next(
+            (node for key in ("camera_matrix", "cameraMatrix", "CameraMat", "K")
+             if not (node := fs.getNode(key)).empty()),
+            fs.getNode("camera_matrix"),
+        )
+        d_node = next(
+            (node for key in ("distortion_coefficients", "distortion_coeffs", "distCoeffs", "DistCoeff", "D")
+             if not (node := fs.getNode(key)).empty()),
+            fs.getNode("distortion_coefficients"),
+        )
         if cm_node.empty() or d_node.empty():
             raise ValueError(
-                "OpenCV YAML에서 'camera_matrix' 또는 'distortion_coefficients' 항목을 찾을 수 없습니다."
+                "OpenCV YAML에서 camera matrix 또는 distortion coefficients를 찾을 수 없습니다 "
+                "(지원 키: camera_matrix/cameraMatrix/CameraMat/K, "
+                "distortion_coefficients/distCoeffs/DistCoeff/D)."
             )
         K = cm_node.mat()
         D = d_node.mat()
@@ -283,7 +293,14 @@ def load_opencv_calibration(path: str) -> StandardCalibration:
 
 
 def _matrix_data(node: dict[str, Any], name: str) -> np.ndarray:
-    if not isinstance(node, dict) or "data" not in node:
+    if not isinstance(node, dict):
+        data = np.asarray(node, dtype=np.float64)
+        if name == "camera_matrix" and data.size == 9:
+            return data.reshape(3, 3)
+        if name == "distortion_coefficients" and data.size > 0:
+            return data.reshape(1, -1)
+        raise ValueError(f"{name}가 matrix data 형식이 아닙니다.")
+    if "data" not in node:
         raise ValueError(f"{name} 섹션에 data가 없습니다.")
     rows = int(node.get("rows", 1))
     cols = int(node.get("cols", len(node["data"])))
@@ -319,7 +336,10 @@ def load_kalibr_camchain(path: str, camera_key: str | None = None) -> StandardCa
     data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("Kalibr camchain YAML의 최상위는 객체여야 합니다.")
-    cam_keys = [k for k, v in data.items() if str(k).startswith("cam") and isinstance(v, dict)]
+    cam_keys = [
+        k for k, v in data.items()
+        if str(k).startswith("cam") and str(k)[3:].isdigit() and isinstance(v, dict)
+    ]
     if not cam_keys:
         raise ValueError("Kalibr camchain YAML에서 cam0/cam1 섹션을 찾을 수 없습니다.")
     key = camera_key or sorted(cam_keys)[0]
@@ -356,6 +376,92 @@ def load_kalibr_camchain(path: str, camera_key: str | None = None) -> StandardCa
     )
 
 
+def _first_present(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+    return None
+
+
+def _numeric_array(value: Any, name: str) -> np.ndarray:
+    """YAML list/matrix뿐 아니라 "1, 2, 3" 문자열도 숫자 배열로 받는다."""
+    if isinstance(value, dict) and "data" in value:
+        value = value["data"]
+    if isinstance(value, str):
+        tokens = [part.strip() for part in value.replace(";", ",").split(",") if part.strip()]
+        if not tokens:
+            raise ValueError(f"{name} 값이 비어 있습니다.")
+        try:
+            value = [float(part) for part in tokens]
+        except ValueError as e:
+            raise ValueError(f"{name} 문자열을 숫자로 해석할 수 없습니다: {e}") from e
+    return np.asarray(value, dtype=np.float64)
+
+
+def _load_generic_yaml(data: dict[str, Any], path: str) -> StandardCalibration | None:
+    """현장에서 흔한 비표준 OpenCV 키 별칭을 관대하게 정규화한다."""
+    label = data.get("camera_name") or data.get("label") or Path(path).stem
+    # 장비별 이름 하나 아래에 calibration 값 전체를 넣는 현장 포맷:
+    # bottom_center_calibration_data: {cameraMatrix: ..., distCoeffs: ...}
+    if len(data) == 1:
+        wrapper_name, wrapped = next(iter(data.items()))
+        if isinstance(wrapped, dict) and any(
+            key in wrapped for key in ("cameraMatrix", "CameraMat", "K", "camera_matrix")
+        ):
+            data = wrapped
+            label = str(wrapper_name)
+
+    k_value = _first_present(data, ("cameraMatrix", "CameraMat", "K"))
+    d_value = _first_present(data, ("distCoeffs", "DistCoeff", "D", "distortion_coeffs"))
+
+    projection = data.get("projection_parameters")
+    if k_value is None and isinstance(projection, dict):
+        if all(key in projection for key in ("fx", "fy", "cx", "cy")):
+            k_value = _camera_matrix_from_intrinsics(projection)
+    if k_value is None and all(key in data for key in ("fx", "fy", "cx", "cy")):
+        k_value = _camera_matrix_from_intrinsics(data)
+
+    distortion_params = data.get("distortion_parameters")
+    if d_value is None and isinstance(distortion_params, dict):
+        preferred_order = ("k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6")
+        d_value = [distortion_params[key] for key in preferred_order if key in distortion_params]
+
+    if k_value is None or d_value is None:
+        return None
+
+    K = _numeric_array(k_value, "camera matrix")
+    if K.size == 9:
+        K = K.reshape(3, 3)
+    D = _numeric_array(d_value, "distortion coefficients")
+
+    resolution = data.get("resolution") or data.get("image_size") or [None, None]
+    width = data.get("image_width") or data.get("image_w") or data.get("width")
+    height = data.get("image_height") or data.get("image_h") or data.get("height")
+    if isinstance(resolution, (list, tuple)) and len(resolution) >= 2:
+        width = width or resolution[0]
+        height = height or resolution[1]
+
+    distortion_model = data.get("distortion_model") or data.get("distortion_type")
+    model_name = _parse_model(data.get("calibration_model") or data.get("camera_model"))
+    # 5개 이상인 OpenCV 계수는 fisheye(항상 4개)가 아니라 radtan/plumb_bob
+    # 계열이다. 파일에 모델명이 없는 경우에도 이 경우는 안전하게 판별 가능하다.
+    if model_name is None and D.size >= 5:
+        model_name = CameraModelType.EXTENDED_PINHOLE
+    return _finalize(
+        label=label,
+        camera_matrix=K,
+        distortion=D,
+        model_name=model_name,
+        distortion_model=distortion_model,
+        width=width,
+        height=height,
+        camera_name=data.get("camera_name"),
+        coefficient_order=None,
+        source_format="generic_yaml",
+        source_path=path,
+    )
+
+
 def _looks_like_opencv_filestorage(path: str) -> bool:
     try:
         first = Path(path).read_text(encoding="utf-8", errors="ignore").lstrip()[:80]
@@ -379,9 +485,13 @@ def load_standard_calibration(path: str, *, camera_key: str | None = None) -> St
         return _load_standard_dict(data, path, "standard_yaml")
     if "camera_matrix" in data and "distortion_coefficients" in data:
         return load_ros_camera_info(path)
-    if any(str(k).startswith("cam") for k in data):
+    if any(str(k).startswith("cam") and str(k)[3:].isdigit() and isinstance(v, dict)
+           for k, v in data.items()):
         return load_kalibr_camchain(path, camera_key=camera_key)
+    generic = _load_generic_yaml(data, path)
+    if generic is not None:
+        return generic
     raise ValueError(
-        "알 수 없는 calibration 포맷입니다. 지원: standard JSON, OpenCV YAML, "
-        "ROS CameraInfo YAML, Kalibr camchain YAML."
+        "알 수 없는 calibration 포맷입니다. 지원: standard JSON/YAML, OpenCV YAML "
+        "(camera_matrix 또는 K/cameraMatrix), ROS CameraInfo YAML, Kalibr camchain YAML."
     )

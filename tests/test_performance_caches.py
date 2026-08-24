@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 from calibration.compare import run_all_models
-from calibration.detector import clear_image_preprocess_cache, detect_image_file
+from calibration.detector import clear_image_preprocess_cache, detect_dataset, detect_image_file
 from calibration.types import (
     CalibrationResult,
     CameraConfig,
@@ -14,6 +14,8 @@ from calibration.types import (
     Frame,
     FrameStatus,
     ImageInfo,
+    PatternConfig,
+    PatternType,
 )
 
 
@@ -133,3 +135,24 @@ def test_image_preprocessing_cache_reuses_file_quality_metadata(monkeypatch, tmp
     assert info1.phash == "cached-hash"
     assert info2.phash == "cached-hash"
     assert info1.sharpness == info2.sharpness
+
+
+def test_parallel_detection_caps_default_worker_count_for_large_inputs(monkeypatch):
+    observed = []
+    monkeypatch.setattr("calibration.detector.os.cpu_count", lambda: 32)
+    monkeypatch.setattr(
+        "calibration.detector._detect_dataset_parallel",
+        lambda paths, pattern, workers: observed.append(workers) or [],
+    )
+    pattern = PatternConfig(
+        type=PatternType.CHARUCO,
+        squares_x=7,
+        squares_y=5,
+        square_size=0.04,
+        marker_size=0.03,
+        dictionary="DICT_5X5_100",
+    )
+
+    detect_dataset([f"image_{i}.jpg" for i in range(100)], pattern, parallel=True)
+
+    assert observed == [4]

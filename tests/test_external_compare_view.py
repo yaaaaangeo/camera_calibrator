@@ -33,6 +33,7 @@ from calibration.types import (  # noqa: E402
 from calibration.validation import validate_all_models  # noqa: E402
 from export.opencv import export_opencv_yaml  # noqa: E402
 from ui.external_compare_view import ExternalCompareView  # noqa: E402
+from calibration.calibration_io import StandardCalibration  # noqa: E402
 
 W, H = 640, 480
 TRUE_K = np.array([[500.0, 0, W / 2], [0, 500.0, H / 2], [0, 0, 1]])
@@ -150,6 +151,21 @@ def test_manual_input_comparison_populates_table_and_verdict(qapp, dataset_and_c
     assert view.table.item(5, 2).text().endswith("%")
     assert "내 결과" in view.verdict_label.text() or "Pinhole" in view.verdict_label.text()
     assert view.image_combo.count() > 0
+    assert view.spatial_error_table.rowCount() > 0
+    assert view.radial_error_table.rowCount() > 0
+    assert view.statistical_tests_table.rowCount() > 0
+    assert view.bootstrap_table.rowCount() > 0
+    assert view.parameter_table.rowCount() > 0
+    assert view.final_benchmark_table.rowCount() > 0
+    # 우세한 값과 Winner 셀은 흰 배경 숫자만 나열하지 않고 시각적으로 강조한다.
+    winner_item = view.table.item(0, 3)
+    assert winner_item is not None and winner_item.font().bold()
+    from ui.external_compare_view import _WINNER_CELL_COLOR
+    assert winner_item.background().color() == _WINNER_CELL_COLOR
+    assert view.table.alternatingRowColors()
+    assert "Model Comparison" not in [
+        view.benchmark_tabs.tabText(i) for i in range(view.benchmark_tabs.count())
+    ]
 
 
 def test_load_yaml_button_flow_prefills_model_and_runs(qapp, dataset_and_config, validation_results, external_yaml_path):
@@ -201,3 +217,54 @@ def test_invalid_distortion_text_is_rejected_gracefully(qapp, monkeypatch, datas
     view._on_run_comparison()  # 내부에서 ValueError -> QMessageBox.warning, 크래시 없어야 함
     assert view._last_result is None
     assert calls, "잘못된 입력 경고가 떠야 함"
+
+
+def test_external_compare_scrolls_and_yaml_prefill_remains_editable(qapp):
+    view = ExternalCompareView()
+    try:
+        view._loaded_yaml_path = "/tmp/example.yaml"
+        view._loaded_calibration = StandardCalibration(
+            label="loaded",
+            camera_matrix=TRUE_K.copy(),
+            distortion=TRUE_D.reshape(-1, 1),
+            width=W,
+            height=H,
+        )
+        view.fx_spin.setValue(777.0)
+        view.distortion_edit.setText("-0.1, 0.02, 0, 0, 0")
+
+        params = view._external_params_from_yaml()
+
+        assert view.scroll_area.widgetResizable()
+        assert params.camera_matrix[0, 0] == 777.0
+        np.testing.assert_allclose(params.distortion.reshape(-1), [-0.1, 0.02, 0, 0, 0])
+    finally:
+        view.close()
+
+
+def test_result_tables_have_category_headers_and_consistent_width_rules(qapp):
+    from PySide6.QtWidgets import QHeaderView
+    from ui.external_compare_view import ExternalCompareView
+    from ui.theme import Theme
+
+    view = ExternalCompareView()
+    try:
+        # 카테고리 구분은 유지하되 밝은 pastel header 대신 공통 dark token을 쓴다.
+        assert Theme.TABLE_HEADER_VARIANTS[0] in view.table.styleSheet()  # Overview
+        assert Theme.TABLE_HEADER_VARIANTS[1] in view.spatial_error_table.styleSheet()  # Error Analysis
+        assert Theme.TABLE_HEADER_VARIANTS[3] in view.statistical_tests_table.styleSheet()  # Statistical
+        assert Theme.TABLE_HEADER_VARIANTS[4] in view.parameter_table.styleSheet()  # Parameter
+        assert Theme.TABLE_HEADER_VARIANTS[5] in view.final_benchmark_table.styleSheet()  # Final
+
+        assert view.table.font().pointSize() == 10
+        assert view.table.horizontalHeader().sectionResizeMode(0) == QHeaderView.Stretch
+        assert (
+            view.spatial_error_table.horizontalHeader().sectionResizeMode(0)
+            == QHeaderView.ResizeToContents
+        )
+        assert (
+            view.spatial_error_table.horizontalHeader().sectionResizeMode(12)
+            == QHeaderView.Stretch
+        )
+    finally:
+        view.close()

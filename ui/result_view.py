@@ -36,6 +36,7 @@ from calibration.types import (
     ValidationResult,
 )
 from calibration.models.common import regional_edge_average
+from ui.theme import Theme, qcolor, set_tone
 
 _MODEL_LABELS = {
     CameraModelType.PINHOLE: "Pinhole",
@@ -270,43 +271,45 @@ class ResultView(QWidget):
 
         if not self._calibration_results:
             self.model_status_label.setText("")
+            set_tone(self.model_status_label, "muted")
         elif result is None:
             self.model_status_label.setText(
                 f"⚠ {_MODEL_LABELS.get(model, model)} 모델이 아직 계산되지 않았습니다."
             )
-            self.model_status_label.setStyleSheet("color: #ef6c00;")
+            set_tone(self.model_status_label, "warning")
         elif not result.success:
             reason = f" ({result.error_message})" if result.error_message else ""
             self.model_status_label.setText(
                 f"✕ {_MODEL_LABELS.get(model, model)} 모델은 캘리브레이션에 실패했습니다{reason}. "
                 f"Export/이상치 제거를 쓸 수 없습니다 - 다른 모델을 선택하세요."
             )
-            self.model_status_label.setStyleSheet("color: #c62828;")
+            set_tone(self.model_status_label, "bad")
         else:
             self.model_status_label.setText(
                 f"✓ {_MODEL_LABELS.get(model, model)} 모델 사용 가능 (RMS {result.rms_error:.3f}px)"
             )
-            self.model_status_label.setStyleSheet("color: #2e7d32;")
+            set_tone(self.model_status_label, "good")
 
         if not self._calibration_results:
             self.calibration_status_label.setText("")
+            set_tone(self.calibration_status_label, "muted")
         elif calibration_result is None:
             self.calibration_status_label.setText(
                 f"⚠ {_MODEL_LABELS.get(calibration_model, calibration_model)} 모델이 아직 계산되지 않았습니다."
             )
-            self.calibration_status_label.setStyleSheet("color: #ef6c00;")
+            set_tone(self.calibration_status_label, "warning")
         elif not calibration_result.success:
             reason = f" ({calibration_result.error_message})" if calibration_result.error_message else ""
             self.calibration_status_label.setText(
                 f"✕ {_MODEL_LABELS.get(calibration_model, calibration_model)} 모델은 캘리브레이션에 실패했습니다{reason}. "
                 f"이상치 제거 기준으로 쓸 수 없습니다 - 다른 모델을 선택하세요."
             )
-            self.calibration_status_label.setStyleSheet("color: #c62828;")
+            set_tone(self.calibration_status_label, "bad")
         else:
             self.calibration_status_label.setText(
                 f"✓ {_MODEL_LABELS.get(calibration_model, calibration_model)} 모델 사용 가능 (RMS {calibration_result.rms_error:.3f}px)"
             )
-            self.calibration_status_label.setStyleSheet("color: #2e7d32;")
+            set_tone(self.calibration_status_label, "good")
 
     def _sync_combo_model(self, target: QComboBox, model: CameraModelType | None) -> None:
         if model is None:
@@ -377,7 +380,12 @@ class ResultView(QWidget):
                     undistortion, score_str, selection_conf, recommend,
                 ]
             ):
-                self.table.setItem(row, col, QTableWidgetItem(value))
+                item = QTableWidgetItem(value)
+                # RMSE/P95/Stability 등의 숫자는 기본 흰색을 유지하고 실제 추천
+                # 판정 셀만 semantic GOOD 색으로 강조한다.
+                if row == len(self._row_labels) - 1 and recommend:
+                    item.setForeground(qcolor(Theme.GOOD))
+                self.table.setItem(row, col, item)
 
         self._update_model_status()
 
@@ -387,11 +395,11 @@ class ResultView(QWidget):
         """
         if not checks:
             self.sanity_label.setText("아직 계산되지 않았습니다.")
-            self.sanity_label.setStyleSheet("")
+            set_tone(self.sanity_label, "muted")
             return
         if not any(c.issues for c in checks):
             self.sanity_label.setText("✓ 모든 모델 이상 없음 (fx/fy, principal point, aspect ratio, distortion, FOV, RMS)")
-            self.sanity_label.setStyleSheet("color: #2e7d32;")
+            set_tone(self.sanity_label, "good")
             return
         lines = []
         has_error = False
@@ -405,7 +413,7 @@ class ResultView(QWidget):
                 mark = "✖" if issue.severity.value == "error" else "⚠"
                 lines.append(f"{mark} [{label}] {issue.message}")
         self.sanity_label.setText("\n".join(lines))
-        self.sanity_label.setStyleSheet("color: #c62828;" if has_error else "color: #ef6c00;")
+        set_tone(self.sanity_label, "bad" if has_error else "warning")
 
     def set_recommendation_message(self, message: str) -> None:
         self.recommendation_label.setText(message)

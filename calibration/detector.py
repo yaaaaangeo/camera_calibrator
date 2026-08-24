@@ -434,7 +434,12 @@ def detect_chessboard(
             ),
         )
 
-    corners = _normalize_chessboard_corner_order(corners.astype(np.float32))
+    # OpenCV versions differ here: findChessboardCornersSB may return either
+    # (N, 2) or the classic (N, 1, 2). DetectionResult has always promised the
+    # latter, which the live overlay and calibration collectors both consume.
+    corners = _normalize_chessboard_corner_order(
+        corners.astype(np.float32).reshape(-1, 1, 2)
+    )
     num_corners = cols * rows
     ids = np.arange(num_corners, dtype=np.int32).reshape(-1, 1)
     object_points = build_chessboard_object_points(pattern)
@@ -583,6 +588,20 @@ def build_detect_fn(pattern: PatternConfig) -> Callable[[np.ndarray, str], Detec
     )
 
 
+def maximum_pattern_corners(pattern: PatternConfig) -> int:
+    """Return the maximum 2D points produced by the configured detector.
+
+    ChArUco and chessboard use their internal intersections.  AprilGrid emits
+    four image points per tag in :func:`detect_aprilgrid`.  Keeping this next
+    to the detector avoids duplicating pattern-specific counting rules in UI.
+    """
+    if pattern.type in (PatternType.CHARUCO, PatternType.CHESSBOARD):
+        return max(0, (pattern.squares_x - 1) * (pattern.squares_y - 1))
+    if pattern.type == PatternType.APRILGRID:
+        return max(0, pattern.squares_x * pattern.squares_y * 4)
+    return 0
+
+
 def detect_dataset(
     image_paths: list[str],
     pattern: PatternConfig,
@@ -617,7 +636,10 @@ def detect_dataset(
     """
     cpu_count = os.cpu_count() or 1
     if parallel and len(image_paths) > 1 and cpu_count > 1:
-        effective_workers = max_workers if max_workers is not None else max(1, cpu_count - 1)
+        # 프로세스마다 고해상도 원본 + grayscale/품질 분석용 임시 배열을
+        # 동시에 보유한다. 코어 수만큼(예: 31개) 띄우면 800 MB급 데이터셋에서
+        # RAM 압박/스왑으로 GUI까지 멎으므로 UI 기본값은 4개로 제한한다.
+        effective_workers = max_workers if max_workers is not None else min(4, max(1, cpu_count - 1))
         logger.info(
             "병렬 검출 시작: 이미지 %d장, max_workers=%s",
             len(image_paths), effective_workers,
@@ -652,6 +674,9 @@ _worker_detect_fn: Optional[Callable[[np.ndarray, str], DetectionResult]] = None
 
 def _init_worker(pattern: PatternConfig) -> None:
     global _worker_detect_fn
+    # ProcessPool 바깥에서 이미 이미지 단위 병렬화를 하므로 각 프로세스 안의
+    # OpenCV 스레드 풀까지 코어 수만큼 생성하면 심한 중첩 병렬화가 된다.
+    cv2.setNumThreads(1)
     _worker_detect_fn = build_detect_fn(pattern)
 
 

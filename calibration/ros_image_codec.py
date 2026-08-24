@@ -54,12 +54,35 @@ _YUV422_ENCODING_MAP: dict[str, int] = {
     "yuy2": cv2.COLOR_YUV2BGR_YUY2,
 }
 
+# Jetson CSI/GStreamer 기반 드라이버에서 흔한 4:2:0 semi-planar 형식. ROS 표준
+# 상수는 대문자지만 일부 드라이버가 소문자 문자열을 발행해 둘 다 받는다.
+_YUV420SP_ENCODING_MAP: dict[str, int] = {
+    "NV12": cv2.COLOR_YUV2BGR_NV12,
+    "nv12": cv2.COLOR_YUV2BGR_NV12,
+    "NV21": cv2.COLOR_YUV2BGR_NV21,
+    "nv21": cv2.COLOR_YUV2BGR_NV21,
+}
+
+
+def _message_buffer(data):
+    """Return a zero-copy buffer when the ROS sequence type supports it.
+
+    rospy bytes, rclpy ``array('B')`` and rosbags numpy arrays all expose the
+    buffer protocol.  A defensive bytes fallback keeps custom message objects
+    working without forcing a full-frame copy on the normal live path.
+    """
+    try:
+        view = memoryview(data)
+        return view if view.contiguous else bytes(data)
+    except TypeError:
+        return bytes(data)
+
 
 def _decode_yuv422(msg, cvt_code: int) -> np.ndarray | None:
     """YUV422류(픽셀당 2바이트, 크로마 서브샘플링 패킹)는 _ENCODING_MAP의
     "채널 N개가 픽셀마다 연속으로 붙어있다" 가정이 안 맞아 별도 경로로 뺐다.
     """
-    raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+    raw = np.frombuffer(_message_buffer(msg.data), dtype=np.uint8)
     row_bytes = msg.step  # uint8이라 itemsize=1, step은 이미 바이트 단위
     if raw.size < msg.height * row_bytes:
         return None  # 데이터 길이가 헤더와 안 맞음 - 손상된 프레임, 건너뜀
@@ -67,6 +90,23 @@ def _decode_yuv422(msg, cvt_code: int) -> np.ndarray | None:
     arr = raw.reshape(msg.height, row_bytes)
     arr = arr[:, : msg.width * 2]  # YUV422은 픽셀당 2바이트
     arr = arr.reshape(msg.height, msg.width, 2)
+    try:
+        return cv2.cvtColor(arr, cvt_code)
+    except cv2.error:
+        return None
+
+
+def _decode_yuv420sp(msg, cvt_code: int) -> np.ndarray | None:
+    """NV12/NV21 (Y plane + interleaved UV/VU plane) -> BGR."""
+    if msg.height % 2 or msg.width % 2:
+        return None
+    raw = np.frombuffer(_message_buffer(msg.data), dtype=np.uint8)
+    row_bytes = msg.step
+    storage_rows = msg.height * 3 // 2
+    if raw.size < storage_rows * row_bytes:
+        return None
+    arr = raw[: storage_rows * row_bytes].reshape(storage_rows, row_bytes)
+    arr = np.ascontiguousarray(arr[:, : msg.width])
     try:
         return cv2.cvtColor(arr, cvt_code)
     except cv2.error:
@@ -81,6 +121,8 @@ def decode_raw_image(msg) -> np.ndarray | None:
     msg.data는 rosbags(역직렬화된 numpy 배열)와 rospy(bytes/bytearray) 둘 다
     올 수 있어 np.frombuffer로 통일한다.
     """
+    if msg.encoding in _YUV420SP_ENCODING_MAP:
+        return _decode_yuv420sp(msg, _YUV420SP_ENCODING_MAP[msg.encoding])
     if msg.encoding in _YUV422_ENCODING_MAP:
         return _decode_yuv422(msg, _YUV422_ENCODING_MAP[msg.encoding])
 
@@ -90,7 +132,7 @@ def decode_raw_image(msg) -> np.ndarray | None:
     dtype, channels, cvt = spec
 
     itemsize = np.dtype(dtype).itemsize
-    raw = np.frombuffer(bytes(msg.data), dtype=dtype)
+    raw = np.frombuffer(_message_buffer(msg.data), dtype=dtype)
     row_elems = msg.step // itemsize
     if raw.size < msg.height * row_elems:
         return None  # 데이터 길이가 헤더와 안 맞음 - 손상된 프레임, 건너뜀
@@ -110,7 +152,7 @@ def decode_raw_image(msg) -> np.ndarray | None:
 
 def decode_compressed_image(msg) -> np.ndarray | None:
     """sensor_msgs/CompressedImage (duck-typed: .data) -> BGR np.ndarray."""
-    buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+    buf = np.frombuffer(_message_buffer(msg.data), dtype=np.uint8)
     img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
     return img  # 디코딩 실패하면 cv2가 None을 반환 - 그대로 전달해서 건너뛰게 함
 

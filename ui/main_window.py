@@ -52,7 +52,6 @@ from calibration.types import (
 from calibration.recommender import compute_final_result
 from calibration.sanity_check import run_sanity_checks
 from calibration.quality import coverage_percentage
-from calibration.rosbag_reader import list_image_topics
 from calibration.ros_live import ROS_LIVE_BACKEND
 from calibration.project_io import load_project, save_project, PROJECT_EXTENSION
 from export.opencv import export_opencv_yaml
@@ -71,11 +70,13 @@ from ui.external_compare_view import ExternalCompareView
 from ui.diagnosis_view import DiagnosisView
 from ui.stability_view import StabilityView
 from ui.live_capture_dialog import LiveCaptureDialog
+from ui.wheel_guard import WheelChangeGuard
 from ui.worker import (
     PipelineWorker,
     OutlierPruneWorker,
     CrossDatasetValidationWorker,
     SelfCheckWorker,
+    BagTopicDiscoveryWorker,
     BagExtractionWorker,
     run_worker_in_thread,
 )
@@ -103,6 +104,12 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Camera Calibration Tool")
+        # Qt 기본 동작은 마우스 포인터만 spinbox/combo/tab 위에 있어도 휠로
+        # 값/선택 탭을 바꾼다. 앱 전역 필터로 우발 변경을 차단한다.
+        self._wheel_change_guard = WheelChangeGuard(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._wheel_change_guard)
         # 예전엔 화면 크기와 무관하게 무조건 1280x860으로 고정 리사이즈했다 -
         # 실사용자 버그: 화면(또는 사용 가능 영역, 예를 들어 작업표시줄/독을 뺀
         # 영역)이 860px보다 낮으면 창 아래쪽(탭 내용, 버튼 등)이 화면 밖으로
@@ -145,6 +152,9 @@ class MainWindow(QMainWindow):
         self._bag_thread: QThread | None = None
         self._bag_worker = None  # QThread가 살아있는 동안 GC 방지용 강한 참조
         self._bag_progress_dialog: QProgressDialog | None = None
+        self._bag_topic_thread: QThread | None = None
+        self._bag_topic_worker = None
+        self._bag_topic_progress_dialog: QProgressDialog | None = None
         self._self_check_worker = None  # 위와 동일한 이유로 별도 워커도 강한 참조 보관
 
         self._build_menu_bar()
@@ -243,8 +253,22 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(self.self_check_action)
 
     def _build_settings_panel(self) -> QWidget:
-        group = QGroupBox("Camera Setup & Pattern")
-        outer = QHBoxLayout(group)
+        group = QGroupBox("▼ Camera Setup / Pattern")
+        group.setObjectName("settingsPanel")
+        group.setCheckable(True)
+        group.setChecked(True)
+        # checkable QGroupBox의 동작은 유지하되 theme에서 indicator를 0px로 숨긴다.
+        # 사용자는 제목의 화살표/문구를 클릭해서만 접고 펼치므로 별도 체크박스가
+        # 보이지 않는다.
+        group.setToolTip("제목의 화살표를 클릭해 Camera Setup 영역을 접거나 펼칩니다.")
+        group_layout = QVBoxLayout(group)
+        content = QWidget()
+        outer = QHBoxLayout(content)
+        outer.setContentsMargins(0, 0, 0, 0)
+        group_layout.addWidget(content)
+        self.settings_group = group
+        self.settings_content = content
+        group.toggled.connect(self._on_settings_panel_toggled)
 
         camera_form = QFormLayout()
         self.width_spin = QSpinBox()
@@ -320,6 +344,7 @@ class MainWindow(QMainWindow):
         self.load_live_button.clicked.connect(self._on_load_from_live)
         self.loaded_label = QLabel("불러온 이미지: 0장")
         self.run_button = QPushButton("캘리브레이션 실행")
+        self.run_button.setProperty("role", "primary")
         self.run_button.clicked.connect(self._on_run_pipeline)
         self.run_button.setEnabled(False)
         action_layout.addWidget(self.load_button)
@@ -331,6 +356,12 @@ class MainWindow(QMainWindow):
         outer.addLayout(action_layout)
 
         return group
+
+    def _on_settings_panel_toggled(self, expanded: bool) -> None:
+        self.settings_content.setVisible(expanded)
+        self.settings_group.setTitle(
+            "▼ Camera Setup / Pattern" if expanded else "▶ Camera Setup / Pattern"
+        )
 
     # ------------------------------------------------------------------
     # 이미지 로드 / 파이프라인 실행
@@ -356,14 +387,36 @@ class MainWindow(QMainWindow):
         if not bag_path:
             return
 
-        try:
-            topics = list_image_topics(bag_path)
-        except ImportError as e:
-            QMessageBox.critical(self, "rosbags 미설치", str(e))
-            return
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.critical(self, "bag 읽기 실패", f"bag 파일을 여는 데 실패했습니다:\n{e}")
-            return
+        # 큰 ROS1 bag은 토픽 목록을 얻기 위해 파일 인덱스를 여는 단계부터
+        # 수 초 이상 걸린다. 추출뿐 아니라 이 검색도 반드시 GUI 밖에서 한다.
+        worker = BagTopicDiscoveryWorker(bag_path)
+        thread = run_worker_in_thread(worker, self)
+        progress = QProgressDialog("bag 인덱스에서 이미지 토픽을 검색 중...", "", 0, 0, self)
+        progress.setWindowTitle("bag 여는 중")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+
+        worker.progress.connect(progress.setLabelText)
+        worker.progress.connect(self.status_label.setText)
+        # 반드시 MainWindow bound method에 직접 연결해야 Qt가 GUI thread로
+        # queued delivery한다. lambda 안에서 dialog를 만들면 worker thread에서
+        # 실행될 수 있어 QObject::setParent 오류와 segfault가 발생한다.
+        worker.topics_ready.connect(self._on_bag_topics_ready)
+        worker.error.connect(self._on_error)
+        worker.finished.connect(progress.close)
+        worker.finished.connect(self._on_bag_topic_worker_finished)
+
+        self._bag_topic_thread, self._bag_topic_worker = thread, worker
+        self._bag_topic_progress_dialog = progress
+        self.load_button.setEnabled(False)
+        self.load_bag_button.setEnabled(False)
+        thread.finished.connect(self._on_bag_thread_finished)
+        thread.start()
+        progress.show()
+
+    def _on_bag_topics_ready(self, topics: list, bag_path: str) -> None:
+        """백그라운드 검색 결과를 받은 뒤에만 사용자 선택 UI를 연다."""
 
         if not topics:
             QMessageBox.warning(self, "이미지 토픽 없음", "이 bag 안에서 이미지 토픽을 찾지 못했습니다.")
@@ -388,7 +441,18 @@ class MainWindow(QMainWindow):
             return
 
         out_dir = str(Path(bag_path).with_suffix("").as_posix()) + "_extracted"
+        self._start_bag_extraction(bag_path, topic, out_dir, interval)
 
+    def _on_bag_topic_worker_finished(self) -> None:
+        self._bag_topic_progress_dialog = None
+
+    def _on_bag_thread_finished(self) -> None:
+        self.load_button.setEnabled(True)
+        self.load_bag_button.setEnabled(True)
+
+    def _start_bag_extraction(
+        self, bag_path: str, topic: str, out_dir: str, interval: float
+    ) -> None:
         # 이미지 추출 자체(메시지 디코딩 + 디스크 기록)는 큰 bag에서 수십 초~
         # 몇 분까지 걸릴 수 있어 QThread로 분리한다. 예전엔 여기서 바로
         # extract_images_from_bag()을 동기 호출해서, 큰 bag을 불러올 때
@@ -413,18 +477,15 @@ class MainWindow(QMainWindow):
         # 무한 반복 바를 유지한다.
         worker.progress_value.connect(self._on_bag_progress_value)
         self._bag_progress_dialog = progress
-        worker.finished_extraction.connect(
-            lambda extracted: self._on_bag_extraction_finished(extracted, bag_path)
-        )
+        worker.finished_extraction.connect(self._on_bag_extraction_finished)
         worker.error.connect(self._on_error)
         worker.finished.connect(progress.close)
-        worker.finished.connect(lambda: setattr(self, "_bag_progress_dialog", None))
+        worker.finished.connect(self._on_bag_extraction_worker_finished)
 
         self._bag_thread, self._bag_worker = thread, worker
         self.load_button.setEnabled(False)
         self.load_bag_button.setEnabled(False)
-        thread.finished.connect(lambda: self.load_button.setEnabled(True))
-        thread.finished.connect(lambda: self.load_bag_button.setEnabled(True))
+        thread.finished.connect(self._on_bag_thread_finished)
         thread.start()
         progress.show()
 
@@ -439,6 +500,9 @@ class MainWindow(QMainWindow):
         # total == 0(아직 메시지 개수를 모르는 상태)이면 setRange(0,0) 그대로
         # 두어 무한 반복 바를 유지한다 - 값을 알 수 없는데 억지로 고정폭으로
         # 바꾸면 항상 0%로 멈춰 있는 것처럼 보여 오히려 더 헷갈린다.
+
+    def _on_bag_extraction_worker_finished(self) -> None:
+        self._bag_progress_dialog = None
 
     def _on_bag_extraction_finished(self, extracted: list[str], bag_path: str) -> None:
         if not extracted:

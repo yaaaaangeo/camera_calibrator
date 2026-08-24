@@ -126,6 +126,29 @@ def test_yuv422_corrupted_data_returns_none_not_crash():
     assert decode_raw_image(msg) is None
 
 
+def test_nv12_nv21_jetson_encodings_decode_with_padded_step():
+    """Jetson 카메라 파이프라인에서 흔한 NV12/NV21과 row padding을 지원한다."""
+    height, width, step = 8, 10, 12
+    for encoding in ("NV12", "nv12", "NV21", "nv21"):
+        packed = np.zeros((height * 3 // 2, step), dtype=np.uint8)
+        packed[:height, :width] = 128  # Y
+        packed[height:, :width] = 128  # neutral interleaved UV/VU
+        msg = _FakeImageMsg(height, width, encoding, step, packed.reshape(-1))
+
+        out = decode_raw_image(msg)
+
+        assert out is not None, f"{encoding} 디코딩 실패"
+        assert out.shape == (height, width, 3)
+        assert np.abs(out.astype(int) - 130).mean() < 5
+
+
+def test_nv12_odd_dimensions_or_corrupted_data_returns_none():
+    odd = _FakeImageMsg(7, 10, "NV12", 10, np.zeros(105, dtype=np.uint8))
+    short = _FakeImageMsg(8, 10, "NV12", 10, np.zeros(10, dtype=np.uint8))
+    assert decode_raw_image(odd) is None
+    assert decode_raw_image(short) is None
+
+
 def test_unsupported_encoding_returns_none_not_crash():
     msg = _FakeImageMsg(5, 5, "unknown_weird_encoding", 5, np.zeros(25, dtype=np.uint8))
     assert decode_raw_image(msg) is None

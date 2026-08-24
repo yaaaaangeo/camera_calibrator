@@ -9,7 +9,7 @@ tests/test_rosbag_and_live_fixes.py
    default_typestore를 안 넘겨서 발생.
 
 2. 실시간 구독이 "계속 프레임 수신 대기 중"에서 멈춤 - 카메라가 지원 안 하는
-   인코딩(yuv422 등)으로 발행하면 프레임이 도착해도 조용히 버려져서
+    인코딩으로 발행하면 프레임이 도착해도 조용히 버려져서
    사용자는 "아무것도 안 온다"고 착각하게 된다.
 """
 
@@ -37,6 +37,62 @@ def test_any_reader_called_with_default_typestore():
         _, kwargs = mock_reader_cls.call_args
         assert "default_typestore" in kwargs
         assert kwargs["default_typestore"] == "FAKE_TYPESTORE"
+
+
+def test_bag_topic_discovery_worker_runs_lookup_outside_ui_callback(monkeypatch):
+    import pytest
+    pytest.importorskip("PySide6")
+    from ui.worker import BagTopicDiscoveryWorker
+
+    expected = [object()]
+    monkeypatch.setattr("ui.worker.list_image_topics", lambda path: expected)
+    worker = BagTopicDiscoveryWorker("large.bag")
+    received = []
+    errors = []
+    worker.topics_ready.connect(lambda topics, path: received.append((topics, path)))
+    worker.error.connect(errors.append)
+
+    worker.run()
+
+    assert received == [(expected, "large.bag")]
+    assert not errors
+
+
+def test_bag_topic_result_is_delivered_on_receiver_gui_thread(monkeypatch):
+    """회귀 테스트: 결과 콜백에서 dialog/widget을 만들어도 되는 thread여야 한다."""
+    import pytest
+    pytest.importorskip("PySide6")
+    from PySide6.QtCore import QEventLoop, QObject, QThread, Slot
+    from PySide6.QtWidgets import QApplication
+    from ui.worker import BagTopicDiscoveryWorker
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("ui.worker.list_image_topics", lambda path: [])
+    loop = QEventLoop()
+
+    class Receiver(QObject):
+        def __init__(self):
+            super().__init__()
+            self.on_own_thread = False
+
+        @Slot(object, str)
+        def receive(self, topics, path):
+            self.on_own_thread = QThread.currentThread() == self.thread() == app.thread()
+            loop.quit()
+
+    receiver = Receiver()
+    worker = BagTopicDiscoveryWorker("large.bag")
+    thread = QThread()
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
+    worker.topics_ready.connect(receiver.receive)
+    worker.finished.connect(thread.quit)
+
+    thread.start()
+    loop.exec()
+    thread.wait(2000)
+
+    assert receiver.on_own_thread
 
 
 def test_any_reader_default_typestore_used_by_extract_too():
@@ -124,17 +180,17 @@ def test_real_ros2_bag_with_embedded_typedefs_still_works(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_unsupported_encoding_returns_none_reproduces_original_symptom():
-    """지원 안 하는 인코딩(nv12 등)은 decode_image_message가 None을
+    """지원 안 하는 인코딩(32FC1 등)은 decode_image_message가 None을
     반환한다 - 예전 코드는 이 경우를 조용히 버려서 "대기 중" 상태로
     영원히 멈춘 것처럼 보이는 버그의 근본 원인이었다.
 
-    (yuv422는 이후 지원 목록에 추가돼 더 이상 이 테스트에 적합하지 않다 -
-    nv12처럼 아직 지원 안 하는 인코딩으로 검증한다.)
+    (yuv422와 nv12는 이후 지원 목록에 추가돼 더 이상 이 테스트에 적합하지
+    않다. 캘리브레이션 입력으로 지원하지 않는 depth float로 검증한다.)
     """
     from calibration.ros_image_codec import decode_image_message
 
     class FakeMsg:
-        encoding = "nv12"
+        encoding = "32FC1"
         data = np.zeros(100, dtype=np.uint8)
 
     result = decode_image_message(FakeMsg(), "sensor_msgs/Image")
@@ -151,9 +207,9 @@ def test_report_decode_error_calls_on_error_callback():
     calls = []
     sub._on_error = lambda detail: calls.append(detail)
 
-    sub._report_decode_error("encoding=yuv422 지원 안 함")
+    sub._report_decode_error("encoding=32FC1 지원 안 함")
     assert len(calls) == 1
-    assert "yuv422" in calls[0]
+    assert "32FC1" in calls[0]
 
 
 def test_report_decode_error_is_rate_limited():
@@ -207,12 +263,12 @@ def test_extract_error_message_includes_actual_encoding_name(tmp_path):
         img = np.zeros((10, 10), dtype=np.uint16)
         msg = RbImage(
             header=RbHeader(seq=0, stamp=RbTime(sec=0, nanosec=0), frame_id="c"),
-            height=10, width=10, encoding="nv12", is_bigendian=0, step=10,
+            height=10, width=10, encoding="32FC1", is_bigendian=0, step=40,
             data=img.reshape(-1).view(np.uint8),
         )
         writer.write(conn, 0, ts.serialize_ros1(msg, RbImage.__msgtype__))
 
     from calibration.rosbag_reader import extract_images_from_bag
     import pytest as _pytest
-    with _pytest.raises(ValueError, match="nv12"):
+    with _pytest.raises(ValueError, match="32FC1"):
         extract_images_from_bag(bag_path, "/camera1/image_raw", str(tmp_path / "out"))

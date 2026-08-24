@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QApplication
 
 from calibration.log_utils import setup_logging
 from ui.main_window import MainWindow
+from ui.theme import apply_theme
 from app.zen import print_zen_greeting
 
 
@@ -47,6 +48,7 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("Camera Calibration Tool")
+    apply_theme(app)
 
     window = MainWindow()
     window.show()

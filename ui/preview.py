@@ -82,6 +82,7 @@ class PreviewView(QWidget):
         original_layout = QVBoxLayout(original_group)
         self.original_label = QLabel("이미지를 선택하고 [미리보기 갱신]을 누르세요.")
         self.original_label.setAlignment(Qt.AlignCenter)
+        self.original_label.setProperty("surface", "image")
         original_layout.addWidget(self.original_label)
         images_row.addWidget(original_group)
 
@@ -89,6 +90,7 @@ class PreviewView(QWidget):
         undistorted_layout = QVBoxLayout(undistorted_group)
         self.undistorted_label = QLabel("-")
         self.undistorted_label.setAlignment(Qt.AlignCenter)
+        self.undistorted_label.setProperty("surface", "image")
         undistorted_layout.addWidget(self.undistorted_label)
         images_row.addWidget(undistorted_group)
 

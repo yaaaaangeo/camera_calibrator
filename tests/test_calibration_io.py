@@ -163,3 +163,63 @@ def test_direct_opencv_loader_rejects_missing_matrix(tmp_path):
 
     with pytest.raises(ValueError, match="camera_matrix"):
         load_opencv_calibration(path)
+
+
+@pytest.mark.parametrize(
+    ("k_key", "d_key"),
+    [("K", "D"), ("cameraMatrix", "distCoeffs"), ("CameraMat", "DistCoeff")],
+)
+def test_auto_loader_accepts_common_plain_yaml_aliases(tmp_path, k_key, d_key):
+    path = tmp_path / f"aliases_{k_key}.yaml"
+    path.write_text(
+        yaml.safe_dump({
+            k_key: K.reshape(-1).tolist(),
+            d_key: D.tolist(),
+            "resolution": [1280, 720],
+            "distortion_model": "plumb_bob",
+        }),
+        encoding="utf-8",
+    )
+
+    loaded = load_standard_calibration(str(path))
+
+    assert loaded.source_format == "generic_yaml"
+    assert loaded.width == 1280 and loaded.height == 720
+    np.testing.assert_allclose(loaded.camera_matrix, K)
+    np.testing.assert_allclose(loaded.distortion.reshape(-1), D)
+
+
+def test_ros_yaml_accepts_plain_matrix_lists(tmp_path):
+    path = tmp_path / "plain_ros.yaml"
+    path.write_text(yaml.safe_dump({
+        "image_width": 1280,
+        "image_height": 720,
+        "camera_matrix": K.reshape(-1).tolist(),
+        "distortion_coefficients": D.tolist(),
+        "distortion_model": "plumb_bob",
+    }), encoding="utf-8")
+
+    loaded = load_standard_calibration(str(path))
+
+    np.testing.assert_allclose(loaded.camera_matrix, K)
+    np.testing.assert_allclose(loaded.distortion.reshape(-1), D)
+
+
+def test_loader_accepts_wrapped_comma_string_calibration(tmp_path):
+    path = tmp_path / "bottom_center_calibration_data.yaml"
+    path.write_text(yaml.safe_dump({
+        "bottom_center_calibration_data": {
+            "image_w": 1920,
+            "image_h": 1536,
+            "cameraMatrix": ", ".join(str(v) for v in K.reshape(-1)),
+            "distCoeffs": ", ".join(str(v) for v in D),
+        }
+    }), encoding="utf-8")
+
+    loaded = load_standard_calibration(str(path))
+
+    assert loaded.label == "bottom_center_calibration_data"
+    assert loaded.width == 1920 and loaded.height == 1536
+    assert loaded.model_name == CameraModelType.EXTENDED_PINHOLE
+    np.testing.assert_allclose(loaded.camera_matrix, K)
+    np.testing.assert_allclose(loaded.distortion.reshape(-1), D)

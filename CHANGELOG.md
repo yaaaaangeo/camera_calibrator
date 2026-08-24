@@ -5,51 +5,16 @@
 
 ## [Unreleased]
 
-### 수정 (Fixed) — 실사용자 UI 버그 리포트
+### JetPack / 실시간 카메라
 
-- **"① Dataset"과 "② Detection" 탭 중복 제거.** 두 탭이 `DatasetView`를
-  `group_title`만 바꿔 두 번 띄운 것이라 내용이 100% 동일했습니다. Detection
-  탭을 없애고 Dataset 탭 하나로 합쳤습니다(탭 번호 전체 재정렬: 이제 ①~⑨).
-- **"python3 is not responding" 응답 없음 창.** 계산 자체는 이미
-  QThread/`ProcessPoolExecutor`로 분리돼 있었지만, `detect_dataset()`의
-  병렬 검출이 `os.cpu_count()`를 그대로 다 써서 코어를 전부 점유 -
-  수백 장짜리 데이터셋에서 GUI 프로세스가 OS 스케줄링을 못 받아 "응답
-  없음"으로 오판되는 문제가 있었습니다. 코어 하나는 항상 GUI 몫으로
-  남겨두도록 `calibration/performance.py`의 `resolve_worker_count`와
-  `calibration/detector.py`의 병렬 검출 기본값을 고쳤습니다.
-- **Fisheye 캘리브레이션이 특정 데이터셋에서 크래시.** OpenCV 5.0.0에서
-  재현: `cv2.fisheye.calibrate()` 내부 `InitExtrinsics`가 코너 분포가
-  애매하거나 보드 각도가 카메라 광축과 거의 평행한 프레임에서 호모그래피
-  분해가 퇴화(degenerate)하며 크래시했습니다(`fabs(norm_u1) > 0` 어서션).
-  기존 코드는 실패하면 `CALIB_CHECK_COND` 안전장치를 꺼서 재시도했는데,
-  이는 오히려 더 위험한 무방비 크래시 경로였습니다. `CALIB_CHECK_COND`를
-  켠 채로 에러 메시지에서 문제 프레임 인덱스를 파싱해 그 프레임만
-  제외하고 재시도하도록 `calibration/models/fisheye.py`에
-  `_robust_fisheye_calibrate`를 새로 추가했습니다. 인덱스를 안 주는
-  경우엔 이진 탐색으로 문제 프레임을 좁혀 제외합니다. 성공 시 어떤
-  프레임을 제외했는지 새 `CalibrationResult.warning_message` 필드로
-  알립니다. 합성 데이터 60개 시나리오로 검증: 기존 방식 성공률 약
-  24% → 약 98%로 개선. 나머지 실패도 크래시 대신 명확한 실패 메시지를
-  돌려줍니다.
-- **작은 화면에서 창이 세로로 잘림.** `resize(1280, 860)` 고정값 대신
-  화면의 사용 가능 영역(available geometry)을 기준으로 크기를 계산하고
-  화면 중앙에 배치하도록 `ui/main_window.py`를 고쳤습니다.
-- **rosbag 이미지 추출 진행바가 고정폭 안에서 안 채워짐.**
-  `QProgressDialog(0, 0, ...)`으로 만들어서 실제로는 진행률과 무관하게
-  움직이는 무한 반복 바(busy indicator)였습니다. `BagExtractionWorker`에
-  숫자 진행 시그널(`progress_value`)을 추가하고
-  `QProgressDialog.setMaximum()/setValue()`에 연결해 실제 진행률만큼
-  고정폭 막대가 채워지도록 고쳤습니다.
-- **"④ Calibration" 탭 이름을 "③ Outlier"로 변경.** 이 탭에서 실제로
-  하는 일(모델 선택/실행 + 이상치 제거)에 더 맞는 이름으로 바꿨습니다
-  (내용은 그대로).
-
-### 알려진 이슈 (Known Issues) — 이번 세션에서 발견, 미수정
-
-- OpenCV 5.0.0 환경에서 `detect_chessboard()`가 반환하는 코너 배열의
-  shape이 `(N, 1, 2)`가 아니라 `(N, 2)`로 나오는 회귀가 있습니다
-  (`tests/test_chessboard.py::test_detect_chessboard_succeeds_on_real_image`
-  가 원본 코드에서도 실패하는 것으로 확인). ChArUco 패턴에는 영향 없음.
+- JetPack 6.2.1 ARM64용 `requirements-jetson.txt`, 자동 설치 스크립트와
+  preflight를 추가했습니다. Ubuntu 22.04 호환 `PySide6 6.7.3`, Qt 충돌 없는
+  OpenCV contrib headless wheel, ROS apt 패키지가 보이는 가상환경을 사용합니다.
+- ROS 프레임을 Qt 이벤트 큐에 무한 적재하지 않고 최신 한 장만 보관하도록
+  변경했습니다. 프리뷰는 최대 10 FPS이고 수신/표시/폐기 통계를 보여줍니다.
+- 4K 프리뷰는 BGR 원본을 먼저 480px로 축소해 RGB/QImage 복사량을 줄였고,
+  ROS 메시지 버퍼도 가능한 경우 불필요한 `bytes` 복사를 제거했습니다.
+- Jetson CSI/GStreamer 카메라에서 흔한 NV12/NV21 디코딩을 추가했습니다.
 
 ### 업그레이드 (Upgraded)
 

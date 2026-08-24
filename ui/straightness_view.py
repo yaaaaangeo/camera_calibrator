@@ -43,9 +43,9 @@ _PREVIEW_MAX_WIDTH = 900
 
 # 설계 문서 3.1번과 같은 어휘(Excellent/Good/Warning/Poor)를 색으로 매핑.
 # BGR 순서(cv2로 그리므로).
-_COLOR_EXCELLENT = (80, 175, 76)    # 초록
-_COLOR_WARNING = (0, 165, 255)      # 주황
-_COLOR_POOR = (40, 40, 220)         # 빨강
+_COLOR_EXCELLENT = (0, 185, 118)    # #76B900 (BGR)
+_COLOR_WARNING = (0, 168, 224)      # #E0A800 (BGR)
+_COLOR_POOR = (79, 83, 217)         # #D9534F (BGR)
 _RESIDUAL_MAX_FOR_COLOR = 1.5       # 이 값 이상이면 완전히 빨강 (px)
 
 
@@ -135,6 +135,7 @@ class StraightnessView(QWidget):
         group_layout = QVBoxLayout(group)
         self.image_label = QLabel("이미지를 선택하고 [지도 갱신]을 누르세요.")
         self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setProperty("surface", "image")
         group_layout.addWidget(self.image_label)
         layout.addWidget(group)
 

@@ -16,6 +16,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QGridLayout, QLabel, QProgressBar, QWidget
 
 from calibration.quality import LiveCoverageBars
+from ui.theme import Theme
 
 
 class LiveCoverageBarsWidget(QWidget):
@@ -79,9 +80,9 @@ class LiveCoverageBarsWidget(QWidget):
             self._style_bar(bar, pct)
 
     def _style_bar(self, bar: QProgressBar, pct: int) -> None:
-        color = "#2ecc71" if pct >= self._GOOD_THRESHOLD else "#e67e22"
+        color = Theme.GOOD if pct >= self._GOOD_THRESHOLD else Theme.WARNING
         bar.setStyleSheet(
-            "QProgressBar { border: 1px solid #999; border-radius: 3px; "
-            "text-align: center; background: #eee; }"
+            f"QProgressBar {{ border: 1px solid {Theme.BORDER_STRONG}; border-radius: 3px; "
+            f"text-align: center; color: {Theme.TEXT_VALUE}; background: {Theme.BG_TERTIARY}; }}"
             f"QProgressBar::chunk {{ background-color: {color}; }}"
         )

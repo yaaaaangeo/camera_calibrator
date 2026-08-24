@@ -29,10 +29,11 @@ OS 프로세스에서 실행한다 - 그 프로세스는 자기만의 GIL을 가
 from __future__ import annotations
 
 import time
+import threading
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QMetaObject, QThread, Qt, Signal, Slot
 
 from calibration.types import (
     CameraConfig,
@@ -40,7 +41,8 @@ from calibration.types import (
     Dataset,
     PatternConfig,
 )
-from calibration.detector import detect_dataset, summarize_dataset
+from calibration.detector import build_detect_fn, detect_dataset, summarize_dataset
+from calibration.latest_frame import FrameBufferStats, LatestFrameBuffer
 from calibration.quality import analyze_dataset_quality
 from calibration.frame_quality import compute_frame_quality_scores, compute_dataset_quality_score
 from calibration.image_quality import evaluate_dataset_image_quality
@@ -48,8 +50,9 @@ from calibration.quality import coverage_percentage
 from calibration.models.common import infer_image_size
 from calibration.recommender import compute_model_scores, build_recommendation_message
 from calibration.self_check import run_all_self_checks
-from calibration.rosbag_reader import extract_images_from_bag
+from calibration.rosbag_reader import extract_images_from_bag, list_image_topics
 from calibration.validation import validate_cross_datasets
+from calibration.external_compare import compare_with_external_params
 from calibration.pipeline_process import (
     run_models_and_validation,
     run_outlier_pruning_and_validation,
@@ -74,6 +77,87 @@ def _wait_with_heartbeat(future, progress_signal, label: str):
         except FutureTimeoutError:
             elapsed = time.monotonic() - start
             progress_signal.emit(f"{label} ({elapsed:.0f}초 경과 - 계산 중입니다)")
+
+
+class LiveDetectionWorker(QObject):
+    """Latest-only pattern detection worker for the live preview.
+
+    ``submit_frame`` is intentionally safe to call from the GUI thread even
+    after this object has moved to a QThread: it only replaces a single-slot
+    buffer and schedules at most one queued worker invocation.  While OpenCV
+    is busy, any number of incoming frames therefore collapse into one latest
+    frame instead of growing a Qt signal queue.
+    """
+
+    result_ready = Signal(object)  # DetectionResult
+    error = Signal(str)
+
+    def __init__(self, pattern_config: PatternConfig):
+        super().__init__()
+        self.pattern_config = pattern_config
+        self._frame_buffer = LatestFrameBuffer()
+        self._schedule_lock = threading.Lock()
+        self._scheduled = False
+        self._stopping = False
+        self._detect_fn = None
+        self._frame_index = 0
+
+    @Slot()
+    def initialize(self) -> None:
+        """Build OpenCV detector objects in the thread that will use them."""
+        try:
+            self._detect_fn = build_detect_fn(self.pattern_config)
+        except Exception as exc:  # noqa: BLE001 - keep raw preview alive
+            self.error.emit(f"Live detection 초기화 실패: {exc}")
+
+    def submit_frame(self, frame: object, timestamp_sec: float) -> None:
+        """Replace the pending frame and schedule no more than one work item."""
+        if not hasattr(frame, "shape"):
+            return
+        with self._schedule_lock:
+            if self._stopping:
+                return
+            self._frame_buffer.put(frame, timestamp_sec)
+            if self._scheduled:
+                return
+            self._scheduled = True
+            QMetaObject.invokeMethod(self, "_process_latest", Qt.QueuedConnection)
+
+    @Slot()
+    def _process_latest(self) -> None:
+        pending = self._frame_buffer.take()
+        if pending is not None and not self._stopping and self._detect_fn is not None:
+            frame, _timestamp_sec = pending
+            image_id = f"live_preview_{self._frame_index:08d}"
+            self._frame_index += 1
+            try:
+                result = self._detect_fn(frame, image_id)
+            except Exception as exc:  # noqa: BLE001 - a bad frame must not stop preview
+                self.error.emit(f"Live detection 오류: {exc}")
+            else:
+                if not self._stopping:
+                    self.result_ready.emit(result)
+
+        # Detection may have taken longer than the camera interval.  If frames
+        # arrived meanwhile, schedule exactly one more invocation for the most
+        # recent slot; otherwise release the scheduling flag atomically.
+        with self._schedule_lock:
+            if self._stopping:
+                self._scheduled = False
+                self._frame_buffer.clear()
+            elif self._frame_buffer.has_pending():
+                QMetaObject.invokeMethod(self, "_process_latest", Qt.QueuedConnection)
+            else:
+                self._scheduled = False
+
+    def request_stop(self) -> None:
+        """Thread-safe stop request; an in-flight OpenCV call may finish first."""
+        with self._schedule_lock:
+            self._stopping = True
+            self._frame_buffer.clear()
+
+    def buffer_stats(self) -> FrameBufferStats:
+        return self._frame_buffer.stats()
 
 
 
@@ -364,6 +448,88 @@ class SelfCheckWorker(QObject):
             self.finished.emit()
 
 
+class BagTopicDiscoveryWorker(QObject):
+    """큰 rosbag의 메타데이터/인덱스 검색을 GUI 스레드 밖에서 수행한다.
+
+    ROS1 bag은 파일을 여는 것만으로도 큰 인덱스를 읽을 수 있다. 이 단계를
+    GUI에서 직접 실행하면 실제 이미지 디코딩을 시작하기도 전에 운영체제가
+    창을 '응답 없음'으로 판정한다.
+    """
+
+    progress = Signal(str)
+    # bag_path까지 signal payload로 보내고 MainWindow의 bound method에 직접
+    # 연결한다. Python lambda를 중간에 두면 PySide가 그 lambda를 sender의
+    # worker thread에서 호출할 수 있어, 그 안에서 dialog를 만들면 즉시
+    # cross-thread QObject parent 오류/segfault가 난다.
+    topics_ready = Signal(object, str)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, bag_path: str):
+        super().__init__()
+        self.bag_path = bag_path
+
+    def run(self) -> None:
+        try:
+            self.progress.emit("bag 인덱스에서 이미지 토픽을 검색 중...")
+            self.topics_ready.emit(list_image_topics(self.bag_path), self.bag_path)
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"bag 읽기 실패: {e}")
+        finally:
+            self.finished.emit()
+
+
+class ExternalComparisonWorker(QObject):
+    """External Compare의 재학습/K-fold/bootstrap을 별도 프로세스에서 실행."""
+
+    progress = Signal(str)
+    result_ready = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        dataset,
+        camera_config,
+        pattern_config,
+        my_model,
+        my_validation,
+        external,
+        use_rational_model: bool,
+    ):
+        super().__init__()
+        self.dataset = dataset
+        self.camera_config = camera_config
+        self.pattern_config = pattern_config
+        self.my_model = my_model
+        self.my_validation = my_validation
+        self.external = external
+        self.use_rational_model = use_rational_model
+
+    def run(self) -> None:
+        try:
+            self.progress.emit("External Compare 계산 중... (재학습/K-fold/bootstrap 포함)")
+            with ProcessPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    compare_with_external_params,
+                    self.dataset,
+                    self.camera_config,
+                    self.pattern_config,
+                    self.my_model,
+                    self.my_validation,
+                    self.external,
+                    self.use_rational_model,
+                )
+                result = _wait_with_heartbeat(
+                    future, self.progress, "External Compare 계산 중...",
+                )
+            self.result_ready.emit(result)
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"External Compare 계산 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
 class BagExtractionWorker(QObject):
     """rosbag에서 이미지를 뽑아 .jpg로 저장하는 무거운 작업(수백~수천 개
     메시지를 디코딩+디스크 기록)을 GUI 스레드 밖으로 분리한다.
@@ -384,7 +550,7 @@ class BagExtractionWorker(QObject):
     # done/total은 이미 알고 있으므로 별도 숫자 시그널로 내보내
     # QProgressDialog.setMaximum()/setValue()에 직접 연결한다.
     progress_value = Signal(int, int)  # (done, total)
-    finished_extraction = Signal(list)  # list[str] - 저장된 이미지 경로
+    finished_extraction = Signal(object, str)  # (list[str], bag_path)
     error = Signal(str)
     finished = Signal()
 
@@ -422,7 +588,7 @@ class BagExtractionWorker(QObject):
                 progress_callback=_on_progress,
                 cancel_check=lambda: self._cancelled,
             )
-            self.finished_extraction.emit(extracted)
+            self.finished_extraction.emit(extracted, self.bag_path)
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"bag 이미지 추출 중 오류: {e}")
         finally:

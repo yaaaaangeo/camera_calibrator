@@ -18,19 +18,25 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QProgressBar,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
 from calibration.types import CoverageCell, DatasetQualityScore, DiversityScores
+from ui.theme import Theme
 
 
 def _score_to_color(score: float) -> QColor:
-    """0(빨강, 부족) ~ 1(초록, 충분) 그라데이션."""
+    """Dark status surface: insufficient red -> sufficient NVIDIA green."""
     score = max(0.0, min(1.0, score))
-    r = int(255 * (1 - score))
-    g = int(200 * score)
-    return QColor(r, g, 60)
+    low = QColor(Theme.COVERAGE_LOW)
+    high = QColor(Theme.COVERAGE_HIGH)
+    return QColor(
+        int(low.red() + (high.red() - low.red()) * score),
+        int(low.green() + (high.green() - low.green()) * score),
+        int(low.blue() + (high.blue() - low.blue()) * score),
+    )
 
 
 class CoverageGridWidget(QWidget):
@@ -60,10 +66,11 @@ class CoverageGridWidget(QWidget):
                 label.setAlignment(Qt.AlignCenter)
                 label.setMinimumSize(60, 45)
                 color = _score_to_color(score)
-                text_color = "#000000" if score > 0.4 else "#ffffff"
+                text_color = Theme.TEXT_VALUE
+                border_color = Theme.GOOD if score >= 0.7 else (Theme.WARNING if score >= 0.35 else Theme.BAD)
                 label.setStyleSheet(
                     f"background-color: {color.name()}; color: {text_color}; "
-                    f"border: 1px solid #333; font-weight: bold;"
+                    f"border: 1px solid {border_color}; font-weight: bold;"
                 )
                 self._layout.addWidget(label, r, c)
                 self._cell_labels[(r, c)] = label
@@ -134,7 +141,12 @@ class CoverageView(QWidget):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        content = QWidget()
+        layout = QVBoxLayout(content)
 
         grid_group = QGroupBox("Coverage Map")
         grid_layout = QVBoxLayout(grid_group)
@@ -161,6 +173,10 @@ class CoverageView(QWidget):
         self.warning_list = QListWidget()
         warning_layout.addWidget(self.warning_list)
         layout.addWidget(warning_group)
+
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll)
+        self.scroll_area = scroll
 
     def set_quality(
         self,

@@ -25,11 +25,13 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -54,6 +56,8 @@ from calibration.external_compare import (
     compare_with_external_params,
 )
 from calibration.calibration_io import StandardCalibration, load_standard_calibration
+from ui.worker import ExternalComparisonWorker, run_worker_in_thread
+from ui.theme import Theme
 
 _MODEL_LABELS = {
     CameraModelType.PINHOLE: "Pinhole",
@@ -63,6 +67,10 @@ _MODEL_LABELS = {
 _MODEL_ORDER = [CameraModelType.PINHOLE, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE]
 
 _PANEL_MAX_WIDTH = 460
+_BEST_CELL_COLOR = QColor(Theme.TABLE_BEST)
+_WINNER_CELL_COLOR = QColor(Theme.TABLE_WINNER)
+_TIE_CELL_COLOR = QColor(Theme.TABLE_TIE)
+_TAB_HEADER_COLORS = Theme.TABLE_HEADER_VARIANTS
 
 
 def _cv_to_qpixmap(img_bgr: np.ndarray, max_width: int = _PANEL_MAX_WIDTH) -> QPixmap:
@@ -106,8 +114,14 @@ class ExternalCompareView(QWidget):
         self._loaded_calibration: StandardCalibration | None = None
         self._reference_calibration: StandardCalibration | None = None
         self._candidate_calibration: StandardCalibration | None = None
+        self._comparison_thread = None
+        self._comparison_worker = None
 
-        layout = QVBoxLayout(self)
+        root_layout = QVBoxLayout(self)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
 
         intro = QLabel(
             "예전에 구한 카메라 파라미터(다른 사람/다른 툴 결과)를 입력하면, "
@@ -120,7 +134,19 @@ class ExternalCompareView(QWidget):
 
         layout.addWidget(self._build_input_group())
         layout.addWidget(self._build_run_row())
+        legend = QLabel(
+            "표 색상: 짙은 녹색 = 더 낮은 오차/우세한 결과 · 회색 = 동률 또는 줄 구분 · "
+            "파라미터 차이는 그 자체로 우열이 아니므로 색상 판정을 하지 않습니다."
+        )
+        legend.setWordWrap(True)
+        legend.setStyleSheet(
+            f"background: {Theme.BG_SECONDARY}; border: 1px solid {Theme.BORDER}; "
+            f"padding: 6px; color: {Theme.TEXT_SECONDARY};"
+        )
+        layout.addWidget(legend)
         layout.addWidget(self._build_benchmark_tabs(), stretch=1)
+        self.scroll_area.setWidget(content)
+        root_layout.addWidget(self.scroll_area)
 
     # ------------------------------------------------------------------
     # 입력 영역
@@ -197,6 +223,7 @@ class ExternalCompareView(QWidget):
         v.addLayout(cand_row)
 
         self.run_pair_button = QPushButton("Reference vs Candidate 파일 비교 실행")
+        self.run_pair_button.setProperty("role", "primary")
         self.run_pair_button.clicked.connect(self._on_run_file_pair_comparison)
         v.addWidget(self.run_pair_button)
         return group
@@ -220,8 +247,14 @@ class ExternalCompareView(QWidget):
         h.addWidget(self.my_model_combo)
 
         self.run_button = QPushButton("비교 실행")
-        self.run_button.clicked.connect(self._on_run_comparison)
+        self.run_button.setProperty("role", "primary")
+        # 실제 버튼 경로는 무거운 비교를 별도 프로세스에서 실행한다. 기존
+        # _on_run_comparison()은 계산 로직 단위 테스트용 동기 진입점으로 유지.
+        self.run_button.clicked.connect(self._on_run_comparison_async)
         h.addWidget(self.run_button)
+        self.comparison_status_label = QLabel("비교 대기 중")
+        self.comparison_status_label.setWordWrap(True)
+        h.addWidget(self.comparison_status_label, stretch=1)
         h.addStretch(1)
         return row
 
@@ -263,22 +296,129 @@ class ExternalCompareView(QWidget):
             "Parameter Analysis",
         )
         self.benchmark_tabs.addTab(
-            self._tab_page([self._build_model_comparison_group()]),
-            "Model Comparison",
-        )
-        self.benchmark_tabs.addTab(
             self._tab_page([self._build_final_benchmark_group()]),
             "Final Report",
         )
+        self.benchmark_tabs.setMinimumHeight(520)
+        self.benchmark_tabs.currentChanged.connect(self._on_benchmark_tab_changed)
+        self._style_result_tables()
         return self.benchmark_tabs
 
-    def _tab_page(self, widgets: list[QWidget]) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
+    def _style_result_tables(self) -> None:
+        for tab_index in range(self.benchmark_tabs.count()):
+            page = self.benchmark_tabs.widget(tab_index)
+            header_color = _TAB_HEADER_COLORS[tab_index % len(_TAB_HEADER_COLORS)]
+            for table in page.findChildren(QTableWidget):
+                table.setAlternatingRowColors(True)
+                table.setStyleSheet(
+                    f"QTableView {{ font-size: 10pt; color: {Theme.TEXT_PRIMARY}; "
+                    f"background-color: {Theme.TABLE_ODD}; alternate-background-color: {Theme.TABLE_EVEN}; "
+                    f"gridline-color: #2A2A2A; selection-background-color: {Theme.BG_SELECTED}; }}"
+                    f"QHeaderView::section {{ background-color: {header_color}; "
+                    f"color: {Theme.TEXT_PRIMARY}; font-size: 10pt; font-weight: 600; padding: 6px; "
+                    f"border: none; border-right: 1px solid {Theme.BORDER}; "
+                    f"border-bottom: 1px solid {Theme.BORDER_STRONG}; }}"
+                )
+
+                body_font = table.font()
+                body_font.setPointSize(10)
+                table.setFont(body_font)
+                table.verticalHeader().setDefaultSectionSize(28)
+
+                header = table.horizontalHeader()
+                header.setDefaultAlignment(Qt.AlignCenter)
+                header.setMinimumSectionSize(72)
+                header.setMaximumSectionSize(360)
+                columns = table.columnCount()
+                if columns == 0:  # heatmap은 결과 렌더 시 20x20 열 폭을 별도 지정
+                    continue
+                if table is self.final_report_evidence_table:
+                    header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+                    header.setSectionResizeMode(1, QHeaderView.Stretch)
+                elif columns <= 5:
+                    for col in range(columns):
+                        header.setSectionResizeMode(col, QHeaderView.Stretch)
+                else:
+                    for col in range(columns):
+                        header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+                    header.setSectionResizeMode(columns - 1, QHeaderView.Stretch)
+
+    @staticmethod
+    def _highlight_item(table: QTableWidget, row: int, col: int, color: QColor, *, bold: bool = False) -> None:
+        item = table.item(row, col)
+        if item is None:
+            return
+        item.setBackground(color)
+        if bold:
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+
+    @classmethod
+    def _highlight_lower_pair(
+        cls,
+        table: QTableWidget,
+        row: int,
+        reference_col: int,
+        candidate_col: int,
+        reference_value,
+        candidate_value,
+    ) -> None:
+        if reference_value is None or candidate_value is None:
+            return
+        if abs(float(reference_value) - float(candidate_value)) < 1e-12:
+            cls._highlight_item(table, row, reference_col, _TIE_CELL_COLOR)
+            cls._highlight_item(table, row, candidate_col, _TIE_CELL_COLOR)
+        elif float(reference_value) < float(candidate_value):
+            cls._highlight_item(table, row, reference_col, _BEST_CELL_COLOR, bold=True)
+        else:
+            cls._highlight_item(table, row, candidate_col, _BEST_CELL_COLOR, bold=True)
+
+    @classmethod
+    def _highlight_named_winner(
+        cls,
+        table: QTableWidget,
+        row: int,
+        winner: str | None,
+        reference_label: str,
+        candidate_label: str,
+        reference_col: int,
+        candidate_col: int,
+        winner_col: int,
+    ) -> None:
+        if winner == reference_label:
+            cls._highlight_item(table, row, reference_col, _BEST_CELL_COLOR, bold=True)
+            cls._highlight_item(table, row, winner_col, _WINNER_CELL_COLOR, bold=True)
+        elif winner == candidate_label:
+            cls._highlight_item(table, row, candidate_col, _BEST_CELL_COLOR, bold=True)
+            cls._highlight_item(table, row, winner_col, _WINNER_CELL_COLOR, bold=True)
+        elif winner and winner.lower() == "tie":
+            cls._highlight_item(table, row, reference_col, _TIE_CELL_COLOR)
+            cls._highlight_item(table, row, candidate_col, _TIE_CELL_COLOR)
+            cls._highlight_item(table, row, winner_col, _TIE_CELL_COLOR, bold=True)
+
+    def _tab_page(self, widgets: list[QWidget]) -> QScrollArea:
+        """각 결과 탭은 자기 스크롤을 가진다.
+
+        예전에는 External Compare 전체에 바깥 스크롤 하나만 있어 Overview의
+        스크롤 offset이 높이가 다른 탭에도 그대로 적용됐고, 탭을 바꾸면 데이터가
+        있는데도 빈 영역부터 보였다.
+        """
+        page = QScrollArea()
+        page.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         for widget in widgets:
             layout.addWidget(widget)
         layout.addStretch(1)
+        page.setWidget(content)
         return page
+
+    def _on_benchmark_tab_changed(self, index: int) -> None:
+        page = self.benchmark_tabs.widget(index)
+        if isinstance(page, QScrollArea):
+            page.verticalScrollBar().setValue(0)
+        self.scroll_area.ensureWidgetVisible(self.benchmark_tabs, 0, 20)
 
     def _build_result_group(self) -> QGroupBox:
         group = QGroupBox("정량 비교 결과 (Hold-out test 프레임 기준, 동일 조건)")
@@ -307,17 +447,17 @@ class ExternalCompareView(QWidget):
 
         self.verdict_label = QLabel("아직 비교를 실행하지 않았습니다.")
         self.verdict_label.setWordWrap(True)
-        self.verdict_label.setStyleSheet("font-weight: bold;")
+        self.verdict_label.setProperty("role", "sectionTitle")
         v.addWidget(self.verdict_label)
 
         self.decision_label = QLabel("Decision: N/A")
         self.decision_label.setWordWrap(True)
-        self.decision_label.setStyleSheet("color: #333333;")
+        self.decision_label.setProperty("tone", "info")
         v.addWidget(self.decision_label)
 
         self.caveats_label = QLabel("")
         self.caveats_label.setWordWrap(True)
-        self.caveats_label.setStyleSheet("color: #666666; font-size: 11px;")
+        self.caveats_label.setProperty("tone", "muted")
         v.addWidget(self.caveats_label)
 
         return group
@@ -377,11 +517,11 @@ class ExternalCompareView(QWidget):
         image_label = QLabel(initial_text)
         image_label.setAlignment(Qt.AlignCenter)
         image_label.setMinimumHeight(180)
-        image_label.setStyleSheet("background: #f7f7f7; border: 1px solid #dddddd;")
+        image_label.setProperty("surface", "image")
         layout.addWidget(image_label)
         caption_label = QLabel("")
         caption_label.setWordWrap(True)
-        caption_label.setStyleSheet("color: #666666; font-size: 11px;")
+        caption_label.setProperty("tone", "muted")
         layout.addWidget(caption_label)
         return box, image_label, caption_label
 
@@ -391,7 +531,7 @@ class ExternalCompareView(QWidget):
 
         self.final_report_label = QLabel("아직 비교를 실행하지 않았습니다.")
         self.final_report_label.setWordWrap(True)
-        self.final_report_label.setStyleSheet("font-weight: bold;")
+        self.final_report_label.setProperty("role", "sectionTitle")
         v.addWidget(self.final_report_label)
 
         self.final_report_evidence_table = QTableWidget(0, 2)
@@ -401,7 +541,7 @@ class ExternalCompareView(QWidget):
         v.addWidget(self.final_report_evidence_table)
 
         final_table_label = QLabel("Final Benchmark Table")
-        final_table_label.setStyleSheet("font-weight: bold;")
+        final_table_label.setProperty("role", "sectionTitle")
         v.addWidget(final_table_label)
 
         self.final_benchmark_table = QTableWidget(0, 5)
@@ -460,7 +600,7 @@ class ExternalCompareView(QWidget):
 
         self.heatmap_summary_label = QLabel("아직 비교를 실행하지 않았습니다.")
         self.heatmap_summary_label.setWordWrap(True)
-        self.heatmap_summary_label.setStyleSheet("color: #666666; font-size: 11px;")
+        self.heatmap_summary_label.setProperty("tone", "muted")
         v.addWidget(self.heatmap_summary_label)
 
         grid = QGridLayout()
@@ -507,7 +647,7 @@ class ExternalCompareView(QWidget):
 
         self.error_distribution_summary_label = QLabel("아직 비교를 실행하지 않았습니다.")
         self.error_distribution_summary_label.setWordWrap(True)
-        self.error_distribution_summary_label.setStyleSheet("color: #666666; font-size: 11px;")
+        self.error_distribution_summary_label.setProperty("tone", "muted")
         v.addWidget(self.error_distribution_summary_label)
 
         self.error_distribution_table = QTableWidget(0, 7)
@@ -527,7 +667,7 @@ class ExternalCompareView(QWidget):
             "현재 프로젝트의 3개 calibration model을 hold-out validation과 information criteria 기준으로 비교합니다."
         )
         note.setWordWrap(True)
-        note.setStyleSheet("color: #666666; font-size: 11px;")
+        note.setProperty("tone", "muted")
         v.addWidget(note)
 
         self.model_comparison_table = QTableWidget(0, 10)
@@ -551,7 +691,7 @@ class ExternalCompareView(QWidget):
             "파라미터 차이는 진단 신호이고, 최종 판단은 hold-out residual/edge/radial/straightness를 함께 봐야 합니다."
         )
         self.parameter_note_label.setWordWrap(True)
-        self.parameter_note_label.setStyleSheet("color: #666666; font-size: 11px;")
+        self.parameter_note_label.setProperty("tone", "muted")
         v.addWidget(self.parameter_note_label)
 
         self.parameter_table = QTableWidget(0, 5)
@@ -571,7 +711,7 @@ class ExternalCompareView(QWidget):
             "Reference/Candidate 파라미터를 고정하고 각 validation subset에서 pose만 다시 추정합니다."
         )
         self.benchmark_validation_note_label.setWordWrap(True)
-        self.benchmark_validation_note_label.setStyleSheet("color: #666666; font-size: 11px;")
+        self.benchmark_validation_note_label.setProperty("tone", "muted")
         v.addWidget(self.benchmark_validation_note_label)
 
         self.benchmark_validation_table = QTableWidget(0, 9)
@@ -602,7 +742,7 @@ class ExternalCompareView(QWidget):
             "차이는 Candidate - Reference이므로 음수면 Candidate 오차가 더 낮습니다."
         )
         note.setWordWrap(True)
-        note.setStyleSheet("color: #666666; font-size: 11px;")
+        note.setProperty("tone", "muted")
         v.addWidget(note)
 
         self.statistical_tests_table = QTableWidget(0, 8)
@@ -622,7 +762,7 @@ class ExternalCompareView(QWidget):
             "공통 프레임 pair를 bootstrap resampling해서 Candidate가 Reference보다 낮은 RMSE를 낼 확률과 CI를 추정합니다."
         )
         note.setWordWrap(True)
-        note.setStyleSheet("color: #666666; font-size: 11px;")
+        note.setProperty("tone", "muted")
         v.addWidget(note)
 
         self.bootstrap_table = QTableWidget(0, 2)
@@ -640,7 +780,7 @@ class ExternalCompareView(QWidget):
             "Reference/Candidate 각각에 대해 validation 프레임 pose를 고정하고 intrinsic/distortion Jacobian을 수치미분으로 근사합니다."
         )
         note.setWordWrap(True)
-        note.setStyleSheet("color: #666666; font-size: 11px;")
+        note.setProperty("tone", "muted")
         v.addWidget(note)
 
         self.parameter_observability_table = QTableWidget(0, 10)
@@ -708,7 +848,6 @@ class ExternalCompareView(QWidget):
         self._validation_results = validation_results
         self._calibration_results = calibration_results or {}
         self._use_rational_model = use_rational_model
-        self._render_model_comparison_table()
 
     # ------------------------------------------------------------------
     # 외부 YAML 불러오기
@@ -726,6 +865,13 @@ class ExternalCompareView(QWidget):
         try:
             loaded = load_standard_calibration(path)
         except Exception as e:  # noqa: BLE001
+            # 이전에 성공한 파일이 남아 있으면 이후 [비교 실행]이 눈에 보이는
+            # 수동 입력 대신 그 오래된 파일을 계속 사용한다. 실패 시 파일 모드를
+            # 확실히 해제해 아래 입력란이 즉시 유효해지게 한다.
+            self._loaded_yaml_path = None
+            self._loaded_calibration = None
+            self.yaml_status_label.setText("불러오기 실패 - 아래 수동 입력을 사용합니다.")
+            self._manual_group.setEnabled(True)
             QMessageBox.critical(self, "불러오기 실패", str(e))
             return
 
@@ -821,11 +967,20 @@ class ExternalCompareView(QWidget):
     def _external_params_from_yaml(self) -> ExternalCameraParams:
         loaded = self._loaded_calibration or load_standard_calibration(self._loaded_yaml_path)
         model = self.external_model_combo.currentData()
+        # 파일 값은 입력 위젯에 채워 넣되, 사용자가 그 값을 보정한 경우 화면에
+        # 보이는 값이 실제 비교에도 쓰여야 한다. 이전 구현은 위젯 편집을 무시하고
+        # 원본 YAML 배열을 다시 사용해 '직접 입력이 막힌' 것처럼 보였다.
+        K = np.array([
+            [self.fx_spin.value(), 0.0, self.cx_spin.value()],
+            [0.0, self.fy_spin.value(), self.cy_spin.value()],
+            [0.0, 0.0, 1.0],
+        ])
+        D = _parse_distortion_text(self.distortion_edit.text())
         return ExternalCameraParams(
             label=self.label_edit.text().strip() or loaded.label or "예전 결과",
             model_name=model,
-            camera_matrix=loaded.camera_matrix,
-            distortion=loaded.distortion,
+            camera_matrix=K,
+            distortion=D,
             source_note=(
                 self.source_note_edit.text().strip()
                 or f"{loaded.source_format}: {loaded.source_path or self._loaded_yaml_path}"
@@ -839,10 +994,10 @@ class ExternalCompareView(QWidget):
     # 비교 실행
     # ------------------------------------------------------------------
 
-    def _on_run_comparison(self) -> None:
+    def _prepare_comparison_inputs(self):
         if self._dataset is None or self._camera_config is None or self._pattern_config is None:
             QMessageBox.warning(self, "데이터 없음", "먼저 이미지를 불러오고 캘리브레이션을 실행하세요.")
-            return
+            return None
 
         my_model = self.my_model_combo.currentData()
         my_validation = self._validation_results.get(my_model)
@@ -852,7 +1007,7 @@ class ExternalCompareView(QWidget):
                 f"{_MODEL_LABELS.get(my_model, my_model)} 모델의 Hold-out Validation 결과가 없습니다. "
                 "먼저 [캘리브레이션 실행]을 완료해 주세요.",
             )
-            return
+            return None
 
         try:
             if self._loaded_yaml_path:
@@ -861,16 +1016,72 @@ class ExternalCompareView(QWidget):
                 external = self._external_params_from_manual_input()
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "외부 파라미터 입력 오류", str(e))
+            return None
+        return my_model, my_validation, external
+
+    def _on_run_comparison(self) -> None:
+        """동기 비교 진입점. UI 버튼은 _on_run_comparison_async를 사용한다."""
+        prepared = self._prepare_comparison_inputs()
+        if prepared is None:
             return
+        my_model, my_validation, external = prepared
 
         result = compare_with_external_params(
             self._dataset, self._camera_config, self._pattern_config,
             my_model, my_validation, external,
             use_rational_model=self._use_rational_model,
         )
+        self._display_comparison_result(result)
+
+    def _on_run_comparison_async(self) -> None:
+        if self._comparison_thread is not None and self._comparison_thread.isRunning():
+            QMessageBox.information(self, "비교 진행 중", "External Compare 계산이 이미 진행 중입니다.")
+            return
+        prepared = self._prepare_comparison_inputs()
+        if prepared is None:
+            return
+        my_model, my_validation, external = prepared
+        worker = ExternalComparisonWorker(
+            self._dataset,
+            self._camera_config,
+            self._pattern_config,
+            my_model,
+            my_validation,
+            external,
+            self._use_rational_model,
+        )
+        thread = run_worker_in_thread(worker, self)
+        worker.progress.connect(self.comparison_status_label.setText)
+        worker.result_ready.connect(self._display_comparison_result)
+        worker.error.connect(self._on_comparison_error)
+        thread.finished.connect(self._on_comparison_finished)
+        self._comparison_thread, self._comparison_worker = thread, worker
+        self.run_button.setEnabled(False)
+        self.comparison_status_label.setText("External Compare 계산 시작 중...")
+        thread.start()
+
+    def _display_comparison_result(self, result: ExternalComparisonResult) -> None:
         self._last_result = result
         self._render_result(result)
         self._populate_image_combo(result)
+        self.benchmark_tabs.setCurrentIndex(0)
+        overview_page = self.benchmark_tabs.widget(0)
+        if isinstance(overview_page, QScrollArea):
+            overview_page.verticalScrollBar().setValue(0)
+        self.scroll_area.ensureWidgetVisible(self.benchmark_tabs, 0, 20)
+        if result.mine.success and result.external.success:
+            self.comparison_status_label.setText("비교 완료 - 아래 Overview에 결과를 표시했습니다.")
+        else:
+            self.comparison_status_label.setText(f"비교 실패: {result.verdict}")
+
+    def _on_comparison_error(self, message: str) -> None:
+        self.comparison_status_label.setText(message)
+        QMessageBox.critical(self, "External Compare 실패", message)
+
+    def _on_comparison_finished(self) -> None:
+        self.run_button.setEnabled(True)
+        self._comparison_thread = None
+        self._comparison_worker = None
 
     def _on_run_file_pair_comparison(self) -> None:
         if self._dataset is None or self._camera_config is None or self._pattern_config is None:
@@ -916,6 +1127,9 @@ class ExternalCompareView(QWidget):
             self.table.setItem(row, 1, QTableWidgetItem(_fmt_value(candidate_val, fmt)))
             self.table.setItem(row, 2, QTableWidgetItem(_fmt_improvement(improvement)))
             self.table.setItem(row, 3, QTableWidgetItem(winner or "N/A"))
+            self._highlight_named_winner(
+                self.table, row, winner, result.external.label, result.mine.label, 0, 1, 3
+            )
 
         if result.mine.success and result.external.success:
             for row, metric in enumerate(result.metric_rows[:10]):
@@ -947,7 +1161,6 @@ class ExternalCompareView(QWidget):
         )
         self.caveats_label.setText("\n".join(result.caveats))
         self._render_final_report_summary(result)
-        self._render_model_comparison_table()
         self._render_final_benchmark_table(result)
         self._render_spatial_error_table(result)
         self._render_radial_error_table(result)
@@ -969,6 +1182,16 @@ class ExternalCompareView(QWidget):
             self.final_benchmark_table.setItem(row_index, 2, QTableWidgetItem(row.candidate))
             self.final_benchmark_table.setItem(row_index, 3, QTableWidgetItem(row.improvement))
             self.final_benchmark_table.setItem(row_index, 4, QTableWidgetItem(row.winner))
+            self._highlight_named_winner(
+                self.final_benchmark_table,
+                row_index,
+                row.winner,
+                result.external.label,
+                result.mine.label,
+                1,
+                2,
+                4,
+            )
 
     def _render_final_report_summary(self, result: ExternalComparisonResult) -> None:
         decision = result.winner_decision
@@ -1022,7 +1245,6 @@ class ExternalCompareView(QWidget):
                 f"max |corr| {corr}, weak {weak}"
             )
 
-        model_bits = self._model_analysis_summary()
         sections = [
             ("Performance Comparison", " / ".join([
                 metric_summary("RMSE"),
@@ -1032,7 +1254,6 @@ class ExternalCompareView(QWidget):
             ("Statistical Evidence", "; ".join(stats) or "N/A"),
             ("Visual Evidence", "; ".join(visual_bits)),
             ("Parameter Analysis", "; ".join(param_bits) or "N/A"),
-            ("Model Analysis", model_bits),
             ("FINAL VERDICT", decision.status),
             ("One-line diagnosis", result.verdict or "N/A"),
         ]
@@ -1140,6 +1361,16 @@ class ExternalCompareView(QWidget):
             if row.improvement_pct is not None:
                 winner = f"{winner} ({row.improvement_pct:+.1f}%)"
             self.worst_case_table.setItem(row_index, 5, QTableWidgetItem(winner))
+            self._highlight_named_winner(
+                self.worst_case_table,
+                row_index,
+                row.winner,
+                result.external.label,
+                result.mine.label,
+                2,
+                4,
+                5,
+            )
 
     def _render_spatial_error_table(self, result: ExternalComparisonResult) -> None:
         rows = []
@@ -1173,6 +1404,15 @@ class ExternalCompareView(QWidget):
             ]
             for col, value in enumerate(values):
                 self.spatial_error_table.setItem(row_index, col, QTableWidgetItem(value))
+            self._highlight_lower_pair(
+                self.spatial_error_table, row_index, 4, 5, cell.reference_mean, cell.candidate_mean
+            )
+            self._highlight_lower_pair(
+                self.spatial_error_table, row_index, 7, 8, cell.reference_rmse, cell.candidate_rmse
+            )
+            self._highlight_lower_pair(
+                self.spatial_error_table, row_index, 10, 11, cell.reference_p95, cell.candidate_p95
+            )
 
     def _render_radial_error_table(self, result: ExternalComparisonResult) -> None:
         rows = []
@@ -1205,6 +1445,12 @@ class ExternalCompareView(QWidget):
             ]
             for col, value in enumerate(values):
                 self.radial_error_table.setItem(row_index, col, QTableWidgetItem(value))
+            self._highlight_lower_pair(
+                self.radial_error_table, row_index, 5, 6, band.reference_rmse, band.candidate_rmse
+            )
+            self._highlight_lower_pair(
+                self.radial_error_table, row_index, 8, 9, band.reference_p95, band.candidate_p95
+            )
 
     def _render_selected_residual_heatmap(self, *_args) -> None:
         result = self._last_result
@@ -1282,20 +1528,22 @@ class ExternalCompareView(QWidget):
     @staticmethod
     def _heatmap_color(value: float | None, scale: float, mode: str) -> QColor:
         if value is None:
-            return QColor(245, 245, 245)
+            return QColor(Theme.BG_SECONDARY)
         if mode == "difference":
             ratio = min(abs(float(value)) / scale, 1.0)
-            intensity = int(60 + 150 * ratio)
             if value > 0:
-                return QColor(255, 235 - intensity // 4, 235 - intensity // 3)
+                return QColor(55 + int(70 * ratio), 27, 27)
             if value < 0:
-                return QColor(235 - intensity // 3, 245, 255)
-            return QColor(245, 245, 245)
+                return QColor(29, 48 + int(38 * ratio), 18)
+            return QColor(Theme.BG_TERTIARY)
         ratio = min(max(float(value) / scale, 0.0), 1.0)
-        red = int(255)
-        green = int(255 - 150 * ratio)
-        blue = int(220 - 180 * ratio)
-        return QColor(red, green, max(40, blue))
+        low = QColor(Theme.COVERAGE_HIGH)
+        high = QColor(Theme.HEATMAP_HIGH)
+        return QColor(
+            int(low.red() + (high.red() - low.red()) * ratio),
+            int(low.green() + (high.green() - low.green()) * ratio),
+            int(low.blue() + (high.blue() - low.blue()) * ratio),
+        )
 
     def _render_error_distribution_table(self, result: ExternalComparisonResult) -> None:
         distribution = result.error_distribution
@@ -1365,6 +1613,14 @@ class ExternalCompareView(QWidget):
             )
             improvement = "N/A" if row.improvement_pct is None else f"{row.improvement_pct:+.1f}%"
             self.benchmark_validation_table.setItem(row_index, 8, QTableWidgetItem(improvement))
+            self._highlight_lower_pair(
+                self.benchmark_validation_table,
+                row_index,
+                3,
+                6,
+                row.reference_validation_rms_mean,
+                row.candidate_validation_rms_mean,
+            )
 
     def _render_statistical_tests_table(self, result: ExternalComparisonResult) -> None:
         rows = result.statistical_tests

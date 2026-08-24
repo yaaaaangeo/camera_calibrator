@@ -81,6 +81,18 @@ docker run --rm \
 프로젝트를 곧바로 개발 컨테이너로 열고 싶다면 `Dockerfile` 상단 주석과
 `.devcontainer/devcontainer.json`을 참고하세요 (X11 포워딩 방법 포함).
 
+**방법 D - JetPack 6.2.1 / Jetson AGX Orin**
+
+JetPack의 Ubuntu 22.04 ARM64에서는 일반 requirements 대신 호환 wheel을 고정한
+자동 설치 스크립트를 사용합니다.
+
+```bash
+source /opt/ros/humble/setup.bash
+./scripts/install_jetson.sh
+```
+
+자세한 전제 조건, 실행법과 카메라 현장 검증은 [JETSON.md](JETSON.md)에 있습니다.
+
 ## 3. 실행
 
 ```bash
@@ -121,25 +133,20 @@ camera-calibrator
    컴퓨터에 설치되어 있어야 함 - rospy/rclpy는 pip로 설치되지 않음)
 3. **[캘리브레이션 실행]** 클릭 → 검출 → 3모델 계산 → Hold-out → 추천까지 자동 진행
 4. 탭을 넘기며 결과 확인:
-   - **① Dataset**: 이미지별 상태/코너 수/재투영 오차/**품질 점수(Frame Quality Score)·등급**,
-     검출 성공/실패와 실패 이유까지 한 탭에서 확인
-   - **② Coverage**: 4×4 커버리지 맵 + 데이터셋 다양성 점수 + 경고
-   - **③ Outlier**: 선택 모델 기준 이상치 제거·재계산
-     (예전 이름은 "Calibration"이었는데, 이 탭에서 실제로 하는 일 - 모델
-     선택/실행 + 이상치 제거 - 에 맞춰 이름을 바꿨다)
-   - **④ Validation**: sanity check + Dataset B/C cross-dataset validation
-   - **⑤ Error Analysis**: Undistort Preview, Edge Error Map, Straightness Map, 외부 결과 비교
+   - **① Dataset**: 이미지별 상태/코너 수/재투영 오차/**품질 점수(Frame Quality Score)·등급**
+   - **② Detection**: 검출 성공/실패와 실패 이유를 독립 탭에서 확인
+   - **③ Coverage**: 4×4 커버리지 맵 + 데이터셋 다양성 점수 + 경고
+   - **④ Calibration**: 선택 모델 기준 이상치 제거·재계산
+   - **⑤ Validation**: sanity check + Dataset B/C cross-dataset validation
+   - **⑥ Error Analysis**: Undistort Preview, Edge Error Map, Straightness Map, 외부 결과 비교
      (OpenCV YAML / ROS CameraInfo YAML / Kalibr camchain YAML / 표준 JSON import)
      + benchmark compatibility 검사(width/height, model, distortion model, 계수 개수,
      NaN/Inf, matrix shape, 파라미터 범위)
      + Reference/Candidate를 둘 다 파일로 로드하는 독립 benchmark 비교
-   - **⑥ Stability**: bootstrap/repeatability 기반 파라미터 안정성(fx/fy/cx/cy 표준편차,
-     condition number, 최대 상관계수 등 세부 불확실성)
-   - **⑦ Model Comparison**: 3모델 비교표(Train/Test/P95/Edge/Radial/AIC/BIC/Stability/Observability) + 추천 이유
-     (Stability/Observability/Undistortion은 여기선 한 줄 요약 점수만 보여준다 -
-     세부 내역은 위 ⑥ Stability 탭 참고)
-   - **⑧ Diagnosis**: failure pattern, 원인 분석, 다음 촬영 추천
-   - **⑨ Export**: OpenCV/ROS YAML, **HTML 종합 리포트**, **JSON**, **CSV** export
+   - **⑦ Stability**: bootstrap/repeatability 기반 파라미터 안정성
+   - **⑧ Model Comparison**: 3모델 비교표(Train/Test/P95/Edge/Radial/AIC/BIC/Stability/Observability) + 추천 이유
+   - **⑨ Diagnosis**: failure pattern, 원인 분석, 다음 촬영 추천
+   - **⑩ Export**: OpenCV/ROS YAML, **HTML 종합 리포트**, **JSON**, **CSV** export
 5. 상단 메뉴 **파일 → 프로젝트 저장(Ctrl+S)** 으로 지금까지의 전체 상태(데이터셋,
    3모델 결과, 검증, 추천)를 `.ccproj` 파일로 저장할 수 있다. **파일 → 프로젝트
    불러오기(Ctrl+O)** 로 나중에 이어서 작업 가능 — 원본 이미지 파일이 없어져도
@@ -216,9 +223,10 @@ ROS가 설치 안 된 컴퓨터에서도 동작합니다.
 지원하는 이미지 인코딩(`calibration/ros_image_codec.py`):
 `mono8`, `mono16`, `bgr8`, `rgb8`, `bgra8`, `rgba8`,
 `bayer_rggb8/bggr8/gbrg8/grbg8`(+16비트 버전), `yuv422`/`yuv422_yuy2`/`yuyv`/`uyvy`/`yuy2`
-(YUYV·UYVY 계열, v4l2_camera/usb_cam 등 흔한 드라이버가 씀), CompressedImage(jpeg/png).
+(YUYV·UYVY 계열), `NV12`/`NV21`(Jetson CSI/GStreamer 계열),
+CompressedImage(jpeg/png).
 지원 안 하는 인코딩을 만나면 에러 메시지에 실제 인코딩 이름이 나옵니다
-(예: "발견된 인코딩: nv12") - 필요하면 이슈로 알려주시면 추가하겠습니다.
+(예: "발견된 인코딩: 32FC1") - 필요하면 이슈로 알려주시면 추가하겠습니다.
 
 ### 5.2 실시간 토픽 구독 (`[실시간 카메라 구독]` 버튼, **ROS1 또는 ROS2 설치 필요**)
 
@@ -233,9 +241,17 @@ ROS2(humble 등)가 컴퓨터에 설치되고 환경이 source 되어 있어야�
 캡처하는 방식 - 설계 문서 7번, 장수보다 자세 다양성이 중요하기 때문). 편의를
 위해 "N초마다 자동 캡처" 옵션도 있습니다.
 
+고속/4K 토픽은 Qt 이벤트 큐에 프레임을 계속 쌓지 않습니다. 스레드 안전한 단일
+슬롯에 **최신 프레임 한 장만** 유지하고 프리뷰를 최대 10 FPS로 제한합니다.
+원본 해상도의 최신 프레임은 그대로 캡처하며, 화면 아래에서 수신/표시/폐기 수를
+확인할 수 있습니다. Jetson CSI/GStreamer 토픽을 위해 NV12/NV21도 지원합니다.
+
+JetPack 6.2.1 + ROS 2 Humble 설치는 일반 requirements 대신 ARM64 호환 버전을
+고정해야 합니다. 자동 설치와 현장 검증 절차는 [JETSON.md](JETSON.md)를 따르세요.
+
 > **알려진 이슈 (부분 해결)**: 환경이 감지되고 토픽도 맞게 골랐는데 "프레임
 > 수신 대기 중..."에서 멈추는 경우가 있었습니다. 원인 중 하나를 찾아 고쳤습니다:
-> 카메라가 지원 안 하는 인코딩(예: yuv422)으로 발행하면 프레임이 실제로 도착해도
+> 카메라가 당시 지원하지 않던 인코딩으로 발행하면 프레임이 실제로 도착해도
 > 디코딩에 실패해 **조용히 버려지고 있었습니다** - 이제 디코딩 실패 시 화면에
 > "⚠ 프레임은 도착했지만 디코딩에 실패했습니다 (encoding='...')" 라고 표시됩니다
 > (3초 rate-limit). 그래도 계속 멈춰있다면 다른 원인(토픽에 실제로 발행이
@@ -525,7 +541,7 @@ Extended Pinhole과 Fisheye가 통계적으로 구분하기 어려워질 수 있
 | **ROS 연동 확장 (실시간 토픽 구독)** | ✅ `calibration/ros_live.py` + `ui/live_capture_dialog.py` (ROS1/ROS2 자동 감지, ⚠️ 실제 ROS 환경에서 최종 검증 필요 — 아래 5번 참고) |
 | **CLI 진입점 (헤드리스 실행)** | ✅ `app/cli.py` (CI/배치 처리용, JSON 요약, 종료 코드 설계) |
 | **프로젝트 저장/불러오기** | ✅ `calibration/project_io.py` (`.ccproj`, JSON, 원본 이미지 없이도 이어서 작업 가능) |
-| **Straightness Residual 시각화** | ✅ `ui/straightness_view.py` (⑤ Error Analysis 탭 안의 Straightness Map, 행/열 라인을 이미지 위에 초록~빨강으로 오버레이) |
+| **Straightness Residual 시각화** | ✅ `ui/straightness_view.py` (⑥ Straightness Map 탭, 행/열 라인을 이미지 위에 초록~빨강으로 오버레이) |
 | **JSON/CSV export** | ✅ `export/json_export.py`, `export/csv_export.py` (구조화된 전체 결과 / 이미지별 상세 데이터, UI·CLI 둘 다 지원) |
 | **Chessboard(일반 체스보드) 패턴 지원** | ✅ `calibration/detector.py` (UI/CLI 둘 다, ChArUco와 동일한 파이프라인 재사용 - straightness.py 등 기존 모듈 변경 없음. ⚠️ 대칭 패턴이라 방향 모호성 있음, README 3번 주의사항 참고) |
 

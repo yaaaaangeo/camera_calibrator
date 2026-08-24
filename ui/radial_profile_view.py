@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from calibration.types import CalibrationResult, CameraModelType, RadialErrorProfile
+from ui.theme import Theme
 
 _MODEL_LABELS = {
     CameraModelType.PINHOLE: "Pinhole",
@@ -33,10 +34,11 @@ _MODEL_LABELS = {
 }
 _MODEL_ORDER = [CameraModelType.PINHOLE, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE]
 
-_BAR_COLOR_LOW = QColor(46, 125, 50)     # 초록 (오차 작음)
-_BAR_COLOR_HIGH = QColor(198, 40, 40)    # 빨강 (오차 큼)
-_AXIS_COLOR = QColor(80, 80, 80)
-_EMPTY_COLOR = QColor(230, 230, 230)
+_BAR_COLOR_LOW = QColor(Theme.GOOD)
+_BAR_COLOR_HIGH = QColor(Theme.BAD)
+_AXIS_COLOR = QColor(Theme.GRAPH_AXIS)
+_GRID_COLOR = QColor(Theme.GRAPH_GRID)
+_EMPTY_COLOR = QColor(Theme.TEXT_DISABLED)
 
 
 def _lerp_color(t: float) -> QColor:
@@ -81,6 +83,7 @@ class RadialProfileChartWidget(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
 
         rect = self.rect()
+        painter.fillRect(rect, QColor(Theme.GRAPH_BG))
         plot_rect = QRectF(
             self._MARGIN_LEFT,
             self._MARGIN_TOP,
@@ -91,6 +94,7 @@ class RadialProfileChartWidget(QWidget):
         if not self._profile or not self._profile.bins:
             painter.setPen(QPen(_AXIS_COLOR))
             painter.drawText(rect, Qt.AlignCenter, "표시할 데이터가 없습니다.\n(캘리브레이션 실행 후 표시됩니다)")
+            painter.end()
             return
 
         bins = self._profile.bins
@@ -114,7 +118,7 @@ class RadialProfileChartWidget(QWidget):
         # y축 눈금 (0, 25%, 50%, 75%, 100%)
         for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
             y = plot_rect.bottom() - frac * plot_rect.height()
-            painter.setPen(QPen(QColor(220, 220, 220)))
+            painter.setPen(QPen(_GRID_COLOR))
             painter.drawLine(plot_rect.left(), y, plot_rect.right(), y)
             painter.setPen(QPen(_AXIS_COLOR))
             painter.drawText(
@@ -144,7 +148,7 @@ class RadialProfileChartWidget(QWidget):
                 painter.setPen(Qt.NoPen)
                 painter.drawRect(QRectF(x, plot_rect.bottom() - bar_h, bar_w, bar_h))
 
-                painter.setPen(QPen(QColor(30, 30, 30)))
+                painter.setPen(QPen(QColor(Theme.TEXT_VALUE)))
                 painter.drawText(
                     QRectF(x, plot_rect.bottom() - bar_h - 16, bar_w, 14),
                     Qt.AlignCenter,
@@ -166,6 +170,10 @@ class RadialProfileChartWidget(QWidget):
             Qt.AlignCenter,
             "반지름(px, 이미지 중심으로부터 거리) →",
         )
+        # paintEvent가 반환되기 전에 backing store를 확실히 해제한다. 보통은
+        # Python 참조 카운팅으로 즉시 소멸하지만, 예외/종료 경로에서 active
+        # painter가 남으면 QBackingStore::endPaint 경고가 연쇄적으로 발생한다.
+        painter.end()
 
 
 class RadialProfileView(QWidget):

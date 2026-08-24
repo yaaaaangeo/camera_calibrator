@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from calibration.types import Dataset, FrameStatus, QualityGrade
+from ui.theme import Theme
 
 _STATUS_LABEL = {
     FrameStatus.PENDING: "대기",
@@ -29,11 +30,11 @@ _STATUS_LABEL = {
 }
 
 _STATUS_COLOR = {
-    FrameStatus.PENDING: "#888888",
-    FrameStatus.DETECTED: "#2e7d32",
-    FrameStatus.DETECTION_FAILED: "#c62828",
-    FrameStatus.DISABLED_OUTLIER: "#ef6c00",
-    FrameStatus.DISABLED_MANUAL: "#6d4c41",
+    FrameStatus.PENDING: Theme.TEXT_SECONDARY,
+    FrameStatus.DETECTED: Theme.GOOD,
+    FrameStatus.DETECTION_FAILED: Theme.BAD,
+    FrameStatus.DISABLED_OUTLIER: Theme.WARNING,
+    FrameStatus.DISABLED_MANUAL: Theme.TEXT_DISABLED,
 }
 
 # 설계 문서 6번 - Frame Quality Score 등급 표시
@@ -47,12 +48,12 @@ _GRADE_LABEL = {
 }
 
 _GRADE_COLOR = {
-    QualityGrade.EXCELLENT: "#2e7d32",
-    QualityGrade.VERY_GOOD: "#558b2f",
-    QualityGrade.GOOD: "#9e9d24",
-    QualityGrade.WARNING: "#ef6c00",
-    QualityGrade.POOR: "#d84315",
-    QualityGrade.REJECT: "#c62828",
+    QualityGrade.EXCELLENT: Theme.GOOD,
+    QualityGrade.VERY_GOOD: Theme.GOOD,
+    QualityGrade.GOOD: Theme.GOOD,
+    QualityGrade.WARNING: Theme.WARNING,
+    QualityGrade.POOR: Theme.BAD,
+    QualityGrade.REJECT: Theme.BAD,
 }
 
 
@@ -98,7 +99,7 @@ class DatasetView(QWidget):
             name_item = QTableWidgetItem(frame.image_info.image_id)
 
             status_item = QTableWidgetItem(_STATUS_LABEL.get(frame.status, frame.status.value))
-            status_item.setForeground(_qcolor(_STATUS_COLOR.get(frame.status, "#000000")))
+            status_item.setForeground(_qcolor(_STATUS_COLOR.get(frame.status, Theme.INFO)))
             if frame.status == FrameStatus.DETECTION_FAILED and det and det.failure_reason:
                 # 실패 이유를 셀에 바로 짧게 붙이고, 전체 문구는 tooltip으로 (칸이 좁아 잘릴 수 있음)
                 status_item.setText(f"{_STATUS_LABEL[FrameStatus.DETECTION_FAILED]}: {det.failure_reason}")
@@ -115,7 +116,7 @@ class DatasetView(QWidget):
                 _GRADE_LABEL.get(frame.quality.grade, "-") if frame.quality else "-"
             )
             if frame.quality:
-                grade_item.setForeground(_qcolor(_GRADE_COLOR.get(frame.quality.grade, "#000000")))
+                grade_item.setForeground(_qcolor(_GRADE_COLOR.get(frame.quality.grade, Theme.INFO)))
 
             self.table.setItem(row, 0, name_item)
             self.table.setItem(row, 1, status_item)

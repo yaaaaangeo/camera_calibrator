@@ -87,6 +87,47 @@ def test_diversity_bars_are_aligned(qapp):
     widget.close()
 
 
+def test_coverage_view_is_scrollable_on_short_screens(qapp):
+    from ui.coverage_view import CoverageView
+
+    view = CoverageView()
+    try:
+        assert view.scroll_area.widgetResizable()
+        view.resize(800, 320)
+        view.show()
+        QApplication.processEvents()
+        assert view.scroll_area.verticalScrollBar() is not None
+    finally:
+        view.close()
+
+
+def test_mouse_wheel_does_not_change_numbers_combos_or_tabs(qapp, monkeypatch):
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+    from ui.main_window import MainWindow
+
+    monkeypatch.setattr(MainWindow, "_offer_autosave_recovery", lambda self: None)
+    win = MainWindow()
+    try:
+        win.show()
+        QApplication.processEvents()
+        targets = [
+            (win.width_spin, win.width_spin.value),
+            (win.dictionary_combo, win.dictionary_combo.currentIndex),
+            (win.tabs.tabBar(), win.tabs.currentIndex),
+        ]
+        for widget, getter in targets:
+            before = getter()
+            event = QWheelEvent(
+                QPointF(5, 5), QPointF(5, 5), QPoint(), QPoint(0, 120),
+                Qt.NoButton, Qt.NoModifier, Qt.ScrollUpdate, False,
+            )
+            QApplication.sendEvent(widget, event)
+            assert getter() == before
+    finally:
+        win.close()
+
+
 def test_result_view_table_has_no_complexity_row(qapp):
     from ui.result_view import ResultView
 
@@ -116,6 +157,34 @@ def test_pattern_size_widgets_use_mm_and_convert_to_meters(qapp):
 
         assert abs(pattern_config.square_size - 0.04) < 1e-9
         assert abs(pattern_config.marker_size - 0.03) < 1e-9
+    finally:
+        win.close()
+
+
+def test_camera_setup_panel_can_collapse_and_expand(qapp, monkeypatch):
+    from ui.main_window import MainWindow
+    from ui.theme import APP_STYLESHEET
+
+    monkeypatch.setattr(MainWindow, "_offer_autosave_recovery", lambda self: None)
+    win = MainWindow()
+    try:
+        win.show()
+        QApplication.processEvents()
+        expanded_height = win.settings_group.height()
+        assert win.settings_group.isCheckable()  # 기존 토글 동작은 그대로 유지
+        assert 'QGroupBox#settingsPanel::indicator' in APP_STYLESHEET
+        assert 'width: 0px; height: 0px' in APP_STYLESHEET  # 별도 checkbox는 보이지 않음
+
+        win.settings_group.setChecked(False)
+        QApplication.processEvents()
+        assert not win.settings_content.isVisible()
+        assert "▶" in win.settings_group.title()
+        assert win.settings_group.height() < expanded_height
+
+        win.settings_group.setChecked(True)
+        QApplication.processEvents()
+        assert win.settings_content.isVisible()
+        assert "▼" in win.settings_group.title()
     finally:
         win.close()
 
