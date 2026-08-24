@@ -126,17 +126,20 @@ def test_main_window_uses_documented_top_level_tabs(qapp):
     win = MainWindow()
     try:
         labels = [win.tabs.tabText(i) for i in range(win.tabs.count())]
+        # 실사용자 피드백: "Dataset"과 "Detection" 탭이 내용이 100% 동일해서
+        # Detection 탭을 없앴다(탭 번호 재정렬). ④ Calibration은 실제로 이
+        # 탭에서 제일 눈에 띄는 기능(이상치 제거)에 맞춰 "Outlier"로 이름을
+        # 바꿨다 - 내용(모델 선택/실행 + 이상치 제거)은 그대로다.
         assert labels == [
             "① Dataset",
-            "② Detection",
-            "③ Coverage",
-            "④ Calibration",
-            "⑤ Validation",
-            "⑥ Error Analysis",
-            "⑦ Stability",
-            "⑧ Model Comparison",
-            "⑨ Diagnosis",
-            "⑩ Export",
+            "② Coverage",
+            "③ Outlier",
+            "④ Validation",
+            "⑤ Error Analysis",
+            "⑥ Stability",
+            "⑦ Model Comparison",
+            "⑧ Diagnosis",
+            "⑨ Export",
         ]
     finally:
         win.close()

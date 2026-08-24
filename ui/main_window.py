@@ -16,6 +16,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, QTimer, Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -102,7 +103,30 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Camera Calibration Tool")
-        self.resize(1280, 860)
+        # 예전엔 화면 크기와 무관하게 무조건 1280x860으로 고정 리사이즈했다 -
+        # 실사용자 버그: 화면(또는 사용 가능 영역, 예를 들어 작업표시줄/독을 뺀
+        # 영역)이 860px보다 낮으면 창 아래쪽(탭 내용, 버튼 등)이 화면 밖으로
+        # 잘려 나갔다. 항상 화면의 "사용 가능한 영역"(available geometry -
+        # 작업표시줄 등을 제외한 실제로 창을 놓을 수 있는 크기)을 기준으로
+        # 최대 1280x860, 최소한 화면의 90%까지는 채우도록 계산한다.
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(1280, available.width())
+            height = min(860, available.height())
+            # 화면이 작아도 UI가 너무 쪼그라들지 않게 최소 크기는 유지하되,
+            # 그 최소 크기가 사용 가능 영역보다 크면(아주 작은 화면) 영역에 맞춘다.
+            width = max(width, min(960, available.width()))
+            height = max(height, min(640, available.height()))
+            self.resize(width, height)
+            # 창이 화면 밖으로 나가지 않도록 사용 가능 영역 안쪽에 위치시킨다.
+            self.move(
+                available.x() + max(0, (available.width() - width) // 2),
+                available.y() + max(0, (available.height() - height) // 2),
+            )
+        else:
+            self.resize(1280, 860)
+        self.setMinimumSize(800, 600)
 
         # --- 상태 ---
         self.image_paths: list[str] = []
@@ -120,6 +144,7 @@ class MainWindow(QMainWindow):
         self._self_check_thread: QThread | None = None
         self._bag_thread: QThread | None = None
         self._bag_worker = None  # QThread가 살아있는 동안 GC 방지용 강한 참조
+        self._bag_progress_dialog: QProgressDialog | None = None
         self._self_check_worker = None  # 위와 동일한 이유로 별도 워커도 강한 참조 보관
 
         self._build_menu_bar()
@@ -131,8 +156,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._build_settings_panel())
 
         self.tabs = QTabWidget()
+        # 이전엔 "Dataset"과 "Detection" 탭이 완전히 동일한 DatasetView를
+        # group_title만 바꿔 두 번 보여줬다(내용이 100% 중복) - 실사용자 피드백으로
+        # Detection 탭을 없애고 Dataset 탭 하나로 합쳤다.
         self.dataset_view = DatasetView(group_title="Dataset")
-        self.detection_view = DatasetView(group_title="Detection")
         self.coverage_view = CoverageView()
         self.result_view = ResultView(standalone=False)
         self.preview_view = PreviewView()
@@ -143,15 +170,17 @@ class MainWindow(QMainWindow):
         self.stability_view = StabilityView()
         self.error_analysis_tab = self._build_error_analysis_tab()
         self.tabs.addTab(self.dataset_view, "① Dataset")
-        self.tabs.addTab(self.detection_view, "② Detection")
-        self.tabs.addTab(self.coverage_view, "③ Coverage")
-        self.tabs.addTab(self.result_view.calibration_widget, "④ Calibration")
-        self.tabs.addTab(self.result_view.validation_widget, "⑤ Validation")
-        self.tabs.addTab(self.error_analysis_tab, "⑥ Error Analysis")
-        self.tabs.addTab(self.stability_view, "⑦ Stability")
-        self.tabs.addTab(self.result_view.model_comparison_widget, "⑧ Model Comparison")
-        self.tabs.addTab(self.diagnosis_view, "⑨ Diagnosis")
-        self.tabs.addTab(self.result_view.export_widget, "⑩ Export")
+        self.tabs.addTab(self.coverage_view, "② Coverage")
+        # 탭 제목만 "Outlier"로 바꿨다 - 실제 내용(모델 선택/실행 + 이상치 제거)은
+        # 그대로다. 사용자 피드백: "Calibration"이라는 이름이 이 탭에서 실제로
+        # 제일 눈에 띄는 기능(이상치 제거)과 안 맞아 헷갈렸다.
+        self.tabs.addTab(self.result_view.calibration_widget, "③ Outlier")
+        self.tabs.addTab(self.result_view.validation_widget, "④ Validation")
+        self.tabs.addTab(self.error_analysis_tab, "⑤ Error Analysis")
+        self.tabs.addTab(self.stability_view, "⑥ Stability")
+        self.tabs.addTab(self.result_view.model_comparison_widget, "⑦ Model Comparison")
+        self.tabs.addTab(self.diagnosis_view, "⑧ Diagnosis")
+        self.tabs.addTab(self.result_view.export_widget, "⑨ Export")
         layout.addWidget(self.tabs, stretch=1)
 
         self.status_label = QLabel("이미지를 불러온 뒤 [캘리브레이션 실행]을 누르세요.")
@@ -378,11 +407,18 @@ class MainWindow(QMainWindow):
 
         worker.progress.connect(progress.setLabelText)
         worker.progress.connect(self.status_label.setText)
+        # 실사용자 버그 수정: total을 알게 되는 즉시 막대를 고정폭 퍼센트
+        # 바로 전환하고(setRange(0,0)이면 계속 무한 반복 바), 그 안에서
+        # 색이 실제 진행률만큼 차오르게 한다. total이 아직 0(파악 전)이면
+        # 무한 반복 바를 유지한다.
+        worker.progress_value.connect(self._on_bag_progress_value)
+        self._bag_progress_dialog = progress
         worker.finished_extraction.connect(
             lambda extracted: self._on_bag_extraction_finished(extracted, bag_path)
         )
         worker.error.connect(self._on_error)
         worker.finished.connect(progress.close)
+        worker.finished.connect(lambda: setattr(self, "_bag_progress_dialog", None))
 
         self._bag_thread, self._bag_worker = thread, worker
         self.load_button.setEnabled(False)
@@ -391,6 +427,18 @@ class MainWindow(QMainWindow):
         thread.finished.connect(lambda: self.load_bag_button.setEnabled(True))
         thread.start()
         progress.show()
+
+    def _on_bag_progress_value(self, done: int, total: int) -> None:
+        dialog = getattr(self, "_bag_progress_dialog", None)
+        if dialog is None:
+            return
+        if total > 0:
+            if dialog.maximum() != total:
+                dialog.setMaximum(total)
+            dialog.setValue(min(done, total))
+        # total == 0(아직 메시지 개수를 모르는 상태)이면 setRange(0,0) 그대로
+        # 두어 무한 반복 바를 유지한다 - 값을 알 수 없는데 억지로 고정폭으로
+        # 바꾸면 항상 0%로 멈춰 있는 것처럼 보여 오히려 더 헷갈린다.
 
     def _on_bag_extraction_finished(self, extracted: list[str], bag_path: str) -> None:
         if not extracted:
@@ -508,7 +556,6 @@ class MainWindow(QMainWindow):
     def _on_dataset_ready(self, dataset: Dataset) -> None:
         self.dataset = dataset
         self.dataset_view.set_dataset(dataset)
-        self.detection_view.set_dataset(dataset)
         self.coverage_view.set_dataset_quality_score(dataset.quality_score)
 
     def _on_quality_ready(self, warnings: list[str]) -> None:
@@ -521,7 +568,6 @@ class MainWindow(QMainWindow):
         if self.dataset is not None and self.camera_config is not None:
             self.preview_view.set_context(self.dataset, self.camera_config, results, self.pattern_config)
             self.dataset_view.set_dataset(self.dataset)  # per_frame_error 채워졌으니 갱신
-            self.detection_view.set_dataset(self.dataset)
             if self.pattern_config is not None:
                 self.straightness_view.set_context(self.dataset, self.camera_config, results, self.pattern_config)
             # 설계 문서 8번 - 3모델 계산이 끝날 때마다 sanity check도 함께 갱신한다
@@ -769,7 +815,6 @@ class MainWindow(QMainWindow):
         """
         self.dataset = dataset
         self.dataset_view.set_dataset(dataset)
-        self.detection_view.set_dataset(dataset)
         self.coverage_view.set_dataset_quality_score(dataset.quality_score)
 
     # ------------------------------------------------------------------
@@ -977,7 +1022,6 @@ class MainWindow(QMainWindow):
 
         # --- 각 탭 새로고침 ---
         self.dataset_view.set_dataset(self.dataset)
-        self.detection_view.set_dataset(self.dataset)
         self.coverage_view.set_quality(self.dataset.coverage_grid, self.dataset.diversity, [])
         if self.calibration_results:
             self.preview_view.set_context(self.dataset, self.camera_config, self.calibration_results, self.pattern_config)

@@ -378,6 +378,12 @@ class BagExtractionWorker(QObject):
     """
 
     progress = Signal(str)
+    # 실사용자 버그: 진행 다이얼로그가 setRange(0,0)짜리 "무한 반복 바"(busy
+    # indicator)라서 실제 진행률과 무관하게 그냥 색 막대가 왔다갔다 하는
+    # 것처럼 보였다(고정폭 안에서 채워지는 게 아니라 막대 자체가 움직임).
+    # done/total은 이미 알고 있으므로 별도 숫자 시그널로 내보내
+    # QProgressDialog.setMaximum()/setValue()에 직접 연결한다.
+    progress_value = Signal(int, int)  # (done, total)
     finished_extraction = Signal(list)  # list[str] - 저장된 이미지 경로
     error = Signal(str)
     finished = Signal()
@@ -405,6 +411,7 @@ class BagExtractionWorker(QObject):
                 )
             else:
                 self.progress.emit(f"bag에서 이미지 추출 중... ({done}개 메시지 처리, {saved}장 저장됨)")
+            self.progress_value.emit(done, total)
 
         try:
             extracted = extract_images_from_bag(
