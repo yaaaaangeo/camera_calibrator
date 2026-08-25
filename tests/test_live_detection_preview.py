@@ -114,3 +114,53 @@ def test_live_dialog_accepts_legacy_string_pattern_type(tmp_path, monkeypatch):
         assert "ChArUco" in label_texts
     finally:
         dialog.close()
+
+
+def test_live_dialog_auto_captures_detected_novel_pose_only(tmp_path, monkeypatch):
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+    from calibration.types import CameraConfig
+    import ui.live_capture_dialog as live_module
+
+    _app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(live_module, "ROS_LIVE_BACKEND", None)
+    raw, detection = _detected_charuco()
+    dialog = live_module.LiveCaptureDialog(
+        str(tmp_path),
+        pattern_config=_charuco_pattern(),
+        camera_config=CameraConfig(width=raw.shape[1], height=raw.shape[0]),
+    )
+    try:
+        dialog._live_detection_active = True
+        dialog._on_live_detection_frame_ready(raw, detection)
+        assert len(dialog.captured_paths) == 1
+        assert dialog.captured_image_size == (raw.shape[1], raw.shape[0])
+
+        # 시간 간격이 지났어도 같은 자세는 중복 자동 저장하지 않는다.
+        dialog._last_auto_capture_t = 0.0
+        dialog._on_live_detection_frame_ready(raw, detection)
+        assert len(dialog.captured_paths) == 1
+        assert "같은 자세" in dialog.count_label.text()
+    finally:
+        dialog._live_detection_active = False
+        dialog.close()
+
+
+def test_live_dialog_is_resizable_and_maximizable(tmp_path, monkeypatch):
+    pytest.importorskip("PySide6")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    import ui.live_capture_dialog as live_module
+
+    _app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(live_module, "ROS_LIVE_BACKEND", None)
+    dialog = live_module.LiveCaptureDialog(str(tmp_path), pattern_config=_charuco_pattern())
+    try:
+        assert dialog.windowFlags() & Qt.WindowMaximizeButtonHint
+        assert dialog.isSizeGripEnabled()
+        before = dialog.size()
+        dialog.resize(before.width() + 200, before.height() + 100)
+        assert dialog.width() > before.width()
+        assert dialog.height() > before.height()
+    finally:
+        dialog.close()

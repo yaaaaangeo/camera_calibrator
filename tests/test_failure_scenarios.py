@@ -266,6 +266,39 @@ def test_failure_checklist_no_corners_are_kept_but_not_used_for_calibration():
     assert "사용 가능한 프레임이 0장" in result.error_message
 
 
+@pytest.mark.parametrize("degenerate_kind", ["collinear", "duplicate", "non_finite"])
+def test_calibration_input_rejects_views_that_cannot_form_homography(degenerate_kind):
+    """OpenCV 5의 matH0 3x3 assertion을 내는 퇴화 프레임은 미리 제외한다."""
+    obj = np.array(
+        [[[0.0, 0.0, 0.0]], [[1.0, 0.0, 0.0]], [[0.0, 1.0, 0.0]], [[1.0, 1.0, 0.0]]],
+        dtype=np.float32,
+    )
+    img = np.array(
+        [[[10.0, 10.0]], [[20.0, 10.0]], [[10.0, 20.0]], [[20.0, 20.0]]],
+        dtype=np.float32,
+    )
+    if degenerate_kind == "collinear":
+        img[:, 0, 1] = 10.0
+    elif degenerate_kind == "duplicate":
+        img[3] = img[0]
+    else:
+        img[3, 0, 0] = np.nan
+
+    frame = Frame(
+        image_info=ImageInfo("bad_homography", "/fake/bad.jpg", W, H),
+        detection=DetectionResult(
+            "bad_homography", success=True, corners=img, object_points=obj, num_corners=4
+        ),
+        status=FrameStatus.DETECTED,
+    )
+
+    frames, object_points, image_points = collect_calibration_inputs(Dataset(frames=[frame]))
+
+    assert frames == []
+    assert object_points == []
+    assert image_points == []
+
+
 def test_failure_checklist_calibration_failure_is_sanity_error():
     result = CalibrationResult(
         model_name=CameraModelType.PINHOLE,

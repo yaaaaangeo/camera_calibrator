@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QProgressBar,
     QPushButton,
     QStackedWidget,
     QSpinBox,
@@ -93,6 +94,7 @@ _ARUCO_DICTIONARIES = [
     "DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000",
     "DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000",
     "DICT_6X6_50", "DICT_6X6_100", "DICT_6X6_250", "DICT_6X6_1000",
+    "DICT_7X7_50", "DICT_7X7_100", "DICT_7X7_250", "DICT_7X7_1000",
     "DICT_APRILTAG_16h5", "DICT_APRILTAG_25h9",
     "DICT_APRILTAG_36h10", "DICT_APRILTAG_36h11",
 ]
@@ -250,6 +252,11 @@ class MainWindow(QMainWindow):
 
         self.status_label = QLabel("이미지를 불러온 뒤 [캘리브레이션 실행]을 누르세요.")
         self.statusBar().addWidget(self.status_label, stretch=1)
+        self.pipeline_progress_bar = QProgressBar()
+        self.pipeline_progress_bar.setMinimumWidth(180)
+        self.pipeline_progress_bar.setTextVisible(True)
+        self.pipeline_progress_bar.hide()
+        self.statusBar().addPermanentWidget(self.pipeline_progress_bar)
 
         self.home_view.intrinsic_requested.connect(self._show_intrinsic_workspace)
         self.home_view.stereo_requested.connect(self._show_stereo_workspace)
@@ -373,7 +380,7 @@ class MainWindow(QMainWindow):
         self.width_spin.setValue(1920)
         self.height_spin = QSpinBox()
         self.height_spin.setRange(1, 20000)
-        self.height_spin.setValue(1080)
+        self.height_spin.setValue(1536)
         camera_form.addRow("Width", self.width_spin)
         camera_form.addRow("Height", self.height_spin)
 
@@ -638,7 +645,16 @@ class MainWindow(QMainWindow):
             return
 
         self.image_paths = dialog.captured_paths
-        self.loaded_label.setText(f"불러온 이미지: {len(dialog.captured_paths)}장 (실시간 캡처)")
+        if dialog.captured_image_size is not None:
+            width, height = dialog.captured_image_size
+            self.width_spin.setValue(width)
+            self.height_spin.setValue(height)
+            size_text = f", {width}×{height} 자동 반영"
+        else:
+            size_text = ""
+        self.loaded_label.setText(
+            f"불러온 이미지: {len(dialog.captured_paths)}장 (실시간 캡처{size_text})"
+        )
         self.run_button.setEnabled(True)
 
     def _on_pattern_type_changed(self) -> None:
@@ -699,6 +715,7 @@ class MainWindow(QMainWindow):
         thread = run_worker_in_thread(worker, self)
 
         worker.progress.connect(self.status_label.setText)
+        worker.progress_value.connect(self._on_pipeline_progress_value)
         worker.dataset_ready.connect(self._on_dataset_ready)
         worker.quality_ready.connect(self._on_quality_ready)
         worker.models_ready.connect(self._on_models_ready)
@@ -709,9 +726,23 @@ class MainWindow(QMainWindow):
         self._thread, self._worker = thread, worker
         self.run_button.setEnabled(False)
         self.load_button.setEnabled(False)
+        self.pipeline_progress_bar.setRange(0, max(1, len(self.image_paths)))
+        self.pipeline_progress_bar.setValue(0)
+        self.pipeline_progress_bar.show()
         thread.finished.connect(lambda: self.run_button.setEnabled(True))
         thread.finished.connect(lambda: self.load_button.setEnabled(True))
+        thread.finished.connect(self.pipeline_progress_bar.hide)
         thread.start()
+
+    def _on_pipeline_progress_value(self, done: int, total: int) -> None:
+        if total <= 0:
+            self.pipeline_progress_bar.setRange(0, 0)
+            self.pipeline_progress_bar.setFormat("계산 중...")
+        else:
+            self.pipeline_progress_bar.setRange(0, total)
+            self.pipeline_progress_bar.setValue(min(done, total))
+            self.pipeline_progress_bar.setFormat("%p%")
+        self.pipeline_progress_bar.show()
 
     # --- PipelineWorker 콜백 ---
 

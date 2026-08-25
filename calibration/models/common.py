@@ -106,6 +106,8 @@ def collect_calibration_inputs(
             continue
 
         obj, img = det.object_points, det.corners
+        if obj is None or img is None:
+            continue
         excluded = det.excluded_corner_indices
         if excluded:
             mask = np.ones(obj.shape[0], dtype=bool)
@@ -113,7 +115,7 @@ def collect_calibration_inputs(
             mask[valid_idx] = False
             obj, img = obj[mask], img[mask]
 
-        if obj.shape[0] < MIN_CORNERS_PER_FRAME:
+        if not _is_valid_calibration_view(obj, img):
             continue
 
         usable_frames.append(f)
@@ -121,6 +123,48 @@ def collect_calibration_inputs(
         image_points.append(img)
 
     return usable_frames, object_points, image_points
+
+
+def _is_valid_calibration_view(obj: np.ndarray, img: np.ndarray) -> bool:
+    """OpenCV의 planar homography 초기화가 가능한 한 뷰인지 검사한다.
+
+    ``calibrateCameraExtended``는 각 뷰에서 먼저 3x3 homography를 구한다.
+    점이 4개여도 중복되거나 한 직선 위에 있으면 homography가 비어 있고,
+    OpenCV 5.x에서는 ``matH0.size() == Size(3,3)`` assertion으로 종료된다.
+    라이브 검출 및 corner-level 제외 후에 생길 수 있는 이 입력을 호출 전에
+    걸러서, 나머지 정상 프레임만으로 캘리브레이션하도록 한다.
+    """
+    if obj is None or img is None:
+        return False
+
+    try:
+        obj_pts = np.asarray(obj).reshape(-1, 3)
+        img_pts = np.asarray(img).reshape(-1, 2)
+    except (TypeError, ValueError):
+        return False
+    if (
+        len(obj_pts) != len(img_pts)
+        or len(obj_pts) < MIN_CORNERS_PER_FRAME
+        or not np.all(np.isfinite(obj_pts))
+        or not np.all(np.isfinite(img_pts))
+    ):
+        return False
+
+    # 같은 좌표를 여러 번 센 것은 homography의 독립 대응점이 아니다.
+    if len(np.unique(obj_pts, axis=0)) < MIN_CORNERS_PER_FRAME:
+        return False
+    if len(np.unique(img_pts, axis=0)) < MIN_CORNERS_PER_FRAME:
+        return False
+
+    # ChArUco/체스보드/AprilGrid의 object point는 평면 위에 있으므로 PCA로
+    # 평면의 두 축을 얻는다. object/image 모두 2차원 rank여야 homography를
+    # 유일하게 초기화할 수 있다.
+    obj_centered = obj_pts - np.mean(obj_pts, axis=0)
+    img_centered = img_pts - np.mean(img_pts, axis=0)
+    return bool(
+        np.linalg.matrix_rank(obj_centered) >= 2
+        and np.linalg.matrix_rank(img_centered) >= 2
+    )
 
 
 def infer_image_size(dataset: Dataset, camera_config: CameraConfig) -> tuple[int, int]:

@@ -213,6 +213,10 @@ def test_ui_default_pattern_type_is_charuco_with_visible_rows(qapp):
         assert win.pattern_type_combo.currentData() == PatternType.CHARUCO
         assert win._pattern_form.isRowVisible(4)  # Marker size
         assert win._pattern_form.isRowVisible(5)  # Dictionary
+        assert win.width_spin.value() == 1920
+        assert win.height_spin.value() == 1536
+        assert win.dictionary_combo.findText("DICT_7X7_50") >= 0
+        assert win.dictionary_combo.findText("DICT_7X7_1000") >= 0
     finally:
         win.close()
 
@@ -232,6 +236,24 @@ def test_ui_switching_to_chessboard_hides_marker_and_dictionary_rows(qapp):
         assert pattern_config.type == PatternType.CHESSBOARD
         assert pattern_config.marker_size is None
         assert pattern_config.dictionary is None
+    finally:
+        win.close()
+
+
+def test_pipeline_progress_bar_supports_detection_percent_and_calibration_busy_state(qapp):
+    from ui.main_window import MainWindow
+
+    win = MainWindow()
+    try:
+        win._on_pipeline_progress_value(3, 10)
+        assert win.pipeline_progress_bar.maximum() == 10
+        assert win.pipeline_progress_bar.value() == 3
+        assert win.pipeline_progress_bar.format() == "%p%"
+
+        win._on_pipeline_progress_value(0, 0)
+        assert win.pipeline_progress_bar.minimum() == 0
+        assert win.pipeline_progress_bar.maximum() == 0
+        assert win.pipeline_progress_bar.format() == "계산 중..."
     finally:
         win.close()
 

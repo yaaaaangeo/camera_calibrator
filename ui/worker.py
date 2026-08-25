@@ -92,6 +92,7 @@ class LiveDetectionWorker(QObject):
     """
 
     result_ready = Signal(object)  # DetectionResult
+    frame_result_ready = Signal(object, object)  # exact source frame, DetectionResult
     error = Signal(str)
 
     def __init__(self, pattern_config: PatternConfig):
@@ -139,6 +140,7 @@ class LiveDetectionWorker(QObject):
             else:
                 if not self._stopping:
                     self.result_ready.emit(result)
+                    self.frame_result_ready.emit(frame, result)
 
         # Detection may have taken longer than the camera interval.  If frames
         # arrived meanwhile, schedule exactly one more invocation for the most
@@ -167,6 +169,9 @@ class PipelineWorker(QObject):
     """전체 파이프라인(1차 실행)을 담당. run()이 끝나면 finished를 emit한다."""
 
     progress = Signal(str)
+    # total > 0이면 실제 완료 비율, total == 0이면 내부 반복 횟수를 알 수 없는
+    # OpenCV 최적화가 실행 중이라는 busy indicator로 UI가 표시한다.
+    progress_value = Signal(int, int)
     dataset_ready = Signal(object)          # Dataset
     quality_ready = Signal(list)            # 경고 문구 리스트
     models_ready = Signal(dict)             # dict[CameraModelType, CalibrationResult]
@@ -194,11 +199,21 @@ class PipelineWorker(QObject):
     def run(self) -> None:
         try:
             self.progress.emit(f"{len(self.image_paths)}장 이미지에서 ChArUco 코너 검출 중...")
+            self.progress_value.emit(0, len(self.image_paths))
             # 이미 QThread(백그라운드 스레드) 안이라 프로세스 풀을 더 띄워도 UI가
             # 멈추지 않는다. 이미지가 충분히 많을 때만 병렬화 이득이 프로세스 생성
             # 비용을 넘어서므로, 적은 장수(<= 8)에서는 그냥 순차로 둔다.
             use_parallel = len(self.image_paths) > 8
-            dataset = detect_dataset(self.image_paths, self.pattern_config, parallel=use_parallel)
+            def _on_detection_progress(done: int, total: int) -> None:
+                self.progress.emit(f"코너 검출 중... {done}/{total}장 ({done / total * 100:.0f}%)")
+                self.progress_value.emit(done, total)
+
+            dataset = detect_dataset(
+                self.image_paths,
+                self.pattern_config,
+                parallel=use_parallel,
+                progress_callback=_on_detection_progress,
+            )
             self.dataset = dataset
             self.dataset_ready.emit(dataset)
 
@@ -214,6 +229,9 @@ class PipelineWorker(QObject):
             self.dataset_ready.emit(dataset)  # 1차 점수(재투영 오차 제외) 반영해서 테이블 갱신
 
             self.progress.emit("Pinhole / Extended Pinhole / Fisheye 3개 모델 계산 중...")
+            # cv2의 optimizer는 iteration callback을 제공하지 않는다. 가짜 퍼센트를
+            # 만들지 않고 이 구간만 실제 실행 여부를 나타내는 busy bar로 전환한다.
+            self.progress_value.emit(0, 0)
             # cv2.calibrateCamera 등은 GIL을 놓아준다는 보장이 없어, 완전히
             # 별도 프로세스로 돌려서 GUI 스레드가 절대 막히지 않게 한다
             # (자세한 이유는 파일 상단 docstring 참고).
@@ -257,6 +275,7 @@ class PipelineWorker(QObject):
             self.recommendation_ready.emit(scores, message)
 
             self.progress.emit("완료.")
+            self.progress_value.emit(1, 1)
         except Exception as e:  # noqa: BLE001 - UI에 원인을 그대로 보여주기 위해 광범위하게 캐치
             self.error.emit(f"파이프라인 실행 중 오류: {e}")
         finally:

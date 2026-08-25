@@ -279,10 +279,9 @@ def compute_live_coverage_bars(
     Dataset 전체 파이프라인(Coverage Map, Outlier 등)을 돌릴 필요 없이
     detect_charuco() 결과만 있으면 계산 가능하다.
 
-    x_full_spread_ratio / y_full_spread_ratio: 이미지 너비/높이의 이 비율만큼
-    표준편차가 퍼지면 만점(1.0)으로 본다. 기본값 25% - distance_diversity가
-    CV 0.5, rotation_diversity가 표준편차 30도를 만점 기준으로 삼는 것과
-    같은 성격의 V1 휴리스틱이다 (calibration/quality.py 모듈 docstring 참고).
+    x_full_spread_ratio / y_full_spread_ratio: 이미지 너비/높이의 이 비율을
+    양쪽 방향으로 확보해 전체 범위가 2배에 도달하면 만점(1.0)으로 본다.
+    누적 min/max 범위 기반이라 프레임을 추가했을 때 점수가 감소하지 않는다.
     """
     w, h = image_size
     successful = [
@@ -292,14 +291,28 @@ def compute_live_coverage_bars(
 
     xs = [f.detection.board_center_px[0] for f in successful]
     ys = [f.detection.board_center_px[1] for f in successful]
-    x_coverage = _normalized_spread(xs, full_score_spread=w * x_full_spread_ratio)
-    y_coverage = _normalized_spread(ys, full_score_spread=h * y_full_spread_ratio)
+    # 실시간 progress bar는 이미 확보한 촬영 범위를 뜻하므로 새 샘플이
+    # 추가됐을 때 절대로 줄어들면 안 된다. 표준편차는 같은 자세를 한 장
+    # 추가하는 것만으로도 작아질 수 있어 누적 UI에는 맞지 않는다. 지금까지
+    # 관측한 min~max 범위를 쓰면 잘못 찍은 프레임은 바를 올리지 않을 뿐,
+    # 이미 확보한 범위를 깎지는 않는다.
+    def _range_coverage(values: list[float], full_range: float) -> float:
+        if len(values) < 2 or full_range <= 0:
+            return 0.0
+        return float(min(1.0, (max(values) - min(values)) / full_range))
+
+    x_coverage = _range_coverage(xs, w * x_full_spread_ratio * 2.0)
+    y_coverage = _range_coverage(ys, h * y_full_spread_ratio * 2.0)
 
     area_ratios = [f.detection.board_area_ratio for f in successful if f.detection.board_area_ratio is not None]
-    size_coverage = _distance_diversity_from_area_ratios(area_ratios)
+    if len(area_ratios) < 2 or max(area_ratios) <= 0:
+        size_coverage = 0.0
+    else:
+        relative_range = (max(area_ratios) - min(area_ratios)) / max(area_ratios)
+        size_coverage = float(min(1.0, relative_range / 0.5))
 
     tilts = [f.detection.board_tilt_deg for f in successful if f.detection.board_tilt_deg is not None]
-    skew_coverage = _rotation_diversity_from_tilts(tilts)
+    skew_coverage = _range_coverage(tilts, 60.0)
 
     return LiveCoverageBars(
         x_coverage=x_coverage,

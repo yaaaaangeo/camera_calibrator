@@ -608,6 +608,7 @@ def detect_dataset(
     *,
     parallel: bool = False,
     max_workers: Optional[int] = None,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Dataset:
     """이미지 경로 리스트 전체를 검출해 Dataset(Frame 리스트)으로 반환.
 
@@ -633,6 +634,9 @@ def detect_dataset(
             GUI 프로세스가 OS 스케줄링을 못 받아 "python3 is not responding"
             창이 뜬다. QThread/별도 프로세스로 계산을 분리해도, OS가 CPU 자체를
             GUI에 배분 못 하면 소용없다).
+        progress_callback: 이미지 한 장의 검출이 끝날 때마다 ``(완료 수, 전체 수)``를
+            알린다. UI 진행률 표시용이며, 순차/병렬 경로 모두 마지막에 전체 수에
+            도달한다.
     """
     cpu_count = os.cpu_count() or 1
     if parallel and len(image_paths) > 1 and cpu_count > 1:
@@ -644,11 +648,22 @@ def detect_dataset(
             "병렬 검출 시작: 이미지 %d장, max_workers=%s",
             len(image_paths), effective_workers,
         )
-        pairs = _detect_dataset_parallel(image_paths, pattern, effective_workers)
+        if progress_callback is None:
+            # 기존 내부 호출/테스트 더블과의 3-인자 호환성을 유지한다.
+            pairs = _detect_dataset_parallel(image_paths, pattern, effective_workers)
+        else:
+            pairs = _detect_dataset_parallel(
+                image_paths, pattern, effective_workers, progress_callback
+            )
     else:
         logger.debug("순차 검출: 이미지 %d장", len(image_paths))
         detect_fn = build_detect_fn(pattern)
-        pairs = [detect_image_file(p, detect_fn) for p in image_paths]
+        pairs = []
+        total = len(image_paths)
+        for done, path in enumerate(image_paths, start=1):
+            pairs.append(detect_image_file(path, detect_fn))
+            if progress_callback is not None:
+                progress_callback(done, total)
 
     dataset = Dataset()
     for info, result in pairs:
@@ -690,6 +705,7 @@ def _detect_dataset_parallel(
     image_paths: list[str],
     pattern: PatternConfig,
     max_workers: Optional[int],
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> list[tuple[ImageInfo, DetectionResult]]:
     with ProcessPoolExecutor(
         max_workers=max_workers,
@@ -698,7 +714,13 @@ def _detect_dataset_parallel(
     ) as executor:
         # executor.map은 결과를 제출 순서대로 돌려준다 (완료 순서 아님) -
         # 순차 실행과 동일한 프레임 순서를 보장하기 위해 중요.
-        return list(executor.map(_detect_one_in_worker, image_paths))
+        pairs = []
+        total = len(image_paths)
+        for done, pair in enumerate(executor.map(_detect_one_in_worker, image_paths), start=1):
+            pairs.append(pair)
+            if progress_callback is not None:
+                progress_callback(done, total)
+        return pairs
 
 
 def summarize_dataset(dataset: Dataset) -> str:

@@ -218,6 +218,22 @@ def test_main_window_uses_documented_top_level_tabs(qapp):
         win.close()
 
 
+def test_model_refitting_view_scrolls_in_a_short_window(qapp):
+    """⑪ 탭은 낮은 창에서 내용을 압축/중첩하지 않고 세로 스크롤한다."""
+    from ui.model_refitting_view import ModelRefittingView
+
+    view = ModelRefittingView()
+    try:
+        view.resize(900, 260)
+        view.show()
+        QApplication.processEvents()
+
+        assert view.scroll_area.verticalScrollBar().maximum() > 0
+        assert view.scroll_area.widget().minimumSizeHint().height() > view.scroll_area.viewport().height()
+    finally:
+        view.close()
+
+
 def test_main_window_has_help_menu_next_to_file_menu(qapp):
     from ui.main_window import MainWindow
 

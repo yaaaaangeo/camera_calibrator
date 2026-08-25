@@ -4,12 +4,9 @@ camera_calibrator.ui.live_capture_dialog
 
 실시간 ROS 토픽 구독 + 캡처 다이얼로그.
 
-설계: 자동으로 계속 찍는 게 아니라 - 라이브 프리뷰를 보면서 사용자가
-직접 [캡처] 버튼을 눌러 원하는 자세에서 저장하는 방식을 기본으로 한다.
-캘리브레이션 데이터셋 품질은 장수보다 자세 다양성이 중요하므로(설계 문서 7번),
-사용자가 보드를 이리저리 움직이며 좋은 자세에서 직접 캡처하는 게 무작정
-자동 캡처보다 낫다. 다만 편의를 위해 "N초마다 자동 캡처" 옵션도 둔다
-(rosbag 추출의 시간 기반 샘플링과 같은 이유).
+설계: 라이브 검출에서 코너가 확인되고 이전 저장 자세와 충분히 다를 때
+자동 캡처한다. 캘리브레이션 데이터셋 품질은 장수보다 자세 다양성이
+중요하므로 같은 자세는 반복 저장하지 않으며, 수동 [캡처]도 함께 제공한다.
 
 스레드 안전성/부하 제한: ROS 콜백은 백그라운드 스레드에서 온다. 프레임은
 Qt 이벤트 큐로 emit하지 않고 단일 슬롯 LatestFrameBuffer에 최신 한 장만
@@ -71,6 +68,7 @@ _PREVIEW_FPS = 10
 # 실시간 코칭 전용으로 추가한다.
 _MIN_FRAMES_FOR_LIVE_COACHING = 3
 _MAX_WARNINGS_SHOWN = 2
+_MAX_AUTO_CAPTURES = 120
 _CORNER_COLOR_BGR = (0, 185, 118)  # Theme.ACCENT (#76B900), OpenCV BGR order
 _HULL_COLOR_BGR = (55, 110, 85)
 
@@ -184,11 +182,15 @@ class LiveCaptureDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("실시간 ROS 토픽 구독")
-        self.setMinimumWidth(540)
+        self.setMinimumSize(640, 560)
+        self.resize(960, 820)
+        self.setSizeGripEnabled(True)
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
 
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self.captured_paths: list[str] = []
+        self.captured_image_size: tuple[int, int] | None = None
 
         self._subscriber: LiveTopicSubscriber | None = None
         self._latest_frame: np.ndarray | None = None
@@ -201,6 +203,7 @@ class LiveCaptureDialog(QDialog):
         self._detection_worker: LiveDetectionWorker | None = None
         self._live_detection_active = False
         self._latest_live_detection: DetectionResult | None = None
+        self._last_auto_detection: DetectionResult | None = None
 
         # 캡처될 때마다 여기 채워지는 (프레임별) 검출 결과 - X/Y/Size/Skew
         # 바를 실시간으로 갱신하는 데 쓰인다. 패턴/카메라 설정이 없으면
@@ -289,9 +292,15 @@ class LiveCaptureDialog(QDialog):
         self.capture_button.setProperty("role", "primary")
         self.capture_button.clicked.connect(self._manual_capture)
         self.capture_button.setEnabled(False)
-        self.auto_capture_check = QCheckBox("자동 캡처, 간격(초):")
+        self.auto_capture_check = QCheckBox("코너 검출 시 자동 캡처, 최소 간격(초):")
+        self.auto_capture_check.setChecked(True)
+        self.auto_capture_check.setToolTip(
+            "코너 검출에 성공하고 이전 저장 자세와 충분히 달라졌을 때만 저장합니다. "
+            f"같은 자세를 계속 비추면 이미지 수가 늘어나지 않으며 자동 저장은 "
+            f"{_MAX_AUTO_CAPTURES}장에서 멈춥니다."
+        )
         self.auto_interval_spin = QDoubleSpinBox()
-        self.auto_interval_spin.setRange(0.2, 30.0)
+        self.auto_interval_spin.setRange(0.5, 30.0)
         self.auto_interval_spin.setValue(1.0)
         self.auto_interval_spin.setSingleStep(0.5)
         capture_row.addWidget(self.capture_button)
@@ -452,7 +461,7 @@ class LiveCaptureDialog(QDialog):
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.initialize)
-        worker.result_ready.connect(self._on_live_detection_ready)
+        worker.frame_result_ready.connect(self._on_live_detection_frame_ready)
         worker.error.connect(self._on_live_detection_error)
         thread.finished.connect(worker.deleteLater)
 
@@ -507,13 +516,6 @@ class LiveCaptureDialog(QDialog):
             )
         self.stream_status_label.setText(status)
 
-        if self.auto_capture_check.isChecked():
-            now = time.monotonic()
-            interval = self.auto_interval_spin.value()
-            if self._last_auto_capture_t is None or (now - self._last_auto_capture_t) >= interval:
-                self._save_frame(img_bgr)
-                self._last_auto_capture_t = now
-
     def _render_live_preview(self) -> None:
         if self._latest_frame is None:
             return
@@ -521,9 +523,76 @@ class LiveCaptureDialog(QDialog):
             self._latest_frame,
             self._latest_live_detection,
             self._maximum_corners,
-            max_width=_PREVIEW_MAX_WIDTH,
+            max_width=max(_PREVIEW_MAX_WIDTH, self.preview_label.width() - 16),
         )
-        self.preview_label.setPixmap(_cv_to_qpixmap(preview))
+        self.preview_label.setPixmap(
+            _cv_to_qpixmap(preview, max_width=max(_PREVIEW_MAX_WIDTH, self.preview_label.width() - 16))
+        )
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt override naming)
+        super().resizeEvent(event)
+        if self._latest_frame is not None:
+            QTimer.singleShot(0, self._render_live_preview)
+
+    def _on_live_detection_frame_ready(
+        self, frame: np.ndarray, detection: DetectionResult
+    ) -> None:
+        """검출 결과와 정확히 같은 원본 프레임을 받아 자동 캡처한다."""
+        if not self._live_detection_active:
+            return
+        self._on_live_detection_ready(detection)
+        if not self.auto_capture_check.isChecked() or not detection.success:
+            return
+        if detection.num_corners < 4:
+            return
+        if len(self.captured_paths) >= _MAX_AUTO_CAPTURES:
+            self.auto_capture_check.setChecked(False)
+            self.count_label.setText(
+                f"캡처된 이미지: {len(self.captured_paths)}장 · 자동 저장 상한에 도달했습니다"
+            )
+            return
+
+        now = time.monotonic()
+        interval = self.auto_interval_spin.value()
+        if self._last_auto_capture_t is not None and now - self._last_auto_capture_t < interval:
+            return
+        if not self._is_novel_auto_pose(detection, frame.shape[:2]):
+            self.count_label.setText(
+                f"캡처된 이미지: {len(self.captured_paths)}장 · 같은 자세라 자동 저장 대기 중"
+            )
+            return
+
+        if self._save_frame(frame, detection=detection):
+            self._last_auto_capture_t = now
+            self._last_auto_detection = detection
+
+    def _is_novel_auto_pose(
+        self, detection: DetectionResult, image_shape: tuple[int, int]
+    ) -> bool:
+        """거의 같은 자세의 수백 장 자동 저장을 막는 가벼운 novelty gate."""
+        previous = self._last_auto_detection
+        if previous is None:
+            return True
+
+        h, w = image_shape
+        if detection.board_center_px is not None and previous.board_center_px is not None:
+            dx = detection.board_center_px[0] - previous.board_center_px[0]
+            dy = detection.board_center_px[1] - previous.board_center_px[1]
+            if np.hypot(dx, dy) >= 0.025 * np.hypot(w, h):
+                return True
+
+        current_area = detection.board_area_ratio
+        previous_area = previous.board_area_ratio
+        if current_area is not None and previous_area is not None and previous_area > 0:
+            if abs(current_area - previous_area) / previous_area >= 0.08:
+                return True
+
+        current_tilt = detection.board_tilt_deg
+        previous_tilt = previous.board_tilt_deg
+        if current_tilt is not None and previous_tilt is not None:
+            if abs(current_tilt - previous_tilt) >= 5.0:
+                return True
+        return False
 
     def _on_live_detection_ready(self, detection: DetectionResult) -> None:
         if not self._live_detection_active:
@@ -569,36 +638,42 @@ class LiveCaptureDialog(QDialog):
 
     def _manual_capture(self) -> None:
         if self._latest_frame is not None:
-            self._save_frame(self._latest_frame)
+            self._save_frame(self._latest_frame, detection=self._latest_live_detection)
 
-    def _save_frame(self, img_bgr: np.ndarray) -> None:
+    def _save_frame(
+        self, img_bgr: np.ndarray, detection: DetectionResult | None = None
+    ) -> bool:
+        h, w = img_bgr.shape[:2]
+        if self.captured_image_size is not None and self.captured_image_size != (w, h):
+            self.count_label.setText(
+                f"캡처된 이미지: {len(self.captured_paths)}장 · 해상도가 바뀌어 저장하지 않음 "
+                f"({w}×{h})"
+            )
+            return False
         idx = len(self.captured_paths)
         filename = self._output_dir / f"live_{idx:04d}_{time.time():.3f}.jpg"
-        cv2.imwrite(str(filename), img_bgr)
+        if not cv2.imwrite(str(filename), img_bgr):
+            self.count_label.setText(f"캡처 저장 실패: {filename}")
+            return False
+        self.captured_image_size = (w, h)
         self.captured_paths.append(str(filename))
         self.count_label.setText(f"캡처된 이미지: {len(self.captured_paths)}장")
-        self._update_coverage_bars(img_bgr, image_id=filename.stem)
+        self._update_coverage_bars(detection, image_id=filename.stem, path=str(filename))
+        return True
 
-    def _update_coverage_bars(self, img_bgr: np.ndarray, image_id: str) -> None:
-        """방금 캡처한 프레임에 검출을 돌려서 X/Y/Size/Skew 바 + 구역별 다양성
-        코칭 문구를 함께 갱신.
-
-        캡처 직후에만 돌리는 이유: 매 라이브 프레임(수십 fps)마다 검출을
-        돌리면 GUI 스레드가 버벅일 수 있고, 어차피 이 프로젝트는 "자동으로
-        계속 찍지 않고 사용자가 캡처한 프레임만" 데이터셋에 반영한다는
-        설계 원칙(파일 상단 docstring)을 따른다 - 실시간 피드백도 같은
-        원칙을 지켜야 사용자가 보는 바 = 실제로 저장되는 데이터셋과 일치한다.
-        """
-        if self._detect_fn is None or self._camera_config is None:
+    def _update_coverage_bars(
+        self, detection: DetectionResult | None, image_id: str, path: str
+    ) -> None:
+        """백그라운드 검출 결과를 재사용해 GUI 스레드의 중복 검출을 없앤다."""
+        if detection is None or self._camera_config is None or self.captured_image_size is None:
             return
-        h, w = img_bgr.shape[:2]
-        info = ImageInfo(image_id=image_id, path="", width=w, height=h)
-        detection = self._detect_fn(img_bgr, image_id)
+        w, h = self.captured_image_size
+        info = ImageInfo(image_id=image_id, path=path, width=w, height=h)
         self._detected_frames.append(Frame(image_info=info, detection=detection))
 
         bars = compute_live_coverage_bars(
             self._detected_frames,
-            image_size=(self._camera_config.width, self._camera_config.height),
+            image_size=self.captured_image_size,
         )
         self.coverage_bars.set_bars(bars)
         self._update_coverage_coaching()
@@ -623,7 +698,11 @@ class LiveCaptureDialog(QDialog):
             return
 
         temp_dataset = Dataset(frames=self._detected_frames)
-        cells = compute_coverage_grid(temp_dataset, self._camera_config)
+        if self.captured_image_size is None:
+            return
+        width, height = self.captured_image_size
+        live_camera_config = CameraConfig(width=width, height=height)
+        cells = compute_coverage_grid(temp_dataset, live_camera_config)
         warnings = coverage_warnings(cells)
 
         if not warnings:
@@ -649,6 +728,15 @@ class LiveCaptureDialog(QDialog):
             )
             if reply != QMessageBox.Yes:
                 return
+        elif not any(f.detection and f.detection.success for f in self._detected_frames):
+            QMessageBox.warning(
+                self,
+                "검출 가능한 캡처 없음",
+                "저장된 이미지에서 현재 Calibration Pattern 설정과 일치하는 코너가 "
+                "검출되지 않았습니다. Squares X/Y와 Dictionary를 실제 보드에 맞춘 뒤 "
+                "다시 캡처하세요.",
+            )
+            return
         self.accept()
 
     def reject(self) -> None:

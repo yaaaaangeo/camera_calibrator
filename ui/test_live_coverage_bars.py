@@ -100,3 +100,21 @@ def test_failed_detections_are_ignored():
     bars_without_failed = compute_live_coverage_bars([ok], image_size=(640, 480))
     assert bars_with_failed.x_coverage == bars_without_failed.x_coverage
     assert bars_with_failed.y_coverage == bars_without_failed.y_coverage
+
+
+def test_live_coverage_never_decreases_when_repetitive_frame_is_added():
+    """누적 progress는 같은 자세를 더 찍었다고 이미 확보한 범위를 잃지 않는다."""
+    varied = [
+        _frame("left", 80, 240, 0.15, 5.0),
+        _frame("right", 560, 240, 0.55, 40.0),
+    ]
+    before = compute_live_coverage_bars(varied, image_size=(640, 480))
+    after = compute_live_coverage_bars(
+        varied + [_frame(f"repeat_{i}", 320, 240, 0.30, 20.0) for i in range(20)],
+        image_size=(640, 480),
+    )
+
+    assert after.x_coverage >= before.x_coverage
+    assert after.y_coverage >= before.y_coverage
+    assert after.size_coverage >= before.size_coverage
+    assert after.skew_coverage >= before.skew_coverage

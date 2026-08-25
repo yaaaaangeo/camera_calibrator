@@ -12,8 +12,25 @@ from __future__ import annotations
 import numpy as np
 import cv2
 
-from calibration.detector import detect_dataset, summarize_dataset
-from calibration.types import FrameStatus
+from calibration.detector import build_charuco_board, detect_dataset, summarize_dataset
+from calibration.types import FrameStatus, PatternConfig, PatternType
+
+
+def test_builds_7x7_charuco_board_with_7x7_dictionary():
+    pattern = PatternConfig(
+        type=PatternType.CHARUCO,
+        squares_x=7,
+        squares_y=7,
+        square_size=0.04,
+        marker_size=0.03,
+        dictionary="DICT_7X7_100",
+    )
+
+    board = build_charuco_board(pattern)
+
+    assert board.getChessboardSize() == (7, 7)
+    assert board.getDictionary().markerSize == 7
+    assert len(board.getChessboardCorners()) == 36
 
 
 def test_detect_dataset_succeeds_on_real_charuco_images(synthetic_distorted_dataset_dir, pattern_config):
@@ -45,6 +62,23 @@ def test_detect_dataset_handles_blank_image_without_crashing(tmp_path, pattern_c
     frame = dataset.frames[0]
     assert frame.status == FrameStatus.DETECTION_FAILED
     assert frame.image_info.path == path  # 파일 자체는 그대로 참조되어야 함
+
+
+def test_detect_dataset_reports_progress_for_every_image(tmp_path, pattern_config):
+    paths = []
+    for index in range(3):
+        path = str(tmp_path / f"blank_{index}.jpg")
+        cv2.imwrite(path, np.full((32, 48, 3), 255, dtype=np.uint8))
+        paths.append(path)
+
+    calls = []
+    detect_dataset(
+        paths,
+        pattern_config,
+        progress_callback=lambda done, total: calls.append((done, total)),
+    )
+
+    assert calls == [(1, 3), (2, 3), (3, 3)]
 
 
 def test_detect_dataset_mixed_success_and_failure(synthetic_distorted_dataset_dir, tmp_path, pattern_config):

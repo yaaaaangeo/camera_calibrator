@@ -18,8 +18,10 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHeaderView,
     QLabel,
+    QLayout,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -51,7 +53,22 @@ class ModelRefittingView(QWidget):
         self._camera_config: CameraConfig | None = None
         self._last_result: ModelRefitResult | None = None
 
-        layout = QVBoxLayout(self)
+        # 이 탭은 표와 파라미터 편집기를 함께 보여 주므로 필요한 세로 길이가
+        # 비교적 크다. 최상위 레이아웃에 모두 직접 넣으면 창이 낮아졌을 때
+        # Qt가 자식 위젯을 최소 높이 아래로 압축해 내용이 겹쳐 보일 수 있다.
+        # 내용의 자연스러운 높이는 유지하고, 부족한 공간은 탭 자체의 세로
+        # 스크롤로 처리한다.
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QScrollArea.NoFrame)
+        outer_layout.addWidget(self.scroll_area)
+
+        content = QWidget()
+        self.scroll_area.setWidget(content)
+        layout = QVBoxLayout(content)
+        layout.setSizeConstraint(QLayout.SetMinimumSize)
 
         intro = QLabel(
             "Rational/Extended Pinhole 8계수 모델을 reference로 삼아, 이미지 전체 샘플에서 "
