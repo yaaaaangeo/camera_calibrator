@@ -10,11 +10,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
     QHBoxLayout,
@@ -35,6 +37,11 @@ from calibration.detector import build_detect_fn
 from calibration.stereo import match_common_charuco_corners
 
 
+_PREVIEW_MIN_WIDTH = 420
+_MAX_AUTO_CAPTURES = 120
+_MIN_COMMON_CORNERS_AUTO = 4
+
+
 def _pixmap(img_bgr: np.ndarray, max_width: int = 420) -> QPixmap:
     h, w = img_bgr.shape[:2]
     if w > max_width:
@@ -52,7 +59,10 @@ class StereoLiveCaptureDialog(QDialog):
     def __init__(self, output_dir: str, pattern_config=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Live Dual Camera Capture")
-        self.setMinimumWidth(900)
+        self.setMinimumSize(900, 720)
+        self.resize(1200, 900)
+        self.setSizeGripEnabled(True)
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
 
         self.output_dir = Path(output_dir)
         self.pattern_config = pattern_config
@@ -69,6 +79,9 @@ class StereoLiveCaptureDialog(QDialog):
         self._topics: list[LiveTopic] = []
         self._subscribe_started_at: float | None = None
         self._last_sync_delta_ms: float | None = None
+        self._last_auto_capture_t: float | None = None
+        self._last_auto_detection = None
+        self._last_coach_result = None
 
         self.pair_ready.connect(self._on_pair_ready)
         self.error_ready.connect(self._on_error)
@@ -115,8 +128,22 @@ class StereoLiveCaptureDialog(QDialog):
         self.capture_button.setProperty("role", "primary")
         self.capture_button.clicked.connect(self._capture_pair)
         self.capture_button.setEnabled(False)
+        self.auto_capture_check = QCheckBox("양쪽 코너 검출 시 자동 캡처, 최소 간격(초):")
+        self.auto_capture_check.setChecked(True)
+        self.auto_capture_check.setEnabled(self._detect_fn is not None)
+        self.auto_capture_check.setToolTip(
+            "두 카메라 모두 코너가 검출되고 common corner가 충분하며, 이전 저장 "
+            "자세와 충분히 달라졌을 때만 저장합니다. 같은 자세를 계속 비추면 "
+            f"pair 수가 늘어나지 않으며 자동 저장은 {_MAX_AUTO_CAPTURES}쌍에서 멈춥니다."
+        )
+        self.auto_interval_spin = QDoubleSpinBox()
+        self.auto_interval_spin.setRange(0.5, 30.0)
+        self.auto_interval_spin.setValue(1.0)
+        self.auto_interval_spin.setSingleStep(0.5)
         self.count_label = QLabel("캡처된 stereo pairs: 0쌍")
         capture_row.addWidget(self.capture_button)
+        capture_row.addWidget(self.auto_capture_check)
+        capture_row.addWidget(self.auto_interval_spin)
         capture_row.addWidget(self.count_label)
         capture_row.addStretch(1)
         layout.addLayout(capture_row)
@@ -231,16 +258,44 @@ class StereoLiveCaptureDialog(QDialog):
         self.subscribe_button.setText("구독 중지")
         self.status_label.setText("두 토픽을 구독 중입니다. 동기 pair가 들어오면 미리보기가 갱신됩니다.")
 
+    def _preview_max_width(self) -> int:
+        return max(_PREVIEW_MIN_WIDTH, self.preview1.width() - 16)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt override naming)
+        super().resizeEvent(event)
+        if self._latest_pair is not None:
+            QTimer.singleShot(0, self._redraw_previews_at_current_size)
+
+    def _redraw_previews_at_current_size(self) -> None:
+        """창 크기 변경 시 코너 검출을 다시 돌리지 않고, 마지막 검출 결과로
+        미리보기만 새 크기에 맞게 다시 그린다 (detection은 비용이 커서 매
+        resize 이벤트마다 재실행하면 드래그 중 GUI가 버벅인다)."""
+        pair = self._latest_pair
+        if pair is None:
+            return
+        max_width = self._preview_max_width()
+        cached = self._last_coach_result
+        if cached is not None and cached[0] is pair:
+            _, det1, det2, obs = cached
+            self.preview1.setPixmap(_pixmap(self._overlay_detection(pair.image_cam1, det1, obs.common_ids, obs.quality_status), max_width=max_width))
+            self.preview2.setPixmap(_pixmap(self._overlay_detection(pair.image_cam2, det2, obs.common_ids, obs.quality_status), max_width=max_width))
+        else:
+            self.preview1.setPixmap(_pixmap(pair.image_cam1, max_width=max_width))
+            self.preview2.setPixmap(_pixmap(pair.image_cam2, max_width=max_width))
+
     def _on_pair_ready(self, pair: StereoLivePair) -> None:
         self._latest_pair = pair
         self._last_sync_delta_ms = pair.sync_delta_ms
-        self.preview1.setPixmap(_pixmap(pair.image_cam1))
-        self.preview2.setPixmap(_pixmap(pair.image_cam2))
+        max_width = self._preview_max_width()
+        self.preview1.setPixmap(_pixmap(pair.image_cam1, max_width=max_width))
+        self.preview2.setPixmap(_pixmap(pair.image_cam2, max_width=max_width))
         self.capture_button.setEnabled(True)
         self.status_label.setText(f"Latest sync delta: {pair.sync_delta_ms:.1f} ms")
         self._render_live_capture_coach(pair)
 
     def _render_live_capture_coach(self, pair: StereoLivePair) -> None:
+        max_width = self._preview_max_width()
+        self._last_coach_result = None
         if self._detect_fn is None:
             self.capture_coach_label.setText(
                 f"Sync Δt: {pair.sync_delta_ms:.1f} ms · Pattern 설정이 없어 detection coach는 비활성화됨"
@@ -266,9 +321,11 @@ class StereoLiveCaptureDialog(QDialog):
                 image_size_cam1=(pair.image_cam1.shape[1], pair.image_cam1.shape[0]),
                 image_size_cam2=(pair.image_cam2.shape[1], pair.image_cam2.shape[0]),
             )
-            self.preview1.setPixmap(_pixmap(self._overlay_detection(pair.image_cam1, det1, obs.common_ids, obs.quality_status)))
-            self.preview2.setPixmap(_pixmap(self._overlay_detection(pair.image_cam2, det2, obs.common_ids, obs.quality_status)))
+            self._last_coach_result = (pair, det1, det2, obs)
+            self.preview1.setPixmap(_pixmap(self._overlay_detection(pair.image_cam1, det1, obs.common_ids, obs.quality_status), max_width=max_width))
+            self.preview2.setPixmap(_pixmap(self._overlay_detection(pair.image_cam2, det2, obs.common_ids, obs.quality_status), max_width=max_width))
             warnings = " / ".join(obs.quality_warnings[:3]) if obs.quality_warnings else "캡처하기 좋은 pair입니다."
+            auto_note = self._maybe_auto_capture(det1, obs, pair)
             self.capture_coach_label.setText(
                 "LIVE CAPTURE COACH\n"
                 f"Detected corners: cam1={det1.num_corners}, cam2={det2.num_corners}, "
@@ -276,9 +333,61 @@ class StereoLiveCaptureDialog(QDialog):
                 f"Quality: {obs.quality_score:.1f} ({obs.quality_status}), "
                 f"Sync Δt: {pair.sync_delta_ms:.1f} ms\n"
                 f"Hint: {warnings}"
+                + (f"\n{auto_note}" if auto_note else "")
             )
         except Exception as exc:  # noqa: BLE001
             self.capture_coach_label.setText(f"Live coach 계산 실패: {exc}")
+
+    def _maybe_auto_capture(self, det1, obs, pair: StereoLivePair) -> str | None:
+        """양쪽 코너가 검출되고 common corner가 충분하며 이전 저장 자세와 충분히
+        다를 때만 자동 저장한다. 단일 카메라 실시간 캡처(live_capture_dialog.py)의
+        novelty gate와 같은 판단 기준(중심 이동/면적 변화/기울기 변화)을 쓴다 -
+        같은 자세를 계속 비추는 것만으로 수백 쌍이 쌓이는 걸 막기 위함이다.
+        """
+        if not self.auto_capture_check.isChecked():
+            return None
+        if obs.common_count < _MIN_COMMON_CORNERS_AUTO:
+            return None
+        if len(self.captured_paths_cam1) >= _MAX_AUTO_CAPTURES:
+            self.auto_capture_check.setChecked(False)
+            return f"⚠ 자동 저장 상한({_MAX_AUTO_CAPTURES}쌍)에 도달했습니다."
+
+        now = time.monotonic()
+        interval = self.auto_interval_spin.value()
+        if self._last_auto_capture_t is not None and now - self._last_auto_capture_t < interval:
+            return None
+        if not self._is_novel_auto_pose(det1, pair.image_cam1.shape[:2]):
+            return "같은 자세라 자동 저장 대기 중"
+
+        self._capture_pair()
+        self._last_auto_capture_t = now
+        self._last_auto_detection = det1
+        return "✓ 자동 저장됨"
+
+    def _is_novel_auto_pose(self, detection, image_shape: tuple[int, int]) -> bool:
+        previous = self._last_auto_detection
+        if previous is None:
+            return True
+
+        h, w = image_shape
+        if detection.board_center_px is not None and previous.board_center_px is not None:
+            dx = detection.board_center_px[0] - previous.board_center_px[0]
+            dy = detection.board_center_px[1] - previous.board_center_px[1]
+            if np.hypot(dx, dy) >= 0.025 * np.hypot(w, h):
+                return True
+
+        current_area = detection.board_area_ratio
+        previous_area = previous.board_area_ratio
+        if current_area is not None and previous_area is not None and previous_area > 0:
+            if abs(current_area - previous_area) / previous_area >= 0.08:
+                return True
+
+        current_tilt = detection.board_tilt_deg
+        previous_tilt = previous.board_tilt_deg
+        if current_tilt is not None and previous_tilt is not None:
+            if abs(current_tilt - previous_tilt) >= 5.0:
+                return True
+        return False
 
     @staticmethod
     def _overlay_detection(img_bgr: np.ndarray, detection, common_ids: np.ndarray, status: str) -> np.ndarray:

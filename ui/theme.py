@@ -202,6 +202,30 @@ QSpinBox::up-button, QDoubleSpinBox::up-button,
 QSpinBox::down-button, QDoubleSpinBox::down-button {{
     background-color: {Theme.BG_ELEVATED}; border-left: 1px solid {Theme.BORDER}; width: 18px;
 }}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+    background-color: #2C2C2C;
+}}
+/* 기본 스타일의 화살표는 어두운 배경 위에서 거의 안 보였다 - 테두리만으로
+   흰색 삼각형을 직접 그려서 확실히 보이게 한다. */
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+    width: 0px; height: 0px;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid #F5F5F5;
+}}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+    width: 0px; height: 0px;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #F5F5F5;
+}}
+QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {{
+    border-bottom-color: {Theme.TEXT_DISABLED};
+}}
+QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{
+    border-top-color: {Theme.TEXT_DISABLED};
+}}
 
 QCheckBox, QRadioButton {{ color: {Theme.TEXT_PRIMARY}; spacing: 7px; }}
 QCheckBox::indicator, QRadioButton::indicator {{

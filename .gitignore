@@ -1,6 +1,3 @@
-cd ~/camera_calibrator
-
-cat > .gitignore <<'EOF'
 # Python
 __pycache__/
 *.py[cod]
@@ -42,9 +39,12 @@ dist/
 output/
 outputs/
 results/
+Output/
+calibration_output/
 cache/
 tmp/
 temp/
+htmlcov/
 
 # Large datasets / recordings
 data/
@@ -52,6 +52,8 @@ dataset/
 datasets/
 rosbag/
 bags/
+live_captures/
+library/
 *.bag
 *.db3
 *.mcap
@@ -74,4 +76,3 @@ bags/
 core
 core.*
 *.core
-EOF

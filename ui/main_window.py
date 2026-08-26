@@ -11,6 +11,7 @@ calibration/*.py에 있고, 여기서는 그 함수들을 worker.py를 통해 �
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Qt
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
@@ -78,8 +80,10 @@ from ui.worker import (
     SelfCheckWorker,
     BagTopicDiscoveryWorker,
     BagExtractionWorker,
+    LibrarySaveWorker,
     run_worker_in_thread,
 )
+from ui.library_view import LibraryView
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +92,8 @@ logger = logging.getLogger(__name__)
 # 복구를 제안할 수 있어야 하기 때문 (사용자가 저장 위치를 고를 필요 없음).
 _AUTOSAVE_DIR = Path.home() / ".camera_calibrator"
 _AUTOSAVE_PATH = _AUTOSAVE_DIR / "autosave.ccproj"
+
+_SHEEP_TRACK_LEN = 14  # 진행률 불명 구간에서 양이 걸어가는 트랙의 칸 수
 
 # ChArUco에서 흔히 쓰이는 사전 목록 (cv2.aruco.DICT_* 속성명 그대로)
 _ARUCO_DICTIONARIES = [
@@ -230,6 +236,8 @@ class MainWindow(QMainWindow):
         self._self_check_worker = None  # 위와 동일한 이유로 별도 워커도 강한 참조 보관
         self._model_refit_thread: QThread | None = None
         self._model_refit_worker = None
+        self._library_thread: QThread | None = None
+        self._library_worker = None
         self._pending_stereo_intrinsic_slot: str | None = None
 
         self._build_menu_bar()
@@ -245,9 +253,11 @@ class MainWindow(QMainWindow):
         self.intrinsic_workspace = IntrinsicWorkspace.create_for_main_window(self, settings_panel)
         self.intrinsic_workspace.back_requested.connect(self._show_home)
         self.stereo_workspace = StereoWorkspace()
+        self.library_view = LibraryView()
         self.workspace_stack.addWidget(self.home_view)
         self.workspace_stack.addWidget(self.intrinsic_workspace)
         self.workspace_stack.addWidget(self.stereo_workspace)
+        self.workspace_stack.addWidget(self.library_view)
         layout.addWidget(self.workspace_stack, stretch=1)
 
         self.status_label = QLabel("이미지를 불러온 뒤 [캘리브레이션 실행]을 누르세요.")
@@ -257,9 +267,17 @@ class MainWindow(QMainWindow):
         self.pipeline_progress_bar.setTextVisible(True)
         self.pipeline_progress_bar.hide()
         self.statusBar().addPermanentWidget(self.pipeline_progress_bar)
+        # 진행률을 알 수 없는 구간(3모델 + Hold-out 계산 중)에서 기본 Qt
+        # 인디케이터 대신 양이 진행 바를 가로질러 걸어가는 애니메이션을 보여준다.
+        self._sheep_pos = 0
+        self._sheep_timer = QTimer(self)
+        self._sheep_timer.setInterval(140)
+        self._sheep_timer.timeout.connect(self._advance_busy_sheep)
 
         self.home_view.intrinsic_requested.connect(self._show_intrinsic_workspace)
         self.home_view.stereo_requested.connect(self._show_stereo_workspace)
+        self.home_view.library_requested.connect(self._show_library_workspace)
+        self.library_view.back_requested.connect(self._show_home)
         self.stereo_workspace.back_requested.connect(self._show_home)
         self.stereo_workspace.calibrate_intrinsic_requested.connect(self._on_stereo_intrinsic_requested)
 
@@ -284,6 +302,10 @@ class MainWindow(QMainWindow):
         self.stereo_workspace.set_pattern_config(self.pattern_config or self._current_pattern_config())
         self.workspace_stack.setCurrentWidget(self.stereo_workspace)
         self.status_label.setText("Camera-to-Camera Stereo Workspace")
+
+    def _show_library_workspace(self) -> None:
+        self.workspace_stack.setCurrentWidget(self.library_view)
+        self.status_label.setText("Library")
 
     def _on_stereo_intrinsic_requested(self, slot: str) -> None:
         self._pending_stereo_intrinsic_slot = slot
@@ -369,12 +391,28 @@ class MainWindow(QMainWindow):
         content = QWidget()
         outer = QHBoxLayout(content)
         outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(20)  # 3등분 섹션(Camera/Pattern/Actions) 사이 가로 간격만 살짝 추가
         group_layout.addWidget(content)
         self.settings_group = group
         self.settings_content = content
         group.toggled.connect(self._on_settings_panel_toggled)
 
         camera_form = QFormLayout()
+        camera_form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        # QFormLayout에 세로 간격을 따로 정해주지 않으면 Qt가 부모 레이아웃인
+        # outer(QHBoxLayout)의 spacing 값을 그대로 물려받는다 - 그래서
+        # outer.setSpacing()으로 가로 간격만 넓혔는데도 이 폼의 행간(세로
+        # 간격)까지 같이 넓어지는 부작용이 있었다. 원래 기본값(6px)으로
+        # 고정해서 가로/세로 간격을 서로 독립적으로 만든다.
+        camera_form.setVerticalSpacing(6)
+        self.sensor_name_edit = QLineEdit()
+        self.sensor_name_edit.setPlaceholderText("예: econ120")
+        self.sensor_name_edit.setToolTip(
+            "이 카메라를 구분하는 이름입니다. Library 탭은 이 이름으로 결과를 "
+            "분류합니다 - 비워두면 서로 다른 카메라의 계산 결과가 전부 같은 "
+            "'camera' 항목 하나에 섞입니다."
+        )
+        camera_form.addRow("Camera Name", self.sensor_name_edit)
         self.width_spin = QSpinBox()
         self.width_spin.setRange(1, 20000)
         self.width_spin.setValue(1920)
@@ -397,9 +435,11 @@ class MainWindow(QMainWindow):
             "(CLI의 --rational 플래그와 동일한 옵션입니다.)"
         )
         camera_form.addRow("", self.rational_checkbox)
-        outer.addLayout(camera_form)
+        outer.addLayout(camera_form, stretch=1)
 
         pattern_form = QFormLayout()
+        pattern_form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        pattern_form.setVerticalSpacing(6)  # camera_form과 같은 이유(outer 간격 상속 방지)
         self.squares_x_spin = QSpinBox()
         self.squares_x_spin.setRange(3, 30)
         self.squares_x_spin.setValue(7)
@@ -437,7 +477,7 @@ class MainWindow(QMainWindow):
         pattern_form.addRow("Marker size", self.marker_size_spin)
         pattern_form.addRow("Dictionary", self.dictionary_combo)
         self._pattern_form = pattern_form  # setRowVisible로 마커/딕셔너리 행을 토글하기 위해 보관
-        outer.addLayout(pattern_form)
+        outer.addLayout(pattern_form, stretch=1)
 
         action_layout = QVBoxLayout()
         self.load_button = QPushButton("이미지 불러오기")
@@ -457,7 +497,7 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(self.loaded_label)
         action_layout.addWidget(self.run_button)
         action_layout.addStretch(1)
-        outer.addLayout(action_layout)
+        outer.addLayout(action_layout, stretch=1)
 
         return group
 
@@ -693,7 +733,11 @@ class MainWindow(QMainWindow):
         )
 
     def _current_camera_config(self) -> CameraConfig:
-        return CameraConfig(width=self.width_spin.value(), height=self.height_spin.value())
+        return CameraConfig(
+            width=self.width_spin.value(),
+            height=self.height_spin.value(),
+            sensor_name=self.sensor_name_edit.text().strip() or None,
+        )
 
     def _on_run_pipeline(self) -> None:
         if not self.image_paths:
@@ -732,17 +776,38 @@ class MainWindow(QMainWindow):
         thread.finished.connect(lambda: self.run_button.setEnabled(True))
         thread.finished.connect(lambda: self.load_button.setEnabled(True))
         thread.finished.connect(self.pipeline_progress_bar.hide)
+        thread.finished.connect(self._stop_busy_sheep)
         thread.start()
 
     def _on_pipeline_progress_value(self, done: int, total: int) -> None:
         if total <= 0:
-            self.pipeline_progress_bar.setRange(0, 0)
-            self.pipeline_progress_bar.setFormat("계산 중...")
+            self._start_busy_sheep()
         else:
+            self._stop_busy_sheep()
             self.pipeline_progress_bar.setRange(0, total)
             self.pipeline_progress_bar.setValue(min(done, total))
             self.pipeline_progress_bar.setFormat("%p%")
         self.pipeline_progress_bar.show()
+
+    def _start_busy_sheep(self) -> None:
+        if self._sheep_timer.isActive():
+            return
+        self._sheep_pos = 0
+        self.pipeline_progress_bar.setRange(0, _SHEEP_TRACK_LEN)
+        self._render_busy_sheep()
+        self._sheep_timer.start()
+
+    def _stop_busy_sheep(self) -> None:
+        self._sheep_timer.stop()
+
+    def _advance_busy_sheep(self) -> None:
+        self._sheep_pos = (self._sheep_pos + 1) % (_SHEEP_TRACK_LEN + 1)
+        self._render_busy_sheep()
+
+    def _render_busy_sheep(self) -> None:
+        track = "·" * self._sheep_pos + "🐑" + "·" * (_SHEEP_TRACK_LEN - self._sheep_pos)
+        self.pipeline_progress_bar.setValue(self._sheep_pos)
+        self.pipeline_progress_bar.setFormat(track)
 
     # --- PipelineWorker 콜백 ---
 
@@ -795,6 +860,8 @@ class MainWindow(QMainWindow):
         # 계산이 완전히 끝난 시점(추천까지 나온 시점)이라 여기서 조용히
         # 자동 저장한다 - 다음에 앱이 비정상 종료돼도 이 결과는 남는다.
         self._autosave()
+        self._auto_save_calibration_outputs()
+        self._save_to_library()
         if self._pending_stereo_intrinsic_slot is not None and recommended is not None:
             result = self.calibration_results.get(recommended)
             if result is not None and result.success:
@@ -841,6 +908,79 @@ class MainWindow(QMainWindow):
             logger.debug("자동 저장 완료: %s", _AUTOSAVE_PATH)
         except Exception:  # noqa: BLE001 - 자동 저장 실패로 사용자 작업을 막으면 안 됨
             logger.exception("자동 저장 실패 (무시하고 계속 진행)")
+
+    def _auto_save_calibration_outputs(self) -> None:
+        """Pinhole/Extended Pinhole/Fisheye 중 성공한 모델의 파라미터(K/D)를
+        OpenCV YAML로 output/ 폴더에 자동 저장한다.
+
+        위 _autosave()는 앱 크래시 복구용 고정 파일 하나를 계속 덮어쓰는
+        반면, 이건 사용자가 나중에 실제로 꺼내 쓸 결과물이라 실행마다 타임
+        스탬프가 붙은 별개 파일로 남긴다 - 재실행해도 이전 결과가 지워지지
+        않는다.
+        """
+        if self.camera_config is None or self.pattern_config is None:
+            return
+        output_dir = Path.cwd() / "output"
+        sensor = self.camera_config.sensor_name or "camera"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        saved: list[str] = []
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for model, result in self.calibration_results.items():
+                if not result.success:
+                    continue
+                # self.calibration_results는 QThread의 Signal(dict)을 건너온
+                # 딕셔너리라, PySide6가 str-Enum 키를 평범한 str로 낮춰서
+                # 넘길 때가 있다 - .value 접근 전에 다시 enum으로 정규화한다
+                # (calibration/library.py의 같은 문제와 동일한 원인).
+                filename = f"{sensor}_{CameraModelType(model).value}_{timestamp}.yaml"
+                export_opencv_yaml(result, self.camera_config, self.pattern_config, str(output_dir / filename))
+                saved.append(filename)
+        except Exception:  # noqa: BLE001 - 자동 저장 실패로 사용자 작업을 막으면 안 됨
+            logger.exception("파라미터 자동 저장 실패 (무시하고 계속 진행)")
+            return
+        if saved:
+            self.status_label.setText(
+                self.status_label.text() + f"  ·  output/ 폴더에 저장됨: {', '.join(saved)}"
+            )
+
+    def _save_to_library(self) -> None:
+        """이 실행의 이미지+결과 전체를 Library 탭이 읽는 library/ 폴더로 복사한다.
+
+        이미지 수백 장을 복사하는 파일 I/O라 GUI 스레드를 막지 않도록 QThread로
+        분리한다 (Independent Benchmark 검출을 분리한 것과 같은 이유).
+        """
+        if self.dataset is None or self.camera_config is None or self.pattern_config is None:
+            return
+        IntrinsicWorkspace.sync_owner_state(self)
+        worker = LibrarySaveWorker(
+            self.dataset, self.camera_config, self.pattern_config,
+            self.calibration_results, self.validation_results, self.scores,
+        )
+        thread = run_worker_in_thread(worker, self)
+        worker.saved.connect(self._on_library_saved)
+        worker.error.connect(self._on_library_save_error)
+        self._library_thread, self._library_worker = thread, worker
+        # 이미지가 많으면 복사에 몇 초~수십 초 걸린다 - 저장이 끝나기 전에
+        # 폴더를 열어보고 "왜 없지?"하고 오해하지 않도록, 시작하자마자 바로
+        # 진행 중임을 상태표시줄에 남긴다 (완료/실패는 각각의 콜백이 이어서 갱신).
+        self.status_label.setText(
+            self.status_label.text() + "  ·  Library에 저장 중... (이미지 복사라 시간이 걸릴 수 있습니다)"
+        )
+        thread.start()
+
+    def _on_library_saved(self, run_dir: str) -> None:
+        self.status_label.setText(self.status_label.text() + f"  ·  Library에 저장됨: {run_dir}")
+        if hasattr(self, "library_view"):
+            self.library_view.mark_dirty()
+
+    def _on_library_save_error(self, message: str) -> None:
+        # Library 저장은 부가 기능이라 QMessageBox로 계산 흐름을 막지 않는다 -
+        # 다만 콘솔 로그(전체 traceback)와 상태표시줄(요약 한 줄) 양쪽에 남겨서
+        # 조용히 사라지지 않게 한다.
+        logger.warning(message)
+        first_line = message.strip().splitlines()[0] if message.strip() else message
+        self.status_label.setText(self.status_label.text() + f"  ·  ⚠ Library 저장 실패: {first_line}")
 
     def _offer_autosave_recovery(self) -> None:
         """창이 뜨자마자 한 번, 이전 실행의 자동 저장본이 있으면 복구를 제안한다."""
@@ -1082,7 +1222,7 @@ class MainWindow(QMainWindow):
     def _on_export_opencv(self, model: CameraModelType) -> None:
         result = self.calibration_results.get(model)
         if not result or not result.success or self.camera_config is None or self.pattern_config is None:
-            QMessageBox.warning(self, "Export 불가", f"{model.value} 모델의 캘리브레이션 결과가 없습니다.")
+            QMessageBox.warning(self, "Export 불가", f"{CameraModelType(model).value} 모델의 캘리브레이션 결과가 없습니다.")
             return
         path = self.result_view.prompt_save_path("camera.yaml", "YAML (*.yaml *.yml)")
         if not path:
@@ -1096,7 +1236,7 @@ class MainWindow(QMainWindow):
     def _on_export_ros(self, model: CameraModelType) -> None:
         result = self.calibration_results.get(model)
         if not result or not result.success or self.camera_config is None:
-            QMessageBox.warning(self, "Export 불가", f"{model.value} 모델의 캘리브레이션 결과가 없습니다.")
+            QMessageBox.warning(self, "Export 불가", f"{CameraModelType(model).value} 모델의 캘리브레이션 결과가 없습니다.")
             return
         path = self.result_view.prompt_save_path("camera_info.yaml", "YAML (*.yaml *.yml)")
         if not path:
@@ -1113,7 +1253,7 @@ class MainWindow(QMainWindow):
             not result or not result.success or self.dataset is None
             or self.camera_config is None or self.pattern_config is None
         ):
-            QMessageBox.warning(self, "Export 불가", f"{model.value} 모델의 캘리브레이션 결과가 없습니다.")
+            QMessageBox.warning(self, "Export 불가", f"{CameraModelType(model).value} 모델의 캘리브레이션 결과가 없습니다.")
             return
         path = self.result_view.prompt_save_path("calibration_report.html", "HTML (*.html)")
         if not path:
@@ -1153,7 +1293,7 @@ class MainWindow(QMainWindow):
             not result or not result.success or self.dataset is None
             or self.camera_config is None or self.pattern_config is None
         ):
-            QMessageBox.warning(self, "Export 불가", f"{model.value} 모델의 캘리브레이션 결과가 없습니다.")
+            QMessageBox.warning(self, "Export 불가", f"{CameraModelType(model).value} 모델의 캘리브레이션 결과가 없습니다.")
             return
         path = self.result_view.prompt_save_path("calibration.json", "JSON (*.json)")
         if not path:
@@ -1279,6 +1419,7 @@ class MainWindow(QMainWindow):
                 logger.warning("Stereo 결과 복원 실패: %s", exc)
 
         # --- 설정 패널 위젯도 불러온 값으로 맞춰준다 (재계산/이어서 작업 시 일관성) ---
+        self.sensor_name_edit.setText(self.camera_config.sensor_name or "")
         self.width_spin.setValue(self.camera_config.width)
         self.height_spin.setValue(self.camera_config.height)
         self.squares_x_spin.setValue(self.pattern_config.squares_x)

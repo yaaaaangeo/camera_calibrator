@@ -83,9 +83,11 @@ class DatasetView(QWidget):
         for col in range(2, 7):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         self.table.setColumnWidth(0, 140)
-        # 상태 칸의 긴 문장이 줄바꿈되게 하고, 행 높이도 내용에 맞춰 늘어나게 한다
-        # (전에는 한 줄로 잘려서 tooltip으로만 전체 내용을 볼 수 있었음).
-        self.table.setWordWrap(True)
+        # 상태 칸에 긴 실패 이유가 들어가면 줄바꿈 때문에 그 행만 검출 성공
+        # 행보다 훨씬 높아져서 표가 들쭉날쭉해 보였다. 줄바꿈을 끄고 한 줄로
+        # 말줄임(...) 처리해서 모든 행 높이를 통일하고, 전체 문구는 계속
+        # tooltip(위 status_item.setToolTip)으로 볼 수 있게 유지한다.
+        self.table.setWordWrap(False)
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         group_layout.addWidget(self.table)
@@ -133,8 +135,8 @@ class DatasetView(QWidget):
             f"총 {total}장  |  검출 성공 {detected}장  |  "
             f"현재 사용 중 {enabled}장 ({enabled/total*100:.0f}%)" if total else "이미지 없음"
         )
-        # 상태 칸의 긴 문장이 줄바꿈된 만큼 행 높이도 늘려준다 (안 그러면
-        # 텍스트는 wrap됐는데 행이 여전히 한 줄 높이라 위아래로 잘려 보임).
+        # 줄바꿈이 꺼져 있어(setWordWrap(False)) 모든 행이 원래 한 줄 높이지만,
+        # 폰트/DPI 차이에 따른 실제 한 줄 높이를 여기서 다시 맞춰준다.
         self.table.resizeRowsToContents()
 
     def refresh_errors(self, dataset: Dataset) -> None:

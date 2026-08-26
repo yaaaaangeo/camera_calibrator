@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import time
 import threading
+import traceback
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
@@ -50,6 +51,7 @@ from calibration.quality import coverage_percentage
 from calibration.models.common import infer_image_size
 from calibration.recommender import compute_model_scores, build_recommendation_message
 from calibration.self_check import run_all_self_checks
+from calibration.library import save_calibration_run
 from calibration.rosbag_reader import extract_images_from_bag, list_image_topics
 from calibration.validation import validate_cross_datasets
 from calibration.external_compare import compare_with_external_params
@@ -619,6 +621,94 @@ class StereoPairDetectionWorker(QObject):
             self.progress.emit(f"Stereo pair detection 완료: {len(pairs)} usable pairs")
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"Stereo pair detection 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
+class BenchmarkDetectionWorker(QObject):
+    """External Compare 탭의 Independent Benchmark 이미지 검출을 GUI 밖에서 수행.
+
+    detect_dataset() 자체는 8장 초과일 때 ProcessPoolExecutor로 병렬화되지만,
+    호출부가 GUI 스레드에서 직접 그 결과를 기다리면 병렬 처리 여부와 무관하게
+    GUI 스레드가 블로킹돼 "python3 is not responding"이 뜬다. 다른 탭의 검출
+    (PipelineWorker, StereoPairDetectionWorker)은 이미 QThread로 분리돼 있었지만
+    이 경로만 빠져 있었다.
+    """
+
+    progress = Signal(str)
+    dataset_ready = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, image_paths: list[str], pattern_config: PatternConfig, camera_config: CameraConfig):
+        super().__init__()
+        self.image_paths = image_paths
+        self.pattern_config = pattern_config
+        self.camera_config = camera_config
+
+    def run(self) -> None:
+        try:
+            total = len(self.image_paths)
+            self.progress.emit(f"Benchmark 이미지 검출 중... ({total}장)")
+
+            def _on_progress(done: int, total_count: int) -> None:
+                self.progress.emit(f"Benchmark 이미지 검출 중... {done}/{total_count}장")
+
+            dataset = detect_dataset(
+                self.image_paths,
+                self.pattern_config,
+                parallel=total > 8,
+                progress_callback=_on_progress,
+            )
+            if dataset.num_detected > 0:
+                analyze_dataset_quality(dataset, self.camera_config)
+            self.dataset_ready.emit(dataset)
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"Benchmark 불러오기 실패: {e}")
+        finally:
+            self.finished.emit()
+
+
+class LibrarySaveWorker(QObject):
+    """계산 결과(이미지 사본 포함)를 Library 폴더에 저장하는 무거운 파일 I/O를
+    GUI 밖에서 수행한다. dataset을 deepcopy하고 이미지 수백 장을 복사하는
+    작업이라, 이미지가 많을 때 GUI 스레드에서 직접 하면 잠깐이라도 멈춘다.
+    """
+
+    saved = Signal(str)  # run_dir
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        dataset,
+        camera_config: CameraConfig,
+        pattern_config: PatternConfig,
+        calibration_results,
+        validation_results,
+        model_scores=None,
+    ):
+        super().__init__()
+        self.dataset = dataset
+        self.camera_config = camera_config
+        self.pattern_config = pattern_config
+        self.calibration_results = calibration_results
+        self.validation_results = validation_results
+        self.model_scores = model_scores
+
+    def run(self) -> None:
+        try:
+            run_dir = save_calibration_run(
+                self.dataset,
+                self.camera_config,
+                self.pattern_config,
+                self.calibration_results,
+                self.validation_results,
+                model_scores=self.model_scores,
+            )
+            self.saved.emit(str(run_dir))
+        except Exception:  # noqa: BLE001 - Library 저장 실패로 사용자 작업을 막으면 안 됨
+            self.error.emit(f"Library 저장 실패:\n{traceback.format_exc()}")
         finally:
             self.finished.emit()
 

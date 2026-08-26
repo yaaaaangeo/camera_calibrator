@@ -339,43 +339,46 @@ def test_model_status_label_warns_on_unrun_model(qapp):
         view.close()
 
 
-def test_dataset_table_status_column_stretches_and_wraps(qapp):
-    """"상태" 컬럼이 남는 공간을 가져가야 하고(Stretch), 좁은 창에서는 긴
-    실패 이유 텍스트가 줄바꿈되면서 행 높이도 늘어나야 한다.
+def test_dataset_table_status_column_stretches_without_wrapping(qapp):
+    """"상태" 컬럼이 남는 공간을 가져가야 하고(Stretch), 실패 이유가 길어도
+    줄바꿈하지 않고 한 줄로 말줄임 처리해 검출 성공 행과 높이가 같아야 한다
+    (긴 실패 이유 때문에 그 행만 유독 높아지는 문제 수정).
     """
     from PySide6.QtCore import QCoreApplication
     from PySide6.QtWidgets import QHeaderView
     from calibration.types import Dataset, DetectionResult, Frame, FrameStatus, ImageInfo
     from ui.dataset_view import DatasetView
 
-    info = ImageInfo(image_id="frame_0000", path="/fake/0.jpg", width=640, height=480)
-    det = DetectionResult(
-        image_id="frame_0000", success=False, num_corners=0,
+    detected_info = ImageInfo(image_id="frame_0000", path="/fake/0.jpg", width=640, height=480)
+    detected_det = DetectionResult(image_id="frame_0000", success=True, num_corners=24)
+    failed_info = ImageInfo(image_id="frame_0001", path="/fake/1.jpg", width=640, height=480)
+    failed_det = DetectionResult(
+        image_id="frame_0001", success=False, num_corners=0,
         failure_reason="마커는 검출됐지만 체스보드 코너 보간 실패 (보드 일부만 보이거나 각도가 너무 큼)",
     )
-    dataset = Dataset(frames=[Frame(image_info=info, detection=det, status=FrameStatus.DETECTION_FAILED)])
+    dataset = Dataset(frames=[
+        Frame(image_info=detected_info, detection=detected_det, status=FrameStatus.DETECTED),
+        Frame(image_info=failed_info, detection=failed_det, status=FrameStatus.DETECTION_FAILED),
+    ])
 
     view = DatasetView()
     try:
         header = view.table.horizontalHeader()
         assert header.sectionResizeMode(1) == QHeaderView.Stretch, "상태(컬럼1)가 Stretch여야 함"
-        assert view.table.wordWrap()
+        assert not view.table.wordWrap(), "긴 실패 이유로 행 높이가 들쭉날쭉해지지 않도록 줄바꿈은 꺼져 있어야 함"
 
-        # 좁은 창 - 줄바꿈으로 행이 여러 줄이 되어 한 줄 높이보다 커야 함
+        # 좁은 창이어도 줄바꿈이 없으니 두 행 높이가 같아야 한다.
         view.resize(500, 400)
         view.show()
         QCoreApplication.processEvents()
         view.set_dataset(dataset)
         QCoreApplication.processEvents()
-        narrow_row_height = view.table.rowHeight(0)
-        assert narrow_row_height > 30, "좁은 창에서는 줄바꿈으로 행 높이가 늘어나야 함"
-
-        # 넓은 창 - 한 줄에 다 들어가서 행 높이가 컴팩트해야 함
-        view.resize(1260, 500)
-        QCoreApplication.processEvents()
-        view.set_dataset(dataset)
-        QCoreApplication.processEvents()
-        wide_row_height = view.table.rowHeight(0)
-        assert wide_row_height < narrow_row_height, "넓은 창에서는 행 높이가 좁은 창보다 작아야 함"
+        detected_row_height = view.table.rowHeight(0)
+        failed_row_height = view.table.rowHeight(1)
+        assert failed_row_height == detected_row_height, (
+            "검출 실패 행이 검출 성공 행과 높이가 같아야 함 (긴 실패 이유는 tooltip으로만 표시)"
+        )
+        # 전체 문구는 여전히 tooltip으로 확인 가능해야 한다.
+        assert view.table.item(1, 1).toolTip() == failed_det.failure_reason
     finally:
         view.close()

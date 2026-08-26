@@ -48,8 +48,7 @@ from calibration.types import (
     ValidationResult,
 )
 from calibration.recommender import compute_model_scores
-from calibration.detector import detect_dataset, summarize_dataset
-from calibration.quality import analyze_dataset_quality
+from calibration.detector import summarize_dataset
 from calibration.external_compare import (
     ComparisonSide,
     ExternalCameraParams,
@@ -58,7 +57,7 @@ from calibration.external_compare import (
     compare_with_external_params,
 )
 from calibration.calibration_io import StandardCalibration, load_standard_calibration
-from ui.worker import ExternalComparisonWorker, run_worker_in_thread
+from ui.worker import BenchmarkDetectionWorker, ExternalComparisonWorker, run_worker_in_thread
 from ui.theme import Theme
 
 _MODEL_LABELS = {
@@ -120,6 +119,8 @@ class ExternalCompareView(QWidget):
         self._benchmark_image_paths: list[str] = []
         self._comparison_thread = None
         self._comparison_worker = None
+        self._benchmark_thread = None
+        self._benchmark_worker = None
 
         root_layout = QVBoxLayout(self)
         self.scroll_area = QScrollArea()
@@ -1066,6 +1067,9 @@ class ExternalCompareView(QWidget):
         if self._pattern_config is None or self._camera_config is None:
             QMessageBox.warning(self, "패턴 설정 없음", "먼저 Camera Setup / Pattern을 설정하고 이미지를 불러오세요.")
             return
+        if self._benchmark_thread is not None and self._benchmark_thread.isRunning():
+            QMessageBox.information(self, "검출 진행 중", "Benchmark 이미지 검출이 이미 진행 중입니다.")
+            return
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "Independent Benchmark 이미지 선택",
@@ -1074,19 +1078,35 @@ class ExternalCompareView(QWidget):
         )
         if not paths:
             return
-        try:
-            self.benchmark_status_label.setText(f"Benchmark 이미지 검출 중... ({len(paths)}장)")
-            dataset = detect_dataset(paths, self._pattern_config, parallel=len(paths) > 8)
-            if dataset.num_detected > 0:
-                analyze_dataset_quality(dataset, self._camera_config)
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.critical(self, "Benchmark 불러오기 실패", str(e))
-            return
 
-        self._benchmark_dataset = dataset
         self._benchmark_image_paths = list(paths)
+        # detect_dataset()은 이미지가 많으면(특히 수백 장) 몇 초~몇십 초가
+        # 걸릴 수 있다. GUI 스레드에서 직접 기다리면 그동안 Qt 이벤트 루프가
+        # 멈춰 OS가 "python3 is not responding"을 띄운다 - QThread 워커로 분리.
+        worker = BenchmarkDetectionWorker(paths, self._pattern_config, self._camera_config)
+        thread = run_worker_in_thread(worker, self)
+        worker.progress.connect(self.benchmark_status_label.setText)
+        worker.dataset_ready.connect(self._on_benchmark_dataset_ready)
+        worker.error.connect(self._on_benchmark_worker_error)
+        thread.finished.connect(self._on_benchmark_worker_finished)
+        self._benchmark_thread, self._benchmark_worker = thread, worker
+        self.select_benchmark_button.setEnabled(False)
+        self.benchmark_status_label.setText(f"Benchmark 이미지 검출 중... ({len(paths)}장)")
+        thread.start()
+
+    def _on_benchmark_dataset_ready(self, dataset: Dataset) -> None:
+        self._benchmark_dataset = dataset
         self._update_benchmark_status()
         QMessageBox.information(self, "Benchmark 불러오기 완료", summarize_dataset(dataset))
+
+    def _on_benchmark_worker_error(self, message: str) -> None:
+        self._benchmark_image_paths = []
+        QMessageBox.critical(self, "Benchmark 불러오기 실패", message)
+
+    def _on_benchmark_worker_finished(self) -> None:
+        self.select_benchmark_button.setEnabled(True)
+        self._benchmark_thread = None
+        self._benchmark_worker = None
 
     def _on_clear_benchmark_dataset(self) -> None:
         self._benchmark_dataset = None
