@@ -13,6 +13,7 @@ from ui.theme import Theme
 class CalibrationHomeView(QWidget):
     intrinsic_requested = Signal()
     stereo_requested = Signal()
+    camera_lidar_requested = Signal()
     library_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None):
@@ -28,7 +29,7 @@ class CalibrationHomeView(QWidget):
         content_layout.setAlignment(Qt.AlignCenter)
         content_layout.setSpacing(18)
 
-        title = QLabel("CAMERA CALIBRATION")
+        title = QLabel("CALIBRATION")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 26px; font-weight: 700;")
         content_layout.addWidget(title)
@@ -40,6 +41,7 @@ class CalibrationHomeView(QWidget):
 
         cards = QGridLayout()
         cards.setHorizontalSpacing(16)
+        cards.setVerticalSpacing(16)
         cards.addWidget(
             self._card(
                 "CAMERA INTRINSIC",
@@ -62,14 +64,25 @@ class CalibrationHomeView(QWidget):
         )
         cards.addWidget(
             self._card(
+                "CAMERA ↔ LIDAR",
+                "Calibrate\n- Extrinsic Rotation\n- Extrinsic Translation\n\n"
+                "FAST-Calib (circular-hole target)\n\nOutput\nR, T\n4x4 Transform",
+                "START",
+                self.camera_lidar_requested.emit,
+            ),
+            1,
+            0,
+        )
+        cards.addWidget(
+            self._card(
                 "LIBRARY",
                 "지금까지 계산한 캘리브레이션 결과를\n카메라별로 다시 살펴봅니다\n\n"
                 "- 모델별 RMS / Hold-out RMS\n- 왜곡 보정 전/후 미리보기",
                 "OPEN",
                 self.library_requested.emit,
             ),
-            0,
-            2,
+            1,
+            1,
         )
         content_layout.addLayout(cards)
         root.addWidget(content, alignment=Qt.AlignCenter)

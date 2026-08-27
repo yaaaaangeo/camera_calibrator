@@ -67,6 +67,7 @@ from export.csv_export import export_csv
 from export.stereo import stereo_pairs_to_dict, stereo_result_to_dict
 
 from ui.calibration_home_view import CalibrationHomeView
+from ui.camera_lidar_workspace import CameraLidarWorkspace
 from ui.help_view import HelpView
 from ui.intrinsic_workspace import IntrinsicWorkspace
 from ui.stereo_workspace import StereoWorkspace
@@ -190,7 +191,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Camera Calibration Tool")
+        self.setWindowTitle("Calibration Tool")
         # Qt 기본 동작은 마우스 포인터만 spinbox/combo/tab 위에 있어도 휠로
         # 값/선택 탭을 바꾼다. 앱 전역 필터로 우발 변경을 차단한다.
         self._wheel_change_guard = WheelChangeGuard(self)
@@ -239,6 +240,7 @@ class MainWindow(QMainWindow):
         self._library_thread: QThread | None = None
         self._library_worker = None
         self._pending_stereo_intrinsic_slot: str | None = None
+        self._pending_camera_lidar_intrinsic: bool = False
 
         self._build_menu_bar()
 
@@ -253,10 +255,12 @@ class MainWindow(QMainWindow):
         self.intrinsic_workspace = IntrinsicWorkspace.create_for_main_window(self, settings_panel)
         self.intrinsic_workspace.back_requested.connect(self._show_home)
         self.stereo_workspace = StereoWorkspace()
+        self.camera_lidar_workspace = CameraLidarWorkspace()
         self.library_view = LibraryView()
         self.workspace_stack.addWidget(self.home_view)
         self.workspace_stack.addWidget(self.intrinsic_workspace)
         self.workspace_stack.addWidget(self.stereo_workspace)
+        self.workspace_stack.addWidget(self.camera_lidar_workspace)
         self.workspace_stack.addWidget(self.library_view)
         layout.addWidget(self.workspace_stack, stretch=1)
 
@@ -276,10 +280,15 @@ class MainWindow(QMainWindow):
 
         self.home_view.intrinsic_requested.connect(self._show_intrinsic_workspace)
         self.home_view.stereo_requested.connect(self._show_stereo_workspace)
+        self.home_view.camera_lidar_requested.connect(self._show_camera_lidar_workspace)
         self.home_view.library_requested.connect(self._show_library_workspace)
         self.library_view.back_requested.connect(self._show_home)
         self.stereo_workspace.back_requested.connect(self._show_home)
         self.stereo_workspace.calibrate_intrinsic_requested.connect(self._on_stereo_intrinsic_requested)
+        self.camera_lidar_workspace.back_requested.connect(self._show_home)
+        self.camera_lidar_workspace.calibrate_intrinsic_requested.connect(
+            self._on_camera_lidar_intrinsic_requested
+        )
 
         # 앱이 응답 없음/강제 종료 등으로 꺼져도 마지막으로 완료된 계산
         # 결과는 자동 저장본에서 복구할 수 있게, 창이 뜨자마자 한 번 확인한다.
@@ -303,9 +312,31 @@ class MainWindow(QMainWindow):
         self.workspace_stack.setCurrentWidget(self.stereo_workspace)
         self.status_label.setText("Camera-to-Camera Stereo Workspace")
 
+    def _show_camera_lidar_workspace(self) -> None:
+        self.workspace_stack.setCurrentWidget(self.camera_lidar_workspace)
+        self.status_label.setText("Camera ↔ LiDAR (FAST-Calib) Workspace")
+
     def _show_library_workspace(self) -> None:
         self.workspace_stack.setCurrentWidget(self.library_view)
         self.status_label.setText("Library")
+
+    def _on_camera_lidar_intrinsic_requested(self, _slot: str) -> None:
+        self._pending_camera_lidar_intrinsic = True
+        if self.calibration_results and self.camera_config is not None:
+            chosen = next((s.model_name for s in self.scores if s.is_recommended), None)
+            if chosen is None:
+                chosen = self.result_view.model_combo.currentData()
+            result = self.calibration_results.get(chosen)
+            if result is not None and result.success:
+                self.camera_lidar_workspace.set_previous_intrinsic(self._standard_from_result(result))
+                self._pending_camera_lidar_intrinsic = False
+                self._show_camera_lidar_workspace()
+                return
+        self._show_intrinsic_workspace()
+        self.status_label.setText(
+            "Camera ↔ LiDAR용 Intrinsic이 필요합니다. 기존 Intrinsic Workspace에서 캘리브레이션을 "
+            "완료하면 자동으로 연결됩니다."
+        )
 
     def _on_stereo_intrinsic_requested(self, slot: str) -> None:
         self._pending_stereo_intrinsic_slot = slot
@@ -871,6 +902,12 @@ class MainWindow(QMainWindow):
                 )
                 self._pending_stereo_intrinsic_slot = None
                 self._show_stereo_workspace()
+        if self._pending_camera_lidar_intrinsic and recommended is not None:
+            result = self.calibration_results.get(recommended)
+            if result is not None and result.success:
+                self.camera_lidar_workspace.set_previous_intrinsic(self._standard_from_result(result))
+                self._pending_camera_lidar_intrinsic = False
+                self._show_camera_lidar_workspace()
 
     def _autosave(self) -> None:
         """마지막으로 완료된 계산 결과를 홈 디렉터리의 고정 파일에 저장한다.

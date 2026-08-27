@@ -87,6 +87,20 @@ def is_valid_rotation_matrix(R: np.ndarray, tol: float = 1e-3) -> tuple[bool, di
     return (det_ok and orthogonal_ok), diagnostics
 
 
+def rotation_geodesic_distance(R_a: np.ndarray, R_b: np.ndarray, degrees: bool = False) -> float:
+    """SO(3) geodesic angular distance between two rotation matrices --
+    the angle of the relative rotation R_a^T @ R_b, via the standard
+    trace formula: theta = arccos((trace(R_a^T @ R_b) - 1) / 2). Unlike a
+    per-axis Euler/RPY difference, this is a single, convention-independent
+    "how far apart are these two orientations" number."""
+    R_a = np.asarray(R_a, dtype=float)
+    R_b = np.asarray(R_b, dtype=float)
+    relative = R_a.T @ R_b
+    cos_theta = (np.trace(relative) - 1.0) / 2.0
+    theta = float(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
+    return np.degrees(theta) if degrees else theta
+
+
 def to_homogeneous(R: np.ndarray, t: np.ndarray) -> np.ndarray:
     """Compose a 3x3 rotation and 3-vector translation into a 4x4 homogeneous transform."""
     R = np.asarray(R, dtype=float)
@@ -113,6 +127,53 @@ def compose_transforms(T_a: np.ndarray, T_b: np.ndarray) -> np.ndarray:
     """Compose two 4x4 transforms: applying the result to a point p gives
     T_a @ (T_b @ p), i.e. T_b is applied first."""
     return np.asarray(T_a, dtype=float) @ np.asarray(T_b, dtype=float)
+
+
+def rotation_matrix_to_rpy(R: np.ndarray, degrees: bool = False) -> tuple[float, float, float]:
+    """Inverse of rpy_to_rotation_matrix: extract (roll, pitch, yaw) from a
+    3x3 rotation matrix built as R = Rz(yaw) @ Ry(pitch) @ Rx(roll)."""
+    R = np.asarray(R, dtype=float)
+    pitch = np.arcsin(np.clip(-R[2, 0], -1.0, 1.0))
+    roll = np.arctan2(R[2, 1], R[2, 2])
+    yaw = np.arctan2(R[1, 0], R[0, 0])
+    if degrees:
+        roll, pitch, yaw = np.degrees([roll, pitch, yaw])
+    return float(roll), float(pitch), float(yaw)
+
+
+def rotation_matrix_to_quaternion(R: np.ndarray) -> tuple[float, float, float, float]:
+    """3x3 rotation matrix -> quaternion (x, y, z, w), via Shepperd's method
+    (numerically stable across all rotation angles, unlike the naive
+    trace-only formula near a 180 degree rotation)."""
+    R = np.asarray(R, dtype=float)
+    trace = np.trace(R)
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2, 1] - R[1, 2]) * s
+        y = (R[0, 2] - R[2, 0]) * s
+        z = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+    q = np.array([x, y, z, w])
+    q = q / np.linalg.norm(q)
+    return float(q[0]), float(q[1]), float(q[2]), float(q[3])
 
 
 def transform_points(T: np.ndarray, points: np.ndarray) -> np.ndarray:

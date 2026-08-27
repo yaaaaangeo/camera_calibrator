@@ -52,11 +52,19 @@ from calibration.models.common import infer_image_size
 from calibration.recommender import compute_model_scores, build_recommendation_message
 from calibration.self_check import run_all_self_checks
 from calibration.library import save_calibration_run
-from calibration.rosbag_reader import extract_images_from_bag, list_image_topics
+from calibration.rosbag_reader import (
+    extract_images_from_bag,
+    extract_image_near_timestamp,
+    extract_pointcloud_near_timestamp,
+    list_image_topics,
+)
+from camera_lidar.multi_scene import calibrate_multi_scene, compare_strict_vs_flexible
+from camera_lidar.types import ImageFrame, PointCloudFrame
 from calibration.validation import validate_cross_datasets
 from calibration.external_compare import compare_with_external_params
 from calibration.model_refitting import refit_extended_pinhole_to_pinhole
 from calibration.stereo_controller import StereoController
+from calibration.camera_lidar_controller import CameraLidarController
 from calibration.pipeline_process import (
     run_models_and_validation,
     run_outlier_pruning_and_validation,
@@ -488,14 +496,25 @@ class BagTopicDiscoveryWorker(QObject):
     error = Signal(str)
     finished = Signal()
 
-    def __init__(self, bag_path: str):
+    def __init__(self, bag_path: str, list_fn=None, label: str = "이미지"):
         super().__init__()
         self.bag_path = bag_path
+        # list_fn=None(기본값)이면 run()에서 모듈 전역 이름 list_image_topics를
+        # "그 자리에서" 다시 찾는다 - list_fn의 기본값 자체를 list_image_topics로
+        # 박아두면(이른 바인딩) 기존 회귀 테스트가 하던
+        # monkeypatch.setattr("ui.worker.list_image_topics", ...) 가 이 워커에는
+        # 더 이상 적용되지 않는 문제가 생긴다(그 몽키패치는 모듈 전역 이름을
+        # 바꾸는 것이지, 이미 만들어진 클래스의 기본 인자 값을 바꾸지는 못한다).
+        # camera_lidar의 Bag 소스 섹션은 이 워커를 list_fn=list_pointcloud_topics로
+        # 두 번째로 재사용해서 LiDAR 토픽도 검색한다.
+        self.list_fn = list_fn
+        self.label = label
 
     def run(self) -> None:
         try:
-            self.progress.emit("bag 인덱스에서 이미지 토픽을 검색 중...")
-            self.topics_ready.emit(list_image_topics(self.bag_path), self.bag_path)
+            self.progress.emit(f"bag 인덱스에서 {self.label} 토픽을 검색 중...")
+            list_fn = self.list_fn if self.list_fn is not None else list_image_topics
+            self.topics_ready.emit(list_fn(self.bag_path), self.bag_path)
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"bag 읽기 실패: {e}")
         finally:
@@ -744,6 +763,199 @@ class StereoCalibrationWorker(QObject):
             self.progress.emit("Stereo calibration 완료.")
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"Stereo calibration 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
+class CameraLidarCalibrationWorker(QObject):
+    """단일 CalibrationScene에 대해 FAST-Calib(camera_lidar/*)를 GUI
+    스레드 밖에서 수행한다. 다른 워커와 마찬가지로 실제 계산 로직은
+    calibration.camera_lidar_controller에 그대로 있고, 여기서는 호출/신호
+    변환만 담당한다."""
+
+    progress = Signal(str)
+    result_ready = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, scene, roi_mode: str = "manual"):
+        super().__init__()
+        self.scene = scene
+        self.roi_mode = roi_mode
+
+    def run(self) -> None:
+        try:
+            self.progress.emit("FAST-Calib 계산 중... (marker/plane 검출 -> correspondence -> R,t 계산)")
+            result = CameraLidarController().calibrate(self.scene, roi_mode=self.roi_mode)
+            self.result_ready.emit(result)
+            if result.success:
+                self.progress.emit(f"FAST-Calib 완료 (residual RMSE {result.residual_rmse_m * 1000:.2f} mm).")
+            else:
+                self.progress.emit(f"FAST-Calib 실패: {result.error_message}")
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"FAST-Calib 계산 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
+class SceneExtractionWorker(QObject):
+    """bag의 camera topic 전체를 스캔해 Stable Scene Segment candidate들을
+    찾는(MARKER EXTRACTION) 무거운 작업(프레임마다 ArUco 검출)을 GUI
+    스레드 밖에서 수행한다. 실제 계산은
+    calibration.camera_lidar_controller.CameraLidarController.
+    extract_scene_candidates()에 있고, 여기서는 호출/신호 변환만 담당한다."""
+
+    progress = Signal(str)
+    # (done, total) -- total==0이면 total_frames를 알아내지 못한 경우로, UI가
+    # BagExtractionWorker.progress_value와 동일하게 busy indicator로 표시한다.
+    progress_value = Signal(int, int)
+    candidates_ready = Signal(object)  # list[SceneCandidate]
+    summary_ready = Signal(object)     # ExtractionDiagnosticSummary -- Marker Extraction Diagnostic funnel
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, bag_path: str, camera_topic: str, lidar_topic: str, intrinsics, target):
+        super().__init__()
+        self.bag_path = bag_path
+        self.camera_topic = camera_topic
+        self.lidar_topic = lidar_topic
+        self.intrinsics = intrinsics
+        self.target = target
+        self._cancelled = False
+
+    def request_cancel(self) -> None:
+        """다른 스레드(GUI)에서 호출됨 -- BagExtractionWorker.request_cancel과
+        동일한 패턴. 불리언 플래그 하나만 건드리므로 락 없이도 안전하다."""
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(f"Marker extraction 시작: {self.camera_topic} 전체 프레임을 스캔합니다...")
+            candidates, summary = CameraLidarController().extract_scene_candidates(
+                self.bag_path, self.camera_topic, self.lidar_topic,
+                self.intrinsics, self.target,
+                progress_callback=self.progress.emit,
+                frame_progress_callback=self.progress_value.emit,
+                cancel_check=lambda: self._cancelled,
+            )
+            self.candidates_ready.emit(candidates)
+            self.summary_ready.emit(summary)
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"Marker extraction 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
+class BagPreviewWorker(QObject):
+    """Bag timeline을 스크럽할 때 t 근처의 이미지+PointCloud2 프레임 하나씩을
+    GUI 스레드 밖에서 읽어온다 (extract_images_from_bag의 "전체를 시간 간격
+    샘플링해 디스크에 저장"과 달리, 단발성 조회라 훨씬 가볍지만 그래도 bag
+    인덱스를 다시 여는 I/O라 스레드 분리 원칙은 동일하게 적용한다)."""
+
+    progress = Signal(str)
+    preview_ready = Signal(object, object)  # (ImageFrame, PointCloudFrame)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, bag_path: str, camera_topic: str, lidar_topic: str, t_sec: float):
+        super().__init__()
+        self.bag_path = bag_path
+        self.camera_topic = camera_topic
+        self.lidar_topic = lidar_topic
+        self.t_sec = t_sec
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(f"t={self.t_sec:.2f}s 근처 프레임을 불러오는 중...")
+            image, image_ts, image_frame_id = extract_image_near_timestamp(
+                self.bag_path, self.camera_topic, self.t_sec
+            )
+            points, points_ts, points_frame_id = extract_pointcloud_near_timestamp(
+                self.bag_path, self.lidar_topic, self.t_sec
+            )
+            image_frame = ImageFrame(
+                timestamp=image_ts, image=image, frame_id=image_frame_id,
+                source_metadata={"bag_path": self.bag_path, "topic": self.camera_topic},
+            )
+            cloud_frame = PointCloudFrame(
+                timestamp=points_ts,
+                points=points[:, :3],
+                frame_id=points_frame_id,
+                intensity=points[:, 3] if points.shape[1] > 3 else None,
+                source_metadata={"bag_path": self.bag_path, "topic": self.lidar_topic},
+            )
+            self.preview_ready.emit(image_frame, cloud_frame)
+            self.progress.emit(
+                f"Preview 로드 완료 (Δt camera-lidar = {(image_ts - points_ts) * 1000:.1f} ms)."
+            )
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"Bag preview 로드 실패: {e}")
+        finally:
+            self.finished.emit()
+
+
+class MultiSceneCalibrationWorker(QObject):
+    """여러 CapturedScene을 모아 Multi-Scene FAST-Calib(joint solve)를 GUI
+    스레드 밖에서 수행한다. 실제 계산은 camera_lidar.multi_scene에 있고,
+    여기서는 CameraLidarCalibrationWorker와 동일하게 호출/신호 변환만 담당한다."""
+
+    progress = Signal(str)
+    result_ready = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, captured_scenes: list, policy: str = "strict"):
+        super().__init__()
+        self.captured_scenes = captured_scenes
+        self.policy = policy
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(
+                f"Multi-Scene FAST-Calib 계산 중... ({self.policy.upper()} policy, "
+                f"{len(self.captured_scenes)}개 scene 중 included된 scene만 사용)"
+            )
+            result = calibrate_multi_scene(self.captured_scenes, policy=self.policy)
+            self.result_ready.emit(result)
+            if result.success:
+                self.progress.emit(
+                    f"Multi-Scene FAST-Calib 완료 ({result.scene_count} scenes, "
+                    f"residual RMSE {result.residual_rmse_m * 1000:.2f} mm)."
+                )
+            else:
+                self.progress.emit(f"Multi-Scene FAST-Calib 실패: {result.error_message}")
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"Multi-Scene FAST-Calib 계산 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
+class PolicyComparisonWorker(QObject):
+    """COMPARE BOTH: STRICT/FLEXIBLE Multi-Scene calibration을 각각 실행하고
+    두 결과 차이를 계산한다(camera_lidar.multi_scene.compare_strict_vs_flexible).
+    같은 solver를 두 번(다른 scene 부분집합으로) 돌리는 것뿐, 별도 solver를
+    구현하지 않는다는 원칙은 그대로 지킨다."""
+
+    progress = Signal(str)
+    result_ready = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, captured_scenes: list):
+        super().__init__()
+        self.captured_scenes = captured_scenes
+
+    def run(self) -> None:
+        try:
+            self.progress.emit("STRICT vs FLEXIBLE 비교 계산 중... (같은 solver를 두 scene 부분집합에 각각 적용)")
+            result = compare_strict_vs_flexible(self.captured_scenes)
+            self.result_ready.emit(result)
+            if result.strict_result.success and result.flexible_result.success:
+                self.progress.emit(f"비교 완료 (impact: {result.impact}).")
+            else:
+                self.progress.emit("비교 완료 (STRICT 또는 FLEXIBLE 중 하나 이상 실패).")
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(f"STRICT vs FLEXIBLE 비교 중 오류: {e}")
         finally:
             self.finished.emit()
 

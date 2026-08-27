@@ -28,11 +28,13 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 import cv2
+import numpy as np
 
 from calibration.ros_image_codec import decode_image_message
+from calibration.ros_pointcloud_codec import decode_pointcloud2_message
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,7 @@ except ImportError:  # rosbags는 선택적 의존성 - 설치 안 해도 나머
     ROSBAGS_AVAILABLE = False
 
 _IMAGE_MSG_TYPES = {"sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage"}
+_POINTCLOUD_MSG_TYPES = {"sensor_msgs/msg/PointCloud2"}
 
 
 def _portable_output_path(path: str) -> Path:
@@ -61,6 +64,20 @@ class BagImageTopic:
     name: str
     msg_type: str
     count: int
+
+
+@dataclass
+class TopicInfo:
+    """일반화된 bag 토픽 메타데이터(이름 + 메시지 타입 + 메시지 수).
+
+    BagImageTopic과 사실상 같은 모양이지만, list_image_topics의 기존
+    호출부(Camera Intrinsic의 "rosbag에서 불러오기")를 건드리지 않기 위해
+    BagImageTopic은 그대로 두고, 카메라/LiDAR 어느 쪽이든 쓸 수 있는
+    새 코드(list_pointcloud_topics 등)는 이 타입을 쓴다.
+    """
+    name: str
+    msg_type: str
+    count: int | None = None
 
 
 def _require_rosbags() -> None:
@@ -91,30 +108,144 @@ def _open_reader(bag_path: str) -> AnyReader:
     return AnyReader([Path(bag_path)], default_typestore=get_typestore(latest_store))
 
 
-def list_image_topics(bag_path: str) -> list[BagImageTopic]:
-    """bag 안에서 이미지 메시지 타입(Image/CompressedImage)인 토픽만 골라 반환.
+def _list_topics_by_type(bag_path: str, msg_types: set[str]) -> list[TopicInfo]:
+    """주어진 메시지 타입 집합에 속하는 토픽만 골라 반환하는 공용 헬퍼.
 
     같은 토픽이 멀티 커넥션(예: 여러 노드가 같은 토픽을 발행)으로 잡힐 수 있어
     토픽 이름 기준으로 메시지 수를 합산하고 중복 제거한다.
+    list_image_topics/list_pointcloud_topics가 이 헬퍼를 공유한다.
     """
     _require_rosbags()
-    logger.info("bag 열기 시도: %s", bag_path)
     counts: dict[str, int] = {}
     types: dict[str, str] = {}
 
     with _open_reader(bag_path) as reader:
         for conn in reader.connections:
-            if conn.msgtype not in _IMAGE_MSG_TYPES:
+            if conn.msgtype not in msg_types:
                 continue
             counts[conn.topic] = counts.get(conn.topic, 0) + conn.msgcount
             types[conn.topic] = conn.msgtype
 
-    topics = [
-        BagImageTopic(name=topic, msg_type=types[topic], count=counts[topic])
+    return [
+        TopicInfo(name=topic, msg_type=types[topic], count=counts[topic])
         for topic in sorted(counts)
     ]
-    logger.info("bag에서 이미지 토픽 %d개 발견: %s", len(topics), [t.name for t in topics])
+
+
+def list_image_topics(bag_path: str) -> list[BagImageTopic]:
+    """bag 안에서 이미지 메시지 타입(Image/CompressedImage)인 토픽만 골라 반환."""
+    logger.info("bag 열기 시도: %s", bag_path)
+    topics = _list_topics_by_type(bag_path, _IMAGE_MSG_TYPES)
+    result = [BagImageTopic(name=t.name, msg_type=t.msg_type, count=t.count or 0) for t in topics]
+    logger.info("bag에서 이미지 토픽 %d개 발견: %s", len(result), [t.name for t in result])
+    return result
+
+
+def list_pointcloud_topics(bag_path: str) -> list[TopicInfo]:
+    """bag 안에서 PointCloud2 메시지 타입인 토픽만 골라 반환 (list_image_topics의 LiDAR 버전)."""
+    logger.info("bag에서 PointCloud2 토픽 검색: %s", bag_path)
+    topics = _list_topics_by_type(bag_path, _POINTCLOUD_MSG_TYPES)
+    logger.info("bag에서 PointCloud2 토픽 %d개 발견: %s", len(topics), [t.name for t in topics])
     return topics
+
+
+def read_bag_duration(bag_path: str) -> float:
+    """bag 전체 duration(초). Camera/LiDAR Topic 선택 UI의 timeline scrubbing에 쓰인다."""
+    _require_rosbags()
+    with _open_reader(bag_path) as reader:
+        return max(0.0, reader.duration / 1e9)
+
+
+def _find_message_near_timestamp(bag_path: str, topic: str, msg_types: set[str], t_sec: float):
+    """`topic`의 메시지 중 (bag 시작 + t_sec)에 가장 가까운 timestamp를 가진
+    메시지 하나를 찾아 (역직렬화된 msg, msg_type, timestamp_ns)를 반환한다.
+    Timeline을 스크럽할 때 "그 시점 근처 프레임"을 보여주는 용도 -
+    extract_images_from_bag(전체를 시간 간격으로 샘플링해 디스크에 저장)과는
+    다른, 단발성 조회 함수다.
+    """
+    _require_rosbags()
+    with _open_reader(bag_path) as reader:
+        connections = [c for c in reader.connections if c.topic == topic]
+        if not connections:
+            raise ValueError(f"토픽 '{topic}'을 bag에서 찾을 수 없습니다.")
+        msg_type = connections[0].msgtype
+        if msg_type not in msg_types:
+            raise ValueError(f"토픽 '{topic}'의 메시지 타입이 예상과 다릅니다 ({msg_type}).")
+
+        target_ns = reader.start_time + int(t_sec * 1e9)
+        best = None
+        best_diff = None
+        for connection, timestamp, rawdata in reader.messages(connections=connections):
+            diff = abs(timestamp - target_ns)
+            if best_diff is None or diff < best_diff:
+                best_diff = diff
+                best = (connection, timestamp, rawdata)
+            elif timestamp > target_ns:
+                # 메시지는 시간순으로 온다고 가정 - 목표 시점을 지나쳤고 방금
+                # 최소값을 갱신하지 못했다면 더 가까워질 수 없으므로 중단.
+                break
+        if best is None:
+            raise ValueError(f"토픽 '{topic}'에 메시지가 없습니다.")
+
+        connection, timestamp, rawdata = best
+        msg = reader.deserialize(rawdata, connection.msgtype)
+        return msg, connection.msgtype, timestamp
+
+
+def extract_image_near_timestamp(bag_path: str, topic: str, t_sec: float) -> tuple[np.ndarray, float, str]:
+    """`topic`에서 t_sec(bag 시작 기준 초) 근처 이미지 프레임 하나를 디코딩해
+    (BGR ndarray, timestamp_sec, frame_id)로 반환한다."""
+    msg, msg_type, timestamp_ns = _find_message_near_timestamp(bag_path, topic, _IMAGE_MSG_TYPES, t_sec)
+    img = decode_image_message(msg, msg_type)
+    if img is None:
+        raise ValueError(f"토픽 '{topic}'의 t={t_sec:.3f}s 근처 프레임을 디코딩하지 못했습니다.")
+    frame_id = getattr(getattr(msg, "header", None), "frame_id", "") or ""
+    return img, timestamp_ns / 1e9, frame_id
+
+
+def extract_pointcloud_near_timestamp(bag_path: str, topic: str, t_sec: float) -> tuple[np.ndarray, float, str]:
+    """`topic`에서 t_sec(bag 시작 기준 초) 근처 PointCloud2 프레임 하나를
+    디코딩해 ((N,3) 또는 intensity 있으면 (N,4) ndarray, timestamp_sec, frame_id)로 반환한다."""
+    msg, _msg_type, timestamp_ns = _find_message_near_timestamp(bag_path, topic, _POINTCLOUD_MSG_TYPES, t_sec)
+    points = decode_pointcloud2_message(msg)
+    frame_id = getattr(getattr(msg, "header", None), "frame_id", "") or ""
+    return points, timestamp_ns / 1e9, frame_id
+
+
+def iterate_images(bag_path: str, topic: str) -> Iterator[tuple[np.ndarray, float, str]]:
+    """`topic`의 모든 이미지 프레임을 하나씩 디코딩해서 (BGR ndarray,
+    t_sec(bag 시작 기준 초), frame_id)로 yield하는 제너레이터.
+
+    extract_images_from_bag(시간 간격 샘플링 + 디스크에 .jpg 저장)과 달리
+    아무것도 건너뛰거나 저장하지 않는다 -- camera_lidar.scene_extraction의
+    Stable Scene Segment 탐지(연속 프레임 사이의 marker ID/자세 전환을
+    보는 것)는 전체 프레임이 필요하기 때문이다. t_sec는
+    extract_image_near_timestamp가 받는 인자(bag 시작 기준 상대 초)와 같은
+    기준이라, 여기서 얻은 timestamp를 그대로 extract_pointcloud_near_timestamp
+    에 넘겨 LiDAR 프레임과 짝지을 수 있다.
+    """
+    _require_rosbags()
+    with _open_reader(bag_path) as reader:
+        connections = [c for c in reader.connections if c.topic == topic]
+        if not connections:
+            raise ValueError(f"토픽 '{topic}'을 bag에서 찾을 수 없습니다.")
+        msg_type = connections[0].msgtype
+        if msg_type not in _IMAGE_MSG_TYPES:
+            raise ValueError(f"토픽 '{topic}'은 이미지 타입이 아닙니다 ({msg_type}).")
+        start_time = reader.start_time
+
+        for connection, timestamp, rawdata in reader.messages(connections=connections):
+            try:
+                msg = reader.deserialize(rawdata, connection.msgtype)
+                img = decode_image_message(msg, connection.msgtype)
+            except Exception:  # noqa: BLE001 -- one malformed/corrupt message must not kill (or, worse, hang on) a whole-bag scan
+                logger.warning("프레임 디코딩 중 예외 발생, 건너뜀 (t=%s)", timestamp, exc_info=True)
+                continue
+            if img is None:
+                continue
+            frame_id = getattr(getattr(msg, "header", None), "frame_id", "") or ""
+            t_sec = (timestamp - start_time) / 1e9
+            yield img, t_sec, frame_id
 
 
 def extract_images_from_bag(
