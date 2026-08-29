@@ -29,6 +29,10 @@ this module to calibration.rosbag_reader for the Bag pathway.
 
 from __future__ import annotations
 
+import os
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Iterable, Optional
 
 import numpy as np
@@ -194,6 +198,8 @@ def build_scene_candidates(
     progress_callback: Optional[Callable[[str], None]] = None,
     frame_progress_callback: Optional[Callable[[int, int], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    pair_lidar: bool = True,
+    detector_workers: int = 1,
 ) -> tuple[list[SceneCandidate], ExtractionDiagnosticSummary]:
     """Single streaming pass over `frames_factory()`: detects the camera
     target on each frame, tracks Stable Scene Segment boundaries online
@@ -226,6 +232,15 @@ def build_scene_candidates(
     with a stage-by-stage funnel explaining where the data was lost, not a
     bare empty list.
 
+    If `pair_lidar` is False, candidate creation intentionally skips
+    `cloud_lookup`; callers can load the nearest LiDAR frame later only for
+    the candidates the user actually selects. This keeps camera-only marker
+    extraction fast on bags that produce many candidate segments.
+
+    `detector_workers` can parallelize per-frame ArUco detection while
+    preserving ordered segmentation. Every frame still uses the same
+    full-resolution detector; only scheduling changes.
+
     `cancel_check` (checked every frame): a scan over a large bag can take a
     long time with no way to know in advance how long -- without this there
     was no way to stop one short of killing the whole app (a real user-
@@ -253,9 +268,10 @@ def build_scene_candidates(
             scene_type = classify_candidate(camera_result, target)
             if scene_type != SceneType.INVALID:
                 cloud_points, cloud_timestamp_s = None, None
-                looked_up = cloud_lookup(rep_timestamp_s)
-                if looked_up is not None:
-                    cloud_points, cloud_timestamp_s = looked_up
+                if pair_lidar:
+                    looked_up = cloud_lookup(rep_timestamp_s)
+                    if looked_up is not None:
+                        cloud_points, cloud_timestamp_s = looked_up
                 candidates.append(SceneCandidate(
                     candidate_id=f"candidate_{len(candidates) + 1:03d}",
                     segment_start_s=segment_start_s,
@@ -275,33 +291,35 @@ def build_scene_candidates(
         segment_start_s, segment_end_s, best_in_segment = None, None, None
 
     processed = 0
-    for image, timestamp_s, _frame_id in frames_factory():
-        if cancel_check is not None and cancel_check():
-            _finalize_open_segment()
-            if progress_callback is not None:
-                progress_callback(f"Marker extraction cancelled after {processed} frame(s) scanned.")
-            break
+    start_monotonic = time.monotonic()
 
-        camera_result = detect_camera_target(image, intrinsics, target)
+    def _process_detection(image: np.ndarray, timestamp_s: float, camera_result: CameraDetectionResult) -> None:
+        nonlocal processed, segment_start_s, segment_end_s, best_in_segment
         tracker.observe(camera_result)
         processed += 1
         if frame_progress_callback is not None:
             frame_progress_callback(processed, total_frames or 0)
         if progress_callback is not None and processed % 20 == 0:
+            elapsed_s = time.monotonic() - start_monotonic
+            rate = processed / elapsed_s if elapsed_s > 0 else 0.0
+            elapsed_text = f"elapsed {elapsed_s:.1f}s, {rate:.1f} fps"
             if total_frames:
                 pct = processed / total_frames * 100.0
                 progress_callback(
                     f"Scanning camera topic... {processed}/{total_frames} frames ({pct:.0f}%), "
-                    f"{len(candidates)} candidate(s) so far"
+                    f"{len(candidates)} candidate(s) so far, {elapsed_text}"
                 )
             else:
-                progress_callback(f"Scanning camera topic... {processed} frames processed, {len(candidates)} candidate(s) so far")
+                progress_callback(
+                    f"Scanning camera topic... {processed} frames processed, "
+                    f"{len(candidates)} candidate(s) so far, {elapsed_text}"
+                )
 
         qualifies = camera_result.success and len(camera_result.detected_ids) >= 3
         if not qualifies:
             _finalize_open_segment()
             boundary.reset()
-            continue
+            return
 
         starts_new = boundary.observe(camera_result.detected_ids, _stability_pose(camera_result))
         if starts_new:
@@ -315,14 +333,61 @@ def build_scene_candidates(
         if best_in_segment is None or score > best_in_segment[0]:
             best_in_segment = (score, timestamp_s, camera_result, image.copy())
 
-    else:
-        # Loop completed without a cancel-triggered break -- flush whatever
-        # segment was still open at end of stream.
+    def _cancel_progress() -> None:
         _finalize_open_segment()
+        if progress_callback is not None:
+            progress_callback(f"Marker extraction cancelled after {processed} frame(s) scanned.")
+
+    detector_workers = max(1, min(int(detector_workers or 1), os.cpu_count() or 1))
+    if detector_workers > 1:
+        pending = deque()
+        max_pending = detector_workers * 2
+        cancelled = False
+
+        def _detect(image: np.ndarray) -> CameraDetectionResult:
+            return detect_camera_target(image, intrinsics, target)
+
+        with ThreadPoolExecutor(max_workers=detector_workers) as executor:
+            for image, timestamp_s, _frame_id in frames_factory():
+                if cancel_check is not None and cancel_check():
+                    cancelled = True
+                    break
+                pending.append((image, timestamp_s, executor.submit(_detect, image)))
+                while len(pending) >= max_pending:
+                    pending_image, pending_timestamp_s, future = pending.popleft()
+                    _process_detection(pending_image, pending_timestamp_s, future.result())
+            while pending:
+                if cancel_check is not None and cancel_check():
+                    cancelled = True
+                    break
+                pending_image, pending_timestamp_s, future = pending.popleft()
+                _process_detection(pending_image, pending_timestamp_s, future.result())
+
+        if cancelled:
+            _cancel_progress()
+        else:
+            _finalize_open_segment()
+    else:
+        for image, timestamp_s, _frame_id in frames_factory():
+            if cancel_check is not None and cancel_check():
+                _cancel_progress()
+                break
+
+            camera_result = detect_camera_target(image, intrinsics, target)
+            _process_detection(image, timestamp_s, camera_result)
+        else:
+            # Loop completed without a cancel-triggered break -- flush whatever
+            # segment was still open at end of stream.
+            _finalize_open_segment()
 
     summary = tracker.finalize(segment_count, candidates)
+    summary.lidar_pairing_deferred = not pair_lidar
 
     if progress_callback is not None:
-        progress_callback(f"Marker extraction complete: {len(candidates)} candidate scene(s) found.")
+        elapsed_s = time.monotonic() - start_monotonic
+        progress_callback(
+            f"Marker extraction complete: {len(candidates)} candidate scene(s) found "
+            f"in {elapsed_s:.1f}s."
+        )
 
     return candidates, summary

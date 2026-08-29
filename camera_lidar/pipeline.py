@@ -29,7 +29,7 @@ CalibrationScene from whatever source they read.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -50,6 +50,7 @@ def calibrate_single_scene(
     scene: CalibrationScene,
     roi_mode: str = "manual",
     reference_transform: Optional[tuple[np.ndarray, np.ndarray]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> CameraLidarCalibrationResult:
     """roi_mode: "manual" uses scene.roi (a caller-set box, via
     lidar_detector.detect_lidar_target); "auto" ignores scene.roi and runs
@@ -68,10 +69,15 @@ def calibrate_single_scene(
             success=False, failure_reason=camera_result.failure_reason, camera_detection=camera_result,
         )
 
+    if cancel_check is not None and cancel_check():
+        return CameraLidarCalibrationResult(
+            success=False, failure_reason=FailureReason.CANCELLED, camera_detection=camera_result,
+        )
+
     if roi_mode == "auto":
-        lidar_result = detect_lidar_target_auto(scene.cloud, scene.target)
+        lidar_result = detect_lidar_target_auto(scene.cloud, scene.target, cancel_check=cancel_check)
     else:
-        lidar_result = detect_lidar_target(scene.cloud, scene.roi, scene.target)
+        lidar_result = detect_lidar_target(scene.cloud, scene.roi, scene.target, cancel_check=cancel_check)
     if not lidar_result.success:
         return CameraLidarCalibrationResult(
             success=False, failure_reason=lidar_result.failure_reason,

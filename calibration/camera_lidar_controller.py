@@ -20,8 +20,13 @@ from camera_lidar.types import CalibrationScene, CameraLidarCalibrationResult, S
 
 
 class CameraLidarController:
-    def calibrate(self, scene: CalibrationScene, roi_mode: str = "manual") -> CameraLidarCalibrationResult:
-        return calibrate_single_scene(scene, roi_mode=roi_mode)
+    def calibrate(
+        self,
+        scene: CalibrationScene,
+        roi_mode: str = "manual",
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> CameraLidarCalibrationResult:
+        return calibrate_single_scene(scene, roi_mode=roi_mode, cancel_check=cancel_check)
 
     def extract_scene_candidates(
         self,
@@ -33,6 +38,8 @@ class CameraLidarController:
         progress_callback: Optional[Callable[[str], None]] = None,
         frame_progress_callback: Optional[Callable[[int, int], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
+        pair_lidar: bool = True,
+        detector_workers: int = 1,
     ) -> tuple[list[SceneCandidate], ExtractionDiagnosticSummary]:
         """Bag-wide MARKER EXTRACTION scan (camera_lidar.scene_extraction is
         ROS-independent and never imports calibration.rosbag_reader itself --
@@ -70,4 +77,6 @@ class CameraLidarController:
             progress_callback=progress_callback,
             frame_progress_callback=frame_progress_callback,
             cancel_check=cancel_check,
+            pair_lidar=pair_lidar,
+            detector_workers=detector_workers,
         )

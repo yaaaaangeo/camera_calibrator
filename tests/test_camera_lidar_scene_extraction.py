@@ -276,3 +276,27 @@ def test_build_scene_candidates_keeps_candidate_when_no_lidar_pairing_found(monk
     assert candidates[0].cloud_points is None
     assert candidates[0].cloud_timestamp_s is None
     assert summary.candidates_missing_lidar_pairing == 1
+
+
+def test_build_scene_candidates_can_defer_lidar_pairing(monkeypatch):
+    result = _make_camera_result(CORNER_ORDER)
+    monkeypatch.setattr("camera_lidar.scene_extraction.detect_camera_target", lambda image, intrinsics, target: result)
+
+    def frames_factory():
+        yield _fake_frame(0), 0.0, "frame_0"
+
+    def cloud_lookup(_t_sec):
+        raise AssertionError("LiDAR lookup should be deferred during marker extraction")
+
+    candidates, summary = build_scene_candidates(
+        frames_factory=frames_factory,
+        camera_topic="/cam",
+        lidar_topic="/lidar",
+        intrinsics=object(),
+        target=TargetConfig(),
+        cloud_lookup=cloud_lookup,
+        pair_lidar=False,
+    )
+    assert len(candidates) == 1
+    assert candidates[0].cloud_points is None
+    assert summary.lidar_pairing_deferred is True

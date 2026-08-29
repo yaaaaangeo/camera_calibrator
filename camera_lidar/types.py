@@ -78,6 +78,7 @@ class CalibrationScene:
 
 
 class FailureReason(Enum):
+    CANCELLED = "cancelled"
     CAMERA_MARKER_NOT_FOUND = "camera_marker_not_found"
     LIDAR_PLANE_NOT_FOUND = "lidar_plane_not_found"
     INSUFFICIENT_ROI_POINTS = "insufficient_roi_points"
@@ -89,6 +90,7 @@ class FailureReason(Enum):
 
 
 _FAILURE_MESSAGES: dict[FailureReason, str] = {
+    FailureReason.CANCELLED: "Calibration cancelled by user.",
     FailureReason.CAMERA_MARKER_NOT_FOUND: (
         "Camera marker detection failed: could not detect enough ArUco markers "
         "on the target board. Ensure the board is fully visible, in focus, and "

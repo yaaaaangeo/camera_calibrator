@@ -1,0 +1,12 @@
+marker_size: 0.2
+delta_width_qr_center: 0.55
+delta_height_qr_center: 0.35
+delta_width_circles: 0.5
+delta_height_circles: 0.4
+circle_radius: 0.12
+aruco_dictionary: DICT_6X6_250
+marker_ids:
+  top_left: 1
+  top_right: 2
+  bottom_right: 3
+  bottom_left: 4

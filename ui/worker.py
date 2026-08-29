@@ -28,6 +28,7 @@ OS 프로세스에서 실행한다 - 그 프로세스는 자기만의 GIL을 가
 
 from __future__ import annotations
 
+import os
 import time
 import threading
 import traceback
@@ -88,6 +89,7 @@ def _wait_with_heartbeat(future, progress_signal, label: str):
             return future.result(timeout=_HEARTBEAT_SEC)
         except FutureTimeoutError:
             elapsed = time.monotonic() - start
+            self.progress.emit(f"FAST-Calib elapsed {elapsed:.1f}s.")
             progress_signal.emit(f"{label} ({elapsed:.0f}초 경과 - 계산 중입니다)")
 
 
@@ -207,6 +209,7 @@ class PipelineWorker(QObject):
         self.dataset: Dataset | None = None
 
     def run(self) -> None:
+        start = time.monotonic()
         try:
             self.progress.emit(f"{len(self.image_paths)}장 이미지에서 ChArUco 코너 검출 중...")
             self.progress_value.emit(0, len(self.image_paths))
@@ -331,6 +334,7 @@ class OutlierPruneWorker(QObject):
         self.use_rational_model = use_rational_model
 
     def run(self) -> None:
+        start = time.monotonic()
         try:
             self.progress.emit(f"{self.reference_model.value} 기준으로 이상치 탐지 및 반복 재계산 중...")
             # 이상치 반복 재계산 + 3모델 재계산 + Hold-out 재검증까지 전부
@@ -414,6 +418,7 @@ class CrossDatasetValidationWorker(QObject):
         self.source_dataset_id = source_dataset_id
 
     def run(self) -> None:
+        start = time.monotonic()
         try:
             target_datasets: dict[str, Dataset] = {}
             for dataset_id, paths in self.target_image_paths.items():
@@ -566,6 +571,7 @@ class ExternalComparisonWorker(QObject):
                     future, self.progress, "External Compare 계산 중...",
                 )
             self.result_ready.emit(result)
+            elapsed = time.monotonic() - start
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"External Compare 계산 중 오류: {e}")
         finally:
@@ -782,12 +788,22 @@ class CameraLidarCalibrationWorker(QObject):
         super().__init__()
         self.scene = scene
         self.roi_mode = roi_mode
+        self._cancelled = False
+
+    def request_cancel(self) -> None:
+        self._cancelled = True
 
     def run(self) -> None:
+        start = time.monotonic()
         try:
             self.progress.emit("FAST-Calib 계산 중... (marker/plane 검출 -> correspondence -> R,t 계산)")
-            result = CameraLidarController().calibrate(self.scene, roi_mode=self.roi_mode)
+            result = CameraLidarController().calibrate(
+                self.scene,
+                roi_mode=self.roi_mode,
+                cancel_check=lambda: self._cancelled,
+            )
             self.result_ready.emit(result)
+            elapsed = time.monotonic() - start
             if result.success:
                 self.progress.emit(f"FAST-Calib 완료 (residual RMSE {result.residual_rmse_m * 1000:.2f} mm).")
             else:
@@ -814,13 +830,23 @@ class SceneExtractionWorker(QObject):
     error = Signal(str)
     finished = Signal()
 
-    def __init__(self, bag_path: str, camera_topic: str, lidar_topic: str, intrinsics, target):
+    def __init__(
+        self,
+        bag_path: str,
+        camera_topic: str,
+        lidar_topic: str,
+        intrinsics,
+        target,
+        pair_lidar: bool = False,
+    ):
         super().__init__()
         self.bag_path = bag_path
         self.camera_topic = camera_topic
         self.lidar_topic = lidar_topic
         self.intrinsics = intrinsics
         self.target = target
+        self.pair_lidar = pair_lidar
+        self.detector_workers = min(4, os.cpu_count() or 1)
         self._cancelled = False
 
     def request_cancel(self) -> None:
@@ -837,6 +863,8 @@ class SceneExtractionWorker(QObject):
                 progress_callback=self.progress.emit,
                 frame_progress_callback=self.progress_value.emit,
                 cancel_check=lambda: self._cancelled,
+                pair_lidar=self.pair_lidar,
+                detector_workers=self.detector_workers,
             )
             self.candidates_ready.emit(candidates)
             self.summary_ready.emit(summary)

@@ -33,7 +33,12 @@ from camera_lidar.camera_detector import (
     render_marker_overlay,
 )
 from camera_lidar.correspondence import match_centers, match_partial_centers
-from camera_lidar.lidar_detector import LidarDetectionResult, detect_lidar_target, detect_lidar_target_auto
+from camera_lidar.lidar_detector import (
+    LidarDetectionResult,
+    _extract_boundary,
+    detect_lidar_target,
+    detect_lidar_target_auto,
+)
 from camera_lidar.multi_scene import calibrate_multi_scene, compare_strict_vs_flexible
 from camera_lidar.pipeline import calibrate_single_scene
 from camera_lidar.solver import compute_residuals, solve_rigid_transform
@@ -226,6 +231,32 @@ def test_lidar_detector_insufficient_roi_points():
     result = detect_lidar_target(cloud, ROIConfig(), target)
     assert not result.success
     assert result.failure_reason == FailureReason.INSUFFICIENT_ROI_POINTS
+
+
+def test_boundary_extraction_uses_streaming_neighbor_queries(monkeypatch):
+    """Dense LiDAR frames must not build one huge all-points neighbor query.
+
+    The old batched query path could require memory proportional to the
+    square of the plane-point count before boundary classification started.
+    """
+    import camera_lidar.lidar_detector as lidar_detector_module
+
+    class StreamingOnlyTree:
+        def __init__(self, points):
+            self.points = np.asarray(points)
+
+        def query_ball_point(self, point, radius):
+            assert np.asarray(point).ndim == 1
+            dist = np.linalg.norm(self.points - point, axis=1)
+            return list(np.flatnonzero(dist <= radius))
+
+    monkeypatch.setattr(lidar_detector_module, "cKDTree", StreamingOnlyTree)
+
+    grid = np.array([[x, y] for x in range(4) for y in range(4)], dtype=float)
+    boundary = _extract_boundary(grid, radius=1.1)
+
+    assert boundary.shape == (16,)
+    assert boundary.dtype == bool
 
 
 def test_lidar_detector_auto_finds_board_among_decoy_planes():

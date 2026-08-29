@@ -21,7 +21,7 @@ import time
 
 import cv2
 import numpy as np
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from calibration.calibration_io import StandardCalibration, load_standard_calibration
+from calibration.rosbag_reader import extract_pointcloud_near_timestamp
 from camera_lidar.camera_detector import COMMON_ARUCO_DICTIONARIES, detect_camera_target
 from camera_lidar.gates import compute_target_pose, evaluate_duplicate_gate, evaluate_quality_gate
 from camera_lidar.pipeline import calibrate_single_scene
@@ -50,6 +51,7 @@ from camera_lidar.target_config import CORNER_ORDER, TargetConfig, load_target_c
 from camera_lidar.types import (
     CalibrationScene,
     CapturedScene,
+    FailureReason,
     ImageFrame,
     PointCloudFrame,
     ROIConfig,
@@ -126,6 +128,10 @@ class CameraLidarWorkspace(QWidget):
         self._extraction_thread = None
         self._extraction_worker = None
         self._pending_candidate_queue: list = []
+        self._capture_start_time: float | None = None
+        self._capture_timer = QTimer(self)
+        self._capture_timer.setInterval(1000)
+        self._capture_timer.timeout.connect(self._update_capture_elapsed)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 6, 8, 6)
@@ -612,29 +618,25 @@ class CameraLidarWorkspace(QWidget):
         self.scene_browser.show_detector_test_result(self.image, result, expected_ids)
 
     def _on_add_selected_candidates(self, candidates: list) -> None:
-        usable = [c for c in candidates if c.cloud_points is not None]
-        skipped = len(candidates) - len(usable)
-        if skipped:
-            QMessageBox.warning(
-                self, "LiDAR 페어링 없음",
-                f"{skipped}개 candidate는 근처에서 LiDAR 프레임을 찾지 못해 Scene Manager에 추가하지 못합니다.",
-            )
-        if not usable:
+        if not candidates:
             return
 
         # Sensor-pair-changed confirmation once for the whole batch -- all
         # selected candidates share one extraction run's camera/lidar topic
         # pair, so asking per-candidate would pop a dialog for every scene.
-        self.camera_topic, self.lidar_topic = usable[0].camera_topic, usable[0].lidar_topic
+        self.camera_topic, self.lidar_topic = candidates[0].camera_topic, candidates[0].lidar_topic
         if not self._confirm_sensor_pair_if_changed():
             return
 
-        self._pending_candidate_queue = usable
+        self._pending_candidate_queue = list(candidates)
         self.scene_browser.add_selected_button.setEnabled(False)
         self._process_next_candidate_in_queue()
 
     def _process_next_candidate_in_queue(self) -> None:
         if not self._pending_candidate_queue:
+            self._worker = None
+            self._thread = None
+            self._set_capture_busy(False)
             self.scene_browser.set_candidates(self.scene_browser.candidates)  # refresh Selected/Add-button state
             return
         candidate = self._pending_candidate_queue.pop(0)
@@ -644,6 +646,36 @@ class CameraLidarWorkspace(QWidget):
         roi = self._current_roi()
         points = candidate.cloud_points
         cloud_timestamp = candidate.cloud_timestamp_s if candidate.cloud_timestamp_s is not None else candidate.representative_timestamp_s
+        if points is None:
+            bag_path = self.bag_source.bag_path
+            if not bag_path:
+                QMessageBox.warning(
+                    self,
+                    "LiDAR 페어링 없음",
+                    f"{candidate.candidate_id}의 LiDAR frame을 읽을 bag 경로를 찾지 못했습니다.",
+                )
+                self._process_next_candidate_in_queue()
+                return
+            try:
+                self.scene_browser.set_progress_text(
+                    f"Loading LiDAR frame for {candidate.candidate_id} at "
+                    f"t={candidate.representative_timestamp_s:.2f}s..."
+                )
+                points, cloud_timestamp, _frame_id = extract_pointcloud_near_timestamp(
+                    bag_path,
+                    candidate.lidar_topic,
+                    candidate.representative_timestamp_s,
+                )
+                candidate.cloud_points = points
+                candidate.cloud_timestamp_s = cloud_timestamp
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.warning(
+                    self,
+                    "LiDAR 페어링 실패",
+                    f"{candidate.candidate_id} 근처 LiDAR frame을 읽지 못했습니다:\n{e}",
+                )
+                self._process_next_candidate_in_queue()
+                return
 
         self.image = candidate.image
         self.cloud_points = points
@@ -670,6 +702,7 @@ class CameraLidarWorkspace(QWidget):
         worker.error.connect(self._on_error)
         thread.finished.connect(self._process_next_candidate_in_queue)
         self._thread, self._worker = thread, worker
+        self._set_capture_busy(True)
         thread.start()
 
     # ------------------------------------------------------------------
@@ -688,6 +721,12 @@ class CameraLidarWorkspace(QWidget):
         self.capture_button.clicked.connect(self._on_capture_scene)
         outer.addWidget(self.capture_button)
 
+        self.cancel_capture_button = QPushButton("CANCEL")
+        self.cancel_capture_button.setEnabled(False)
+        self.cancel_capture_button.setVisible(False)
+        self.cancel_capture_button.clicked.connect(self._on_cancel_capture)
+        outer.addWidget(self.cancel_capture_button)
+
         self.diagnostics_text = QPlainTextEdit()
         self.diagnostics_text.setReadOnly(True)
         self.diagnostics_text.setMinimumHeight(160)
@@ -704,7 +743,38 @@ class CameraLidarWorkspace(QWidget):
 
     def _update_capture_enabled(self) -> None:
         ready = self.intrinsics is not None and self.image is not None and self.cloud_points is not None
-        self.capture_button.setEnabled(ready)
+        self.capture_button.setEnabled(ready and self._worker is None)
+
+    def _set_capture_busy(self, busy: bool) -> None:
+        self.capture_button.setEnabled(False if busy else (
+            self.intrinsics is not None and self.image is not None and self.cloud_points is not None
+        ))
+        self.cancel_capture_button.setVisible(busy)
+        self.cancel_capture_button.setEnabled(busy)
+        self.cancel_capture_button.setText("CANCEL")
+        if busy:
+            self._capture_start_time = time.monotonic()
+            self._capture_timer.start()
+            self._update_capture_elapsed()
+        else:
+            self._capture_timer.stop()
+            self._capture_start_time = None
+
+    def _update_capture_elapsed(self) -> None:
+        if self._capture_start_time is None or self._worker is None:
+            return
+        elapsed = time.monotonic() - self._capture_start_time
+        self.capture_ready_label.setText(f"FAST-Calib running... elapsed {elapsed:.0f}s")
+
+    def _on_cancel_capture(self) -> None:
+        worker = self._worker
+        if worker is None or not hasattr(worker, "request_cancel"):
+            return
+        self._pending_candidate_queue = []
+        worker.request_cancel()
+        self.cancel_capture_button.setEnabled(False)
+        self.cancel_capture_button.setText("CANCELLING...")
+        self.result_text.setPlainText("Cancelling FAST-Calib... waiting for the current compute step to stop.")
 
     def _on_capture_scene(self) -> None:
         if self.intrinsics is None or self.image is None or self.cloud_points is None:
@@ -734,8 +804,10 @@ class CameraLidarWorkspace(QWidget):
         worker.result_ready.connect(self._on_capture_result_ready)
         worker.error.connect(self._on_error)
         self._thread, self._worker = thread, worker
-        self.capture_button.setEnabled(False)
-        thread.finished.connect(self._update_capture_enabled)
+        self._set_capture_busy(True)
+        thread.finished.connect(lambda: setattr(self, "_worker", None))
+        thread.finished.connect(lambda: setattr(self, "_thread", None))
+        thread.finished.connect(lambda: self._set_capture_busy(False))
         thread.start()
 
     def _confirm_sensor_pair_if_changed(self) -> bool:
@@ -761,12 +833,18 @@ class CameraLidarWorkspace(QWidget):
         return reply == QMessageBox.Yes
 
     def _on_progress(self, message: str) -> None:
-        pass  # progress text is short-lived; diagnostics/result panels are the durable record
+        if message:
+            self.capture_ready_label.setText(message)
 
     def _on_error(self, message: str) -> None:
         QMessageBox.critical(self, "FAST-Calib 오류", message)
 
     def _on_capture_result_ready(self, result) -> None:
+        if result.failure_reason == FailureReason.CANCELLED:
+            self.diagnostics_text.setPlainText(self._format_diagnostics(result))
+            self.result_text.setPlainText("FAST-Calib cancelled.")
+            return
+
         gate_lines: list[str] = []
         included = result.success
         if result.success:
@@ -849,6 +927,13 @@ class CameraLidarWorkspace(QWidget):
                 lines.append(f"  Plane candidates tried: {lidar.plane_candidate_count} "
                               f"(selected index {lidar.selected_plane_index})")
             lines.append(f"  Plane Inliers: {lidar.plane_inlier_count} ({lidar.plane_inlier_ratio * 100:.1f}%)")
+            if lidar.plane_centroid is not None:
+                cx, cy, cz = lidar.plane_centroid
+                lines.append(f"  Plane Centroid: ({cx:.2f}, {cy:.2f}, {cz:.2f}) m  "
+                             f"[range {np.linalg.norm(lidar.plane_centroid):.2f} m from sensor]")
+            if lidar.plane_normal is not None:
+                nx, ny, nz = lidar.plane_normal
+                lines.append(f"  Plane Normal: ({nx:.3f}, {ny:.3f}, {nz:.3f})")
             lines.append(f"  Boundary Points: {lidar.boundary_point_count}")
             lines.append(f"  Circles: {lidar.valid_circle_count} / 4 "
                          f"({lidar.circle_candidate_count} candidates)")

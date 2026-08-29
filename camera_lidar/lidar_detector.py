@@ -34,7 +34,8 @@ rotation/direction ambiguity against the camera-side centers.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from itertools import combinations
+from typing import Callable, Optional
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -44,27 +45,74 @@ from camera_lidar.target_config import TargetConfig
 from camera_lidar.types import FailureReason, PointCloudFrame, ROIConfig
 
 _MIN_ROI_POINTS = 30
+_MIN_ROI_POINTS_FLOOR = 12
 _PLANE_RANSAC_ITERS = 500
 _PLANE_INLIER_THRESHOLD_M = 0.02
 _MIN_PLANE_INLIER_RATIO = 0.3
+_PLANE_RANSAC_MAX_HYPOTHESIS_POINTS = 60_000
+# Voxel size RANSAC hypothesis/voting is run at (before the final refine
+# step, see `refine_points` in _fit_plane_ransac) -- normalizes point density
+# so a merged multi-scan cloud's inlier counts/ratios aren't biased by
+# whichever region of a candidate plane happens to have denser overlap.
+_RANSAC_VOXEL_SIZE_M = _PLANE_INLIER_THRESHOLD_M
 _BOUNDARY_NEIGHBOR_RADIUS_M = 0.05
 _BOUNDARY_MIN_NEIGHBORS = 4
 _BOUNDARY_ANGULAR_GAP_RAD = np.pi / 2.0
 _CLUSTER_EPS_M = 0.05
 _MIN_CLUSTER_SIZE = 8
+_MIN_CLUSTER_SIZE_FLOOR = 5
 _CIRCLE_FIT_MAX_ERROR_M = 0.02
 _CIRCLE_RADIUS_TOLERANCE_RATIO = 0.5
 _RECTANGLE_EDGE_TOLERANCE_RATIO = 0.3
+_BOUNDARY_RADIUS_SCALES = (1.0, 0.75, 0.5, 1.25, 1.5)
+_CLUSTER_EPS_SCALES = (1.0, 0.75, 0.5, 1.25)
+_MAX_GEOMETRY_CANDIDATES = 12
 # 4 = VALID_FULL, 3 = VALID_PARTIAL (gated downstream by camera_lidar.gates),
 # <3 is not enough to even attempt a rigid-transform correspondence.
 _MIN_VALID_CIRCLES = 3
+
+# Density-adaptive parameter estimation (see _estimate_point_spacing /
+# _estimate_ambient_spacing_3d / _adaptive_min_point_count): a single set of
+# fixed-metric constants can't fit both a sparse single 64-channel scan and a
+# densely merged multi-scan cloud, so boundary/cluster/count thresholds are
+# derived from the point cloud's own local spacing at detection time, and
+# only clipped into [floor, default-above-constant] so already-working dense
+# cases keep their original behavior.
+_SPACING_ESTIMATE_K = 5
+_MIN_ESTIMATED_SPACING_M = 0.001
+_MAX_ESTIMATED_SPACING_M = _BOUNDARY_NEIGHBOR_RADIUS_M * 3.0
+_BOUNDARY_RADIUS_SPACING_MULTIPLIER = 2.5
+_CLUSTER_EPS_SPACING_MULTIPLIER = 2.0
+_MIN_CLUSTER_SIZE_CIRCUMFERENCE_FRACTION = 0.3
+_SPACING_ESTIMATE_K_3D = 5
+_SPACING_ESTIMATE_MAX_SAMPLE = 5_000
+_EXPECTED_POINT_COUNT_COVERAGE = 0.25
 
 # AUTO ROI searches the whole cloud, which is typically much larger than a
 # hand-set MANUAL ROI box -- a plane candidate needs fewer inliers relative
 # to the whole cloud to still be worth pursuing (a small board is a small
 # fraction of a full scene), but still enough to fit a plane/circles reliably.
-_AUTO_MAX_PLANES_DEFAULT = 6
+# A cluttered real scene (room/vehicle interior) can easily have more than 6
+# large flat surfaces (floor, ceiling, several walls, vehicle body panels)
+# competing with the board for RANSAC's largest-plane-first ordering -- 6 was
+# tuned against small synthetic/lab scenes and can exhaust its budget before
+# ever reaching the board's own (much smaller) plane. Extent-rejected decoy
+# planes (_plane_extent_exceeds_auto_search_window) skip the expensive
+# boundary-tracing stage, so searching deeper is cheap.
+_AUTO_MAX_PLANES_DEFAULT = 20
 _AUTO_MIN_PLANE_INLIERS = 60
+_AUTO_MIN_PLANE_INLIERS_FLOOR = 20
+_AUTO_PLANE_EXTENT_SCALE = 3.0
+_AUTO_MIN_PLANE_EXTENT_LIMIT_M = 2.0
+
+
+class _Cancelled(Exception):
+    pass
+
+
+def _check_cancel(cancel_check: Optional[Callable[[], bool]]) -> None:
+    if cancel_check is not None and cancel_check():
+        raise _Cancelled
 
 
 @dataclass
@@ -77,6 +125,12 @@ class LidarDetectionResult:
     plane_inlier_count: int = 0
     plane_inlier_ratio: float = 0.0
     plane_normal: Optional[np.ndarray] = None
+    # Mean of the plane's own inlier points (LiDAR frame) -- lets a caller
+    # sanity-check "is this plane actually where the board should be" (near
+    # the sensor, roughly in front of the camera) vs. a decoy environmental
+    # surface (a wall/floor centroid is typically much farther out) without
+    # needing the full inlier point array.
+    plane_centroid: Optional[np.ndarray] = None
     boundary_point_count: int = 0
     circle_candidate_count: int = 0
     valid_circle_count: int = 0
@@ -88,6 +142,35 @@ class LidarDetectionResult:
     selected_plane_index: Optional[int] = None
 
 
+@dataclass
+class PlaneCandidateInfo:
+    """Diagnostic snapshot of ONE plane candidate tried by
+    detect_lidar_target_auto's plane-peeling search -- passed to the
+    optional `on_plane_candidate` callback for every candidate (not just the
+    one eventually selected), so a caller can inspect why AUTO ROI picked
+    the plane it did instead of the board (e.g. "candidate 0 is a huge, far
+    plane that got extent-rejected before boundary tracing ever ran")."""
+    index: int
+    centroid: np.ndarray                       # (3,) LiDAR frame
+    normal: np.ndarray                         # (3,) unit normal, LiDAR frame
+    inlier_count: int
+    inlier_ratio: float                        # inlier_count / whole-cloud point count
+    extent_xy: tuple[float, float]              # plane-aligned in-plane (width, height)
+    extent_rejected: bool                      # True if too large to be the board -- circle detection was skipped entirely
+    points: np.ndarray                         # (inlier_count, 3) LiDAR frame, for export/visualization
+    stage: Optional[_CircleStageResult] = None  # None iff extent_rejected
+
+
+def _finite_points(points: np.ndarray) -> np.ndarray:
+    """Drops NaN/Inf rows. Real LiDAR drivers commonly pad organized/no-return
+    points with NaN (or, on MANUAL ROI, these already get excluded implicitly
+    since `_apply_roi`'s >=/<= comparisons are False for NaN) -- but AUTO ROI
+    has no ROI box to filter through, so without this, invalid points would
+    reach the ambient-density estimate (_adaptive_min_point_count) and the
+    RANSAC search directly."""
+    return points[np.all(np.isfinite(points), axis=1)]
+
+
 def _apply_roi(points: np.ndarray, roi: ROIConfig) -> np.ndarray:
     mask = (
         (points[:, 0] >= roi.x_min) & (points[:, 0] <= roi.x_max) &
@@ -97,42 +180,145 @@ def _apply_roi(points: np.ndarray, roi: ROIConfig) -> np.ndarray:
     return points[mask]
 
 
-def _fit_plane_ransac(
-    points: np.ndarray, rng: np.random.Generator, iterations: int, threshold: float
-) -> Optional[tuple[np.ndarray, float, np.ndarray]]:
-    """Hand-rolled RANSAC plane fit. Returns (unit normal (3,), d, inlier
-    mask) with plane equation normal . p + d = 0, or None if no 3 non-
-    degenerate points could seed a plane."""
+def _voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    """Grid voxel downsampling (one centroid per occupied voxel). A merged
+    multi-scan cloud is dense where scans overlap and sparse elsewhere;
+    feeding that directly into RANSAC biases both the hypothesis vote and
+    the inlier count toward whichever region of a candidate plane happens to
+    be denser, not toward how well-supported the plane itself is. Intended
+    to feed only the RANSAC hypothesis/voting step -- pass the caller's
+    original full-resolution points as `_fit_plane_ransac`'s `refine_points`
+    so the returned inlier mask and downstream circle fit keep full
+    precision."""
+    if points.shape[0] == 0 or voxel_size <= 0:
+        return points
+    voxel_idx = np.floor(points / voxel_size).astype(np.int64)
+    _, inverse, counts = np.unique(voxel_idx, axis=0, return_inverse=True, return_counts=True)
+    inverse = inverse.reshape(-1)
+    sums = np.zeros((counts.shape[0], 3), dtype=np.float64)
+    np.add.at(sums, inverse, points)
+    return sums / counts[:, None]
+
+
+def _estimate_point_spacing(points_xy: np.ndarray, k: int = _SPACING_ESTIMATE_K) -> float:
+    """Median distance to each point's k-th nearest neighbor in the
+    plane-projected 2D set, clipped to a sane range. Used to scale the
+    boundary/cluster-eps/min-cluster-size parameters to the plane's actual
+    point density instead of a fixed metric constant -- a single estimate
+    lets the same code handle a sparse single 64-channel scan and a densely
+    merged multi-scan cloud."""
+    n = points_xy.shape[0]
+    k_eff = min(k, n - 1)
+    if k_eff < 1:
+        return _BOUNDARY_NEIGHBOR_RADIUS_M
+    tree = cKDTree(points_xy)
+    dist, _ = tree.query(points_xy, k=k_eff + 1)
+    spacing = float(np.median(dist[:, -1]))
+    return float(np.clip(spacing, _MIN_ESTIMATED_SPACING_M, _MAX_ESTIMATED_SPACING_M))
+
+
+def _estimate_ambient_spacing_3d(points: np.ndarray, k: int = _SPACING_ESTIMATE_K_3D) -> float:
+    """Median 3D k-NN spacing over a (possibly strided-down) sample of the
+    whole cloud -- a rough proxy for local LiDAR point density, used only to
+    decide how many points a target-sized plane should realistically
+    contain (see _adaptive_min_point_count). A fixed point-count floor
+    either rejects genuine far-range/sparse detections or lets tiny noise
+    clusters through, depending on which side of the true density it lands
+    on for a given scan."""
     n = points.shape[0]
+    if n > _SPACING_ESTIMATE_MAX_SAMPLE:
+        stride = max(1, n // _SPACING_ESTIMATE_MAX_SAMPLE)
+        points = points[::stride]
+        n = points.shape[0]
+    k_eff = min(k, n - 1)
+    if k_eff < 1:
+        return _PLANE_INLIER_THRESHOLD_M
+    tree = cKDTree(points)
+    dist, _ = tree.query(points, k=k_eff + 1)
+    return float(np.median(dist[:, -1]))
+
+
+def _adaptive_min_point_count(points: np.ndarray, target: TargetConfig, floor: int, default: int) -> int:
+    """Scales a fixed point-count gate to the cloud's own ambient density:
+    the same absolute count that's negligible noise for a dense merged cloud
+    can be the entire available signal for a single sparse scan of a small,
+    distant board. Clipped to [floor, default] so already-working dense
+    cases are unaffected -- this only ever lowers the gate for sparse data,
+    never raises it above the original fixed constant."""
+    spacing = _estimate_ambient_spacing_3d(points)
+    board_area = (
+        max(target.delta_width_qr_center, target.delta_width_circles) *
+        max(target.delta_height_qr_center, target.delta_height_circles)
+    )
+    expected = board_area / (max(spacing, 1e-6) ** 2) * _EXPECTED_POINT_COUNT_COVERAGE
+    return int(np.clip(expected, floor, default))
+
+
+def _fit_plane_ransac(
+    points: np.ndarray,
+    rng: np.random.Generator,
+    iterations: int,
+    threshold: float,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    refine_points: Optional[np.ndarray] = None,
+) -> Optional[tuple[np.ndarray, float, np.ndarray]]:
+    """Hand-rolled RANSAC plane fit. `points` drives hypothesis generation
+    and inlier voting -- pass a voxel-downsampled cloud here to keep dense
+    regions of a merged multi-scan cloud from dominating the vote. The
+    returned (normal, d, inlier_mask) is always refined and evaluated
+    against `refine_points` (defaults to `points`), so the mask indexes
+    whichever array the caller actually wants inliers from (typically the
+    original, full-resolution ROI/remaining-cloud array, for full-precision
+    downstream circle fitting). Returns None if no 3 non-degenerate points
+    could seed a plane."""
+    n = points.shape[0]
+    if n > _PLANE_RANSAC_MAX_HYPOTHESIS_POINTS:
+        hypothesis_idx = rng.choice(n, size=_PLANE_RANSAC_MAX_HYPOTHESIS_POINTS, replace=False)
+        hypothesis_points = points[hypothesis_idx]
+    else:
+        hypothesis_points = points
+    hypothesis_n = hypothesis_points.shape[0]
+
     best_inlier_count = -1
-    best_inliers = None
     best_normal = None
-    for _ in range(iterations):
-        idx = rng.choice(n, size=3, replace=False)
-        p0, p1, p2 = points[idx]
+    best_d = None
+    for iteration in range(iterations):
+        if iteration % 16 == 0:
+            _check_cancel(cancel_check)
+        idx = rng.choice(hypothesis_n, size=3, replace=False)
+        p0, p1, p2 = hypothesis_points[idx]
         normal = np.cross(p1 - p0, p2 - p0)
         norm = np.linalg.norm(normal)
         if norm < 1e-9:
             continue
         normal = normal / norm
         d = -np.dot(normal, p0)
-        dist = np.abs(points @ normal + d)
+        dist = np.abs(hypothesis_points @ normal + d)
         inliers = dist < threshold
         count = int(np.sum(inliers))
         if count > best_inlier_count:
-            best_inlier_count, best_inliers, best_normal = count, inliers, normal
-    if best_inliers is None:
+            best_inlier_count, best_normal, best_d = count, normal, d
+    if best_normal is None or best_d is None:
         return None
 
-    # Refine with a least-squares plane fit (SVD) over the RANSAC inlier set.
-    inlier_pts = points[best_inliers]
+    # Refine with a least-squares plane fit (SVD) over the FULL inlier set,
+    # evaluated against `refine_points` (defaults to `points`). The
+    # hypothesis search may use a bounded-size/voxel-downsampled subset for
+    # speed and density-unbiased voting, but the returned plane/inlier mask
+    # is always computed from refine_points.
+    refine_source = points if refine_points is None else refine_points
+    dist = np.abs(refine_source @ best_normal + best_d)
+    best_inliers = dist < threshold
+    inlier_pts = refine_source[best_inliers]
+    if inlier_pts.shape[0] < 3:
+        return None
     centroid = inlier_pts.mean(axis=0)
-    _, _, vh = np.linalg.svd(inlier_pts - centroid)
+    _, _, vh = np.linalg.svd(inlier_pts - centroid, full_matrices=False)
     normal = vh[-1]
     if np.dot(normal, best_normal) < 0:
         normal = -normal
     d = -np.dot(normal, centroid)
-    dist = np.abs(points @ normal + d)
+    dist = np.abs(refine_source @ normal + d)
     inliers = dist < threshold
     return normal, d, inliers
 
@@ -154,15 +340,25 @@ def _rotation_to_align_z(normal: np.ndarray) -> np.ndarray:
     return np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
 
 
-def _extract_boundary(points_xy: np.ndarray, radius: float) -> np.ndarray:
+def _extract_boundary(
+    points_xy: np.ndarray,
+    radius: float,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> np.ndarray:
     """Boundary points = points whose within-radius neighbors are
     concentrated on one angular side (an interior point has neighbors all
     around it; an edge point has a wide empty angular gap). Returns a
     boolean mask over points_xy."""
     tree = cKDTree(points_xy)
-    neighbor_lists = tree.query_ball_point(points_xy, radius)
     is_boundary = np.zeros(len(points_xy), dtype=bool)
-    for i, neighbors in enumerate(neighbor_lists):
+    for i, point_xy in enumerate(points_xy):
+        if i % 256 == 0:
+            _check_cancel(cancel_check)
+        # Query one point at a time.  Batched radius queries can materialize
+        # an enormous all-neighbor object for dense LiDAR frames before this
+        # loop even starts, while the per-point form keeps the exact same
+        # boundary decision with bounded peak memory.
+        neighbors = tree.query_ball_point(point_xy, radius)
         neighbors = [j for j in neighbors if j != i]
         if len(neighbors) < _BOUNDARY_MIN_NEIGHBORS:
             is_boundary[i] = True
@@ -175,7 +371,12 @@ def _extract_boundary(points_xy: np.ndarray, radius: float) -> np.ndarray:
     return is_boundary
 
 
-def _cluster_points(points_xy: np.ndarray, eps: float, min_size: int) -> list[np.ndarray]:
+def _cluster_points(
+    points_xy: np.ndarray,
+    eps: float,
+    min_size: int,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> list[np.ndarray]:
     """Radius-graph connected-components clustering (DBSCAN-lite, no
     external dependency beyond scipy's cKDTree).
 
@@ -196,6 +397,8 @@ def _cluster_points(points_xy: np.ndarray, eps: float, min_size: int) -> list[np
     visited = np.zeros(n, dtype=bool)
     clusters = []
     for i in range(n):
+        if i % 256 == 0:
+            _check_cancel(cancel_check)
         if visited[i]:
             continue
         stack = [i]
@@ -316,22 +519,61 @@ class _CircleStageResult:
     geometry_edge_residual: Optional[float] = None
 
 
-def _detect_circles_on_plane(plane_points: np.ndarray, normal: np.ndarray, target: TargetConfig) -> _CircleStageResult:
-    R_align = _rotation_to_align_z(normal)
-    flattened = plane_points @ R_align.T
-    z_offset = float(np.mean(flattened[:, 2]))
+def _best_geometry_consistent_fit(
+    circle_fits: list[tuple[np.ndarray, float, float]],
+    target: TargetConfig,
+) -> Optional[tuple[np.ndarray, list[float], int, float]]:
+    circle_fits = sorted(circle_fits, key=lambda c: c[2])[:_MAX_GEOMETRY_CANDIDATES]
+    best = None
 
-    boundary_mask = _extract_boundary(flattened[:, :2], _BOUNDARY_NEIGHBOR_RADIUS_M)
+    for n_circles in (4, 3):
+        if len(circle_fits) < n_circles:
+            continue
+        for combo in combinations(circle_fits, n_circles):
+            centers_xy = np.array([c[0] for c in combo])
+            ordered_xy = _cyclic_order(centers_xy)
+            if n_circles == 4:
+                geometry_ok, geometry_residual = _rectangle_geometry_check(ordered_xy, target)
+            else:
+                geometry_ok, geometry_residual = _triangle_geometry_check(ordered_xy, target)
+            if not geometry_ok:
+                continue
+            fit_errors = [c[2] for c in combo]
+            score = (n_circles, -geometry_residual, -sum(fit_errors))
+            if best is None or score > best[0]:
+                best = (score, ordered_xy, fit_errors, n_circles, geometry_residual)
+        if best is not None and best[3] == 4:
+            break
+
+    if best is None:
+        return None
+    _score, ordered_xy, fit_errors, n_circles, geometry_residual = best
+    return ordered_xy, fit_errors, n_circles, geometry_residual
+
+
+def _detect_circles_with_tuning(
+    flattened: np.ndarray,
+    z_offset: float,
+    R_align: np.ndarray,
+    target: TargetConfig,
+    boundary_radius: float,
+    cluster_eps: float,
+    min_cluster_size: int,
+    cancel_check: Optional[Callable[[], bool]],
+) -> _CircleStageResult:
+    boundary_mask = _extract_boundary(flattened[:, :2], boundary_radius, cancel_check=cancel_check)
     boundary_xy = flattened[boundary_mask][:, :2]
-    if boundary_xy.shape[0] < _MIN_VALID_CIRCLES * _MIN_CLUSTER_SIZE:
+    if boundary_xy.shape[0] < _MIN_VALID_CIRCLES * min_cluster_size:
         return _CircleStageResult(
-            success=False, failure_reason=FailureReason.CIRCLES_NOT_FOUND,
+            success=False,
+            failure_reason=FailureReason.CIRCLES_NOT_FOUND,
             boundary_point_count=int(boundary_xy.shape[0]),
         )
 
-    clusters = _cluster_points(boundary_xy, _CLUSTER_EPS_M, _MIN_CLUSTER_SIZE)
+    clusters = _cluster_points(boundary_xy, cluster_eps, min_cluster_size, cancel_check=cancel_check)
     circle_fits = []
     for component in clusters:
+        _check_cancel(cancel_check)
         fit = _fit_circle(boundary_xy[component])
         if fit is None:
             continue
@@ -348,28 +590,16 @@ def _detect_circles_on_plane(plane_points: np.ndarray, normal: np.ndarray, targe
             boundary_point_count=int(boundary_xy.shape[0]), circle_candidate_count=len(circle_fits),
         )
 
-    # Keep up to 4 best (lowest fit-error) circle candidates -- 4 if that
-    # many passed the filters above, otherwise exactly 3 (a PARTIAL scene;
-    # camera_lidar.pipeline decides whether 3 is usable via the Quality/
-    # Stability/Duplicate gates, this function only reports what LiDAR
-    # geometry itself supports).
-    circle_fits.sort(key=lambda c: c[2])
-    n_circles = min(4, len(circle_fits))
-    best = circle_fits[:n_circles]
-    centers_xy = np.array([c[0] for c in best])
-    fit_errors = [c[2] for c in best]
-
-    ordered_xy = _cyclic_order(centers_xy)
-    if n_circles == 4:
-        geometry_ok, geometry_residual = _rectangle_geometry_check(ordered_xy, target)
-    else:
-        geometry_ok, geometry_residual = _triangle_geometry_check(ordered_xy, target)
-    if not geometry_ok:
+    selected = _best_geometry_consistent_fit(circle_fits, target)
+    if selected is None:
+        n_circles = min(4, len(circle_fits))
+        fit_errors = [c[2] for c in sorted(circle_fits, key=lambda c: c[2])[:n_circles]]
         return _CircleStageResult(
             success=False, failure_reason=FailureReason.GEOMETRY_MISMATCH,
             boundary_point_count=int(boundary_xy.shape[0]), circle_candidate_count=len(circle_fits),
-            valid_circle_count=n_circles, circle_fit_errors_m=fit_errors, geometry_edge_residual=geometry_residual,
+            valid_circle_count=n_circles, circle_fit_errors_m=fit_errors,
         )
+    ordered_xy, fit_errors, n_circles, geometry_residual = selected
 
     # Back-project the ordered 2D circle centers (on the flattened
     # Z=z_offset plane) into the original LiDAR frame. R_align is
@@ -384,56 +614,170 @@ def _detect_circles_on_plane(plane_points: np.ndarray, normal: np.ndarray, targe
     )
 
 
+def _better_circle_stage(candidate: _CircleStageResult, current: Optional[_CircleStageResult]) -> bool:
+    if current is None:
+        return True
+    if candidate.success != current.success:
+        return candidate.success
+    if candidate.valid_circle_count != current.valid_circle_count:
+        return candidate.valid_circle_count > current.valid_circle_count
+    if candidate.circle_candidate_count != current.circle_candidate_count:
+        return candidate.circle_candidate_count > current.circle_candidate_count
+    if candidate.boundary_point_count != current.boundary_point_count:
+        return candidate.boundary_point_count > current.boundary_point_count
+    if candidate.geometry_edge_residual is None:
+        return False
+    if current.geometry_edge_residual is None:
+        return True
+    return candidate.geometry_edge_residual < current.geometry_edge_residual
+
+
+def _detect_circles_on_plane(
+    plane_points: np.ndarray,
+    normal: np.ndarray,
+    target: TargetConfig,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> _CircleStageResult:
+    R_align = _rotation_to_align_z(normal)
+    flattened = plane_points @ R_align.T
+    z_offset = float(np.mean(flattened[:, 2]))
+    best_result: Optional[_CircleStageResult] = None
+
+    # Density-adaptive base parameters (see _estimate_point_spacing):
+    # _BOUNDARY_RADIUS_SCALES / _CLUSTER_EPS_SCALES below now sweep AROUND
+    # these plane-specific estimates instead of around fixed metric
+    # constants, so the same sweep works for a sparse single-scan plane and
+    # a densely merged one. Floored at the original fixed constants -- for a
+    # cloud at least as dense as what those constants were tuned for, this
+    # must reduce to exactly the old behavior; adaptation should only ever
+    # WIDEN the radius/eps for genuinely sparse data, never narrow it below
+    # the validated default (a narrower radius makes boundary extraction
+    # MORE sensitive to incidental density variations that aren't real hole
+    # edges, e.g. a solid filled disc sampled at a different density than
+    # its surrounding plate).
+    spacing = _estimate_point_spacing(flattened[:, :2])
+    base_boundary_radius = max(spacing * _BOUNDARY_RADIUS_SPACING_MULTIPLIER, _BOUNDARY_NEIGHBOR_RADIUS_M)
+    base_cluster_eps = max(spacing * _CLUSTER_EPS_SPACING_MULTIPLIER, _CLUSTER_EPS_M)
+    expected_circumference_points = (2.0 * np.pi * target.circle_radius) / spacing
+    min_cluster_size = int(np.clip(
+        round(expected_circumference_points * _MIN_CLUSTER_SIZE_CIRCUMFERENCE_FRACTION),
+        _MIN_CLUSTER_SIZE_FLOOR,
+        _MIN_CLUSTER_SIZE,
+    ))
+
+    for boundary_scale in _BOUNDARY_RADIUS_SCALES:
+        for eps_scale in _CLUSTER_EPS_SCALES:
+            _check_cancel(cancel_check)
+            result = _detect_circles_with_tuning(
+                flattened,
+                z_offset,
+                R_align,
+                target,
+                base_boundary_radius * boundary_scale,
+                base_cluster_eps * eps_scale,
+                min_cluster_size,
+                cancel_check,
+            )
+            if _better_circle_stage(result, best_result):
+                best_result = result
+            if result.success and result.valid_circle_count == 4:
+                return result
+
+    return best_result or _CircleStageResult(
+        success=False,
+        failure_reason=FailureReason.CIRCLES_NOT_FOUND,
+    )
+
+
+def _plane_extent_exceeds_auto_search_window(
+    plane_points: np.ndarray, normal: np.ndarray, target: TargetConfig, min_plane_inliers: int
+) -> bool:
+    """Reject huge AUTO-ROI decoy planes before expensive boundary tracing.
+
+    A FAST-Calib target plane should be on the order of the configured board
+    geometry.  Floors/walls can have hundreds of thousands of inliers; running
+    hole-boundary extraction on those planes is both slow and not useful.
+    """
+    if plane_points.shape[0] < min_plane_inliers:
+        return False
+
+    R_align = _rotation_to_align_z(normal)
+    xy = (plane_points @ R_align.T)[:, :2]
+    extent = np.ptp(xy, axis=0)
+    board_width = max(
+        target.delta_width_qr_center + 2.0 * target.marker_size,
+        target.delta_width_circles + 2.0 * target.circle_radius,
+    )
+    board_height = max(
+        target.delta_height_qr_center + 2.0 * target.marker_size,
+        target.delta_height_circles + 2.0 * target.circle_radius,
+    )
+    limit_x = max(_AUTO_MIN_PLANE_EXTENT_LIMIT_M, board_width * _AUTO_PLANE_EXTENT_SCALE)
+    limit_y = max(_AUTO_MIN_PLANE_EXTENT_LIMIT_M, board_height * _AUTO_PLANE_EXTENT_SCALE)
+    return bool(extent[0] > limit_x or extent[1] > limit_y)
+
+
 def detect_lidar_target(
     cloud: PointCloudFrame,
     roi: ROIConfig,
     target: TargetConfig,
     rng_seed: int = 42,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> LidarDetectionResult:
     """MANUAL ROI: filter to the caller-supplied box, fit one plane, detect
     circles on it. See detect_lidar_target_auto for the AUTO ROI (no box
     required) alternative."""
-    rng = np.random.default_rng(rng_seed)
-    points = np.asarray(cloud.points[:, :3], dtype=np.float64)
-    roi_points = _apply_roi(points, roi)
+    try:
+        rng = np.random.default_rng(rng_seed)
+        points = _finite_points(np.asarray(cloud.points[:, :3], dtype=np.float64))
+        roi_points = _apply_roi(points, roi)
 
-    if roi_points.shape[0] < _MIN_ROI_POINTS:
+        min_roi_points = _adaptive_min_point_count(points, target, _MIN_ROI_POINTS_FLOOR, _MIN_ROI_POINTS)
+        if roi_points.shape[0] < min_roi_points:
+            return LidarDetectionResult(
+                success=False, failure_reason=FailureReason.INSUFFICIENT_ROI_POINTS,
+                roi_point_count=int(roi_points.shape[0]),
+            )
+
+        ransac_points = _voxel_downsample(roi_points, _RANSAC_VOXEL_SIZE_M)
+        plane = _fit_plane_ransac(
+            ransac_points, rng, _PLANE_RANSAC_ITERS, _PLANE_INLIER_THRESHOLD_M,
+            cancel_check=cancel_check, refine_points=roi_points,
+        )
+        if plane is None:
+            return LidarDetectionResult(
+                success=False, failure_reason=FailureReason.LIDAR_PLANE_NOT_FOUND,
+                roi_point_count=int(roi_points.shape[0]),
+            )
+        normal, _d, inlier_mask = plane
+        inlier_count = int(np.sum(inlier_mask))
+        inlier_ratio = inlier_count / roi_points.shape[0]
+        plane_points = roi_points[inlier_mask]
+        plane_centroid = plane_points.mean(axis=0) if inlier_count > 0 else None
+        if inlier_ratio < _MIN_PLANE_INLIER_RATIO or inlier_count < min_roi_points:
+            return LidarDetectionResult(
+                success=False, failure_reason=FailureReason.LIDAR_PLANE_NOT_FOUND,
+                roi_point_count=int(roi_points.shape[0]), plane_inlier_count=inlier_count,
+                plane_inlier_ratio=inlier_ratio, plane_normal=normal, plane_centroid=plane_centroid,
+            )
+
+        stage = _detect_circles_on_plane(plane_points, normal, target, cancel_check=cancel_check)
         return LidarDetectionResult(
-            success=False, failure_reason=FailureReason.INSUFFICIENT_ROI_POINTS,
+            success=stage.success,
+            failure_reason=stage.failure_reason,
+            circle_centers=stage.circle_centers_lidar,
             roi_point_count=int(roi_points.shape[0]),
+            plane_inlier_count=inlier_count,
+            plane_inlier_ratio=inlier_ratio,
+            plane_normal=normal,
+            plane_centroid=plane_centroid,
+            boundary_point_count=stage.boundary_point_count,
+            circle_candidate_count=stage.circle_candidate_count,
+            valid_circle_count=stage.valid_circle_count,
+            circle_fit_errors_m=stage.circle_fit_errors_m,
         )
-
-    plane = _fit_plane_ransac(roi_points, rng, _PLANE_RANSAC_ITERS, _PLANE_INLIER_THRESHOLD_M)
-    if plane is None:
-        return LidarDetectionResult(
-            success=False, failure_reason=FailureReason.LIDAR_PLANE_NOT_FOUND,
-            roi_point_count=int(roi_points.shape[0]),
-        )
-    normal, _d, inlier_mask = plane
-    inlier_count = int(np.sum(inlier_mask))
-    inlier_ratio = inlier_count / roi_points.shape[0]
-    if inlier_ratio < _MIN_PLANE_INLIER_RATIO or inlier_count < _MIN_ROI_POINTS:
-        return LidarDetectionResult(
-            success=False, failure_reason=FailureReason.LIDAR_PLANE_NOT_FOUND,
-            roi_point_count=int(roi_points.shape[0]), plane_inlier_count=inlier_count,
-            plane_inlier_ratio=inlier_ratio, plane_normal=normal,
-        )
-
-    plane_points = roi_points[inlier_mask]
-    stage = _detect_circles_on_plane(plane_points, normal, target)
-    return LidarDetectionResult(
-        success=stage.success,
-        failure_reason=stage.failure_reason,
-        circle_centers=stage.circle_centers_lidar,
-        roi_point_count=int(roi_points.shape[0]),
-        plane_inlier_count=inlier_count,
-        plane_inlier_ratio=inlier_ratio,
-        plane_normal=normal,
-        boundary_point_count=stage.boundary_point_count,
-        circle_candidate_count=stage.circle_candidate_count,
-        valid_circle_count=stage.valid_circle_count,
-        circle_fit_errors_m=stage.circle_fit_errors_m,
-    )
+    except _Cancelled:
+        return LidarDetectionResult(success=False, failure_reason=FailureReason.CANCELLED)
 
 
 def _stage_progress(result: LidarDetectionResult) -> tuple:
@@ -450,6 +794,8 @@ def detect_lidar_target_auto(
     target: TargetConfig,
     max_planes: int = _AUTO_MAX_PLANES_DEFAULT,
     rng_seed: int = 42,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    on_plane_candidate: Optional[Callable[[PlaneCandidateInfo], None]] = None,
 ) -> LidarDetectionResult:
     """AUTO ROI: LiDAR-only geometry search, no manual box required.
 
@@ -461,68 +807,128 @@ def detect_lidar_target_auto(
     "a RANSAC plane was found" is never treated as "the target was found"
     on its own. Among candidates whose circles do match the target
     geometry, the one with the lowest edge-length residual wins.
+
+    on_plane_candidate: optional diagnostic hook, called once per candidate
+    (in extraction order, including ones later peeled off and discarded)
+    with a PlaneCandidateInfo -- lets a caller inspect *why* AUTO ROI picked
+    the plane it did (e.g. dump every candidate's centroid/normal/extent, or
+    export each candidate's inlier points for external visualization) beyond
+    what the returned LidarDetectionResult keeps for only the winner. Has no
+    effect on detection itself.
     """
-    rng = np.random.default_rng(rng_seed)
-    points = np.asarray(cloud.points[:, :3], dtype=np.float64)
+    try:
+        rng = np.random.default_rng(rng_seed)
+        points = _finite_points(np.asarray(cloud.points[:, :3], dtype=np.float64))
 
-    if points.shape[0] < _MIN_ROI_POINTS:
-        return LidarDetectionResult(
-            success=False, failure_reason=FailureReason.INSUFFICIENT_ROI_POINTS,
-            roi_point_count=int(points.shape[0]),
+        min_roi_points = _adaptive_min_point_count(points, target, _MIN_ROI_POINTS_FLOOR, _MIN_ROI_POINTS)
+        if points.shape[0] < min_roi_points:
+            return LidarDetectionResult(
+                success=False, failure_reason=FailureReason.INSUFFICIENT_ROI_POINTS,
+                roi_point_count=int(points.shape[0]),
+            )
+
+        min_plane_inliers = _adaptive_min_point_count(
+            points, target, _AUTO_MIN_PLANE_INLIERS_FLOOR, _AUTO_MIN_PLANE_INLIERS,
         )
 
-    remaining = points
-    best_result: Optional[LidarDetectionResult] = None
-    best_residual: Optional[float] = None
-    candidate_count = 0
+        remaining = points
+        best_result: Optional[LidarDetectionResult] = None
+        best_residual: Optional[float] = None
+        candidate_count = 0
 
-    for plane_index in range(max_planes):
-        if remaining.shape[0] < _AUTO_MIN_PLANE_INLIERS:
-            break
-        plane = _fit_plane_ransac(remaining, rng, _PLANE_RANSAC_ITERS, _PLANE_INLIER_THRESHOLD_M)
-        if plane is None:
-            break
-        normal, _d, inlier_mask = plane
-        inlier_count = int(np.sum(inlier_mask))
-        if inlier_count < _AUTO_MIN_PLANE_INLIERS:
-            break
-        candidate_count += 1
-        plane_points = remaining[inlier_mask]
-        inlier_ratio = inlier_count / points.shape[0]
+        for plane_index in range(max_planes):
+            if remaining.shape[0] < min_plane_inliers:
+                break
+            _check_cancel(cancel_check)
+            ransac_points = _voxel_downsample(remaining, _RANSAC_VOXEL_SIZE_M)
+            plane = _fit_plane_ransac(
+                ransac_points, rng, _PLANE_RANSAC_ITERS, _PLANE_INLIER_THRESHOLD_M,
+                cancel_check=cancel_check, refine_points=remaining,
+            )
+            if plane is None:
+                break
+            normal, _d, inlier_mask = plane
+            inlier_count = int(np.sum(inlier_mask))
+            if inlier_count < min_plane_inliers:
+                break
+            candidate_count += 1
+            plane_points = remaining[inlier_mask]
+            plane_centroid = plane_points.mean(axis=0)
+            inlier_ratio = inlier_count / points.shape[0]
 
-        stage = _detect_circles_on_plane(plane_points, normal, target)
-        candidate_result = LidarDetectionResult(
-            success=stage.success,
-            failure_reason=stage.failure_reason,
-            circle_centers=stage.circle_centers_lidar,
-            roi_point_count=int(points.shape[0]),
-            plane_inlier_count=inlier_count,
-            plane_inlier_ratio=inlier_ratio,
-            plane_normal=normal,
-            boundary_point_count=stage.boundary_point_count,
-            circle_candidate_count=stage.circle_candidate_count,
-            valid_circle_count=stage.valid_circle_count,
-            circle_fit_errors_m=stage.circle_fit_errors_m,
-            selected_plane_index=plane_index,
-        )
+            extent_rejected = _plane_extent_exceeds_auto_search_window(
+                plane_points, normal, target, min_plane_inliers,
+            )
+            stage: Optional[_CircleStageResult] = None
+            if not extent_rejected:
+                stage = _detect_circles_on_plane(plane_points, normal, target, cancel_check=cancel_check)
 
-        if stage.success:
-            residual = stage.geometry_edge_residual if stage.geometry_edge_residual is not None else 0.0
-            if best_result is None or not best_result.success or residual < best_residual:
-                best_residual = residual
-                best_result = candidate_result
-        elif best_result is None or not best_result.success:
-            if best_result is None or _stage_progress(candidate_result) > _stage_progress(best_result):
-                best_result = candidate_result
+            if on_plane_candidate is not None:
+                R_align = _rotation_to_align_z(normal)
+                extent_xy = tuple(np.ptp((plane_points @ R_align.T)[:, :2], axis=0).tolist())
+                on_plane_candidate(PlaneCandidateInfo(
+                    index=plane_index,
+                    centroid=plane_centroid,
+                    normal=normal,
+                    inlier_count=inlier_count,
+                    inlier_ratio=inlier_ratio,
+                    extent_xy=extent_xy,
+                    extent_rejected=extent_rejected,
+                    points=plane_points,
+                    stage=stage,
+                ))
 
-        # Peel this plane off and keep searching the rest of the cloud.
-        remaining = remaining[~inlier_mask]
+            if extent_rejected:
+                candidate_result = LidarDetectionResult(
+                    success=False,
+                    failure_reason=FailureReason.CIRCLES_NOT_FOUND,
+                    roi_point_count=int(points.shape[0]),
+                    plane_inlier_count=inlier_count,
+                    plane_inlier_ratio=inlier_ratio,
+                    plane_normal=normal,
+                    plane_centroid=plane_centroid,
+                    selected_plane_index=plane_index,
+                )
+                if best_result is None:
+                    best_result = candidate_result
+                remaining = remaining[~inlier_mask]
+                continue
 
-    if best_result is None:
-        return LidarDetectionResult(
-            success=False, failure_reason=FailureReason.LIDAR_PLANE_NOT_FOUND,
-            roi_point_count=int(points.shape[0]), plane_candidate_count=candidate_count,
-        )
+            candidate_result = LidarDetectionResult(
+                success=stage.success,
+                failure_reason=stage.failure_reason,
+                circle_centers=stage.circle_centers_lidar,
+                roi_point_count=int(points.shape[0]),
+                plane_inlier_count=inlier_count,
+                plane_inlier_ratio=inlier_ratio,
+                plane_normal=normal,
+                plane_centroid=plane_centroid,
+                boundary_point_count=stage.boundary_point_count,
+                circle_candidate_count=stage.circle_candidate_count,
+                valid_circle_count=stage.valid_circle_count,
+                circle_fit_errors_m=stage.circle_fit_errors_m,
+                selected_plane_index=plane_index,
+            )
 
-    best_result.plane_candidate_count = candidate_count
-    return best_result
+            if stage.success:
+                residual = stage.geometry_edge_residual if stage.geometry_edge_residual is not None else 0.0
+                if best_result is None or not best_result.success or residual < best_residual:
+                    best_residual = residual
+                    best_result = candidate_result
+            elif best_result is None or not best_result.success:
+                if best_result is None or _stage_progress(candidate_result) > _stage_progress(best_result):
+                    best_result = candidate_result
+
+            # Peel this plane off and keep searching the rest of the cloud.
+            remaining = remaining[~inlier_mask]
+
+        if best_result is None:
+            return LidarDetectionResult(
+                success=False, failure_reason=FailureReason.LIDAR_PLANE_NOT_FOUND,
+                roi_point_count=int(points.shape[0]), plane_candidate_count=candidate_count,
+            )
+
+        best_result.plane_candidate_count = candidate_count
+        return best_result
+    except _Cancelled:
+        return LidarDetectionResult(success=False, failure_reason=FailureReason.CANCELLED)

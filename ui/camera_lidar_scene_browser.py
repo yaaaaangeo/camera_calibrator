@@ -324,7 +324,7 @@ class CameraLidarSceneBrowser(QGroupBox):
                 sync_text = f"  (Δt = {sync_ms:.1f} ms)"
             lines.append(f"LiDAR pairing: {candidate.cloud_points.shape[0]} points{sync_text}")
         else:
-            lines.append("LiDAR pairing: (no cloud found near this timestamp)")
+            lines.append("LiDAR pairing: deferred until ADD SELECTED")
 
         text = QPlainTextEdit()
         text.setReadOnly(True)

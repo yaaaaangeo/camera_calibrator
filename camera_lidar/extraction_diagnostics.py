@@ -46,6 +46,7 @@ class ExtractionDiagnosticSummary:
     full_scenes: int = 0
     partial_scenes: int = 0
     candidates_missing_lidar_pairing: int = 0
+    lidar_pairing_deferred: bool = False
     dictionary: str = ""
     expected_marker_ids: list[int] = field(default_factory=list)
 
@@ -125,7 +126,11 @@ def format_extraction_diagnostics(summary: ExtractionDiagnosticSummary) -> str:
         f"  Stable Segments        {summary.stable_segments}",
         "",
         "LIDAR PAIRING",
-        f"  Candidates w/o Pairing {summary.candidates_missing_lidar_pairing}",
+        (
+            "  Status                Deferred until ADD SELECTED"
+            if summary.lidar_pairing_deferred
+            else f"  Candidates w/o Pairing {summary.candidates_missing_lidar_pairing}"
+        ),
         "",
         "FINAL",
         f"  Scene Candidates       {summary.final_scene_candidates}",
@@ -187,7 +192,10 @@ def diagnose(summary: ExtractionDiagnosticSummary) -> str:
             "representative frames matched too few expected markers)."
         )
 
-    if summary.candidates_missing_lidar_pairing == summary.final_scene_candidates:
+    if (
+        not summary.lidar_pairing_deferred
+        and summary.candidates_missing_lidar_pairing == summary.final_scene_candidates
+    ):
         return (
             "DIAGNOSIS\n\n"
             f"{summary.final_scene_candidates} camera scene candidate(s) were found,\n"
