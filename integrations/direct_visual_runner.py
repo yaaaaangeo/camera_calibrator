@@ -64,20 +64,31 @@ from camera_lidar.types import TargetlessPrior
 _VALID_ROS_VERSIONS = frozenset({"auto", "1", "2"})
 _VALID_LIDAR_TYPES = frozenset({"spinning", "non_repetitive"})
 _VALID_MODES = frozenset({"coarse", "full"})
+_VALID_ROTATIONS = frozenset({0, 90, 180, 270})
 
-# The exact upstream CLI flag names for topics/rotation are the one
-# genuinely uncertain piece of this integration (direct_visual's own
-# published command reference only pins down the positional bag/output
-# dirs, the `-d` spinning-LiDAR flag, and the *names* of the camera
-# intrinsic flags) -- centralized here, in ONE place, so a user pinned to
-# a specific direct_visual_lidar_calibration release can correct the flag
-# spelling in one spot if their installed version differs, without
-# touching UI code or the ROS1/ROS2 command builder below.
+# ROS distro name hints used ONLY to infer ros_version from a configured
+# setup.bash path when ROS_VERSION isn't set in the environment (desktop-
+# launched GUIs commonly don't have ROS sourced into their own process) --
+# see resolve_ros_version.
+_ROS1_DISTRO_HINTS = ("kinetic", "melodic", "noetic")
+_ROS2_DISTRO_HINTS = ("dashing", "eloquent", "foxy", "galactic", "humble", "iron", "jazzy", "rolling")
+
+# The exact upstream CLI flag names for topics are the one genuinely
+# uncertain piece of this integration (direct_visual's own published
+# command reference only pins down the positional bag/output dirs, the
+# `-d` spinning-LiDAR flag, the *names* of the camera intrinsic flags, and
+# find_matches_superglue.py's --rotate_camera/--rotate_lidar flags) --
+# centralized here, in ONE place, so a user pinned to a specific
+# direct_visual_lidar_calibration release can correct the flag spelling in
+# one spot if their installed version differs, without touching UI code or
+# the ROS1/ROS2 command builder below.
 _IMAGE_TOPIC_FLAG = "--image_topic"
 _POINTS_TOPIC_FLAG = "--points_topic"
 _CAMERA_INFO_TOPIC_FLAG = "--camera_info_topic"
-_CAMERA_ROTATE_FLAG = "--camera_rotate_deg"
-_LIDAR_ROTATE_FLAG = "--lidar_rotate_deg"
+# Rotation is an find_matches_superglue.py (MATCHING stage) option, NOT a
+# preprocess option -- see build_matching_args/build_preprocess_args below.
+_CAMERA_ROTATE_FLAG = "--rotate_camera"
+_LIDAR_ROTATE_FLAG = "--rotate_lidar"
 
 
 class RunnerStage(Enum):
@@ -145,6 +156,9 @@ class DirectVisualConfig:
     camera_matrix: Optional[np.ndarray] = None    # (3,3), from StandardCalibration
     distortion: Optional[np.ndarray] = None       # (N,), from StandardCalibration
 
+    # find_matches_superglue.py --rotate_camera/--rotate_lidar (MATCHING
+    # stage only -- see build_matching_args). Upstream only accepts these 4
+    # 90-degree steps, never an arbitrary angle.
     rotate_camera_deg: int = 0
     rotate_lidar_deg: int = 0
 
@@ -160,6 +174,10 @@ class DirectVisualConfig:
             raise ValueError(f"lidar_type must be one of {sorted(_VALID_LIDAR_TYPES)}, got {self.lidar_type!r}")
         if self.mode not in _VALID_MODES:
             raise ValueError(f"mode must be one of {sorted(_VALID_MODES)}, got {self.mode!r}")
+        if self.rotate_camera_deg not in _VALID_ROTATIONS:
+            raise ValueError(f"rotate_camera_deg must be one of {sorted(_VALID_ROTATIONS)}, got {self.rotate_camera_deg!r}")
+        if self.rotate_lidar_deg not in _VALID_ROTATIONS:
+            raise ValueError(f"rotate_lidar_deg must be one of {sorted(_VALID_ROTATIONS)}, got {self.rotate_lidar_deg!r}")
 
 
 @dataclass
@@ -185,10 +203,30 @@ class DirectVisualBootstrapResult:
     cancelled: bool = False
 
 
+def _infer_ros_version_from_setup_path(path: str) -> Optional[str]:
+    """Best-effort ROS1-vs-ROS2 guess from a setup.bash path's ROS distro
+    name (e.g. /opt/ros/humble/setup.bash -> ROS2, /opt/ros/noetic/setup.bash
+    -> ROS1) -- used only as resolve_ros_version's 3rd-priority fallback,
+    never as a substitute for an explicit choice when it can't tell."""
+    lowered = path.lower()
+    if any(hint in lowered for hint in _ROS1_DISTRO_HINTS):
+        return "1"
+    if any(hint in lowered for hint in _ROS2_DISTRO_HINTS):
+        return "2"
+    return None
+
+
 def resolve_ros_version(config: DirectVisualConfig, environ: Optional[dict] = None) -> str:
-    """"auto" resolves via the ROS_VERSION environment variable (set by a
-    sourced ROS setup.bash) -- raises ValueError (a configuration error,
-    never a silent guess) if it can't be determined that way."""
+    """Priority order for ros_version="auto" (never a silent/arbitrary
+    guess -- each tier either confidently resolves or falls through):
+      1. an explicit "1"/"2" on the config (not "auto") -- always wins.
+      2. the ROS_VERSION environment variable (set by a sourced ROS
+         setup.bash in THIS process).
+      3. the ROS distro name embedded in a configured ros_setup_path /
+         workspace_setup_path (covers a desktop-launched GUI whose own
+         process never sourced ROS, but the user pointed the Targetless
+         Bootstrap panel at a setup.bash to source before running).
+      4. otherwise: a clear configuration-error ValueError -- never guessed."""
     if config.ros_version in ("1", "2"):
         return config.ros_version
 
@@ -197,8 +235,15 @@ def resolve_ros_version(config: DirectVisualConfig, environ: Optional[dict] = No
     if env_version in ("1", "2"):
         return env_version
 
+    for path in (config.ros_setup_path, config.workspace_setup_path):
+        if path:
+            inferred = _infer_ros_version_from_setup_path(path)
+            if inferred is not None:
+                return inferred
+
     raise ValueError(
-        "ros_version=\"auto\" but the ROS_VERSION environment variable is not set to 1 or 2 -- "
+        "ros_version=\"auto\" but the ROS_VERSION environment variable is not set to 1 or 2, and no "
+        "ROS1/ROS2 distro could be inferred from the configured ROS Setup / Workspace Setup path -- "
         "select ROS1 or ROS2 explicitly in the Targetless Bootstrap ROS setting."
     )
 
@@ -236,7 +281,8 @@ def _format_floats(values: list) -> str:
 
 
 def build_preprocess_args(config: DirectVisualConfig) -> list:
-    """<INPUT_BAG_DIR> <OUTPUT_PREPROCESSED_DIR> [-d] [topic/intrinsic/rotate flags]."""
+    """<INPUT_BAG_DIR> <OUTPUT_PREPROCESSED_DIR> [-d] [topic/intrinsic flags].
+    Rotation is NOT a preprocess option -- see build_matching_args."""
     args = [config.input_bag_path, config.output_path]
     if config.lidar_type == "spinning":
         args.append("-d")
@@ -255,18 +301,27 @@ def build_preprocess_args(config: DirectVisualConfig) -> list:
             "--camera_distortion_coeffs", _format_floats(np.asarray(config.distortion).reshape(-1).tolist()),
         ]
 
-    if config.rotate_camera_deg:
-        args += [_CAMERA_ROTATE_FLAG, str(config.rotate_camera_deg)]
-    if config.rotate_lidar_deg:
-        args += [_LIDAR_ROTATE_FLAG, str(config.rotate_lidar_deg)]
-
     return args
+
+
+def build_matching_args(config: DirectVisualConfig) -> list:
+    """<OUTPUT_PREPROCESSED_DIR> --rotate_camera N --rotate_lidar N.
+    find_matches_superglue.py's own rotation flags -- always passed
+    explicitly (upstream's own example passes --rotate_lidar 0 rather than
+    omitting it), unlike preprocess's optional topic/intrinsic flags."""
+    return [
+        config.output_path,
+        _CAMERA_ROTATE_FLAG, str(config.rotate_camera_deg),
+        _LIDAR_ROTATE_FLAG, str(config.rotate_lidar_deg),
+    ]
 
 
 def _stage_program_and_args(stage: RunnerStage, config: DirectVisualConfig):
     program = _PROGRAM_BY_STAGE[stage]
     if stage == RunnerStage.PREPROCESS:
         return program, build_preprocess_args(config)
+    if stage == RunnerStage.MATCHING:
+        return program, build_matching_args(config)
     return program, [config.output_path]
 
 
@@ -304,8 +359,19 @@ def check_environment(
                 f"'{ros_command}' command not found on PATH, and no ROS setup path is configured."
             )
 
-    if not config.input_bag_path or not os.path.exists(config.input_bag_path):
-        problems.append(f"Input bag path does not exist: {config.input_bag_path!r}")
+    if not config.input_bag_path:
+        problems.append("Input Bag Directory is not set.")
+    elif not os.path.isdir(config.input_bag_path):
+        # upstream direct_visual preprocess expects a DIRECTORY of bags,
+        # never a single .bag file -- os.path.exists() alone would wrongly
+        # accept a single bag file or any other non-directory path.
+        if os.path.exists(config.input_bag_path):
+            problems.append(
+                f"Input Bag Directory must be a directory (containing calibration bags), "
+                f"not a file: {config.input_bag_path!r}"
+            )
+        else:
+            problems.append(f"Input Bag Directory does not exist: {config.input_bag_path!r}")
 
     if not config.output_path:
         problems.append("Output path is not set.")

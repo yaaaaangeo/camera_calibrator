@@ -35,6 +35,7 @@ from integrations.direct_visual_runner import (
     EnvironmentCheckResult,
     RunnerStage,
     StageResult,
+    build_matching_args,
     build_preprocess_args,
     build_ros_command,
     check_environment,
@@ -77,6 +78,25 @@ def test_config_rejects_invalid_mode():
         _config(mode="ultra")
 
 
+@pytest.mark.parametrize("rotate_camera_deg", [1, 45, 91, 360, -90])
+def test_config_rejects_invalid_camera_rotation(rotate_camera_deg):
+    with pytest.raises(ValueError):
+        _config(rotate_camera_deg=rotate_camera_deg)
+
+
+@pytest.mark.parametrize("rotate_lidar_deg", [1, 45, 91, 360, -90])
+def test_config_rejects_invalid_lidar_rotation(rotate_lidar_deg):
+    with pytest.raises(ValueError):
+        _config(rotate_lidar_deg=rotate_lidar_deg)
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_config_accepts_valid_rotation_steps(rotation):
+    config = _config(rotate_camera_deg=rotation, rotate_lidar_deg=rotation)
+    assert config.rotate_camera_deg == rotation
+    assert config.rotate_lidar_deg == rotation
+
+
 # ---------------------------------------------------------------------------
 # resolve_ros_version
 # ---------------------------------------------------------------------------
@@ -97,6 +117,28 @@ def test_resolve_ros_version_auto_uses_env_var():
 
 def test_resolve_ros_version_auto_raises_without_env_var():
     config = _config(ros_version="auto")
+    with pytest.raises(ValueError):
+        resolve_ros_version(config, environ={})
+
+
+def test_resolve_ros_version_auto_infers_ros2_from_setup_path():
+    config = _config(ros_version="auto", ros_setup_path="/opt/ros/humble/setup.bash")
+    assert resolve_ros_version(config, environ={}) == "2"
+
+
+def test_resolve_ros_version_auto_infers_ros1_from_workspace_setup_path():
+    config = _config(ros_version="auto", workspace_setup_path="/opt/ros/noetic/setup.bash")
+    assert resolve_ros_version(config, environ={}) == "1"
+
+
+def test_resolve_ros_version_env_var_takes_priority_over_setup_path_inference():
+    # ROS_VERSION in the environment always wins over a setup-path guess.
+    config = _config(ros_version="auto", ros_setup_path="/opt/ros/noetic/setup.bash")
+    assert resolve_ros_version(config, environ={"ROS_VERSION": "2"}) == "2"
+
+
+def test_resolve_ros_version_auto_raises_when_setup_path_gives_no_hint():
+    config = _config(ros_version="auto", ros_setup_path="/home/user/my_ros_ws/setup.bash")
     with pytest.raises(ValueError):
         resolve_ros_version(config, environ={})
 
@@ -142,6 +184,46 @@ def test_preprocess_args_include_camera_intrinsics_when_set():
 def test_preprocess_args_omit_camera_intrinsics_when_unset():
     args = build_preprocess_args(_config(camera_matrix=None, distortion=None))
     assert "--camera_intrinsics" not in args
+
+
+# ---------------------------------------------------------------------------
+# Rotation option placement (§18-19, §34): --rotate_camera/--rotate_lidar
+# belong to find_matches_superglue.py (MATCHING stage) ONLY -- never
+# preprocess, and never under the old (wrong) --camera_rotate_deg /
+# --lidar_rotate_deg names.
+# ---------------------------------------------------------------------------
+
+def test_preprocess_args_never_contain_rotation_flags():
+    config = _config(rotate_camera_deg=90, rotate_lidar_deg=180)
+    args = build_preprocess_args(config)
+    assert "--rotate_camera" not in args
+    assert "--rotate_lidar" not in args
+    assert "--camera_rotate_deg" not in args
+    assert "--lidar_rotate_deg" not in args
+
+
+def test_matching_args_contain_correct_rotation_flags():
+    config = _config(rotate_camera_deg=90, rotate_lidar_deg=180)
+    args = build_matching_args(config)
+    assert args == [config.output_path, "--rotate_camera", "90", "--rotate_lidar", "180"]
+
+
+def test_matching_args_always_include_both_rotation_flags_even_at_zero():
+    # Upstream's own example passes --rotate_lidar 0 explicitly rather than
+    # omitting it -- both flags must always be present, not conditional.
+    config = _config(rotate_camera_deg=0, rotate_lidar_deg=0)
+    args = build_matching_args(config)
+    assert "--rotate_camera" in args
+    assert "--rotate_lidar" in args
+    assert args[args.index("--rotate_camera") + 1] == "0"
+    assert args[args.index("--rotate_lidar") + 1] == "0"
+
+
+def test_old_wrong_rotation_flag_names_appear_nowhere():
+    config = _config(rotate_camera_deg=270, rotate_lidar_deg=90)
+    all_args = build_preprocess_args(config) + build_matching_args(config)
+    assert "--camera_rotate_deg" not in all_args
+    assert "--lidar_rotate_deg" not in all_args
 
 
 def test_command_wraps_setup_sourcing_in_bash_lc():
@@ -190,6 +272,40 @@ def test_check_environment_fails_when_bag_path_missing(tmp_path):
     config = _config(input_bag_path=str(tmp_path / "does_not_exist"), output_path=str(tmp_path / "out"))
     result = check_environment(config, platform_system=lambda: "Linux", which=lambda _: "/usr/bin/ros2")
     assert not result.passed
+
+
+# ---------------------------------------------------------------------------
+# Input must be a bag DIRECTORY, never a single bag file (§5, §24, §35).
+# ---------------------------------------------------------------------------
+
+def test_check_environment_fails_when_bag_path_is_a_single_file(tmp_path):
+    bag_file = tmp_path / "scene01.bag"
+    bag_file.write_bytes(b"not a real bag, just a file")
+    config = _config(input_bag_path=str(bag_file), output_path=str(tmp_path / "out"))
+    result = check_environment(config, platform_system=lambda: "Linux", which=lambda _: "/usr/bin/ros2")
+    assert not result.passed
+    assert any("directory" in p.lower() for p in result.problems)
+
+
+def test_check_environment_fails_when_bag_path_is_a_plain_file_not_bag_extension(tmp_path):
+    plain_file = tmp_path / "readme.txt"
+    plain_file.write_text("hello")
+    config = _config(input_bag_path=str(plain_file), output_path=str(tmp_path / "out"))
+    result = check_environment(config, platform_system=lambda: "Linux", which=lambda _: "/usr/bin/ros2")
+    assert not result.passed
+
+
+def test_check_environment_passes_with_a_real_directory_of_bags(tmp_path):
+    bag_dir = tmp_path / "calibration_bags"
+    bag_dir.mkdir()
+    (bag_dir / "scene01.bag").write_bytes(b"fake")
+    (bag_dir / "scene02.bag").write_bytes(b"fake")
+    config = _config(
+        input_bag_path=str(bag_dir), output_path=str(tmp_path / "out"), ros_version="2",
+        camera_matrix=np.eye(3), distortion=np.zeros(5),
+    )
+    result = check_environment(config, platform_system=lambda: "Linux", which=lambda _: "/usr/bin/ros2")
+    assert result.passed, result.problems
 
 
 def test_check_environment_passes_when_everything_ready(tmp_path):
@@ -361,7 +477,7 @@ def test_pipeline_coarse_mode_succeeds_and_never_runs_calibrate():
 
 def test_pipeline_full_mode_runs_all_four_stages_in_order():
     recorder = _StageRecorder()
-    result = _run(_config(mode="full"), recorder)
+    result = _run(_config(mode="full", rotate_camera_deg=90, rotate_lidar_deg=180), recorder)
 
     assert result.success, result.failure_message
     assert len(recorder.calls) == 4
@@ -372,6 +488,16 @@ def test_pipeline_full_mode_runs_all_four_stages_in_order():
     assert "initial_guess_auto" in joined[2]
     assert "calibrate" in joined[3]
     assert result.prior.source_key == "T_lidar_camera"
+
+    # Rotation flags: correct names, on the MATCHING command only.
+    assert "--rotate_camera 90" in joined[1]
+    assert "--rotate_lidar 180" in joined[1]
+    assert "--camera_rotate_deg" not in joined[0]
+    assert "--lidar_rotate_deg" not in joined[0]
+    for stage_command in joined:
+        assert "--camera_rotate_deg" not in stage_command
+        assert "--lidar_rotate_deg" not in stage_command
+    assert "--rotate_camera" not in joined[0]  # never on preprocess
 
 
 def test_pipeline_full_mode_uses_final_source_not_auto_initial():

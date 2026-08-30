@@ -603,6 +603,8 @@ class CameraLidarWorkspace(QWidget):
     # ------------------------------------------------------------------
 
     _BOOTSTRAP_CAMERA_MODELS = ("plumb_bob", "fisheye", "omnidir")
+    _BOOTSTRAP_LOG_MAX_LINES = 2000
+    _BOOTSTRAP_LOG_TRIM_MARGIN = 200
 
     def _build_targetless_bootstrap_widget(self) -> QWidget:
         group = QGroupBox("TARGETLESS BOOTSTRAP")
@@ -631,7 +633,7 @@ class CameraLidarWorkspace(QWidget):
             return edit, row
 
         self.bootstrap_bag_edit, bag_row = path_row(self._on_browse_bootstrap_bag)
-        form.addRow("Input Bag", self._wrap_layout(bag_row))
+        form.addRow("Input Bag Directory", self._wrap_layout(bag_row))
 
         self.bootstrap_output_edit, output_row = path_row(self._on_browse_bootstrap_output)
         self.bootstrap_output_edit.textEdited.connect(
@@ -665,6 +667,20 @@ class CameraLidarWorkspace(QWidget):
         for name in self._BOOTSTRAP_CAMERA_MODELS:
             self.bootstrap_camera_model_combo.addItem(name, name)
         form.addRow("Camera Model (direct_visual)", self.bootstrap_camera_model_combo)
+
+        # find_matches_superglue.py's own --rotate_camera/--rotate_lidar
+        # (§18-19) -- ComboBox-only (0/90/180/270), never a free-angle spin,
+        # since upstream only accepts these 4 steps.
+        def rotation_combo() -> QComboBox:
+            combo = QComboBox()
+            for deg in (0, 90, 180, 270):
+                combo.addItem(f"{deg}°", deg)
+            return combo
+
+        self.bootstrap_camera_rotation_combo = rotation_combo()
+        form.addRow("Camera Rotation", self.bootstrap_camera_rotation_combo)
+        self.bootstrap_lidar_rotation_combo = rotation_combo()
+        form.addRow("LiDAR Image Rotation", self.bootstrap_lidar_rotation_combo)
 
         self.bootstrap_ros_setup_edit, ros_setup_row = path_row(self._on_browse_bootstrap_ros_setup)
         form.addRow("ROS Setup (optional)", self._wrap_layout(ros_setup_row))
@@ -783,6 +799,8 @@ class CameraLidarWorkspace(QWidget):
             camera_model=self.bootstrap_camera_model_combo.currentData(),
             camera_matrix=camera_matrix,
             distortion=distortion,
+            rotate_camera_deg=self.bootstrap_camera_rotation_combo.currentData(),
+            rotate_lidar_deg=self.bootstrap_lidar_rotation_combo.currentData(),
             mode="full" if self.bootstrap_mode_full_radio.isChecked() else "coarse",
             ros_setup_path=self.bootstrap_ros_setup_edit.text().strip(),
             workspace_setup_path=self.bootstrap_workspace_setup_edit.text().strip(),
@@ -808,6 +826,27 @@ class CameraLidarWorkspace(QWidget):
             )
             return
         if self._bootstrap_worker is not None:
+            return
+
+        # Fast, synchronous pre-flight checks (§7/§24) -- give immediate
+        # feedback and refuse to even start the worker thread, rather than
+        # spinning one up only to have ENV_CHECK reject it a moment later.
+        # check_environment() inside the worker still re-validates these
+        # (and more) as the actual source of truth.
+        if self.intrinsics is None:
+            QMessageBox.warning(
+                self, "Camera Intrinsic 필요",
+                "Targetless Bootstrap requires a valid camera intrinsic calibration.",
+            )
+            return
+
+        bag_path = self.bootstrap_bag_edit.text().strip()
+        if not bag_path or not os.path.isdir(bag_path):
+            QMessageBox.warning(
+                self, "Input Bag Directory 필요",
+                "Input Bag Directory must be an existing directory containing calibration bags "
+                "(not a single bag file).",
+            )
             return
 
         try:
@@ -854,9 +893,19 @@ class CameraLidarWorkspace(QWidget):
 
     def _on_bootstrap_log(self, line: str) -> None:
         self.bootstrap_log_text.appendPlainText(line)
+        # Cap accumulated log size (§14) -- trimmed in batches (not every
+        # single line) so this stays cheap even for a very chatty stage.
+        document = self.bootstrap_log_text.document()
+        if document.blockCount() > self._BOOTSTRAP_LOG_MAX_LINES + self._BOOTSTRAP_LOG_TRIM_MARGIN:
+            kept = "\n".join(self.bootstrap_log_text.toPlainText().splitlines()[-self._BOOTSTRAP_LOG_MAX_LINES:])
+            self.bootstrap_log_text.setPlainText(kept)
+            cursor = self.bootstrap_log_text.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            self.bootstrap_log_text.setTextCursor(cursor)
 
     def _on_bootstrap_stage_started(self, stage_value: str) -> None:
         self.bootstrap_status_label.setText(f"RUNNING: {stage_value.upper()}")
+        self.bootstrap_log_text.appendPlainText(f"[{stage_value.upper()}]")
 
     def _on_bootstrap_succeeded(self, prior: TargetlessPrior) -> None:
         self.bootstrap_status_label.setText("DONE")
@@ -985,8 +1034,25 @@ class CameraLidarWorkspace(QWidget):
         self.cloud_timestamp = cloud_frame.timestamp
         self.camera_topic = camera_topic
         self.lidar_topic = lidar_topic
+        self._prefill_bootstrap_defaults_from_bag(camera_topic, lidar_topic)
         self._update_source_label()
         self._update_capture_enabled()
+
+    def _prefill_bootstrap_defaults_from_bag(self, camera_topic: str, lidar_topic: str) -> None:
+        """§6: adopt the Input Source Bag tab's already-selected bag path/
+        topics as Targetless Bootstrap DEFAULTS -- only fills in fields the
+        user hasn't already set (never overwrites something they typed),
+        so this can safely run every time a bag scene loads. The "Use
+        Current Bag Topics" button remains available for an explicit
+        re-sync/overwrite."""
+        if camera_topic and not self.bootstrap_image_topic_edit.text():
+            self.bootstrap_image_topic_edit.setText(camera_topic)
+        if lidar_topic and not self.bootstrap_points_topic_edit.text():
+            self.bootstrap_points_topic_edit.setText(lidar_topic)
+        if self.bag_source.bag_path and not self.bootstrap_bag_edit.text():
+            self.bootstrap_bag_edit.setText(self.bag_source.bag_path)
+            if self._bootstrap_output_path_auto:
+                self.bootstrap_output_edit.setText(self._default_bootstrap_output_dir(self.bag_source.bag_path))
 
     def _update_source_label(self) -> None:
         parts = []
