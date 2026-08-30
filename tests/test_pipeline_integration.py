@@ -5,11 +5,12 @@ tests/test_pipeline_integration.py
 가장 중요한 테스트 파일. "각 모듈이 따로 동작하는 것"과 "전체 파이프라인이
 실제로 이어붙었을 때 안 깨지는 것"은 다른 문제다 - 이 파일은 후자를 검증한다.
 
-detect_dataset -> quality -> frame_quality -> 3모델 계산 -> hold-out validation
--> 추천 -> outlier 제거 -> FinalResult -> OpenCV/ROS/HTML export까지 실제
-합성 데이터(conftest.py의 synthetic_distorted_dataset_dir)로 전부 이어서 돌린다.
+detect_dataset -> quality -> frame_quality -> Standard 4모델 계산 -> hold-out
+validation -> 추천 -> outlier 제거 -> FinalResult -> OpenCV/ROS/HTML export까지
+실제 합성 데이터(conftest.py의 synthetic_distorted_dataset_dir)로 전부 이어서
+돌린다.
 
-@pytest.mark.slow: ChArUco 렌더링 + 3모델 계산이 들어가 있어 다른 테스트보다
+@pytest.mark.slow: ChArUco 렌더링 + Standard 4모델 계산이 들어가 있어 다른 테스트보다
 느리다 (전체 스위트 1초 미만 vs 이 파일 혼자 수 초). CI에서 빠른 피드백이
 필요하면 `pytest -m "not slow"`로 건너뛸 수 있다.
 """
@@ -44,7 +45,7 @@ def test_detection_succeeds_on_synthetic_dataset(synthetic_dataset):
 
 def test_full_pipeline_end_to_end(synthetic_dataset, camera_config, pattern_config, tmp_path):
     """설계 문서 15번 파이프라인 전체를 실제로 이어서 돈다:
-    Detection -> Quality Gate -> 3모델 -> Model Evaluation -> Outlier -> Validation
+    Detection -> Quality Gate -> Standard 4모델 -> Model Evaluation -> Outlier -> Validation
     -> Final Result -> Export(OpenCV/ROS/HTML) 까지.
     """
     dataset = synthetic_dataset
@@ -60,11 +61,11 @@ def test_full_pipeline_end_to_end(synthetic_dataset, camera_config, pattern_conf
     scored = [f for f in dataset.frames if f.quality is not None]
     assert len(scored) == dataset.num_detected
 
-    # 3. Calibration Engine - 3모델 동시 계산
+    # 3. Calibration Engine - Standard 4모델 동시 계산
     results = run_all_models(dataset, camera_config)
     calibration_results = {r.model_name: r for r in results}
-    assert len(calibration_results) == 3
-    assert any(r.success for r in results), "3개 모델이 전부 실패함 - 합성 데이터 문제 가능성"
+    assert len(calibration_results) == 4
+    assert any(r.success for r in results), "Standard 4모델이 전부 실패함 - 합성 데이터 문제 가능성"
 
     for m, r in calibration_results.items():
         if r.success:

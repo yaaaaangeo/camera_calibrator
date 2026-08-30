@@ -14,8 +14,8 @@ scripts/tune_model_score_weights.py
     3. true_fisheye   : cv2.fisheye 왜곡 모델(k1~k4)의 넓은 화각 -> 정답은 Fisheye
 
 각 시나리오를 여러 랜덤 시드로 반복해(포즈 다양성에 따라 우연히 결과가
-바뀌지 않는지 확인) 3모델 계산 + Hold-out validation까지 실제로 돌리고,
-그 결과(CalibrationResult, ValidationResult)를 캐싱한다.
+바뀌지 않는지 확인) Standard 4모델 계산 + Hold-out validation까지 실제로
+돌리고, 그 결과(CalibrationResult, ValidationResult)를 캐싱한다.
 
 캐싱한 뒤에는 recommender.compute_model_scores()를 그대로 재사용해서
 (재구현하지 않음 - 실제 프로덕션 코드와 반드시 같은 로직으로 평가해야 튜닝
@@ -194,8 +194,8 @@ HOLDOUT_SEEDS = [11]  # 가중치 탐색에는 안 쓰고, 최종 평가에만 �
 
 
 def build_cached_results(seeds):
-    """각 시나리오 x 시드마다 실제 3모델 계산 + Hold-out validation을 한 번만
-    돌려서 결과를 캐싱한다. 이후 가중치 탐색은 이 캐시만 갖고 하므로 빠르다.
+    """각 시나리오 x 시드마다 실제 Standard 4모델 계산 + Hold-out validation을
+    한 번만 돌려서 결과를 캐싱한다. 이후 가중치 탐색은 이 캐시만 갖고 하므로 빠르다.
     """
     cache = []
     for name, cfg in SCENARIOS.items():

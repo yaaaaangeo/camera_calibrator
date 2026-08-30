@@ -216,7 +216,7 @@ class RadialProfileView(QWidget):
 
     def set_results(self, calibration_results: dict[CameraModelType, CalibrationResult]) -> None:
         self._results = calibration_results
-        # 3개 모델 전체를 통틀어 가장 큰 구간 평균 오차를 y축 상한으로 고정한다.
+        # 전달된 모델 전체를 통틀어 가장 큰 구간 평균 오차를 y축 상한으로 고정한다.
         # _refresh_chart()가 모델 콤보 변경마다 호출되는데, 그때마다 축이
         # 다시 스케일되면 막대 높이로 모델 간 비교가 안 되기 때문
         # (사용자 피드백: "세로 축이 계속 바뀌니깐 뭐가 더 좋은지 잘 모르겠어").

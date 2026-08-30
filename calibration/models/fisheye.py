@@ -160,8 +160,8 @@ def _bootstrap_fisheye_uncertainty(
     n_jobs: int = 1,
 ) -> ParameterUncertainty | None:
     """설계 문서 20번 - bootstrap 불확실성 추정 로직 자체는 이제
-    calibration/bootstrap.py로 옮겨져 세 모델이 공유한다(중복 로직을 한
-    곳으로 합침). 이 함수는 fisheye 전용 안전장치 하나만 더해서 그 공용
+    calibration/bootstrap.py로 옮겨져 Standard 4모델이 공유한다(중복 로직을
+    한 곳으로 합침). 이 함수는 fisheye 전용 안전장치 하나만 더해서 그 공용
     함수를 감싸는 얇은 래퍼다: cv2.fisheye.CALIB_USE_INTRINSIC_GUESS는
     OpenCV 빌드에 따라 없을 수 있어(모듈 상단 docstring 1번) _fisheye_flag()로
     안전하게 조회한 뒤에 넘긴다.

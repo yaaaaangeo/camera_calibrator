@@ -79,18 +79,35 @@ class HelpView(QWidget):
             </tr>
             <tr>
                 <td><b>중앙 (Pattern)</b></td>
-                <td>Target-specific fields such as Columns/Rows, Square Size, Center Spacing, Tag Pitch, Marker Size, and Dictionary/Tag Family.</td>
+                <td><b>Calibration method</b>(Standard 또는 Object-Releasing, 아래
+                    "Advanced Calibration" 참고) → Target-specific fields such as
+                    Columns/Rows, Square Size, Center Spacing, Tag Pitch, Marker Size,
+                    Dictionary/Tag Family, Grid type(Circle Grid), AprilGrid variant.</td>
             </tr>
             <tr>
                 <td><b>오른쪽 (Actions)</b></td>
                 <td>
                     Rational model 사용(k4~k6) 체크박스 → <b>캘리브레이션 실행</b> →
                     <b>Export</b>(계산된 모델을 골라 OpenCV YAML로 저장) →
-                    <b>취소</b>(코너 검출/3모델 계산이 진행 중일 때 즉시 중단하고, 원하는
+                    <b>취소</b>(코너 검출/모델 계산이 진행 중일 때 즉시 중단하고, 원하는
                     데이터/설정으로 다시 실행할 수 있는 상태로 되돌립니다).
                 </td>
             </tr>
         </table>
+
+        <div class="note">
+            <b>Advanced Calibration (Object-Releasing)</b><br>
+            Calibration method를 Object-Releasing으로 바꾸면, Standard 4모델과는
+            별도로 <code>cv2.calibrateCameraRO</code> 기반 결과를 함께 계산합니다 -
+            카메라 파라미터뿐 아니라 캘리브레이션 타겟 형상 자체도 함께 추정해,
+            타겟 인쇄/부착 오차까지 보정하고 싶은 고정밀 캘리브레이션에 씁니다.
+            <b>Checkerboard/Circle Grid만 지원</b>하며(ChArUco/AprilGrid는 부분
+            검출이 흔해 지원하지 않음), 타겟 전체가 매 프레임 동일한 순서로 빠짐없이
+            검출된 프레임(full-board)만 사용합니다. 결과는 ③ Model Comparison 탭
+            아래 <b>Advanced Calibration</b> 패널에 전용 Hold-out Validation과
+            Standard Brown-Conrady와의 공정 비교(같은 데이터셋, 같은 train/test
+            분할)와 함께 표시되며, Standard의 Hold-out/AIC/BIC와는 섞이지 않습니다.
+        </div>
 
         <h2>탭별 기능</h2>
         <table>

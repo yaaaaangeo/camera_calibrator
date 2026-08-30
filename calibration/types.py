@@ -715,6 +715,61 @@ class ValidationResult:
 
 
 @dataclass
+class ObjectReleasingValidationResult:
+    """Object-Releasing 전용 Hold-out 결과.
+
+    ValidationResult과 분리한 이유: Object-Releasing은 Train에서 K/D뿐 아니라
+    Refined Target Geometry까지 함께 확정하고, Test에서는 이 셋을 전부 고정한 채
+    pose(solvePnP)만 다시 구한다 - Standard Hold-out(_evaluate_on_test)의 test
+    프레임은 각자의 nominal object_points를 쓰지만, 여기서는 반드시 Train에서
+    나온 refined_object_points를 재사용해야 하므로 계산 경로 자체가 다르다.
+    별도 타입으로 두면 Standard 쪽 ValidationResult/직렬화에 영향을 주지 않고
+    이 계약을 명시적으로 강제할 수 있다.
+    """
+    success: bool = True
+    error_message: Optional[str] = None
+    train_frame_ids: list[str] = field(default_factory=list)
+    test_frame_ids: list[str] = field(default_factory=list)
+    # Full-board가 아니어서애초에 eligible pool에도 못 들어간 프레임들
+    # (collect_object_releasing_inputs의 diagnostics에서 그대로 가져온다 -
+    # "이유 없이 조용히 skip"하지 않기 위함).
+    excluded_frame_ids: list[str] = field(default_factory=list)
+    excluded_reasons: dict[str, str] = field(default_factory=dict)
+    # Test 시점에 방어적으로 재검증했을 때 실패한 프레임 (정상 흐름에서는
+    # 비어있어야 함 - eligible pool 단계에서 이미 걸러졌으므로).
+    failed_test_frame_ids: list[str] = field(default_factory=list)
+    failed_test_reasons: dict[str, str] = field(default_factory=dict)
+    train_rms: Optional[float] = None
+    test_rms: Optional[float] = None
+    test_residual_stats: Optional[ResidualStats] = None
+    target_geometry_refinement: Optional[dict[str, float]] = None
+
+
+@dataclass
+class StandardVsObjectReleasingComparison:
+    """Standard Brown-Conrady와 Object-Releasing Brown-Conrady의 공정 비교.
+
+    두 arm이 반드시 "같은 eligible full-board 데이터셋" + "같은 train/test
+    분할"을 쓰도록 강제하는 것이 이 타입의 존재 이유 - train_frame_ids/
+    test_frame_ids가 두 arm 모두에 공통으로 딱 하나씩만 존재한다.
+    """
+    success: bool = True
+    error_message: Optional[str] = None
+    eligible_frame_ids: list[str] = field(default_factory=list)
+    train_frame_ids: list[str] = field(default_factory=list)
+    test_frame_ids: list[str] = field(default_factory=list)
+    standard_result: Optional[CalibrationResult] = None
+    standard_validation: Optional[ValidationResult] = None
+    object_releasing_result: Optional[CalibrationResult] = None
+    object_releasing_validation: Optional[ObjectReleasingValidationResult] = None
+    # ro - standard, 키: fx/fy/cx/cy/k1/k2/p1/p2/k3
+    intrinsics_delta: dict[str, float] = field(default_factory=dict)
+    # 사실만 기술하는 경고 (예: "train은 좋아졌는데 hold-out은 그대로") -
+    # "RO가 더 정확하다" 같은 자동 판정 문구는 절대 넣지 않는다.
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
 class CrossDatasetValidationResult:
     """Dataset A에서 학습한 calibration을 Dataset B/C에 고정 평가한 결과."""
     source_dataset_id: str
@@ -903,7 +958,7 @@ class FinalResult:
     dataset_coverage_pct: Optional[float] = None
     overall_grade: QualityGrade = QualityGrade.WARNING
     confidence: Optional[CalibrationConfidenceReport] = None
-    model_scores: list[ModelScore] = field(default_factory=list)  # 참고용 3개 모델 비교 스냅샷
+    model_scores: list[ModelScore] = field(default_factory=list)  # 참고용 Standard 4모델 비교 스냅샷
     diagnosis: Optional[DiagnosisReport] = None
 
 
@@ -919,8 +974,11 @@ class CalibrationProject:
 
     필드 형태를 실제 UI(ui/main_window.py)와 CLI(app/cli.py)가 런타임에
     들고 다니는 형태(dict[CameraModelType, ...])에 맞췄다 - 원래 설계
-    문서 18번 초안은 list/단일값이었지만, 3모델을 항상 함께 다루는
+    문서 18번 초안은 list/단일값이었지만, Standard 4모델을 항상 함께 다루는
     실제 파이프라인 구조상 모델별 dict가 훨씬 자연스럽고 실수를 줄인다.
+    Object-Releasing(Advanced)은 이 dict에 섞이지 않고 별도 필드
+    (object_releasing_result/object_releasing_validation_result/
+    standard_vs_object_releasing_comparison)로 분리해서 담는다.
     """
     project_name: str
     camera_config: CameraConfig
@@ -928,6 +986,8 @@ class CalibrationProject:
     dataset: Dataset = field(default_factory=Dataset)
     calibration_results: dict[CameraModelType, CalibrationResult] = field(default_factory=dict)
     object_releasing_result: Optional[CalibrationResult] = None
+    object_releasing_validation_result: Optional[ObjectReleasingValidationResult] = None
+    standard_vs_object_releasing_comparison: Optional[StandardVsObjectReleasingComparison] = None
     validation_results: dict[CameraModelType, ValidationResult] = field(default_factory=dict)
     cross_dataset_results: list[CrossDatasetValidationResult] = field(default_factory=list)
     model_scores: list[ModelScore] = field(default_factory=list)

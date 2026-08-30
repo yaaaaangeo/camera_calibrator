@@ -80,7 +80,7 @@ def test_recommender_picks_fisheye_when_distortion_is_clean():
             marks=pytest.mark.xfail(
                 reason=(
                     "알려진 한계 (scripts/TUNING_RESULTS.md 참고): 제한된 화각(FOV)에서는 "
-                    "Extended Pinhole(Brown-Conrady)과 Fisheye(Kannala-Brandt)가 방사왜곡 "
+                    "Extended Pinhole(Rational)과 Fisheye(Kannala-Brandt)가 방사왜곡 "
                     "형태가 비슷해져 통계적으로 구분이 어렵다 - 실측: 노이즈 있는 3개 시드 중 "
                     "1개만 정답. 진짜 fisheye 렌즈가 아니라면 화각이 넓은 데이터를 더 모으는 "
                     "것 외엔 가중치 튜닝으로 해결이 안 되는 근본적인 모델 식별성 문제다."

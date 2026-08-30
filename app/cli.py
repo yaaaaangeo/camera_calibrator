@@ -8,14 +8,17 @@ camera_calibrator.app.cli
         --square-size 0.04 --marker-size 0.03 --output-dir ./out
 
 전체 흐름은 ui/worker.py의 PipelineWorker와 동일한 순서(Detection -> Quality
--> 3모델 -> Validation -> 추천 -> [옵션] Outlier 제거 -> Final Result ->
+-> Standard 4모델 -> Validation -> 추천 -> [옵션] Outlier 제거 -> Final Result ->
 Export)를 따르되, Qt 시그널 대신 stdout에 진행상황을 찍고 예외는 그대로
-위로 던지지 않고 종료 코드로 변환한다.
+위로 던지지 않고 종료 코드로 변환한다. `--calibration-method object_releasing`이면
+Standard 4모델과 별도로 Object-Releasing(Advanced) 결과 + 전용 Hold-out +
+Standard Brown-Conrady와의 비교도 함께 계산한다.
 
 종료 코드:
     0 = 성공 (export 파일까지 다 만들어짐)
     1 = 입력 문제 (이미지 없음, 인자 오류 등)
-    2 = 검출은 됐지만 모든 모델의 캘리브레이션이 실패함
+    2 = 검출은 됐지만 모든 모델의 캘리브레이션이 실패함 (또는 Object-Releasing
+        계산 자체가 실패함)
 """
 
 from __future__ import annotations
@@ -49,6 +52,11 @@ from calibration.models.pinhole import calibrate_pinhole
 from calibration.models.object_releasing import (
     calibrate_object_releasing_brown_conrady,
     is_object_releasing_supported_pattern,
+)
+from calibration.object_releasing_validation import (
+    compare_standard_vs_object_releasing_brown,
+    format_standard_vs_object_releasing_table,
+    validate_object_releasing_holdout,
 )
 from calibration.outlier import recalibrate_with_outlier_pruning, format_outlier_before_after
 from calibration.outlier import recalibrate_with_corner_outlier_pruning, format_corner_outlier_before_after
@@ -803,15 +811,28 @@ def run_pipeline(args) -> int:
     )
     calibration_results = {r.model_name: r for r in results}
     object_releasing_result = None
+    object_releasing_validation_result = None
+    standard_vs_object_releasing_comparison = None
     if args.calibration_method == CalibrationMethod.OBJECT_RELEASING:
         object_releasing_result = calibrate_object_releasing_brown_conrady(dataset, camera_config, pattern_config)
         if not object_releasing_result.success:
             print(f"오류: Object-Releasing calibration failed: {object_releasing_result.error_message}", file=sys.stderr)
             return 2
+        object_releasing_validation_result = validate_object_releasing_holdout(
+            dataset, camera_config, pattern_config, test_ratio=args.test_ratio, seed=args.seed,
+        )
+        standard_vs_object_releasing_comparison = compare_standard_vs_object_releasing_brown(
+            dataset, camera_config, pattern_config, test_ratio=args.test_ratio, seed=args.seed,
+        )
         if not quiet:
             print("Object-Releasing calibration: Brown-Conrady result stored as an advanced result.")
             if object_releasing_result.warning_message:
                 print(object_releasing_result.warning_message)
+            if object_releasing_validation_result.success:
+                print(f"Object-Releasing Hold-out RMSE: {object_releasing_validation_result.test_rms:.3f} px")
+            else:
+                print(f"Object-Releasing Hold-out: {object_releasing_validation_result.error_message}")
+            print(format_standard_vs_object_releasing_table(standard_vs_object_releasing_comparison))
     compute_frame_quality_scores(dataset, pattern_config, image_size, use_reprojection=True)
 
     # 설계 문서 4번 - Overall Dataset Score. 개별 프레임 점수(방금 갱신됨) +
@@ -830,7 +851,7 @@ def run_pipeline(args) -> int:
         print(format_dataset_quality_score(dataset.quality_score))
 
     if not any(r.success for r in results):
-        print("오류: 3개 모델 모두 캘리브레이션에 실패했습니다.", file=sys.stderr)
+        print(f"오류: 선택된 모델 {len(results)}개 모두 캘리브레이션에 실패했습니다.", file=sys.stderr)
         for r in results:
             if r.error_message:
                 print(f"  {r.model_name.value}: {r.error_message}", file=sys.stderr)
@@ -867,6 +888,8 @@ def run_pipeline(args) -> int:
         pattern_config,
         calibration_results,
         object_releasing_result=object_releasing_result,
+        object_releasing_validation_result=object_releasing_validation_result,
+        standard_vs_object_releasing_comparison=standard_vs_object_releasing_comparison,
     )
 
 
@@ -901,6 +924,8 @@ def _run_from_loaded_project(args) -> int:
         args, project.dataset, project.camera_config, project.pattern_config,
         project.calibration_results,
         object_releasing_result=project.object_releasing_result,
+        object_releasing_validation_result=project.object_releasing_validation_result,
+        standard_vs_object_releasing_comparison=project.standard_vs_object_releasing_comparison,
         precomputed_validation=project.validation_results,
         precomputed_scores=project.model_scores,
         precomputed_cross_dataset_results=project.cross_dataset_results,
@@ -910,6 +935,8 @@ def _run_from_loaded_project(args) -> int:
 def _validate_choose_and_export(
     args, dataset, camera_config, pattern_config, calibration_results,
     object_releasing_result=None,
+    object_releasing_validation_result=None,
+    standard_vs_object_releasing_comparison=None,
     precomputed_validation=None,
     precomputed_scores=None,
     precomputed_cross_dataset_results=None,
@@ -1268,6 +1295,8 @@ def _validate_choose_and_export(
             project_name=args.sensor_name or "camera_calibrator",
             camera_config=camera_config, pattern_config=pattern_config, dataset=dataset,
             calibration_results=calibration_results, object_releasing_result=object_releasing_result,
+            object_releasing_validation_result=object_releasing_validation_result,
+            standard_vs_object_releasing_comparison=standard_vs_object_releasing_comparison,
             validation_results=validation_results,
             cross_dataset_results=cross_dataset_results,
             model_scores=scores, outlier_result=outlier_result, final_result=final_result,
@@ -1348,7 +1377,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     src.add_argument("--list-topics", metavar="BAG_PATH", help="이 bag의 이미지 토픽 목록만 출력하고 종료")
     src.add_argument(
         "--load-project", metavar="CCPROJ_PATH",
-        help="저장된 .ccproj 프로젝트를 불러와 이어서 진행 (검출/3모델 계산을 다시 안 함, "
+        help="저장된 .ccproj 프로젝트를 불러와 이어서 진행 (검출/모델 계산을 다시 안 함, "
              "--images/--bag/패턴 옵션과 함께 쓸 수 없음). 원본 이미지가 없어져도 동작함.",
     )
     src.add_argument(
@@ -1375,7 +1404,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     pat = p.add_argument_group("패턴")
     pat.add_argument(
         "--pattern", default="charuco",
-        help="패턴 타입: charuco, chessboard, apriltag_grid/aprilgrid "
+        help="패턴 타입: charuco, chessboard, circle_grid/circles, apriltag_grid/aprilgrid "
              "(기본값 charuco, AprilGrid는 DICT_APRILTAG_* dictionary 필요)",
     )
     pat.add_argument("--squares-x", type=int, help="가로 사각형 개수")
@@ -1502,7 +1531,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     out.add_argument("--json-summary", help="기계가 읽기 좋은 JSON 요약을 이 경로에 저장 (CI 스크립팅용)")
     out.add_argument(
         "--save-project", metavar="CCPROJ_PATH",
-        help="계산이 끝난 뒤 전체 상태(데이터셋, 3모델 결과, 검증, 추천)를 .ccproj 파일로 저장. "
+        help="계산이 끝난 뒤 전체 상태(데이터셋, Standard 4모델 결과, 검증, 추천, "
+             "Object-Releasing 결과/검증/비교)를 .ccproj 파일로 저장. "
              "나중에 --load-project로 다시 불러와 이어서 쓸 수 있음.",
     )
     out.add_argument(
@@ -1512,7 +1542,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     out.add_argument(
         "--cache-dir", metavar="PATH",
-        help="Persistent result cache 폴더. 지정하면 같은 dataset/config/model 옵션의 3모델 계산 결과를 "
+        help="Persistent result cache 폴더. 지정하면 같은 dataset/config/model 옵션의 모델 계산 결과를 "
              "디스크에 저장하고 다음 실행에서 재사용한다.",
     )
     out.add_argument("--quiet", action="store_true", help="진행상황 출력을 최소화 (콘솔 로그도 ERROR만 표시)")

@@ -2,7 +2,10 @@
 camera_calibrator.calibration.compare
 =========================================
 
-설계 문서 17번 Step4/Step5 - 3개 모델 동시 계산 + Model Comparison.
+설계 문서 17번 Step4/Step5 - Standard 4모델(Ideal Pinhole/Brown-Conrady/
+Rational/Fisheye) 동시 계산 + Model Comparison. Object-Releasing(Advanced)은
+이 모듈이 아니라 calibration/models/object_releasing.py +
+calibration/object_releasing_validation.py에서 완전히 별도로 다룬다.
 
 주의: 여기서는 "비교표를 보여주는 것"까지만 한다.
 "어느 모델이 낫다"는 자동 판정(Model Score, 추천)은 recommender.py의 몫이며,
@@ -51,7 +54,8 @@ def run_all_models(
     persistent_cache_dir: str | Path | None = None,
     models: list[CameraModelType] | tuple[CameraModelType, ...] | None = None,
 ) -> list[CalibrationResult]:
-    """세 모델을 정해진 순서로 계산.
+    """Standard 4모델(Ideal Pinhole/Brown-Conrady/Rational/Fisheye)을 정해진
+    순서로 계산.
 
     Pinhole을 가장 먼저 계산하는 이유: Fisheye 초기값으로 넘겨줘야 하기 때문
     (설계 문서 2번 발산 방지). 순서를 바꾸면 안 된다.
@@ -130,16 +134,18 @@ def _model_label(model: CameraModelType) -> str:
 
 
 def format_comparison_table(results: list[CalibrationResult]) -> str:
-    """설계 문서 17번 Step5 형식의 비교표.
+    """설계 문서 17번 Step5 형식의 비교표. results에 담긴 모델 수만큼 열이
+    생긴다 - 보통 Standard 4모델(Ideal Pinhole/Brown-Conrady/Rational/Fisheye)
+    전부이지만, run_all_models(models=[...])로 일부만 계산했다면 그만큼만 나온다.
 
-                      Pinhole  Extended  Fisheye
-        Train RMS        1.12      0.46     0.39
-        Mean Error       0.91      0.38     0.34
-        Edge Error       2.13      0.61     0.42
-        Max Error        3.21      1.82     1.31
-        P95 (pt)         2.05      0.98     0.81
-        P99 (pt)         2.98      1.55     1.20
-        Complexity          *        **      ***
+                      Ideal  Brown  Rational  Fisheye
+        Train RMS      1.12   0.58      0.46     0.39
+        Mean Error     0.91   0.47      0.38     0.34
+        Edge Error     2.13   0.85      0.61     0.42
+        Max Error      3.21   2.40      1.82     1.31
+        P95 (pt)       2.05   1.20      0.98     0.81
+        P99 (pt)       2.98   1.80      1.55     1.20
+        Complexity        *     **        **      ***
 
     P95/P99(pt)는 설계 문서 11번 - 코너 포인트 단위 재투영 오차의 percentile
     (residual_stats.py). Mean/Max Error는 프레임 단위 RMS의 평균/최댓값이라

@@ -3,16 +3,17 @@ camera_calibrator.calibration.bootstrap
 ===========================================
 
 설계 문서 20/21/22번 - Bootstrap Stability / Parameter Confidence Interval을
-Fisheye 전용이 아니라 세 모델 전부에서 쓸 수 있게 일반화한 모듈.
+Fisheye 전용이 아니라 Standard 4모델 전부에서 쓸 수 있게 일반화한 모듈.
 
 원래 이 로직은 calibration/models/fisheye.py의 _bootstrap_fisheye_uncertainty()
 안에만 있었다 - fisheye는 cv2.fisheye.calibrate가 stdDeviations를 안 줘서
-(Pinhole/Extended처럼 "공짜로" 못 얻어서) 어쩔 수 없이 bootstrap을 썼던 것.
-하지만 "이 데이터셋으로 추정한 파라미터가 얼마나 안정적인가"는 Pinhole/Extended
-에도 똑같이 유용한 질문이다 - covariance 기반 표준편차는 선형화된 근사치일
-뿐이고, bootstrap은 실제 재표본화로 얻은 경험적 분포라 서로 다른 관점의
-교차검증 역할을 한다. 그래서 이 함수를 모델 무관하게 만들어 세 모델 다
-(선택적으로) bootstrap 불확실성을 계산할 수 있게 했다.
+(Pinhole/Brown-Conrady/Extended처럼 "공짜로" 못 얻어서) 어쩔 수 없이
+bootstrap을 썼던 것. 하지만 "이 데이터셋으로 추정한 파라미터가 얼마나
+안정적인가"는 Pinhole/Brown-Conrady/Extended에도 똑같이 유용한 질문이다 -
+covariance 기반 표준편차는 선형화된 근사치일 뿐이고, bootstrap은 실제
+재표본화로 얻은 경험적 분포라 서로 다른 관점의 교차검증 역할을 한다. 그래서
+이 함수를 모델 무관하게 만들어 네 모델 다 (선택적으로) bootstrap 불확실성을
+계산할 수 있게 했다.
 
 방법론(기존 fisheye 전용 버전과 동일, 정직하게 한계도 그대로 명시):
     전체 데이터로 얻은 K_ref/D_ref를 초기값 삼아 프레임을 복원추출(bootstrap)로
@@ -153,7 +154,7 @@ def compute_parameter_bootstrap(
     rng_seed: int = 42,
     n_jobs: int = 1,
 ) -> ParameterUncertainty | None:
-    """세 모델 공용 bootstrap 불확실성 추정.
+    """Standard 4모델 공용 bootstrap 불확실성 추정.
 
     flags: 이미 CALIB_USE_INTRINSIC_GUESS까지 포함해 완성된 최종 플래그 값을
     받는다 - 이 함수는 그 값을 그대로 cv2 호출에 넘기기만 한다. fisheye의

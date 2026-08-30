@@ -2,7 +2,10 @@
 camera_calibrator.calibration.models.extended_pinhole
 ========================================================
 
-설계 문서 1번, 17번 Step4 - Pinhole + Brown-Conrady (방사 왜곡 k1~k6 + 접선 왜곡 p1,p2)
+설계 문서 1번, 17번 Step4 - Extended Pinhole (UI/README에서는 "Rational"로
+표기, 방사 왜곡 k1~k6 + 접선 왜곡 p1,p2). Brown-Conrady(5계수, k4~k6 없음)는
+별도 모델 - calibration/models/brown_conrady.py가 이 함수를
+use_rational_model=False로 감싸 relabel한 것이다.
 
 pinhole.py와 구조가 완전히 동일하다. 차이는 딱 하나:
 Pinhole은 왜곡을 0으로 고정하는 플래그를 걸었지만, Extended Pinhole은
@@ -48,7 +51,7 @@ def calibrate_extended_pinhole(
     bootstrap_seed: int = 42,
     bootstrap_jobs: int = 1,
 ) -> CalibrationResult:
-    """Extended Pinhole (Brown-Conrady) 캘리브레이션 실행.
+    """Extended Pinhole (Rational) 캘리브레이션 실행.
 
     Args:
         use_rational_model: True면 k4~k6까지 추정 (CALIB_RATIONAL_MODEL).

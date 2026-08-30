@@ -14,9 +14,10 @@ RegionalError(center/left/right/top/bottom/corner, models/common.py)는
 이 모듈은 "코너 포인트 단위"로 모든 코너 각각의 (반지름, 오차)를 모아
 구간별 평균을 낸다. 화각 전역의 경향(중심 vs 외곽)을 훨씬 세밀하게 보여준다.
 
-pinhole.py / extended_pinhole.py / fisheye.py 세 모델 함수 모두 이 함수를
-동일하게 호출해서 CalibrationResult.radial_profile을 채운다 - regional_error와
-동일한 패턴(공용 모듈, 모델마다 같은 기준)을 따른다.
+pinhole.py / extended_pinhole.py / fisheye.py(brown_conrady.py는
+extended_pinhole.py를 재사용) 모두 이 함수를 동일하게 호출해서
+CalibrationResult.radial_profile을 채운다 - regional_error와 동일한 패턴
+(공용 모듈, 모델마다 같은 기준)을 따른다.
 """
 
 from __future__ import annotations

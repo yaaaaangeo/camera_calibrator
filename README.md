@@ -2,9 +2,13 @@
 
 [![Tests](https://github.com/yaaaaangeo/camera_calibrator/actions/workflows/tests.yml/badge.svg)](https://github.com/yaaaaangeo/camera_calibrator/actions/workflows/tests.yml)
 
-Pinhole / Extended Pinhole(Brown-Conrady) / Fisheye(Kannala-Brandt) 세 모델을
-ChArUco 패턴으로 동시에 캘리브레이션하고, Hold-out 검증 + Model Score 기반으로
-근거 있는 추천을 해주는 도구.
+**Standard Calibration**으로 Ideal Pinhole / Brown-Conrady / Rational(Extended
+Pinhole) / Fisheye(Kannala-Brandt) 네 모델을 ChArUco·Chessboard·Circle
+Grid·AprilGrid 중 원하는 패턴으로 동시에 캘리브레이션하고, Hold-out 검증 +
+Model Score(AIC/BIC) 기반으로 근거 있는 추천을 해주는 도구. Checkerboard/Circle
+Grid에는 **Advanced Calibration(Object-Releasing)** — 카메라 파라미터와 함께
+타겟 형상 자체도 함께 보정하는 `cv2.calibrateCameraRO` 기반 고급 모드 — 도
+별도로 제공한다 (4번 섹션 참고).
 
 ## 1. 요구 사항
 
@@ -14,7 +18,7 @@ ChArUco 패턴으로 동시에 캘리브레이션하고, Hold-out 검증 + Model
   실제 검증됨). 4.x와 5.x 둘 다에서 전체 테스트 스위트가 통과한다 - OpenCV
   5.0에서 `cv2.fisheye.CALIB_*` 플래그 위치가 바뀌고 `cv2.fisheye.calibrate()`의
   요구 shape이 엄격해진 것에 대응하는 코드가 `calibration/models/fisheye.py`에
-  있다 (자세한 내용은 10번 섹션).
+  있다 (자세한 내용은 11번 섹션).
 
 ## 2. 설치
 
@@ -107,14 +111,19 @@ camera-calibrator
 
 창이 뜨면:
 1. 상단에서 해상도(Width/Height)와 패턴 정보를 입력. **Pattern type**을
-   ChArUco(기본, 권장), Chessboard(일반 체스보드), AprilGrid 중 고를 수 있다.
-   Chessboard를 고르면 Marker size/Dictionary 입력칸이 자동으로 숨겨진다
-   (체스보드엔 필요 없으므로). ChArUco/AprilGrid는 사각형 개수/한 칸
-   크기(mm)/마커 크기(mm)/dictionary가 필요하고, Chessboard는 사각형 개수/
-   한 칸 크기(mm)만 있으면 된다. AprilGrid는 Kalibr과 같은 row-major ID
-   배치(왼쪽 위 0번부터 오른쪽으로 증가, 다음 줄로 이동)를 가정한다.
-   앱 내부에서는 OpenCV `DICT_APRILTAG_*` dictionary로 기본 검출을 수행할 수
-   있고, `--export kalibr`로 Kalibr 공식 `aprilgrid` target YAML도 만들 수 있다.
+   ChArUco(기본, 권장), Chessboard(일반 체스보드), Circle Grid(Symmetric/
+   Asymmetric), AprilGrid 중 고를 수 있다. Chessboard/Circle Grid를 고르면
+   Marker size/Dictionary 입력칸이 자동으로 숨겨진다 (그 패턴엔 필요 없으므로).
+   ChArUco/AprilGrid는 사각형(또는 태그) 개수/한 칸 크기(mm)/마커 크기(mm)/
+   dictionary가 필요하고, Chessboard/Circle Grid는 사각형(또는 원) 개수/
+   한 칸 크기(mm)만 있으면 된다 (Circle Grid는 추가로 Grid type을
+   Symmetric/Asymmetric 중에서 고른다). AprilGrid는 Kalibr과 같은 row-major ID
+   배치(왼쪽 위 0번부터 오른쪽으로 증가, 다음 줄로 이동)를 가정하고, **AprilGrid
+   variant**를 OpenCV/AprilTag3 style(기본) 또는 Kalibr style(experimental) 중
+   고를 수 있다 — 오늘 시점 둘 다 같은 OpenCV AprilTag detector 경로를 쓰고
+   variant는 로그 문구만 다르다 (4번 섹션의 AprilGrid 표 참고). 앱 내부에서는
+   OpenCV `DICT_APRILTAG_*` dictionary로 기본 검출을 수행할 수 있고,
+   `--export kalibr`로 Kalibr 공식 `aprilgrid` target YAML도 만들 수 있다.
 
    > ⚠️ **Chessboard를 쓸 때 주의**: 일반 체스보드는 대칭 패턴이라 ChArUco와
    > 달리 (1) 보드 전체가 이미지 안에 다 보여야 검출되고, (2) "어느 쪽이
@@ -135,12 +144,17 @@ camera-calibrator
      이미지는 jpg/png/bmp 파일을 직접 선택) → **[해상도 확인]**(JPEG/PNG 이미지
      한 장을 실제로 디코딩해 크기를 확인하고 Width/Height에 자동 반영) →
      Width/Height(한 줄)
-   - **중앙(Pattern)**: Pattern type/Squares X·Y/Square size/Marker size/Dictionary
+   - **중앙(Pattern)**: **Calibration method**(Standard/Object-Releasing, 아래
+     4번 섹션 참고) → Pattern type/Squares X·Y/Square size/Marker size/
+     Dictionary/Grid type/AprilGrid variant. Object-Releasing을 고르면 지원
+     대상(Checkerboard/Circle Grid)이 아닌 패턴에서는 안내 문구가 뜨고 실행이
+     막힌다.
    - **오른쪽(Actions)**: Rational model 사용(k4~k6) 체크박스 → **[캘리브레이션
      실행]** → **[Export]**(계산된 모델을 골라 OpenCV YAML로 저장 - 예전 Export 탭과
-     동일한 기능) → **[취소]**(코너 검출/3모델 계산이 진행 중일 때 즉시 중단하고,
+     동일한 기능) → **[취소]**(코너 검출/모델 계산이 진행 중일 때 즉시 중단하고,
      원하는 데이터/설정으로 다시 실행할 수 있는 상태로 되돌림)
-4. **[캘리브레이션 실행]** 클릭 → 검출 → 3모델 계산 → Hold-out → 추천까지 자동 진행
+4. **[캘리브레이션 실행]** 클릭 → 검출 → Standard 4모델 계산(+ Object-Releasing을
+   골랐다면 Advanced 결과도 함께) → Hold-out → 추천까지 자동 진행
 5. 탭을 넘기며 결과 확인:
    - **① Dataset**: Coverage Map(4×4 커버리지 맵) → Dataset Diversity(다양성 점수 +
      Overall Dataset Score) → Batch(이미지별 상태/코너 수/재투영 오차/
@@ -149,14 +163,78 @@ camera-calibrator
      오버레이)를 나란히 보여준다 - 옛 Undistort Preview와 Straightness Map을 한
      화면으로 합치고 Edge Error Map은 제거했다. 이미지 아래에는
      "Line Straightness — 보정 전 Xpx → 보정 후 Ypx (개선율 N%)" 한 줄만 표시된다.
-   - **③ Model Comparison**: 3모델 비교표(Train/Test/P95/Edge/Radial/AIC/BIC/Stability/Observability) + 추천 이유
+   - **③ Model Comparison**: Standard 4모델 비교표(Train/Test/P95/Edge/Radial/
+     AIC/BIC/Stability/Observability) + 추천 이유. Object-Releasing을 골랐다면
+     그 아래 **Advanced Calibration** 패널에 Object-Releasing 결과 + 전용
+     Hold-out Validation(Train/Test Frames, RMSE/Median/P95/P99/Max) +
+     Standard Brown-Conrady와의 공정 비교표(같은 full-board 데이터셋/같은
+     train-test 분할, 4번 섹션 참고)가 함께 표시된다. Standard Hold-out/AIC/BIC와는
+     완전히 분리된 결과다.
 6. 상단 메뉴 **파일 → 프로젝트 저장(Ctrl+S)** 으로 지금까지의 전체 상태(데이터셋,
-   3모델 결과, 검증, 추천)를 `.ccproj` 파일로 저장할 수 있다. **파일 → 프로젝트
-   불러오기(Ctrl+O)** 로 나중에 이어서 작업 가능 — 원본 이미지 파일이 없어져도
-   재계산/export는 그대로 된다 (자세한 내용은 4번 폴더 구조의
-   `project_io.py` 설명 참고).
+   Standard 4모델 결과, Object-Releasing 결과/검증/비교, 추천)를 `.ccproj`
+   파일로 저장할 수 있다. **파일 → 프로젝트 불러오기(Ctrl+O)** 로 나중에 이어서
+   작업 가능 — 원본 이미지 파일이 없어져도 재계산/export는 그대로 된다
+   (자세한 내용은 5번 폴더 구조의 `project_io.py` 설명 참고).
 
-## 4. 폴더 구조
+## 4. Camera Models / Calibration Targets / Calibration Method
+
+### Camera Models (Standard Calibration, 4개)
+
+| 모델 | 계수 | 설명 |
+|---|---|---|
+| **Ideal Pinhole** | `fx fy cx cy`, D=0 | 왜곡 없음을 가정하는 특수 목적 모델. |
+| **Brown-Conrady** | `fx fy cx cy` + `k1 k2 p1 p2 k3` (5) | 일반적인 raw camera image에 쓰는 기본 모델. |
+| **Rational** (내부 식별자 `extended_pinhole`) | `fx fy cx cy` + `k1 k2 p1 p2 k3` + `k4 k5 k6` (8, `--rational`/Rational 체크박스로 활성화) | 강한 방사 왜곡을 더 정밀하게 잡는 Advanced 모델. |
+| **Fisheye** (Kannala-Brandt) | `fx fy cx cy` + `k1 k2 k3 k4` | 초광각 렌즈용 `cv2.fisheye` 모델. |
+
+네 모델을 항상 같은 데이터셋/같은 train-test 분할로 동시에 계산하고 비교한다
+(`calibration/compare.py::run_all_models`).
+
+### Calibration Targets
+
+| 타겟 | 상태 |
+|---|---|
+| Checkerboard(일반 체스보드) | 지원. 방향 모호성 있음 (3번 섹션 주의사항 참고). |
+| ChArUco | 지원, 기본값/권장. |
+| Circle Grid | 지원, Symmetric/Asymmetric 둘 다. |
+| AprilGrid | 지원. Variant: **OpenCV / AprilTag3 style**(기본) 또는 **Kalibr style
+  [Experimental]** — 오늘 시점 두 variant는 동일한 OpenCV AprilTag detector
+  경로를 쓰고 로그 문구만 다르다 (`calibration/detector.py::detect_aprilgrid`).
+  Kalibr 스타일로 생성된 실제 타겟에 대한 회귀 테스트가
+  `tests/test_kalibr_aprilgrid_fixture.py` + `tests/assets/aprilgrid/`에
+  있으며(fixture 출처/한계는 그 폴더의 README 참고), 그 검증이 실제 Kalibr
+  산출물로 재확인되기 전까지는 "Kalibr Compatible"로 승격하지 않고
+  Experimental 표시를 유지한다. |
+
+### Calibration Method: Standard vs Object-Releasing (Advanced)
+
+- **Standard**: 위 4개 모델을 계산하고, Hold-out Validation + AIC/BIC 기반
+  추천까지 수행한다. 모든 타겟에서 지원된다.
+- **Object-Releasing** (Advanced): `cv2.calibrateCameraRO`로 카메라 파라미터와
+  **캘리브레이션 타겟 형상(target geometry)** 을 함께 추정한다. 타겟 인쇄/부착
+  오차까지 보정하고 싶은 고정밀 캘리브레이션용 모드다.
+  - **지원 타겟**: Checkerboard, Circle Grid만. ChArUco/AprilGrid는 지원하지
+    않는다 (동일 개수의 포인트를 프레임마다 정확히 같은 순서로 대응시켜야
+    하는데, ChArUco/AprilGrid는 부분 검출이 흔해 이 전제를 보장하기 어렵기
+    때문 - 지원하지 않는 패턴을 고르면 UI/CLI 모두 명확한 오류로 막는다).
+  - **Full-board 검출 필수**: 타겟 전체가 빠짐없이, 매 프레임 동일한 포인트
+    ID·순서로 검출된 프레임만 쓴다. 일부만 보이는 프레임은 이유와 함께
+    제외된다.
+  - **Standard 결과와 분리**: Object-Releasing 결과/Hold-out
+    Validation/Standard-vs-Object-Releasing 비교는 전부 Standard 4모델의
+    Hold-out/AIC/BIC와 별도로 계산·표시된다 - 서로 섞이지 않는다
+    (`calibration/object_releasing_validation.py`).
+  - **Object-Releasing 전용 Hold-out**: Train 프레임만으로 K/D/Refined Target
+    Geometry를 확정하고, Test 프레임에는 그 셋을 전부 고정한 채 pose(solvePnP)만
+    다시 구해 RMSE/Median/P95/P99/Max를 계산한다 - Test 데이터로
+    `calibrateCameraRO`를 다시 부르는 일은 없다.
+  - **Standard Brown-Conrady와의 비교**: 반드시 같은 full-board eligible
+    데이터셋 + 같은 train/test 분할로만 비교한다 (그렇지 않은 비교는 UI/CLI에
+    표시하지 않는다). "RO가 더 정확하다" 같은 자동 판정은 하지 않고, RMSE
+    변화율/파라미터 delta 같은 사실만 보여준다. Target geometry refinement가
+    과도하게 크면(명목 간격 대비) 경고를 표시한다.
+
+## 5. 폴더 구조
 
 ```
 camera_calibrator/
@@ -165,10 +243,14 @@ camera_calibrator/
 │   └── cli.py                 # 헤드리스 CLI 진입점 (python -m app.cli), CI/배치용
 ├── calibration/              # 순수 계산 로직 (UI 의존성 없음)
 │   ├── types.py              # 전체가 공유하는 데이터 구조
-│   ├── detector.py           # ChArUco + Chessboard(일반 체스보드) 검출
-│   ├── models/                # pinhole / extended_pinhole / fisheye
-│   ├── compare.py            # 3모델 동시 실행 + 비교표
-│   ├── validation.py         # Hold-out 검증 (+ Line Straightness)
+│   ├── detector.py           # ChArUco/Chessboard/Circle Grid/AprilGrid 검출
+│   ├── models/                # pinhole / brown_conrady / extended_pinhole /
+│   │                          #   fisheye / object_releasing (Advanced)
+│   ├── compare.py            # Standard 4모델(Ideal Pinhole/Brown-Conrady/
+│   │                          #   Rational/Fisheye) 동시 실행 + 비교표
+│   ├── validation.py         # Standard Hold-out 검증 (+ Line Straightness)
+│   ├── object_releasing_validation.py  # Object-Releasing 전용 Hold-out +
+│   │                          #   Standard Brown-Conrady와의 공정 비교
 │   ├── outlier.py            # 이상치 탐지/제거
 │   ├── quality.py            # Coverage Map / 데이터셋 다양성
 │   ├── frame_quality.py      # 프레임별 품질 점수 (Detection + Geometric)
@@ -205,7 +287,7 @@ camera_calibrator/
 `calibration/`은 UI와 완전히 독립적이라, CLI 스크립트나 다른 프론트엔드에서도
 그대로 재사용할 수 있습니다.
 
-## 5. ROS 연동
+## 6. ROS 연동
 
 두 단계로 나뉩니다.
 
@@ -264,14 +346,15 @@ JetPack 6.2.1 + ROS 2 Humble 설치는 일반 requirements 대신 ARM64 호환 �
 > 테스트하지 못했습니다. 표준 API 기준으로 작성했지만, 실제 ROS 환경에서
 > 한 번 확인해보시는 걸 권장합니다. 문제가 있으면 이슈로 알려주세요.
 
-## 6. 프로젝트 저장/불러오기 (`.ccproj`)
+## 7. 프로젝트 저장/불러오기 (`.ccproj`)
 
 데이터셋이 크거나 캘리브레이션에 시간이 걸릴 때, 앱을 껐다 켜도(또는 CLI를
 여러 번 나눠 실행해도) 이어서 작업할 수 있다.
 
 - **저장되는 것**: 카메라/패턴 설정, 데이터셋(이미지별 검출 결과·품질 점수·상태),
-  3모델 캘리브레이션 결과, Hold-out Validation 결과, 추천 점수, 이상치 제거 이력,
-  최종 결과 - 사실상 화면에 보이는 모든 것.
+  Standard 4모델 캘리브레이션 결과, Hold-out Validation 결과, 추천 점수, 이상치
+  제거 이력, 최종 결과, (Object-Releasing을 썼다면) Advanced 결과 + 전용
+  Hold-out + Standard와의 비교 결과까지 - 사실상 화면에 보이는 모든 것.
 - **저장 안 되는 것**: 원본 이미지 파일 자체(바이트 복사 안 함, 경로만 저장) -
   설계 문서 9번의 "파일을 삭제/복제하지 않는다" 원칙과 같은 이유. 그래서
   **원본 이미지가 없어지거나 옮겨져도** 불러오기 자체는 되고, 재계산(이상치 제거
@@ -291,13 +374,15 @@ python -m app.cli --load-project ./session.ccproj --outlier --output-dir ./out
 
 UI에서는 메뉴 **파일 → 프로젝트 저장/불러오기** (`Ctrl+S` / `Ctrl+O`).
 
-## 7. UI 없이 쓰기 (CLI / Python API)
+## 8. UI 없이 쓰기 (CLI / Python API)
 
-### 6.1 CLI (`app/cli.py`) — CI/서버/배치 처리용
+### 8.1 CLI (`app/cli.py`) — CI/서버/배치 처리용
 
-UI를 안 띄우고 헤드리스로 전체 파이프라인(검출→3모델→검증→추천→export)을
+UI를 안 띄우고 헤드리스로 전체 파이프라인(검출→Standard 4모델→검증→추천→export,
+`--calibration-method object_releasing`이면 Advanced 결과/Hold-out/비교도 포함)을
 한 번에 돌린다. 종료 코드로 성공/실패를 판단할 수 있어 CI 파이프라인에
-바로 끼워 넣기 좋다 (0=성공, 1=입력 문제, 2=전 모델 캘리브레이션 실패).
+바로 끼워 넣기 좋다 (0=성공, 1=입력 문제, 2=전 모델 캘리브레이션 실패 또는
+Object-Releasing 계산 실패).
 
 ```bash
 python -m app.cli \
@@ -329,12 +414,16 @@ python -m app.cli \
 |---|---|
 | `--config PATH` | 패턴/카메라/파이프라인 옵션을 담은 `.yaml`/`.yml`/`.json` 파일 (아래 예시 참고). 같은 옵션을 커맨드라인에 또 주면 커맨드라인이 우선 |
 | `--images` | 이미지 파일/디렉토리/glob 패턴 (여러 개 가능) |
-| `--pattern {charuco,chessboard,apriltag_grid}` | 패턴 타입 (기본 charuco). `aprilgrid` alias도 허용. AprilGrid는 `DICT_APRILTAG_*` dictionary와 Kalibr-compatible row-major marker ID 배치를 사용 |
+| `--pattern {charuco,chessboard,circle_grid,apriltag_grid}` | 패턴 타입 (기본 charuco). `circle-grid`/`circles`, `aprilgrid`/`april_grid` alias도 허용. AprilGrid는 `DICT_APRILTAG_*` dictionary와 Kalibr-compatible row-major marker ID 배치를 사용 |
+| `--circle-grid-type {symmetric,asymmetric}` | Circle Grid일 때 격자 종류 (기본 symmetric) |
+| `--aprilgrid-variant {opencv_apriltag3,kalibr}` | AprilGrid detector variant (기본 opencv_apriltag3). 오늘 시점 둘은 동일한 검출 경로를 쓰고 로그 문구만 다름 (4번 섹션 참고) |
+| `--calibration-method {standard,object_releasing}` | Standard 4모델(기본) 또는 Object-Releasing(Advanced, Checkerboard/Circle Grid만) |
 | `--bag`, `--topic`, `--bag-interval` | rosbag에서 이미지 추출 (`--images` 대신) |
 | `--list-topics BAG_PATH` | bag의 이미지 토픽 목록만 보고 종료 |
-| `--model {pinhole,extended_pinhole,fisheye}` | 자동 추천 대신 강제로 이 모델 선택 |
+| `--model {pinhole,brown_conrady,extended_pinhole,fisheye}` | 자동 추천 대신 강제로 이 모델 선택. `ideal_pinhole`/`brown-conrady`/`extended` alias도 허용 |
+| `--models MODEL [MODEL ...]` | 계산/검증할 모델 목록 (여러 개). 예: `--models pinhole brown_conrady fisheye` |
 | `--outlier` | 이상치 탐지 + 재계산까지 수행 |
-| `--rational` | Extended Pinhole에 8계수(rational) 모델 사용 |
+| `--rational` | Rational 모델(`extended_pinhole`)에서 k1~k6,p1,p2 8계수 사용 |
 | `--diagnostic` | 종합 진단 preset. 기본 5-fold CV + 100회 bootstrap + report/json/csv export |
 | `--cross-validation K` | K-Fold Cross Validation 수행 (`--kfold K`와 동일) |
 | `--bootstrap N` | 최종 선택 모델의 bootstrap 기반 Parameter CI를 N회 재표본으로 계산 |
@@ -383,7 +472,7 @@ python -m app.cli --bag drive.bag --topic /camera/image_raw --bag-interval 0.5 \
   --output-dir ./out
 ```
 
-### 6.2 Python API 직접 사용
+### 8.2 Python API 직접 사용
 
 CLI보다 세밀하게 제어하고 싶다면 `calibration/`, `export/` 모듈을 직접 호출한다:
 
@@ -438,10 +527,11 @@ paths = extract_images_from_bag("drive.bag", "/camera/image_raw", "extracted/", 
 dataset = detect_dataset(paths, pattern)  # 이후 흐름은 위 예시와 동일
 ```
 
-## 8. 테스트
+## 9. 테스트
 
-`tests/` 폴더에 pytest 스위트가 있다 (161개, 빠른 것만 돌리면 ~11초 - 전체는
-3~4분 정도, OpenCV 4.x/5.x 둘 다에서 통과 확인됨). 코드를 고치다가
+`tests/` 폴더에 pytest 스위트가 있다 (수백 개 단위, 빠른 것만 돌리면 수 초 -
+전체는 몇 분 정도, OpenCV 4.x/5.x 둘 다에서 통과 확인됨. 정확한 개수는 계속
+늘어나므로 `pytest --collect-only -q`로 직접 확인하는 걸 권장). 코드를 고치다가
 뭔가 깨지면 이게 잡아준다 - 예전엔 검증할 때마다 스크립트를 즉석으로 짰다가
 끝나면 지웠는데, 그러면 다음에 같은 곳이 또 깨져도 아무도 모른다.
 
@@ -455,14 +545,17 @@ pytest tests/test_straightness.py -v   # 특정 파일만
 **두 단계로 나뉜다:**
 - **빠른 티어** (마커 없음, `not slow`로 걸러짐): 단위 테스트 대부분 +
   `test_smoke_pipeline.py` - 3D->2D 직접 사영으로 이미지 렌더링/검출 없이,
-  Pinhole+Extended 2모델만(Fisheye 생략, 셋 중 가장 느리고 발산 위험도 큼)
-  작은 데이터셋(8~10장)으로 도는 가벼운 파이프라인 스모크 테스트. "핵심
-  배선이 안 끊어졌는지"를 몇 초 안에 확인하는 용도.
+  Pinhole+Rational(Extended) 2모델만(Fisheye 생략, Standard 4모델 중 가장 느리고
+  발산 위험도 큼) 작은 데이터셋(8~10장)으로 도는 가벼운 파이프라인 스모크
+  테스트. Object-Releasing 전용 검증(`test_object_releasing_validation.py`,
+  `test_project_migration.py`, `test_kalibr_aprilgrid_fixture.py`)도 합성
+  데이터/생성된 fixture만 써서 이 빠른 티어에 포함된다. "핵심 배선이 안
+  끊어졌는지"를 몇 초 안에 확인하는 용도.
 - **느린 티어** (`@pytest.mark.slow`): 실제 ChArUco 이미지 렌더링+검출,
-  3모델 전부, Hold-out validation, export까지 포함하는 진짜 통합 테스트
-  (`test_pipeline_integration.py` 등). 정확성 자체를 검증하는 최종 보루.
+  Standard 4모델 전부, Hold-out validation, export까지 포함하는 진짜 통합
+  테스트 (`test_pipeline_integration.py` 등). 정확성 자체를 검증하는 최종 보루.
 
-**fixture 캐싱**: 무거운 계산(3모델+검증+이상치 제거 전체 파이프라인)을
+**fixture 캐싱**: 무거운 계산(Standard 4모델+검증+이상치 제거 전체 파이프라인)을
 쓰는 파일들(`test_project_io.py`, `test_ui_project_io.py`)은 그 계산을
 `module` 스코프 fixture로 한 번만 돌리고 파일 안의 여러 테스트가 공유한다 -
 전에는 테스트마다 매번 새로 계산해서 낭비가 컸다(전체 스위트가 이 변경
@@ -496,12 +589,13 @@ README 배지는 지금은 통과/실패 여부만 보여준다 - 커버리지 %
 (원하면 `.github/workflows/tests.yml`의 coverage 단계 뒤에 `codecov/codecov-action`
 스텝만 추가하면 된다).
 
-## 9. Model Score 가중치 튜닝
+## 10. Model Score 가중치 튜닝
 
 `scripts/tune_model_score_weights.py`로 실제 카메라 데이터셋 없이도 가중치를
-"정답을 아는" 합성 시나리오로 검증해봤다. 진짜 Pinhole/Extended
-Pinhole/Fisheye 카메라를 합성으로 만들어(픽셀 노이즈, 저데이터 경계 케이스
-포함) "정답 모델을 골랐는가"를 채점하고, Dirichlet 무작위 탐색으로 더 나은
+"정답을 아는" 합성 시나리오로 검증해봤다. 진짜 Pinhole/Rational(Extended
+Pinhole)/Fisheye 카메라를 합성으로 만들어(픽셀 노이즈, 저데이터 경계 케이스
+포함, Brown-Conrady 시나리오는 아직 없음) "정답 모델을 골랐는가"를 채점하고,
+Dirichlet 무작위 탐색으로 더 나은
 가중치를 찾아봤다.
 
 ```bash
@@ -525,7 +619,7 @@ Extended Pinhole과 Fisheye가 통계적으로 구분하기 어려워질 수 있
 모델 식별성 문제, 가중치 튜닝으로 해결 안 됨). `tests/test_recommender_accuracy.py`에
 이 한계를 `xfail`로 정직하게 기록해뒀다.
 
-## 10. 개발 진행 상황
+## 11. 개발 진행 상황
 
 설계 문서 기준 V1(필수 기능)은 완료됐고, V2(완성도) 항목도 대부분 구현됐습니다.
 
@@ -534,13 +628,13 @@ Extended Pinhole과 Fisheye가 통계적으로 구분하기 어려워질 수 있
 | Dataset Diversity Score | ✅ |
 | Undistortion Preview | ✅ |
 | Automatic Model Recommendation | ✅ |
-| Parameter Uncertainty (Pinhole/Extended/Fisheye) | ✅ Pinhole/Extended는 `calibrateCameraExtended()`의 stdDeviations를 그대로 사용. Fisheye는 OpenCV가 covariance를 안 줘서 bootstrap resampling으로 별도 추정 (`calibration/models/fisheye.py`의 `_bootstrap_fisheye_uncertainty()`, `estimate_uncertainty=True`일 때만 - 1차 실행 결과에서 기본 활성화) |
+| Parameter Uncertainty (Pinhole/Brown-Conrady/Rational/Fisheye) | ✅ Pinhole/Brown-Conrady/Rational은 `calibrateCameraExtended()`의 stdDeviations를 그대로 사용. Fisheye는 OpenCV가 covariance를 안 줘서 bootstrap resampling으로 별도 추정 (`calibration/models/fisheye.py`의 `_bootstrap_fisheye_uncertainty()`, `estimate_uncertainty=True`일 때만 - 1차 실행 결과에서 기본 활성화) |
 | **Frame Quality Score** | ✅ `calibration/frame_quality.py` |
 | **Edge Error Map (Radial Error Profile)** | ✅ 계산은 유지되어 Model Comparison 표의 Radial Edge 열/HTML 리포트에 반영됨 (`calibration/radial_profile.py`). 전용 그래프 탭은 UI 단순화로 제거됨 |
 | **Line Straightness Residual** | ✅ `calibration/straightness.py` |
 | **HTML Report** | ✅ `export/report.py` |
 | **ROS 연동 확장 (rosbag 이미지 직접 불러오기)** | ✅ `calibration/rosbag_reader.py` (ROS1/ROS2 둘 다 지원, 순수 Python, ROS 설치 불필요) |
-| **ROS 연동 확장 (실시간 토픽 구독)** | ✅ `calibration/ros_live.py` + `ui/live_capture_dialog.py` (ROS1/ROS2 자동 감지, ⚠️ 실제 ROS 환경에서 최종 검증 필요 — 아래 5번 참고) |
+| **ROS 연동 확장 (실시간 토픽 구독)** | ✅ `calibration/ros_live.py` + `ui/live_capture_dialog.py` (ROS1/ROS2 자동 감지, ⚠️ 실제 ROS 환경에서 최종 검증 필요 — 아래 6번 참고) |
 | **CLI 진입점 (헤드리스 실행)** | ✅ `app/cli.py` (CI/배치 처리용, JSON 요약, 종료 코드 설계) |
 | **프로젝트 저장/불러오기** | ✅ `calibration/project_io.py` (`.ccproj`, JSON, 원본 이미지 없이도 이어서 작업 가능) |
 | **Straightness Residual 시각화** | ✅ `ui/undistort_straightness_view.py` (② Preview 탭, Undistort Preview와 한 화면으로 합쳐져 행/열 라인을 보정 후 이미지 위에 초록~빨강으로 오버레이, 아래 텍스트는 보정 전/후 수치 한 줄만 표시) |
@@ -557,7 +651,7 @@ Extended Pinhole과 Fisheye가 통계적으로 구분하기 어려워질 수 있
   `(N,1,3)`이 아니라 `(1,N,3)` shape을 요구하게 된 것(4.x에서는 관대했음) 두
   가지가 원인이었습니다. `opencv-contrib-python==5.0.0.93`을 직접 설치해
   재현하고 수정 후 4.13.0/5.0.0 둘 다에서 전체 테스트 통과를 확인했습니다.
-- **rosbag 읽기 실패("Bag contains no type definitions")**: 위 5번 섹션 참고.
+- **rosbag 읽기 실패("Bag contains no type definitions")**: 위 6번 섹션 참고.
 - **실시간 구독이 "프레임 수신 대기 중"에서 안 멈춤**: 지원 안 하는 인코딩으로
   프레임이 오면 조용히 버려지던 것을 고쳐 화면에 표시되게 함. YUV422 계열
   인코딩(`yuv422`/`yuyv`/`uyvy` 등, 흔한 카메라 드라이버가 씀) 지원 추가.

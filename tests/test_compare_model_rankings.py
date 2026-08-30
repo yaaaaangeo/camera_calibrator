@@ -48,7 +48,7 @@ class TestCompareModelRankings:
         ]
         text = compare_model_rankings(before, after)
         assert "바뀌었습니다" in text
-        assert "Fisheye" in text and "Extended" in text
+        assert "Fisheye" in text and "Rational Pinhole" in text
 
     def test_includes_ranked_order_for_both_sides(self):
         before = [
@@ -71,7 +71,7 @@ class TestCompareModelRankings:
         ]
         text = compare_model_rankings(scores, scores)
         first_rank_line = next(line for line in text.splitlines() if line.startswith("1\uc704"))
-        assert "Extended" in first_rank_line
+        assert "Rational Pinhole" in first_rank_line
 
     def test_empty_inputs_return_message(self):
         assert "정보가 없습니다" in compare_model_rankings([], [])

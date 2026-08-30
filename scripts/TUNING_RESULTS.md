@@ -15,7 +15,7 @@
 | `true_extended_mild_lowdata` | Extended Pinhole | **약한** 왜곡(k1=-0.06) + 적은 프레임(9장) - 의도적으로 어려운 경계 케이스 |
 | `true_fisheye_noisy` | Fisheye | cv2.fisheye 왜곡 모델 + 넓은 화각 + 노이즈 |
 
-각 시나리오를 서로 다른 시드로 여러 번 반복해 "3모델 계산 + Hold-out
+각 시나리오를 서로 다른 시드로 여러 번 반복해 "Standard 4모델 계산 + Hold-out
 validation"까지 실제로 돌리고 결과를 캐싱했다. 그 다음 `recommender.
 compute_model_scores()`를 그대로 재사용해(재구현 없음) 다양한 가중치
 후보(Dirichlet 분포로 무작위 샘플링, 5차원)가 "정답 모델을 골라내는 비율"을
@@ -92,5 +92,5 @@ python scripts/tune_model_score_weights.py \
 
 더 많은 시나리오/시드/후보 개수로 다시 시도해보고 싶다면 `SCENARIOS`,
 `SEEDS`, `HOLDOUT_SEEDS`를 수정하면 된다. 계산 비용 대부분은 캐시 빌드
-단계(실제 3모델 캘리브레이션)에 있고, 탐색 자체(캐시 재사용)는 몇천 개
+단계(실제 Standard 4모델 캘리브레이션)에 있고, 탐색 자체(캐시 재사용)는 몇천 개
 후보를 뽑아도 몇 초면 끝난다.

@@ -248,7 +248,7 @@ def run_pinhole_accuracy_check(
 def run_extended_pinhole_accuracy_check(
     use_rational_model: bool = False, n_images: int = DEFAULT_N_IMAGES, seed: int = DEFAULT_SEED
 ) -> SelfCheckResult:
-    """Extended Pinhole(Brown-Conrady) 정확도 검증.
+    """Extended Pinhole(Rational) 정확도 검증.
 
     use_rational_model=True면 k1~k6,p1,p2 (자유도 8)까지 추정하는 경로(GUI의
     "Rational model 사용" 체크박스, CLI의 --rational)를 그대로 검증한다.

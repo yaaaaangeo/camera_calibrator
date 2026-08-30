@@ -150,6 +150,22 @@ class MainWindow(QMainWindow):
         self.intrinsic_state.object_releasing_result = value
 
     @property
+    def object_releasing_validation_result(self):
+        return self.intrinsic_state.object_releasing_validation_result
+
+    @object_releasing_validation_result.setter
+    def object_releasing_validation_result(self, value):
+        self.intrinsic_state.object_releasing_validation_result = value
+
+    @property
+    def standard_vs_object_releasing_comparison(self):
+        return self.intrinsic_state.standard_vs_object_releasing_comparison
+
+    @standard_vs_object_releasing_comparison.setter
+    def standard_vs_object_releasing_comparison(self, value):
+        self.intrinsic_state.standard_vs_object_releasing_comparison = value
+
+    @property
     def validation_results(self):
         return self.intrinsic_state.validation_results
 
@@ -272,7 +288,7 @@ class MainWindow(QMainWindow):
         self.pipeline_progress_bar.setTextVisible(True)
         self.pipeline_progress_bar.hide()
         self.statusBar().addPermanentWidget(self.pipeline_progress_bar)
-        # 진행률을 알 수 없는 구간(3모델 + Hold-out 계산 중)에서 기본 Qt
+        # 진행률을 알 수 없는 구간(Standard 4모델 + Hold-out 계산 중)에서 기본 Qt
         # 인디케이터 대신 양이 진행 바를 가로질러 걸어가는 애니메이션을 보여준다.
         self._sheep_pos = 0
         self._sheep_timer = QTimer(self)
@@ -495,7 +511,7 @@ class MainWindow(QMainWindow):
 
         # 오른쪽 열 순서: Rational model 체크박스 -> 캘리브레이션 실행 ->
         # Export -> 취소. Export/취소는 각각 옛 "⑦ Export" 탭과, 실행 중인
-        # 계산(코너 검출/3모델 계산)을 중단하는 기능을 대체한다.
+        # 계산(코너 검출/모델 계산)을 중단하는 기능을 대체한다.
         action_layout = QVBoxLayout()
         self.rational_checkbox = QCheckBox("Rational model 사용 (k4~k6 포함)")
         self.rational_checkbox.setToolTip(
@@ -1015,9 +1031,13 @@ class MainWindow(QMainWindow):
         self,
         results: dict[CameraModelType, CalibrationResult],
         object_releasing_result: CalibrationResult | None = None,
+        object_releasing_validation_result=None,
+        standard_vs_object_releasing_comparison=None,
     ) -> None:
         self.calibration_results = results
         self.object_releasing_result = object_releasing_result
+        self.object_releasing_validation_result = object_releasing_validation_result
+        self.standard_vs_object_releasing_comparison = standard_vs_object_releasing_comparison
         if object_releasing_result is not None:
             self.status_label.setText(
                 object_releasing_result.warning_message
@@ -1027,7 +1047,7 @@ class MainWindow(QMainWindow):
         if self.dataset is not None and self.camera_config is not None:
             self.preview_view.set_context(self.dataset, self.camera_config, results, self.pattern_config)
             self.dataset_view.set_dataset(self.dataset)  # per_frame_error 채워졌으니 갱신
-            # 설계 문서 8번 - 3모델 계산이 끝날 때마다 sanity check도 함께 갱신한다
+            # 설계 문서 8번 - Standard 4모델 계산이 끝날 때마다 sanity check도 함께 갱신한다
             # (RMS가 낮아 보여도 결과가 물리적으로 이상할 수 있으므로 항상 확인).
             checks = run_sanity_checks(list(results.values()), self.camera_config)
             self.result_view.set_sanity_checks(checks)
@@ -1074,6 +1094,8 @@ class MainWindow(QMainWindow):
                 dataset=self.dataset,
                 calibration_results=self.calibration_results,
                 object_releasing_result=self.object_releasing_result,
+                object_releasing_validation_result=self.object_releasing_validation_result,
+                standard_vs_object_releasing_comparison=self.standard_vs_object_releasing_comparison,
                 validation_results=self.validation_results,
                 cross_dataset_results=self.cross_dataset_results,
                 model_scores=self.scores,
@@ -1227,6 +1249,8 @@ class MainWindow(QMainWindow):
             self.validation_results,
             self.scores,
             self.object_releasing_result,
+            object_releasing_validation=self.object_releasing_validation_result,
+            standard_vs_object_releasing=self.standard_vs_object_releasing_comparison,
         )
         self.result_view.set_cross_dataset_results(self.cross_dataset_results)
 
@@ -1354,6 +1378,8 @@ class MainWindow(QMainWindow):
             dataset=self.dataset,
             calibration_results=self.calibration_results,
             object_releasing_result=self.object_releasing_result,
+            object_releasing_validation_result=self.object_releasing_validation_result,
+            standard_vs_object_releasing_comparison=self.standard_vs_object_releasing_comparison,
             validation_results=self.validation_results,
             cross_dataset_results=self.cross_dataset_results,
             model_scores=self.scores,
@@ -1386,6 +1412,8 @@ class MainWindow(QMainWindow):
         self.pattern_config = project.pattern_config
         self.calibration_results = project.calibration_results
         self.object_releasing_result = project.object_releasing_result
+        self.object_releasing_validation_result = project.object_releasing_validation_result
+        self.standard_vs_object_releasing_comparison = project.standard_vs_object_releasing_comparison
         self.validation_results = project.validation_results
         self.cross_dataset_results = project.cross_dataset_results
         self.scores = project.model_scores

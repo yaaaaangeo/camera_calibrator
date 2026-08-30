@@ -2,7 +2,7 @@
 tests/test_pipeline_process.py
 ===================================
 
-실제 사용자 버그: PipelineWorker(ui/worker.py)가 무거운 계산(3모델
+실제 사용자 버그: PipelineWorker(ui/worker.py)가 무거운 계산(Standard 4모델
 캘리브레이션 + Hold-out 검증)을 QThread 안에서 직접 돌려서,
 cv2 확장 함수가 GIL을 오래 붙드는 동안 GUI 스레드까지 같이 멈춰
 "python3 is not responding"이 떴다.
@@ -37,7 +37,10 @@ def test_run_models_and_validation_survives_a_real_process_roundtrip(
             run_models_and_validation,
             synthetic_dataset, camera_config, pattern_config, 0.25, False,
         )
-        calibration_results, validation_results, object_releasing_result = future.result(timeout=120)
+        (
+            calibration_results, validation_results, object_releasing_result,
+            object_releasing_validation_result, standard_vs_object_releasing_comparison,
+        ) = future.result(timeout=120)
 
     assert set(calibration_results) == {
         CameraModelType.PINHOLE,
@@ -52,6 +55,8 @@ def test_run_models_and_validation_survives_a_real_process_roundtrip(
         CameraModelType.FISHEYE,
     }
     assert object_releasing_result is None
+    assert object_releasing_validation_result is None
+    assert standard_vs_object_releasing_comparison is None
     assert calibration_results[CameraModelType.PINHOLE].success
     # 자식 프로세스를 오가며 numpy 배열이 깨지지 않았는지 확인 - 3x3이어야 함.
     assert calibration_results[CameraModelType.PINHOLE].camera_matrix.shape == (3, 3)
@@ -91,7 +96,10 @@ def test_run_outlier_pruning_and_validation_survives_a_real_process_roundtrip(
 def test_object_releasing_result_does_not_overwrite_standard_results(
     synthetic_dataset, camera_config, pattern_config
 ):
-    calibration_results, validation_results, object_releasing_result = run_models_and_validation(
+    (
+        calibration_results, validation_results, object_releasing_result,
+        object_releasing_validation_result, standard_vs_object_releasing_comparison,
+    ) = run_models_and_validation(
         synthetic_dataset,
         camera_config,
         pattern_config,
@@ -106,3 +114,11 @@ def test_object_releasing_result_does_not_overwrite_standard_results(
     assert object_releasing_result.calibration_method == CalibrationMethod.OBJECT_RELEASING
     assert object_releasing_result.model_name == CameraModelType.BROWN_CONRADY
     assert validation_results[CameraModelType.BROWN_CONRADY].success in (True, False)
+    # synthetic_dataset은 ChArUco라 Object-Releasing이 disabled -> Hold-out/비교도
+    # 성공은 못 하지만(success=False), 크래시 없이 명확한 이유와 함께 반환돼야 한다.
+    assert object_releasing_validation_result is not None
+    assert not object_releasing_validation_result.success
+    assert object_releasing_validation_result.error_message
+    assert standard_vs_object_releasing_comparison is not None
+    assert not standard_vs_object_releasing_comparison.success
+    assert standard_vs_object_releasing_comparison.error_message

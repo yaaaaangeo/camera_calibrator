@@ -5,14 +5,14 @@ tests/test_radial_profile_view.py
 Edge Error Map(⑤ 탭)의 y축 스케일 회귀 테스트.
 
 실제 사용자 버그: RadialProfileChartWidget이 "지금 선택된 모델 자신의
-최댓값"으로 매번 y축을 다시 스케일해서, Pinhole/Extended Pinhole/Fisheye를
-콤보박스로 오갈 때마다 축이 바뀌었다 - 그러면 막대 높이만 봐서는 어느
-모델이 실제로 더 나은지 비교가 안 된다("세로 축이 계속 바뀌니깐 뭐가 더
-좋은지 잘 모르겠어"라는 피드백).
+최댓값"으로 매번 y축을 다시 스케일해서, 모델(Ideal Pinhole/Brown-Conrady/
+Rational/Fisheye)을 콤보박스로 오갈 때마다 축이 바뀌었다 - 그러면 막대
+높이만 봐서는 어느 모델이 실제로 더 나은지 비교가 안 된다("세로 축이 계속
+바뀌니깐 뭐가 더 좋은지 잘 모르겠어"라는 피드백).
 
-고친 동작: RadialProfileView.set_results()가 3개 모델을 통틀어 가장 큰
-구간 평균 오차 하나를 구해서 고정 스케일로 쓰고, 모델을 바꿔도 이 스케일은
-그대로 유지되어야 한다.
+고친 동작: RadialProfileView.set_results()가 전달된 모델 전체를 통틀어
+가장 큰 구간 평균 오차 하나를 구해서 고정 스케일로 쓰고, 모델을 바꿔도 이
+스케일은 그대로 유지되어야 한다.
 """
 
 from __future__ import annotations

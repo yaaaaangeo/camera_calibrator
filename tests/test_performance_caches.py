@@ -68,6 +68,10 @@ def test_parallel_model_calibration_path_uses_pinhole_and_extended_workers(monke
         use_rational_model=True,
         estimate_fisheye_uncertainty=False,
         model_jobs=2,
+        # 이 테스트는 pinhole/extended/fisheye 워커 병렬 실행 경로만 검증한다 -
+        # Brown-Conrady까지 포함하면 monkeypatch 안 된 실제 calibrate_brown_conrady가
+        # 가짜 데이터로 불려서 무관한 실패를 낼 수 있으므로 모델을 명시적으로 제한한다.
+        models=[CameraModelType.PINHOLE, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE],
     )
 
     assert [r.model_name for r in results] == [

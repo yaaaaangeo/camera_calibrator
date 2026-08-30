@@ -2,10 +2,12 @@
 camera_calibrator.calibration.models.common
 ==============================================
 
-pinhole / extended_pinhole / fisheye 세 모델이 공통으로 쓰는 로직.
+pinhole / extended_pinhole / fisheye가 직접 쓰고, brown_conrady는
+extended_pinhole을 내부적으로 재사용하므로 간접적으로 공유하는 - 즉 Standard
+4모델 전체가 공통으로 쓰는 로직.
 
-원래 pinhole.py 안에 있던 헬퍼들을 여기로 옮겼다. 세 모델이 "같은 구조"를
-갖도록 강제하는 목적도 있다 - 여기 정의된 함수만 쓰면 세 모델의 결과가
+원래 pinhole.py 안에 있던 헬퍼들을 여기로 옮겼다. 네 모델이 "같은 구조"를
+갖도록 강제하는 목적도 있다 - 여기 정의된 함수만 쓰면 네 모델의 결과가
 자동으로 같은 방식(영역 구분 기준, 최소 프레임 조건 등)으로 계산된다.
 """
 
@@ -26,16 +28,16 @@ from calibration.types import (
 # calibrateCamera류 함수가 최소한으로 요구하는 뷰(이미지) 개수.
 # 이론상 3장부터 동작하지만, 안정적인 초점거리 추정을 위해 최소치로 둔다.
 # Fisheye는 파라미터가 더 많아(k1~k4) 이론적으로는 더 많은 뷰가 필요하지만,
-# "최소 조건"은 세 모델 동일하게 두고 부족하면 개별 함수가 실패로 반환하게 한다.
+# "최소 조건"은 모델 전체에 동일하게 두고 부족하면 개별 함수가 실패로 반환하게 한다.
 MIN_FRAMES_REQUIRED = 3
 MIN_CORNERS_PER_FRAME = 4  # cv2.calibrateCamera 계열 최소 요구사항
 
-# 설계 문서 7번 "calibration termination criteria 통일" - 세 모델
-# (calibrateCameraExtended / calibrateCameraExtended+RATIONAL / fisheye.calibrate)이
-# 전부 같은 반복 종료 조건을 쓰도록 여기 하나로 고정한다. OpenCV 기본값
-# (30회, DBL_EPSILON)보다 반복 횟수를 늘리고 종료 오차는 느슨하게 잡았다 -
-# Fisheye처럼 파라미터가 많고 비선형성이 강한 모델은 30회 안에 못 끝나는
-# 경우가 실측에서 있었기 때문에(대화 중 확인), 세 모델 모두 여유를 준다.
+# 설계 문서 7번 "calibration termination criteria 통일" - Standard 4모델의
+# 계산 경로(calibrateCameraExtended / calibrateCameraExtended+RATIONAL /
+# fisheye.calibrate)가 전부 같은 반복 종료 조건을 쓰도록 여기 하나로 고정한다.
+# OpenCV 기본값(30회, DBL_EPSILON)보다 반복 횟수를 늘리고 종료 오차는 느슨하게
+# 잡았다 - Fisheye처럼 파라미터가 많고 비선형성이 강한 모델은 30회 안에 못
+# 끝나는 경우가 실측에서 있었기 때문에(대화 중 확인), 모든 모델에 여유를 준다.
 DEFAULT_TERM_CRITERIA = (
     cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6
 )
@@ -224,8 +226,9 @@ def compute_regional_error(
 ) -> RegionalError:
     """설계 문서 4번 - Center/Left/Right/Top/Bottom/Corner RMS.
 
-    세 모델(Pinhole/Extended/Fisheye) 모두 이 함수를 그대로 재사용하므로,
-    영역 구분 기준이 모델마다 달라질 걱정 없이 공정하게 비교할 수 있다.
+    Standard 4모델(Pinhole/Brown-Conrady/Extended/Fisheye) 모두 이 함수를
+    그대로 재사용하므로, 영역 구분 기준이 모델마다 달라질 걱정 없이 공정하게
+    비교할 수 있다.
     """
     w, h = image_size
     buckets: dict[str, list[float]] = {
@@ -333,7 +336,8 @@ def compute_mad_threshold(errors: list[float], k: float = 3.0, mad_scale: float 
     """threshold = median(error) + k * MAD
 
     원래 outlier.py에 있던 함수를 여기(models/common.py)로 옮겼다 - outlier.py는
-    pinhole/extended_pinhole/fisheye 세 모델 함수를 import하는 "상위" 모듈이라,
+    pinhole/brown_conrady/extended_pinhole/fisheye 모델 함수를 import하는
+    "상위" 모듈이라,
     residual_stats.py(모델 함수들이 CalibrationResult를 만들 때 바로 호출)가
     outlier.py를 다시 import하면 순환 참조가 생긴다. common.py는 모델 함수들의
     "하위" 의존성이라 이 방향의 순환이 생기지 않는다 - outlier.py는 하위

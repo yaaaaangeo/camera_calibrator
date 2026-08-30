@@ -31,6 +31,8 @@ from calibration.types import (
     CameraModelType,
     CrossDatasetValidationResult,
     ModelScore,
+    ObjectReleasingValidationResult,
+    StandardVsObjectReleasingComparison,
     ValidationResult,
 )
 from calibration.models.common import regional_edge_average
@@ -85,7 +87,10 @@ def _stability(cal: CalibrationResult | None) -> float | None:
     return pu.overall_stability if pu else None
 
 
-def _format_object_releasing_result(result: CalibrationResult | None) -> str:
+def _format_object_releasing_result(
+    result: CalibrationResult | None,
+    validation: ObjectReleasingValidationResult | None = None,
+) -> str:
     if result is None:
         return "Object-Releasing: Not run."
     title = "Object-Releasing Brown-Conrady"
@@ -101,15 +106,105 @@ def _format_object_releasing_result(result: CalibrationResult | None) -> str:
     lines.append(f"Calibration RMS: {_fmt(result.rms_error)} px")
     if total:
         lines.append(f"Full-board frames: {accepted}/{total}")
-    lines.append("Hold-out Validation: Not available for Object-Releasing yet.")
+
+    lines.append("")
+    lines.append("Object-Releasing Hold-out Validation")
+    if validation is None:
+        lines.append("Not available (not computed).")
+    elif not validation.success:
+        lines.append(f"Not available: {validation.error_message}")
+    else:
+        lines.append(f"Train Frames      {len(validation.train_frame_ids)}")
+        lines.append(f"Test Frames       {len(validation.test_frame_ids)}")
+        lines.append(f"RMSE              {_fmt(validation.test_rms)} px")
+        stats = validation.test_residual_stats
+        if stats:
+            lines.append(f"Median            {_fmt(stats.median)} px")
+            lines.append(f"P95               {_fmt(stats.p95)} px")
+            lines.append(f"P99               {_fmt(stats.p99)} px")
+            lines.append(f"Max               {_fmt(stats.max)} px")
+        if validation.failed_test_frame_ids:
+            lines.append(f"Rejected test frames: {len(validation.failed_test_frame_ids)}")
+
     geom = result.target_geometry_refinement or {}
     if geom:
+        lines.append("")
         lines.append(
             "Geometry refinement: "
             f"mean={_fmt(geom.get('mean_displacement'))}, "
             f"p95={_fmt(geom.get('p95_displacement'))}, "
             f"max={_fmt(geom.get('max_displacement'))}"
         )
+    return "\n".join(lines)
+
+
+_RO_COMPARISON_ROW_LABELS = [
+    "Train RMS", "Hold-out RMSE", "Median", "P95", "P99", "Max",
+    "fx", "fy", "cx", "cy", "k1", "k2", "p1", "p2", "k3",
+]
+
+
+def _ro_comparison_cell_values(
+    comparison: StandardVsObjectReleasingComparison,
+) -> tuple[list[str], list[str]]:
+    """StandardVsObjectReleasingComparison -> (Standard 열, Object-Releasing 열),
+    _RO_COMPARISON_ROW_LABELS와 같은 순서.
+    """
+    sr, sv = comparison.standard_result, comparison.standard_validation
+    rr, rv = comparison.object_releasing_result, comparison.object_releasing_validation
+
+    def intrinsic(res: CalibrationResult | None, key: str) -> float | None:
+        if res is None or res.camera_matrix is None:
+            return None
+        m = res.camera_matrix.reshape(3, 3)
+        return {"fx": m[0, 0], "fy": m[1, 1], "cx": m[0, 2], "cy": m[1, 2]}[key]
+
+    def distortion(res: CalibrationResult | None, idx: int) -> float | None:
+        if res is None or res.distortion is None:
+            return None
+        arr = res.distortion.reshape(-1)
+        return float(arr[idx]) if idx < len(arr) else None
+
+    def column(cal: CalibrationResult | None, val, ro_val: ObjectReleasingValidationResult | None) -> list[str]:
+        stats = val.test_residual_stats if val else (ro_val.test_residual_stats if ro_val else None)
+        test_rms = val.test_rms if val else (ro_val.test_rms if ro_val else None)
+        return [
+            _fmt(cal.rms_error if cal else None),
+            _fmt(test_rms),
+            _fmt(stats.median if stats else None),
+            _fmt(stats.p95 if stats else None),
+            _fmt(stats.p99 if stats else None),
+            _fmt(stats.max if stats else None),
+            _fmt(intrinsic(cal, "fx")), _fmt(intrinsic(cal, "fy")),
+            _fmt(intrinsic(cal, "cx")), _fmt(intrinsic(cal, "cy")),
+            _fmt(distortion(cal, 0)), _fmt(distortion(cal, 1)),
+            _fmt(distortion(cal, 2)), _fmt(distortion(cal, 3)), _fmt(distortion(cal, 4)),
+        ]
+
+    standard_values = column(sr, sv, None)
+    ro_values = column(rr, None, rv)
+    return standard_values, ro_values
+
+
+def _format_ro_comparison_summary(comparison: StandardVsObjectReleasingComparison | None) -> str:
+    if comparison is None:
+        return "Standard vs Object-Releasing comparison: Not run."
+    if not comparison.success:
+        return f"Standard vs Object-Releasing comparison unavailable: {comparison.error_message}"
+    lines = [
+        f"Same full-board dataset, same train/test split "
+        f"(train={len(comparison.train_frame_ids)}, test={len(comparison.test_frame_ids)})."
+    ]
+    geom = (comparison.object_releasing_result.target_geometry_refinement if comparison.object_releasing_result else None) or {}
+    if geom:
+        lines.append(
+            "Target geometry refinement (Object-Releasing): "
+            f"mean={_fmt(geom.get('mean_displacement'))}, "
+            f"p95={_fmt(geom.get('p95_displacement'))}, "
+            f"max={_fmt(geom.get('max_displacement'))}"
+        )
+    for w in comparison.warnings:
+        lines.append(f"⚠ {w}")
     return "\n".join(lines)
 
 
@@ -148,6 +243,18 @@ class ResultView(QWidget):
         self.object_releasing_label = QLabel("Object-Releasing: Not run.")
         self.object_releasing_label.setWordWrap(True)
         advanced_layout.addWidget(self.object_releasing_label)
+
+        advanced_layout.addWidget(QLabel("Standard Brown-Conrady vs Object-Releasing"))
+        self.ro_comparison_table = QTableWidget(len(_RO_COMPARISON_ROW_LABELS), 2)
+        self.ro_comparison_table.setHorizontalHeaderLabels(["Standard Brown", "Object-Releasing"])
+        self.ro_comparison_table.setVerticalHeaderLabels(_RO_COMPARISON_ROW_LABELS)
+        self.ro_comparison_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ro_comparison_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        advanced_layout.addWidget(self.ro_comparison_table)
+        self.ro_comparison_summary_label = QLabel("Standard vs Object-Releasing comparison: Not run.")
+        self.ro_comparison_summary_label.setWordWrap(True)
+        advanced_layout.addWidget(self.ro_comparison_summary_label)
+
         model_layout.addWidget(advanced_group)
 
         self.validation_widget = QWidget()
@@ -265,10 +372,15 @@ class ResultView(QWidget):
         validation_results: dict[CameraModelType, ValidationResult],
         scores: list[ModelScore],
         object_releasing_result: CalibrationResult | None = None,
+        object_releasing_validation: ObjectReleasingValidationResult | None = None,
+        standard_vs_object_releasing: StandardVsObjectReleasingComparison | None = None,
     ) -> None:
         self._calibration_results = calibration_results
         self._object_releasing_result = object_releasing_result
-        self.object_releasing_label.setText(_format_object_releasing_result(object_releasing_result))
+        self.object_releasing_label.setText(
+            _format_object_releasing_result(object_releasing_result, object_releasing_validation)
+        )
+        self._set_ro_comparison(standard_vs_object_releasing)
         score_by_model = {s.model_name: s for s in scores}
         for col, m in enumerate(_MODEL_ORDER):
             cal = calibration_results.get(m)
@@ -319,6 +431,18 @@ class ResultView(QWidget):
                 self.table.setItem(row, col, item)
 
         self._update_model_status()
+
+    def _set_ro_comparison(self, comparison: StandardVsObjectReleasingComparison | None) -> None:
+        self.ro_comparison_summary_label.setText(_format_ro_comparison_summary(comparison))
+        if comparison is None or not comparison.success:
+            for row in range(len(_RO_COMPARISON_ROW_LABELS)):
+                self.ro_comparison_table.setItem(row, 0, QTableWidgetItem("N/A"))
+                self.ro_comparison_table.setItem(row, 1, QTableWidgetItem("N/A"))
+            return
+        standard_values, ro_values = _ro_comparison_cell_values(comparison)
+        for row, (sv, rv) in enumerate(zip(standard_values, ro_values)):
+            self.ro_comparison_table.setItem(row, 0, QTableWidgetItem(sv))
+            self.ro_comparison_table.setItem(row, 1, QTableWidgetItem(rv))
 
     def set_sanity_checks(self, checks: list) -> None:
         """설계 문서 8번 - 모델별 sanity check 결과를 요약해서 보여준다.

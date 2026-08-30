@@ -2,9 +2,10 @@
 camera_calibrator.ui.worker
 ===============================
 
-캘리브레이션 파이프라인(검출 -> 품질분석 -> 3모델 학습 -> Hold-out -> 추천)은
-이미지 수십 장 기준으로 수 초가 걸릴 수 있어, UI 스레드를 막지 않도록
-QThread 워커로 분리한다.
+캘리브레이션 파이프라인(검출 -> 품질분석 -> Standard 4모델 학습 -> Hold-out ->
+추천, Object-Releasing을 썼다면 그 결과/Hold-out/비교까지)은 이미지 수십 장
+기준으로 수 초가 걸릴 수 있어, UI 스레드를 막지 않도록 QThread 워커로
+분리한다.
 
 이 파일은 순전히 "언제 무엇을 호출하고 어떤 신호로 알릴지"만 담당하고,
 실제 계산 로직은 전부 calibration/*.py의 기존 함수를 그대로 호출한다.
@@ -13,7 +14,7 @@ UI 계층이 계산 로직을 재구현하지 않는다는 원칙을 지키기 �
 --- QThread로 충분하지 않은 부분 (실제 사용자 버그) ---
 
 검출(detect_dataset)은 이미 ProcessPoolExecutor로 병렬화돼 있어 문제 없다.
-그런데 그 다음 3모델 계산(run_all_models)/Hold-out 검증(validate_all_models)은
+그런데 그 다음 Standard 4모델 계산(run_all_models)/Hold-out 검증(validate_all_models)은
 cv2.calibrateCamera/cv2.fisheye.calibrate 같은 C++ 확장 함수를 오래 호출하는데,
 이 함수들이 계산 도중 파이썬 GIL을 놓아준다는 보장이 없다. QThread는 같은
 프로세스 안의 스레드일 뿐이라 GIL은 프로세스 전체에 하나 - 계산 스레드가
@@ -63,7 +64,7 @@ from calibration.validation import validate_cross_datasets
 from calibration.external_compare import compare_with_external_params
 from calibration.pipeline_process import run_models_and_validation
 
-# 위 두 계산(3모델 + Hold-out 진행 상황)은 자식 프로세스 안에서 일어나므로
+# 위 계산(Standard 4모델 + Hold-out 진행 상황)은 자식 프로세스 안에서 일어나므로
 # 세부 진행률 문자열을 실시간으로 받을 수 없다 - future.result()를 이 간격
 # 으로 짧게 타임아웃 걸어 반복 폴링하면서 "아직 죽지 않았다"는 하트비트만
 # 상태바에 남긴다 (실제로 몇 초~몇십 초 걸릴 수 있는 계산이라, 아무 표시도
@@ -188,7 +189,7 @@ class PipelineWorker(QObject):
     progress_value = Signal(int, int)
     dataset_ready = Signal(object)          # Dataset
     quality_ready = Signal(list)            # 경고 문구 리스트
-    models_ready = Signal(dict, object)     # standard results, optional Object-Releasing result
+    models_ready = Signal(dict, object, object, object)  # standard results, RO result, RO validation, RO vs Standard comparison
     validation_ready = Signal(dict)         # dict[CameraModelType, ValidationResult]
     recommendation_ready = Signal(list, str)  # list[ModelScore], 추천 문구
     error = Signal(str)
@@ -221,7 +222,7 @@ class PipelineWorker(QObject):
 
     def request_cancel(self) -> None:
         """GUI 스레드(취소 버튼)에서 호출됨. 지금 실행 중인 자식 프로세스를
-        즉시 강제 종료해서 코너 검출/3모델 계산을 중간에 멈춘다 - 단순
+        즉시 강제 종료해서 코너 검출/모델 계산을 중간에 멈춘다 - 단순
         플래그만 세우면 cv2 호출이 끝날 때까지 몇 초~몇십 초를 더 기다려야
         해서, 실제로 "지금 당장" 멈추려면 프로세스 자체를 죽여야 한다.
         """
@@ -290,7 +291,13 @@ class PipelineWorker(QObject):
                     dataset, self.camera_config, self.pattern_config,
                     self.test_ratio, self.use_rational_model, self.calibration_method,
                 )
-                calibration_results, validation_results, object_releasing_result = _wait_with_heartbeat(
+                (
+                    calibration_results,
+                    validation_results,
+                    object_releasing_result,
+                    object_releasing_validation_result,
+                    standard_vs_object_releasing_comparison,
+                ) = _wait_with_heartbeat(
                     future, self.progress,
                     "Ideal Pinhole / Brown-Conrady / Rational / Fisheye 모델 + Hold-out Validation 계산 중...",
                     cancel_check=self._is_cancel_requested,
@@ -319,7 +326,12 @@ class PipelineWorker(QObject):
                 duplicate_ratio=dup_ratio,
             )
             self.dataset_ready.emit(dataset)
-            self.models_ready.emit(calibration_results, object_releasing_result)
+            self.models_ready.emit(
+                calibration_results,
+                object_releasing_result,
+                object_releasing_validation_result,
+                standard_vs_object_releasing_comparison,
+            )
             self.validation_ready.emit(validation_results)
 
             self.progress.emit("Model Score 계산 및 추천 생성 중...")
@@ -617,7 +629,7 @@ class BagExtractionWorker(QObject):
     calibration.rosbag_reader.extract_images_from_bag()을 GUI 스레드에서
     직접(동기) 호출하고 있었다. 큰 bag(수백 MB, 메시지 수천 개)에서는 이게
     수십 초~몇 분씩 걸리는데, 그동안 Qt 이벤트 루프가 완전히 멈춰서 OS가
-    "python3 is not responding" 창을 띄운다. 다른 무거운 계산(검출/3모델
+    "python3 is not responding" 창을 띄운다. 다른 무거운 계산(검출/모델
     학습/Hold-out)은 이미 PipelineWorker로 QThread에 분리돼 있었는데 이
     경로만 빠져 있었다.
     """

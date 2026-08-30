@@ -1,3 +1,30 @@
+"""
+camera_calibrator.calibration.models.object_releasing
+===========================================================
+
+Advanced Calibration - Object-Releasing Brown-Conrady (`cv2.calibrateCameraRO`/
+`calibrateCameraROExtended` 기반). Standard 4모델(Ideal Pinhole/Brown-Conrady/
+Rational/Fisheye)과는 완전히 분리된 결과이며, 카메라 파라미터(K/D)뿐 아니라
+캘리브레이션 타겟 형상(refined_object_points) 자체도 함께 추정한다.
+
+지원 타겟: Checkerboard, Circle Grid만 (SUPPORTED_OBJECT_RELEASING_PATTERN_TYPES).
+ChArUco/AprilGrid는 지원하지 않는다 - 부분 검출이 흔해 "매 프레임 동일한 개수/
+순서의 포인트 대응"이라는 전제를 보장하기 어렵기 때문이다.
+
+요구 사항: Full-board 검출(타겟 전체가 빠짐없이 보이고, ID가 기대값과 정확히
+일치)만 입력으로 쓴다 - collect_object_releasing_inputs()가 이 필터링과 ID
+canonicalization(모든 프레임이 동일한 포인트 순서를 갖도록 정렬)을 담당한다.
+이 모듈은 DetectionResult.excluded_corner_indices를 의도적으로 무시한다 -
+Object-Releasing은 프레임 전체 단위로 정확한 대응이 필요하므로, 나쁜 관측치는
+프레임 단위로(collect_object_releasing_inputs에서) 걸러야 한다.
+
+Hold-out Validation과 Standard Brown-Conrady와의 공정 비교는 이 모듈이 아니라
+calibration/object_releasing_validation.py에서 수행한다 (Train에서만 이
+모듈의 calibrate_object_releasing_brown_conrady()를 호출하고, Test는 그 결과의
+K/D/refined_object_points를 고정한 채 pose만 재추정 - "Test 데이터로 다시
+캘리브레이션하지 않는다"는 원칙을 지키기 위해 계산 경로를 명확히 분리했다).
+"""
+
 from __future__ import annotations
 
 import cv2

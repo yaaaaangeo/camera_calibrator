@@ -384,9 +384,9 @@ def validate_holdout(
 ) -> ValidationResult:
     """지정된 train/test 분할로 한 모델에 대해 Hold-out validation 수행.
 
-    train_ids/test_ids를 인자로 받는 이유: 세 모델을 비교할 때 반드시
+    train_ids/test_ids를 인자로 받는 이유: 여러 모델을 비교할 때 반드시
     "같은 분할"을 써야 공정하다 (validate_all_models가 분할을 한 번만
-    수행해서 재사용하는 이유이기도 함).
+    수행해서 Standard 4모델 모두에 재사용하는 이유이기도 함).
     """
     if len(train_ids) < MIN_FRAMES_REQUIRED:
         return ValidationResult(
@@ -427,9 +427,16 @@ def validate_all_models(
     seed: int = 42,
     use_rational_model: bool = False,
 ) -> dict[CameraModelType, ValidationResult]:
-    """세 모델을 '동일한 train/test 분할'로 검증. 분할을 여기서 한 번만 하고
-    세 모델 모두에 재사용해야 비교가 공정하다 (모델마다 다른 분할을 쓰면
-    Test RMS 차이가 모델 성능 때문인지 분할 운(運) 때문인지 알 수 없게 된다).
+    """Standard 4모델(Ideal Pinhole/Brown-Conrady/Rational/Fisheye)을 '동일한
+    train/test 분할'로 검증. 분할을 여기서 한 번만 하고 네 모델 모두에
+    재사용해야 비교가 공정하다 (모델마다 다른 분할을 쓰면 Test RMS 차이가
+    모델 성능 때문인지 분할 운(運) 때문인지 알 수 없게 된다).
+
+    Object-Releasing(Advanced)은 이 함수가 다루지 않는다 - full-board 데이터만
+    쓰고, Train에서 K/D뿐 아니라 target geometry까지 함께 확정해야 하므로
+    계산 경로 자체가 다르다. 전용 Hold-out은
+    calibration/object_releasing_validation.py::validate_object_releasing_holdout()를
+    쓴다.
     """
     train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio, seed)
 

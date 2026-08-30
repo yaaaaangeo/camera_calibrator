@@ -15,7 +15,7 @@ camera_calibrator.calibration.frame_quality
    - detector.py 검출 직후 + quality.py의 Coverage Map 계산 직후 호출.
    - 아직 캘리브레이션 전이라 reprojection_error가 없으므로 그 항목은 제외.
 2. compute_frame_quality_scores(dataset, ..., use_reprojection=True)
-   - 3모델 계산 후(Frame.reprojection_error가 채워진 뒤) 다시 호출해 점수를
+   - Standard 4모델 계산 후(Frame.reprojection_error가 채워진 뒤) 다시 호출해 점수를
      갱신한다. 재투영 오차가 반영되면 더 정확한 "쓸 만한 프레임인가"
      판단이 가능해진다.
 

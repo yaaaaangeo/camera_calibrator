@@ -3,7 +3,8 @@ tests/test_bootstrap.py
 ==============================
 
 설계 문서 20/21/22번 - Bootstrap Stability / Parameter Confidence Interval을
-Pinhole/Extended Pinhole/Fisheye 세 모델 공용으로 일반화한 모듈.
+Standard 4모델(Pinhole/Brown-Conrady/Extended Pinhole/Fisheye) 공용으로
+일반화한 모듈.
 """
 
 from __future__ import annotations

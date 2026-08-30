@@ -13,12 +13,12 @@ test_recommender_accuracy.py 등, @pytest.mark.slow)와 달리 여기는 일부�
      알고리즘 자체의 정확성은 test_detector.py, test_pipeline_integration.py
      (느린 스위트)가 이미 커버한다 - 여기서는 "그 다음 단계들이 서로 잘
      맞물리는지"만 본다.
-  2. 3모델 중 Fisheye를 뺐다 - 셋 중 계산이 가장 오래 걸리고 발산 위험도
-     크다 (설계 문서 2번). Pinhole+Extended 둘만으로도 "캘리브레이션 엔진 ->
-     비교 -> 검증 -> 추천" 배선이 끊어졌는지는 충분히 잡아낼 수 있다.
+  2. Standard 4모델 중 Fisheye를 뺐다 - 넷 중 계산이 가장 오래 걸리고 발산
+     위험도 크다 (설계 문서 2번). Pinhole+Extended 둘만으로도 "캘리브레이션
+     엔진 -> 비교 -> 검증 -> 추천" 배선이 끊어졌는지는 충분히 잡아낼 수 있다.
   3. 프레임 수를 8~10장으로 최소화하고, outlier pruning 없이 1회만 계산한다.
 
-무거운 결과(전체 3모델 + 실제 이미지 검출 + export까지)의 정확성 자체를
+무거운 결과(Standard 4모델 전체 + 실제 이미지 검출 + export까지)의 정확성 자체를
 검증하고 싶다면 test_pipeline_integration.py(@pytest.mark.slow)를 봐라 -
 이 파일은 그걸 대체하지 않고 보완한다.
 """
@@ -125,7 +125,7 @@ def test_smoke_quality_gate_does_not_crash():
 def test_smoke_validation_and_recommendation_pipeline():
     """Hold-out Validation -> Model Score -> 추천까지 이어지는 배선 확인
     (Fisheye는 뺀 2모델 기준). run_all_models 대신 두 모델만 직접 계산해서
-    3모델 전체를 도는 test_pipeline_integration.py보다 훨씬 빠르다.
+    Standard 4모델 전체를 도는 test_pipeline_integration.py보다 훨씬 빠르다.
     """
     pattern = _pattern_config()
     dataset = _tiny_synthetic_dataset(pattern, n_frames=10)

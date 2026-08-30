@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -60,6 +61,7 @@ from calibration.types import (
     FrameStatus,
     ImageInfo,
     ModelScore,
+    ObjectReleasingValidationResult,
     ObservabilityReport,
     OutlierResult,
     ParameterUncertainty,
@@ -73,13 +75,16 @@ from calibration.types import (
     ResidualStats,
     SpatialErrorCell,
     SpatialErrorMap,
+    StandardVsObjectReleasingComparison,
     StraightnessBreakdown,
     UndistortionQualityReport,
     ValidationResult,
 )
 
-PROJECT_FORMAT_VERSION = 1
+PROJECT_FORMAT_VERSION = 2
 PROJECT_EXTENSION = ".ccproj"
+
+logger = logging.getLogger(__name__)
 
 
 def project_to_dict(project: CalibrationProject) -> dict:
@@ -424,6 +429,52 @@ def _validation_result_from_dict(d: dict) -> ValidationResult:
     )
 
 
+def _object_releasing_validation_result_from_dict(d) -> ObjectReleasingValidationResult | None:
+    if d is None:
+        return None
+    return ObjectReleasingValidationResult(
+        success=d.get("success", True),
+        error_message=d.get("error_message"),
+        train_frame_ids=d.get("train_frame_ids", []),
+        test_frame_ids=d.get("test_frame_ids", []),
+        excluded_frame_ids=d.get("excluded_frame_ids", []),
+        excluded_reasons=d.get("excluded_reasons", {}),
+        failed_test_frame_ids=d.get("failed_test_frame_ids", []),
+        failed_test_reasons=d.get("failed_test_reasons", {}),
+        train_rms=d.get("train_rms"),
+        test_rms=d.get("test_rms"),
+        test_residual_stats=_residual_stats_from_dict(d.get("test_residual_stats")),
+        target_geometry_refinement=d.get("target_geometry_refinement"),
+    )
+
+
+def _standard_vs_object_releasing_comparison_from_dict(d) -> StandardVsObjectReleasingComparison | None:
+    if d is None:
+        return None
+    return StandardVsObjectReleasingComparison(
+        success=d.get("success", True),
+        error_message=d.get("error_message"),
+        eligible_frame_ids=d.get("eligible_frame_ids", []),
+        train_frame_ids=d.get("train_frame_ids", []),
+        test_frame_ids=d.get("test_frame_ids", []),
+        standard_result=(
+            _calibration_result_from_dict(d["standard_result"]) if d.get("standard_result") else None
+        ),
+        standard_validation=(
+            _validation_result_from_dict(d["standard_validation"]) if d.get("standard_validation") else None
+        ),
+        object_releasing_result=(
+            _calibration_result_from_dict(d["object_releasing_result"])
+            if d.get("object_releasing_result") else None
+        ),
+        object_releasing_validation=_object_releasing_validation_result_from_dict(
+            d.get("object_releasing_validation")
+        ),
+        intrinsics_delta=d.get("intrinsics_delta", {}),
+        warnings=d.get("warnings", []),
+    )
+
+
 def _cross_dataset_result_from_dict(d: dict) -> CrossDatasetValidationResult:
     return CrossDatasetValidationResult(
         source_dataset_id=d.get("source_dataset_id", "A"),
@@ -531,8 +582,83 @@ def _final_result_from_dict(d) -> FinalResult | None:
     )
 
 
+def _raw_array_len(d) -> int | None:
+    """migrate_v1_to_v2용 - 아직 dataclass로 복원하지 않은 raw JSON 값에서
+    distortion 배열 길이만 알고 싶을 때. _arr()과 같은 언랩 규칙(_json_safe가
+    만드는 {"__ndarray__": True, "data": [...]} 포맷, 구버전의 순수 list 둘 다)을
+    따르되 dtype 변환은 하지 않는다 - 여기서는 길이만 필요하다.
+    """
+    if d is None:
+        return None
+    if isinstance(d, dict) and d.get("__ndarray__"):
+        d = d.get("data")
+    if not isinstance(d, list):
+        return None
+    return len(d)
+
+
+def migrate_v1_to_v2(payload: dict) -> dict:
+    """v1 -> v2 마이그레이션.
+
+    v1 시절 "extended_pinhole"은 실제로는 두 가지 다른 의미로 쓰였을 수 있다:
+      - distortion 5계수(k1,k2,p1,p2,k3) -> 지금의 Brown-Conrady 역할이었음
+      - distortion 8계수 이상(k1~k6,p1,p2) -> 지금의 extended_pinhole(Rational)과 동일
+
+    문자열만 보고 바꾸지 않는다 - distortion 벡터 길이로 실제 의미를 판별한다.
+    "pinhole"/"fisheye"는 v1과 v2에서 의미가 같으므로 손대지 않는다.
+    object_releasing_result가 v1 payload에 아예 없는 경우는 project_from_dict의
+    기존 .get(...) 처리로 이미 None으로 정상 로드되므로 여기서 손댈 필요 없다.
+    """
+    project = payload.get("project", {})
+    calibration_results: dict = project.get("calibration_results", {}) or {}
+    validation_results: dict = project.get("validation_results", {}) or {}
+
+    renamed_keys: set[str] = set()
+
+    legacy_entry = calibration_results.get("extended_pinhole")
+    if legacy_entry is not None:
+        dist_len = _raw_array_len(legacy_entry.get("distortion"))
+        if dist_len == 5:
+            calibration_results["brown_conrady"] = calibration_results.pop("extended_pinhole")
+            calibration_results["brown_conrady"]["model_name"] = "brown_conrady"
+            renamed_keys.add("extended_pinhole")
+            logger.info(
+                "Migrated legacy project model: extended_pinhole (5 coeffs) -> brown_conrady"
+            )
+        elif dist_len is not None and dist_len >= 8:
+            logger.info(
+                "Legacy project model extended_pinhole (%d coeffs) already matches current "
+                "Rational meaning - kept as extended_pinhole.", dist_len
+            )
+        elif dist_len is not None:
+            logger.warning(
+                "Legacy project model extended_pinhole has an unexpected distortion length "
+                "(%d) - left unchanged, please verify manually.", dist_len
+            )
+
+    if "extended_pinhole" in renamed_keys and "extended_pinhole" in validation_results:
+        validation_results["brown_conrady"] = validation_results.pop("extended_pinhole")
+
+    final_result = project.get("final_result")
+    if (
+        final_result
+        and final_result.get("chosen_model") == "extended_pinhole"
+        and "extended_pinhole" in renamed_keys
+    ):
+        final_result["chosen_model"] = "brown_conrady"
+        calibration = final_result.get("calibration")
+        if calibration and calibration.get("model_name") == "extended_pinhole":
+            calibration["model_name"] = "brown_conrady"
+
+    payload["format_version"] = PROJECT_FORMAT_VERSION
+    return payload
+
+
 def project_from_dict(payload: dict) -> CalibrationProject:
     version = payload.get("format_version")
+    if version == 1:
+        payload = migrate_v1_to_v2(payload)
+        version = payload["format_version"]
     if version != PROJECT_FORMAT_VERSION:
         raise ValueError(
             f"지원하지 않는 프로젝트 파일 버전입니다: {version} "
@@ -559,6 +685,12 @@ def project_from_dict(payload: dict) -> CalibrationProject:
         object_releasing_result=(
             _calibration_result_from_dict(d["object_releasing_result"])
             if d.get("object_releasing_result") else None
+        ),
+        object_releasing_validation_result=_object_releasing_validation_result_from_dict(
+            d.get("object_releasing_validation_result")
+        ),
+        standard_vs_object_releasing_comparison=_standard_vs_object_releasing_comparison_from_dict(
+            d.get("standard_vs_object_releasing_comparison")
         ),
         validation_results=validation_results,
         cross_dataset_results=[

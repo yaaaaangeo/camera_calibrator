@@ -2,9 +2,9 @@
 tests/test_project_io.py
 =============================
 
-설계 문서 16번 - .ccproj 프로젝트 저장/불러오기. 실제 파이프라인(검출→3모델→
-검증→이상치 제거→FinalResult)을 전부 돌린 뒤 저장하고 다시 불러와서, numpy
-배열 dtype까지 포함해 모든 값이 정확히 왕복되는지 확인한다.
+설계 문서 16번 - .ccproj 프로젝트 저장/불러오기. 실제 파이프라인(검출→Standard
+4모델→검증→이상치 제거→FinalResult)을 전부 돌린 뒤 저장하고 다시 불러와서,
+numpy 배열 dtype까지 포함해 모든 값이 정확히 왕복되는지 확인한다.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def full_project(synthetic_dataset, camera_config, pattern_config):
     """검출~FinalResult까지 실제로 다 돌린 CalibrationProject 하나.
 
     module 스코프로 이 파일의 모든 테스트가 하나의 계산 결과를 공유한다
-    (예전엔 함수 스코프라 테스트 7개가 매번 3모델+검증+이상치제거를 새로
+    (예전엔 함수 스코프라 테스트 7개가 매번 Standard 4모델+검증+이상치제거를 새로
     돌려서 setup에서만 테스트당 ~2.2초씩 낭비되고 있었다).
 
     synthetic_dataset은 세션 스코프라 다른 테스트 파일과도 공유되는데,

@@ -3,8 +3,10 @@ camera_calibrator.calibration.pipeline_process
 ====================================================
 
 ui/worker.py의 PipelineWorker와 app/cli.py의 --outlier 플로우가 "GUI/CLI
-스레드가 아니라 완전히 별도의 OS 프로세스"에서 무거운 계산(3모델 캘리브레이션
-+ Hold-out 검증, 이상치 반복 재계산)을 돌리기 위한 진입점 함수들을 모아둔다.
+스레드가 아니라 완전히 별도의 OS 프로세스"에서 무거운 계산(Standard 4모델
+캘리브레이션 + Hold-out 검증, 이상치 반복 재계산, Object-Releasing을
+썼다면 그 결과/Hold-out/Standard와의 비교까지)을 돌리기 위한 진입점 함수들을
+모아둔다.
 
 --- 왜 QThread만으로는 부족한가 (실제 사용자 버그) ---
 
@@ -20,8 +22,8 @@ detect_dataset()의 병렬 검출은 이미 ProcessPoolExecutor를 쓰고 있어
 얻지 못해 완전히 멈춘다 - 이게 OS가 "python3 is not responding"을 띄우는
 실제 원인이다. 이미지가 몇 장 안 되면 계산이 순식간이라 안 보이다가,
 수백 장(사용자 사례: rosbag에서 뽑은 307장)에서 Rational model(14개
-왜곡 계수)까지 켜면 3모델 x (전체 학습 + Hold-out 재학습)로 번들 조정이
-여러 번 돌아 몇 초~몇십 초씩 걸릴 수 있어 뚜렷하게 나타난다.
+왜곡 계수)까지 켜면 Standard 4모델 x (전체 학습 + Hold-out 재학습)로 번들
+조정이 여러 번 돌아 몇 초~몇십 초씩 걸릴 수 있어 뚜렷하게 나타난다.
 
 완전히 별도의 OS 프로세스로 계산을 돌리면, 그 프로세스는 자기만의 파이썬
 인터프리터/GIL을 가지므로 부모 프로세스(GUI가 있는 쪽)의 GIL은 계산
@@ -46,8 +48,10 @@ from calibration.types import (
     CameraModelType,
     CalibrationMethod,
     Dataset,
+    ObjectReleasingValidationResult,
     OutlierResult,
     PatternConfig,
+    StandardVsObjectReleasingComparison,
     ValidationResult,
 )
 
@@ -60,14 +64,28 @@ def run_models_and_validation(
     use_rational_model: bool,
     calibration_method: CalibrationMethod = CalibrationMethod.STANDARD,
     model_jobs: int = 2,
-) -> tuple[dict[CameraModelType, CalibrationResult], dict[CameraModelType, ValidationResult], CalibrationResult | None]:
-    """3모델 계산(run_all_models) + Hold-out 검증(validate_all_models)을
+) -> tuple[
+    dict[CameraModelType, CalibrationResult],
+    dict[CameraModelType, ValidationResult],
+    CalibrationResult | None,
+    ObjectReleasingValidationResult | None,
+    StandardVsObjectReleasingComparison | None,
+]:
+    """Standard 4-model 계산(run_all_models) + Hold-out 검증(validate_all_models)을
     자식 프로세스 하나에서 이어서 실행한다.
 
-    두 단계를 한 번의 프로세스 제출로 묶은 이유: dataset을 매번 따로
+    calibration_method가 OBJECT_RELEASING이면 같은 프로세스 안에서 이어서:
+      1. calibrate_object_releasing_brown_conrady()로 Advanced 결과를 계산하고
+      2. validate_object_releasing_holdout()으로 RO 전용 Hold-out을 계산하고
+      3. compare_standard_vs_object_releasing_brown()으로 Standard Brown-Conrady와의
+         공정 비교(같은 full-board eligible 데이터셋 + 같은 train/test 분할)를 계산한다.
+    이 셋은 Standard 4모델/AIC-BIC와 완전히 분리된 결과이며, 반환 튜플 뒤쪽
+    세 자리에 항상 담는다(Standard method면 전부 None).
+
+    여러 단계를 한 번의 프로세스 제출로 묶은 이유: dataset을 매번 따로
     pickle해서 자식 프로세스로 보내는 오버헤드(이미지 수백 장 기준 무시 못할
-    크기)를 반으로 줄이기 위해서다. 두 함수 모두 dataset을 읽기만 하고
-    바꾸지 않으므로(기존 설계 그대로) 이렇게 묶어도 결과는 완전히 동일하다.
+    크기)를 줄이기 위해서다. 각 함수 모두 dataset을 읽기만 하고 바꾸지
+    않으므로(기존 설계 그대로) 이렇게 묶어도 결과는 완전히 동일하다.
     """
     from calibration.compare import run_all_models
     from calibration.validation import validate_all_models
@@ -83,20 +101,38 @@ def run_models_and_validation(
     )
     calibration_results = {r.model_name: r for r in results_list}
     object_releasing_result = None
+    object_releasing_validation_result = None
+    standard_vs_object_releasing_comparison = None
     if calibration_method == CalibrationMethod.OBJECT_RELEASING:
         from calibration.models.object_releasing import calibrate_object_releasing_brown_conrady
+        from calibration.object_releasing_validation import (
+            compare_standard_vs_object_releasing_brown,
+            validate_object_releasing_holdout,
+        )
 
         object_releasing_result = calibrate_object_releasing_brown_conrady(
             dataset,
             camera_config,
             pattern_config,
         )
+        object_releasing_validation_result = validate_object_releasing_holdout(
+            dataset, camera_config, pattern_config, test_ratio=test_ratio,
+        )
+        standard_vs_object_releasing_comparison = compare_standard_vs_object_releasing_brown(
+            dataset, camera_config, pattern_config, test_ratio=test_ratio,
+        )
 
     validation_results = validate_all_models(
         dataset, camera_config, pattern_config,
         test_ratio=test_ratio, use_rational_model=use_rational_model,
     )
-    return calibration_results, validation_results, object_releasing_result
+    return (
+        calibration_results,
+        validation_results,
+        object_releasing_result,
+        object_releasing_validation_result,
+        standard_vs_object_releasing_comparison,
+    )
 
 
 def run_outlier_pruning_and_validation(
@@ -115,7 +151,7 @@ def run_outlier_pruning_and_validation(
     dict[CameraModelType, CalibrationResult],
     dict[CameraModelType, ValidationResult],
 ]:
-    """이상치 반복 재계산 + Coverage 재분석 + 3모델 재계산 + Hold-out
+    """이상치 반복 재계산 + Coverage 재분석 + Standard 4모델 재계산 + Hold-out
     재검증까지 전부 자식 프로세스 하나에서 실행한다.
 
     주의 - dataset을 반드시 반환값에 포함시켜야 하는 이유:
@@ -143,8 +179,10 @@ def run_outlier_pruning_and_validation(
     image_size = infer_image_size(dataset, camera_config)
     compute_frame_quality_scores(dataset, pattern_config, image_size, use_reprojection=False)
 
-    calibration_results, validation_results, _object_releasing_result = run_models_and_validation(
-        dataset, camera_config, pattern_config, test_ratio, use_rational_model, model_jobs=2,
+    calibration_results, validation_results, _object_releasing_result, _object_releasing_validation, _ro_comparison = (
+        run_models_and_validation(
+            dataset, camera_config, pattern_config, test_ratio, use_rational_model, model_jobs=2,
+        )
     )
 
     compute_frame_quality_scores(dataset, pattern_config, image_size, use_reprojection=True)

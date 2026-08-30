@@ -11,8 +11,8 @@ tests/test_chessboard.py
 3. object_points 순서가 코너 순서와 정확히 짝이 맞는지 (id -> row/col 역산이
    ChArUco와 동일한 공식을 재사용하므로, 순서가 안 맞으면 캘리브레이션
    자체는 "성공"하지만 결과가 미묘하게 틀어지는 조용한 버그가 됨)
-4. 전체 파이프라인(3모델+검증+straightness)이 체스보드에서도 기존 코드
-   변경 없이 동작하는지
+4. 전체 파이프라인(Standard 4모델+검증+straightness)이 체스보드에서도 기존
+   코드 변경 없이 동작하는지
 """
 
 from __future__ import annotations
@@ -146,7 +146,7 @@ def _build_synthetic_distorted_chessboard_dir(tmp_path_factory, n_images=12, see
 
 
 def test_full_pipeline_with_chessboard_pattern(tmp_path_factory):
-    """검출 -> 3모델 -> Hold-out -> 추천 -> straightness까지 체스보드로
+    """검출 -> Standard 4모델 -> Hold-out -> 추천 -> straightness까지 체스보드로
     전부 이어서 돈다 - straightness.py 등 다른 모듈을 하나도 안 고쳤는데도
     (id -> row/col 공식이 동일해서) 그대로 재사용되는지가 핵심.
     """
@@ -173,7 +173,7 @@ def test_full_pipeline_with_chessboard_pattern(tmp_path_factory):
 
     results = run_all_models(dataset, camera_config)
     calibration_results = {r.model_name: r for r in results}
-    assert any(r.success for r in results), "3개 모델이 전부 실패함"
+    assert any(r.success for r in results), "Standard 4모델이 전부 실패함"
 
     compute_frame_quality_scores(dataset, pattern, image_size, use_reprojection=True)
     validation_results = validate_all_models(dataset, camera_config, pattern, test_ratio=0.3)
@@ -259,7 +259,7 @@ def test_pipeline_progress_bar_supports_detection_percent_and_calibration_busy_s
 
 
 def test_ui_full_pipeline_with_chessboard_selected(qapp, tmp_path_factory):
-    """UI에서 Chessboard를 고르고 실제 이미지로 검출~3모델까지 돌아가는지."""
+    """UI에서 Chessboard를 고르고 실제 이미지로 검출~Standard 4모델까지 돌아가는지."""
     import glob
     from ui.main_window import MainWindow
     from calibration.compare import run_all_models

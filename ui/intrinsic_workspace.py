@@ -21,8 +21,10 @@ from calibration.types import (
     CrossDatasetValidationResult,
     Dataset,
     ModelScore,
+    ObjectReleasingValidationResult,
     OutlierResult,
     PatternConfig,
+    StandardVsObjectReleasingComparison,
     ValidationResult,
 )
 from ui.dataset_view import DatasetView
@@ -38,6 +40,8 @@ class IntrinsicState:
     pattern_config: PatternConfig | None = None
     calibration_results: dict[CameraModelType, CalibrationResult] = field(default_factory=dict)
     object_releasing_result: CalibrationResult | None = None
+    object_releasing_validation_result: ObjectReleasingValidationResult | None = None
+    standard_vs_object_releasing_comparison: StandardVsObjectReleasingComparison | None = None
     validation_results: dict[CameraModelType, ValidationResult] = field(default_factory=dict)
     cross_dataset_results: list[CrossDatasetValidationResult] = field(default_factory=list)
     scores: list[ModelScore] = field(default_factory=list)

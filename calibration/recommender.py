@@ -426,7 +426,15 @@ def compute_model_scores(
     weights: ModelScoreWeights = ModelScoreWeights(),
     use_rational_model: bool = False,
 ) -> list[ModelScore]:
-    """세 모델의 Score를 계산하고, 가장 낮은(=좋은) 모델에 is_recommended=True 표시.
+    """Standard 4모델(Ideal Pinhole/Brown-Conrady/Rational/Fisheye)의 Score를
+    계산하고, 가장 낮은(=좋은) 모델에 is_recommended=True 표시.
+
+    Object-Releasing(Advanced)은 calibration_results에 섞여 들어와도 여기서
+    걸러진다(calibration_method != OBJECT_RELEASING인 것만 남김) - AIC/BIC의
+    파라미터 개수 가정이 "카메라 파라미터만 최적화" 전제인데, Object-Releasing은
+    타겟 형상까지 함께 최적화하는 추가 자유도가 있어 같은 기준으로 비교할 수
+    없기 때문이다. Object-Releasing 자체 품질은
+    calibration/object_releasing_validation.py의 전용 Hold-out/비교로 따로 본다.
 
     Args:
         calibration_results: 모델별 (Outlier pruning까지 마친) 최종 CalibrationResult.
