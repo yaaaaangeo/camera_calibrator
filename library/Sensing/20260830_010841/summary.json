@@ -1,0 +1,33 @@
+{
+  "run_dir": "C:\\Users\\User\\Downloads\\calibration\\camera_calibration\\library\\Sensing\\20260830_010841",
+  "sensor_name": "Sensing",
+  "created_at": "2026-08-30T01:08:42",
+  "num_images": 202,
+  "pattern_type": "charuco",
+  "project_file": "project.ccproj",
+  "sample_image": "images\\bag_0016_t1787883670.410.jpg",
+  "note": "",
+  "models": {
+    "extended_pinhole": {
+      "success": true,
+      "rms_error": 1.7838840466064945,
+      "test_rms": 1.8542807667375178,
+      "distortion_count": 1,
+      "error_message": null
+    },
+    "fisheye": {
+      "success": false,
+      "rms_error": null,
+      "test_rms": null,
+      "distortion_count": null,
+      "error_message": "Fisheye 캘리브레이션 실패: 일부 프레임에서 초기 자세 추정이 불안정합니다(OpenCV(5.0.0) D:\\a\\opencv-python\\opencv-python\\opencv\\modules\\calib\\src\\fisheye.cpp:806: error: (-3:Internal error) CALIB_CHECK_COND - Ill-conditioned matrix for input array 4 in function 'cv::internal::CalibrateExtrinsics'\n). 코너가 적거나 보드 각도가 카메라와 거의 평행한 프레임을 제외해도 안정화되지 않았습니다 - 데이터셋을 다시 확인하거나 문제 프레임을 수동으로 제외한 뒤 다시 시도하세요."
+    },
+    "pinhole": {
+      "success": true,
+      "rms_error": 21.66408749519797,
+      "test_rms": 21.38076571286624,
+      "distortion_count": 1,
+      "error_message": null
+    }
+  }
+}

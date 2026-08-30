@@ -1,0 +1,22 @@
+%YAML 1.2
+---
+calibration_model: extended_pinhole
+image_width: 3840
+image_height: 2160
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 2136.8728926202016, 0., 1920.9392740510577, 0.,
+       2140.2040898709183, 958.69023135846487, 0., 0., 1. ]
+distortion_coefficients: !!opencv-matrix
+   rows: 1
+   cols: 14
+   dt: d
+   data: [ 0.66033031752277327, 4.0604747956996858,
+       0.0049961979400286443, 0.00043106410872825664, 1.5991746600723007,
+       1.4204813753665928, 3.4375347016151281, 4.0588363200927962, 0.,
+       0., 0., 0., 0., 0. ]
+distortion_coefficient_count: 14
+distortion_coefficient_order: "k1,k2,p1,p2,k3,k4,k5,k6,s1,s2,s3,s4,taux,tauy"
+rms_reprojection_error: 3.7452799451786118
