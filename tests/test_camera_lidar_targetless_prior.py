@@ -114,6 +114,67 @@ def test_auto_select_errors_when_no_key_present(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# AUTO SELECT robustness: pick the first VALID candidate, not the first
+# EXISTING one -- a higher-priority key that exists but is corrupt must be
+# skipped in favor of the next candidate, never treated as fatal for "auto".
+# ---------------------------------------------------------------------------
+
+def test_auto_select_case_a_prefers_valid_final_over_valid_auto_initial(tmp_path):
+    path = _write_calib(tmp_path, {
+        "T_lidar_camera": [1, 0, 0, 0, 0, 0, 1],
+        "init_T_lidar_camera_auto": [2, 0, 0, 0, 0, 0, 1],
+    })
+    prior = load_direct_visual_calib(path, source="auto")
+    assert prior.source_key == "T_lidar_camera"
+    assert np.allclose(prior.T_lidar_from_camera[:3, 3], [1, 0, 0])
+
+
+def test_auto_select_case_b_skips_invalid_final_uses_valid_auto_initial(tmp_path):
+    path = _write_calib(tmp_path, {
+        "T_lidar_camera": [0, 0, 0, 0, 0, 0, 0],  # invalid: zero quaternion
+        "init_T_lidar_camera_auto": [2, 0, 0, 0, 0, 0, 1],
+    })
+    prior = load_direct_visual_calib(path, source="auto")
+    assert prior.source_key == "init_T_lidar_camera_auto"
+    assert np.allclose(prior.T_lidar_from_camera[:3, 3], [2, 0, 0])
+
+
+def test_auto_select_case_c_skips_two_invalid_uses_valid_manual_initial(tmp_path):
+    path = _write_calib(tmp_path, {
+        "T_lidar_camera": [0, 0, 0, 0, 0, 0, 0],           # invalid: zero quaternion
+        "init_T_lidar_camera_auto": [1, 2, 3, 0, 0, 1],    # invalid: wrong length (6, not 7)
+        "init_T_lidar_camera": [3, 0, 0, 0, 0, 0, 1],      # valid
+    })
+    prior = load_direct_visual_calib(path, source="auto")
+    assert prior.source_key == "init_T_lidar_camera"
+    assert np.allclose(prior.T_lidar_from_camera[:3, 3], [3, 0, 0])
+
+
+def test_auto_select_case_d_all_missing_or_invalid_raises_with_per_key_reasons(tmp_path):
+    path = _write_calib(tmp_path, {
+        "T_lidar_camera": [0, 0, 0, 0, 0, 0, 0],  # invalid: zero quaternion
+        "init_T_lidar_camera_auto": [float("nan"), 0, 0, 0, 0, 0, 1],  # invalid: non-finite
+        # init_T_lidar_camera: missing entirely
+    })
+    with pytest.raises(ValueError) as excinfo:
+        load_direct_visual_calib(path, source="auto")
+
+    message = str(excinfo.value)
+    assert "T_lidar_camera" in message
+    assert "init_T_lidar_camera_auto" in message
+    assert "init_T_lidar_camera" in message
+
+
+def test_auto_select_case_e_explicit_source_never_falls_back(tmp_path):
+    path = _write_calib(tmp_path, {
+        "T_lidar_camera": [0, 0, 0, 0, 0, 0, 0],  # invalid: zero quaternion
+        "init_T_lidar_camera_auto": [2, 0, 0, 0, 0, 0, 1],  # valid, but must NOT be used
+    })
+    with pytest.raises(ValueError):
+        load_direct_visual_calib(path, source="final")
+
+
+# ---------------------------------------------------------------------------
 # TEST 5 -- malformed JSON, every case must raise ValueError
 # ---------------------------------------------------------------------------
 

@@ -70,6 +70,7 @@ from calibration.pipeline_process import (
     run_models_and_validation,
     run_outlier_pruning_and_validation,
 )
+from integrations.direct_visual_runner import DirectVisualConfig, run_direct_visual_pipeline
 
 # 위 두 계산(3모델 + Hold-out 진행 상황)은 자식 프로세스 안에서 일어나므로
 # 세부 진행률 문자열을 실시간으로 받을 수 없다 - future.result()를 이 간격
@@ -817,6 +818,53 @@ class CameraLidarCalibrationWorker(QObject):
                 self.progress.emit(f"FAST-Calib 실패: {result.error_message}")
         except Exception as e:  # noqa: BLE001
             self.error.emit(f"FAST-Calib 계산 중 오류: {e}")
+        finally:
+            self.finished.emit()
+
+
+class DirectVisualBootstrapWorker(QObject):
+    """Targetless Bootstrap (direct_visual_lidar_calibration external
+    process pipeline)을 GUI 스레드 밖에서 수행한다. 실제 계산 로직은 전부
+    integrations.direct_visual_runner.run_direct_visual_pipeline()에
+    있고 (그 함수는 Qt를 전혀 모른다), 여기서는 다른 워커들과 동일하게
+    콜백 -> Qt signal 변환만 담당한다."""
+
+    progress = Signal(str)
+    log_received = Signal(str)
+    stage_started = Signal(str)    # RunnerStage.value
+    stage_finished = Signal(str)   # RunnerStage.value
+    succeeded = Signal(object)     # TargetlessPrior
+    failed = Signal(str, str)      # DirectVisualFailureReason.value (or "unexpected_error"), message
+    cancelled = Signal()
+    finished = Signal()
+
+    def __init__(self, config: DirectVisualConfig):
+        super().__init__()
+        self.config = config
+        self._cancelled = False
+
+    def request_cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            result = run_direct_visual_pipeline(
+                self.config,
+                on_progress=self.progress.emit,
+                on_log=self.log_received.emit,
+                on_stage_started=lambda stage: self.stage_started.emit(stage.value),
+                on_stage_finished=lambda stage: self.stage_finished.emit(stage.value),
+                cancel_check=lambda: self._cancelled,
+            )
+            if result.cancelled:
+                self.cancelled.emit()
+            elif result.success:
+                self.succeeded.emit(result.prior)
+            else:
+                reason = result.failure_reason.value if result.failure_reason is not None else "unknown"
+                self.failed.emit(reason, result.failure_message)
+        except Exception as e:  # noqa: BLE001 -- surfaced via failed, never crashes the worker thread
+            self.failed.emit("unexpected_error", str(e))
         finally:
             self.finished.emit()
 

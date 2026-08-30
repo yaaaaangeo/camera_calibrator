@@ -105,6 +105,32 @@ class GuidedROIConfig:
 
     fallback_to_auto: bool = True
 
+    def __post_init__(self) -> None:
+        """Validate at construction time (the single entry point every
+        caller -- UI, pipeline, tests -- goes through) rather than
+        silently correcting or deferring to the margin math. tan() is not
+        a sane uncertainty model near/beyond 90 degrees, so
+        rotation_uncertainty_deg is capped well below that at 30 degrees --
+        a coarse Targetless prior with a larger angular error than that
+        should not be trusted as a GUIDED ROI search hint at all."""
+        if not (0.0 <= self.rotation_uncertainty_deg <= 30.0):
+            raise ValueError(
+                f"rotation_uncertainty_deg must be between 0 and 30 degrees, "
+                f"got {self.rotation_uncertainty_deg}"
+            )
+        if self.translation_uncertainty_m < 0.0:
+            raise ValueError(f"translation_uncertainty_m must be >= 0, got {self.translation_uncertainty_m}")
+        if self.safety_margin_m < 0.0:
+            raise ValueError(f"safety_margin_m must be >= 0, got {self.safety_margin_m}")
+        if self.min_margin_m <= 0.0:
+            raise ValueError(f"min_margin_m must be > 0, got {self.min_margin_m}")
+        if self.max_margin_m <= 0.0:
+            raise ValueError(f"max_margin_m must be > 0, got {self.max_margin_m}")
+        if self.min_margin_m > self.max_margin_m:
+            raise ValueError(
+                f"min_margin_m must be <= max_margin_m, got min={self.min_margin_m}, max={self.max_margin_m}"
+            )
+
 
 @dataclass
 class GuidedROIDiagnostics:

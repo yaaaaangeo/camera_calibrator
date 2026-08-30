@@ -17,13 +17,16 @@ Manager/Multi-Scene code behind a different acquisition adapter.
 from __future__ import annotations
 
 import os
+import platform
 import time
+from datetime import datetime
 
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -32,9 +35,11 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSpinBox,
     QTabWidget,
@@ -64,11 +69,13 @@ from camera_lidar.types import (
 )
 from geometry.transform import rotation_matrix_to_quaternion, rotation_matrix_to_rpy
 from input.lidar import read_pcd, read_ply_ascii
+from integrations.direct_visual_runner import DirectVisualConfig
 from ui.camera_lidar_bag_source import CameraLidarBagSource
 from ui.camera_lidar_scene_browser import CameraLidarSceneBrowser
 from ui.theme import Theme, qcolor, set_tone
 from ui.worker import (
     CameraLidarCalibrationWorker,
+    DirectVisualBootstrapWorker,
     MultiSceneCalibrationWorker,
     PolicyComparisonWorker,
     SceneExtractionWorker,
@@ -135,6 +142,12 @@ class CameraLidarWorkspace(QWidget):
         # settings while a capture is in flight (§29).
         self._active_capture_scene: CalibrationScene | None = None
         self._active_capture_roi_mode: str | None = None
+
+        # Targetless Bootstrap (direct_visual_lidar_calibration external
+        # process automation, stage 2) -- see integrations/direct_visual_runner.py.
+        self._bootstrap_thread = None
+        self._bootstrap_worker: DirectVisualBootstrapWorker | None = None
+        self._bootstrap_output_path_auto = True  # False once the user edits Output by hand
 
         self._thread = None
         self._worker = None
@@ -421,6 +434,9 @@ class CameraLidarWorkspace(QWidget):
         self.guided_roi_widget = QWidget()
         outer = QVBoxLayout(self.guided_roi_widget)
         outer.setContentsMargins(0, 0, 0, 0)
+
+        outer.addWidget(self._build_targetless_bootstrap_widget())
+
         outer.addWidget(QLabel("Targetless Prior (direct_visual_lidar_calibration)"))
 
         load_row = QHBoxLayout()
@@ -448,9 +464,9 @@ class CameraLidarWorkspace(QWidget):
         self.prior_file_label.setWordWrap(True)
         form.addRow("File", self.prior_file_label)
 
-        def make_uncertainty_spin(value: float, suffix: str) -> QDoubleSpinBox:
+        def make_uncertainty_spin(value: float, suffix: str, max_value: float = 1000.0) -> QDoubleSpinBox:
             spin = QDoubleSpinBox()
-            spin.setRange(0.0, 1000.0)
+            spin.setRange(0.0, max_value)
             spin.setDecimals(3)
             spin.setSuffix(suffix)
             spin.setValue(value)
@@ -458,7 +474,12 @@ class CameraLidarWorkspace(QWidget):
 
         default = GuidedROIConfig(prior=TargetlessPrior(T_lidar_from_camera=np.eye(4)))
         self.guided_translation_uncertainty_spin = make_uncertainty_spin(default.translation_uncertainty_m, " m")
-        self.guided_rotation_uncertainty_spin = make_uncertainty_spin(default.rotation_uncertainty_deg, " deg")
+        # tan() is not a sane uncertainty model near/beyond 90 degrees (it
+        # diverges, then flips sign past 90) -- capped at 30 degrees to match
+        # GuidedROIConfig.__post_init__'s validation (camera_lidar/types.py).
+        self.guided_rotation_uncertainty_spin = make_uncertainty_spin(
+            default.rotation_uncertainty_deg, " deg", max_value=30.0
+        )
         self.guided_safety_margin_spin = make_uncertainty_spin(default.safety_margin_m, " m")
         self.guided_min_margin_spin = make_uncertainty_spin(default.min_margin_m, " m")
         self.guided_max_margin_spin = make_uncertainty_spin(default.max_margin_m, " m")
@@ -525,7 +546,11 @@ class CameraLidarWorkspace(QWidget):
             prior = load_direct_visual_calib(path, source=self._current_prior_source())
         except Exception as e:  # noqa: BLE001
             # Loading failed -- don't silently keep whatever prior (if any)
-            # was loaded before; make the NOT LOADED state explicit.
+            # was loaded before; make the NOT LOADED state explicit. (This
+            # clear-on-failure behavior is specific to the MANUAL load
+            # button -- a failed/cancelled automatic Targetless Bootstrap
+            # run must NOT clear an existing prior, see
+            # _on_bootstrap_failed/_on_bootstrap_cancelled below.)
             self.targetless_prior = None
             self.prior_status_label.setText("NOT LOADED")
             set_tone(self.prior_status_label, "bad")
@@ -535,6 +560,13 @@ class CameraLidarWorkspace(QWidget):
             QMessageBox.critical(self, "Targetless Prior 불러오기 실패", str(e))
             return
 
+        self._apply_targetless_prior(prior)
+
+    def _apply_targetless_prior(self, prior: TargetlessPrior) -> None:
+        """Single state-update path for a newly-available TargetlessPrior,
+        used identically by the manual 'Load calib.json' button and a
+        successful automatic Targetless Bootstrap run -- both must leave
+        the UI in exactly the same state (§21)."""
         self.targetless_prior = prior
         self.prior_status_label.setText("READY")
         set_tone(self.prior_status_label, "good")
@@ -559,6 +591,294 @@ class CameraLidarWorkspace(QWidget):
             max_local_planes=self.guided_local_planes_spin.value(),
             fallback_to_auto=self.guided_fallback_checkbox.isChecked(),
         )
+
+    # ------------------------------------------------------------------
+    # Targetless Bootstrap (direct_visual_lidar_calibration automation,
+    # stage 2) -- runs preprocess -> find_matches_superglue.py ->
+    # initial_guess_auto -> [FULL REFINE only] calibrate as external ROS
+    # processes (integrations/direct_visual_runner.py) and, on success,
+    # feeds the resulting calib.json through the SAME
+    # _apply_targetless_prior() path as the manual "Load calib.json"
+    # button above.
+    # ------------------------------------------------------------------
+
+    _BOOTSTRAP_CAMERA_MODELS = ("plumb_bob", "fisheye", "omnidir")
+
+    def _build_targetless_bootstrap_widget(self) -> QWidget:
+        group = QGroupBox("TARGETLESS BOOTSTRAP")
+        outer = QVBoxLayout(group)
+
+        self._bootstrap_is_linux = platform.system() == "Linux"
+        if not self._bootstrap_is_linux:
+            note = QLabel(
+                "Automatic direct_visual execution requires a Linux ROS environment.\n\n"
+                "You can still run direct_visual externally and use:\n"
+                "Load direct_visual calib.json"
+            )
+            note.setWordWrap(True)
+            set_tone(note, "warning")
+            outer.addWidget(note)
+
+        form = QFormLayout()
+
+        def path_row(browse_slot) -> tuple[QLineEdit, QHBoxLayout]:
+            row = QHBoxLayout()
+            edit = QLineEdit()
+            browse = QPushButton("Browse...")
+            browse.clicked.connect(browse_slot)
+            row.addWidget(edit, stretch=1)
+            row.addWidget(browse)
+            return edit, row
+
+        self.bootstrap_bag_edit, bag_row = path_row(self._on_browse_bootstrap_bag)
+        form.addRow("Input Bag", self._wrap_layout(bag_row))
+
+        self.bootstrap_output_edit, output_row = path_row(self._on_browse_bootstrap_output)
+        self.bootstrap_output_edit.textEdited.connect(
+            lambda _: setattr(self, "_bootstrap_output_path_auto", False)
+        )
+        form.addRow("Output", self._wrap_layout(output_row))
+
+        self.bootstrap_ros_combo = QComboBox()
+        self.bootstrap_ros_combo.addItem("AUTO", "auto")
+        self.bootstrap_ros_combo.addItem("ROS1", "1")
+        self.bootstrap_ros_combo.addItem("ROS2", "2")
+        form.addRow("ROS", self.bootstrap_ros_combo)
+
+        self.bootstrap_lidar_type_combo = QComboBox()
+        self.bootstrap_lidar_type_combo.addItem("Spinning (Ouster / Velodyne / RoboSense, ...)", "spinning")
+        self.bootstrap_lidar_type_combo.addItem("Non-repetitive (Livox, ...)", "non_repetitive")
+        form.addRow("LiDAR Type", self.bootstrap_lidar_type_combo)
+
+        self.bootstrap_image_topic_edit = QLineEdit()
+        form.addRow("Image Topic", self.bootstrap_image_topic_edit)
+        self.bootstrap_points_topic_edit = QLineEdit()
+        form.addRow("PointCloud Topic", self.bootstrap_points_topic_edit)
+        self.bootstrap_camera_info_topic_edit = QLineEdit()
+        form.addRow("CameraInfo Topic (optional)", self.bootstrap_camera_info_topic_edit)
+
+        use_bag_topics_button = QPushButton("Use Current Bag Topics")
+        use_bag_topics_button.clicked.connect(self._on_use_bag_topics_for_bootstrap)
+        form.addRow(use_bag_topics_button)
+
+        self.bootstrap_camera_model_combo = QComboBox()
+        for name in self._BOOTSTRAP_CAMERA_MODELS:
+            self.bootstrap_camera_model_combo.addItem(name, name)
+        form.addRow("Camera Model (direct_visual)", self.bootstrap_camera_model_combo)
+
+        self.bootstrap_ros_setup_edit, ros_setup_row = path_row(self._on_browse_bootstrap_ros_setup)
+        form.addRow("ROS Setup (optional)", self._wrap_layout(ros_setup_row))
+        self.bootstrap_workspace_setup_edit, workspace_setup_row = path_row(self._on_browse_bootstrap_workspace_setup)
+        form.addRow("Workspace Setup (optional)", self._wrap_layout(workspace_setup_row))
+
+        outer.addLayout(form)
+
+        mode_row = QHBoxLayout()
+        self.bootstrap_mode_coarse_radio = QRadioButton("COARSE ONLY  (fast / recommended for Guided ROI)")
+        self.bootstrap_mode_full_radio = QRadioButton("FULL REFINE  (run NID fine registration)")
+        self.bootstrap_mode_coarse_radio.setChecked(True)
+        self.bootstrap_mode_group = QButtonGroup(group)
+        self.bootstrap_mode_group.addButton(self.bootstrap_mode_coarse_radio)
+        self.bootstrap_mode_group.addButton(self.bootstrap_mode_full_radio)
+        mode_row.addWidget(self.bootstrap_mode_coarse_radio)
+        mode_row.addWidget(self.bootstrap_mode_full_radio)
+        outer.addLayout(mode_row)
+
+        button_row = QHBoxLayout()
+        self.bootstrap_run_button = QPushButton("RUN TARGETLESS BOOTSTRAP")
+        self.bootstrap_run_button.setProperty("role", "primary")
+        self.bootstrap_run_button.clicked.connect(self._on_run_targetless_bootstrap)
+        self.bootstrap_run_button.setEnabled(self._bootstrap_is_linux)
+        button_row.addWidget(self.bootstrap_run_button)
+        self.bootstrap_cancel_button = QPushButton("CANCEL")
+        self.bootstrap_cancel_button.setVisible(False)
+        self.bootstrap_cancel_button.clicked.connect(self._on_cancel_targetless_bootstrap)
+        button_row.addWidget(self.bootstrap_cancel_button)
+        outer.addLayout(button_row)
+
+        self.bootstrap_status_label = QLabel("READY" if self._bootstrap_is_linux else "UNAVAILABLE (non-Linux)")
+        set_tone(self.bootstrap_status_label, "good" if self._bootstrap_is_linux else "bad")
+        outer.addWidget(self.bootstrap_status_label)
+        self.bootstrap_stage_label = QLabel("")
+        outer.addWidget(self.bootstrap_stage_label)
+
+        self.bootstrap_log_text = QPlainTextEdit()
+        self.bootstrap_log_text.setReadOnly(True)
+        self.bootstrap_log_text.setMaximumHeight(120)
+        outer.addWidget(self.bootstrap_log_text)
+
+        return group
+
+    @staticmethod
+    def _wrap_layout(layout) -> QWidget:
+        widget = QWidget()
+        widget.setLayout(layout)
+        return widget
+
+    def _on_browse_bootstrap_bag(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "direct_visual input bag directory 선택")
+        if not path:
+            return
+        self.bootstrap_bag_edit.setText(path)
+        if self._bootstrap_output_path_auto:
+            self.bootstrap_output_edit.setText(self._default_bootstrap_output_dir(path))
+
+    def _on_browse_bootstrap_output(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "direct_visual output directory 선택")
+        if not path:
+            return
+        self.bootstrap_output_edit.setText(path)
+        self._bootstrap_output_path_auto = False
+
+    def _on_browse_bootstrap_ros_setup(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "ROS setup.bash 선택", "", "Bash scripts (*.bash);;All files (*)")
+        if path:
+            self.bootstrap_ros_setup_edit.setText(path)
+
+    def _on_browse_bootstrap_workspace_setup(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Workspace setup.bash 선택", "", "Bash scripts (*.bash);;All files (*)")
+        if path:
+            self.bootstrap_workspace_setup_edit.setText(path)
+
+    def _default_bootstrap_output_dir(self, bag_path: str) -> str:
+        base = os.path.dirname(bag_path.rstrip("/\\")) or "."
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.join(base, "targetless_bootstrap", stamp)
+
+    def _on_use_bag_topics_for_bootstrap(self) -> None:
+        """Pulls the CURRENTLY SELECTED Camera/LiDAR bag topics (Input
+        Source's Bag tab) into the bootstrap fields -- an explicit action,
+        not silent auto-population, matching this file's existing
+        "APPLY BEST CANDIDATE"-style convention for adopting a value from
+        elsewhere in the UI (§8: reuse the existing topic selector instead
+        of re-implementing one)."""
+        camera_topic = self.bag_source.camera_topic_combo.currentData()
+        lidar_topic = self.bag_source.lidar_topic_combo.currentData()
+        if not camera_topic and not lidar_topic:
+            QMessageBox.information(
+                self, "Bag Topics 없음",
+                "Input Source의 Bag 탭에서 먼저 bag을 열고 Camera/LiDAR 토픽을 선택하세요.",
+            )
+            return
+        if camera_topic:
+            self.bootstrap_image_topic_edit.setText(camera_topic)
+        if lidar_topic:
+            self.bootstrap_points_topic_edit.setText(lidar_topic)
+        if self.bag_source.bag_path and not self.bootstrap_bag_edit.text():
+            self.bootstrap_bag_edit.setText(self.bag_source.bag_path)
+            if self._bootstrap_output_path_auto:
+                self.bootstrap_output_edit.setText(self._default_bootstrap_output_dir(self.bag_source.bag_path))
+
+    def _current_direct_visual_config(self) -> DirectVisualConfig:
+        camera_matrix = self.intrinsics.camera_matrix if self.intrinsics is not None else None
+        distortion = self.intrinsics.distortion if self.intrinsics is not None else None
+        return DirectVisualConfig(
+            ros_version=self.bootstrap_ros_combo.currentData(),
+            input_bag_path=self.bootstrap_bag_edit.text().strip(),
+            output_path=self.bootstrap_output_edit.text().strip(),
+            image_topic=self.bootstrap_image_topic_edit.text().strip(),
+            points_topic=self.bootstrap_points_topic_edit.text().strip(),
+            camera_info_topic=self.bootstrap_camera_info_topic_edit.text().strip(),
+            lidar_type=self.bootstrap_lidar_type_combo.currentData(),
+            camera_model=self.bootstrap_camera_model_combo.currentData(),
+            camera_matrix=camera_matrix,
+            distortion=distortion,
+            mode="full" if self.bootstrap_mode_full_radio.isChecked() else "coarse",
+            ros_setup_path=self.bootstrap_ros_setup_edit.text().strip(),
+            workspace_setup_path=self.bootstrap_workspace_setup_edit.text().strip(),
+        )
+
+    def _confirm_superglue_license(self) -> bool:
+        reply = QMessageBox.warning(
+            self, "SuperGlue License Notice",
+            "Automatic direct_visual initial matching uses the upstream SuperGlue-based workflow.\n\n"
+            "The upstream direct_visual documentation warns that SuperGlue is not permitted for "
+            "commercial use. Review the upstream license before commercial deployment.\n\n"
+            "Continue with automatic matching?",
+            QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel,
+        )
+        return reply == QMessageBox.Ok
+
+    def _on_run_targetless_bootstrap(self) -> None:
+        if not self._bootstrap_is_linux:
+            QMessageBox.warning(
+                self, "Linux 필요",
+                "Automatic direct_visual execution requires a Linux ROS environment.\n\n"
+                "You can still run direct_visual externally and use:\nLoad direct_visual calib.json",
+            )
+            return
+        if self._bootstrap_worker is not None:
+            return
+
+        try:
+            config = self._current_direct_visual_config()
+        except Exception as e:  # noqa: BLE001 -- e.g. an invalid enum-like field
+            QMessageBox.critical(self, "Targetless Bootstrap 설정 오류", str(e))
+            return
+
+        if not self._confirm_superglue_license():
+            return
+
+        worker = DirectVisualBootstrapWorker(config)
+        thread = run_worker_in_thread(worker, self)
+        worker.progress.connect(self._on_bootstrap_progress)
+        worker.log_received.connect(self._on_bootstrap_log)
+        worker.stage_started.connect(self._on_bootstrap_stage_started)
+        worker.succeeded.connect(self._on_bootstrap_succeeded)
+        worker.failed.connect(self._on_bootstrap_failed)
+        worker.cancelled.connect(self._on_bootstrap_cancelled)
+        self._bootstrap_thread, self._bootstrap_worker = thread, worker
+        self._set_bootstrap_busy(True)
+        thread.finished.connect(lambda: setattr(self, "_bootstrap_worker", None))
+        thread.finished.connect(lambda: setattr(self, "_bootstrap_thread", None))
+        thread.finished.connect(lambda: self._set_bootstrap_busy(False))
+        thread.start()
+
+    def _on_cancel_targetless_bootstrap(self) -> None:
+        if self._bootstrap_worker is not None:
+            self._bootstrap_worker.request_cancel()
+            self.bootstrap_cancel_button.setEnabled(False)
+            self.bootstrap_status_label.setText("CANCELLING...")
+
+    def _set_bootstrap_busy(self, busy: bool) -> None:
+        self.bootstrap_run_button.setEnabled(not busy and self._bootstrap_is_linux)
+        self.bootstrap_cancel_button.setVisible(busy)
+        self.bootstrap_cancel_button.setEnabled(busy)
+        if busy:
+            self.bootstrap_log_text.clear()
+            self.bootstrap_status_label.setText("RUNNING")
+            set_tone(self.bootstrap_status_label, "warning")
+
+    def _on_bootstrap_progress(self, message: str) -> None:
+        self.bootstrap_stage_label.setText(message)
+
+    def _on_bootstrap_log(self, line: str) -> None:
+        self.bootstrap_log_text.appendPlainText(line)
+
+    def _on_bootstrap_stage_started(self, stage_value: str) -> None:
+        self.bootstrap_status_label.setText(f"RUNNING: {stage_value.upper()}")
+
+    def _on_bootstrap_succeeded(self, prior: TargetlessPrior) -> None:
+        self.bootstrap_status_label.setText("DONE")
+        set_tone(self.bootstrap_status_label, "good")
+        self.bootstrap_stage_label.setText("Targetless Bootstrap complete.")
+        self._apply_targetless_prior(prior)
+
+    def _on_bootstrap_failed(self, reason_value: str, message: str) -> None:
+        # Failure must NEVER clear an existing valid prior (§17/§35) --
+        # _apply_targetless_prior() is simply not called here.
+        self.bootstrap_status_label.setText(f"FAILED: {reason_value.upper()}")
+        set_tone(self.bootstrap_status_label, "bad")
+        QMessageBox.critical(
+            self, "Targetless Bootstrap Failed",
+            f"Stage/Reason:\n{reason_value}\n\nLast Output:\n{message[-1000:]}",
+        )
+
+    def _on_bootstrap_cancelled(self) -> None:
+        # Cancellation must NEVER clear an existing valid prior (§17/§36).
+        self.bootstrap_status_label.setText("CANCELLED")
+        set_tone(self.bootstrap_status_label, "bad")
+        self.bootstrap_stage_label.setText("Targetless Bootstrap cancelled.")
 
     # ------------------------------------------------------------------
     # ④ Input Source (Bag tab / File tab)
@@ -1007,8 +1327,15 @@ class CameraLidarWorkspace(QWidget):
         QMessageBox.critical(self, "FAST-Calib 오류", message)
 
     def _on_capture_result_ready(self, result) -> None:
+        # Preserve the ROI mode this worker actually ran with BEFORE doing
+        # anything else -- the live ROI Mode combo box may have been
+        # changed by the user while the worker was still computing, and
+        # diagnostics must describe what actually ran, not the combo box's
+        # current value.
+        active_roi_mode = self._active_capture_roi_mode
+
         if result.failure_reason == FailureReason.CANCELLED:
-            self.diagnostics_text.setPlainText(self._format_diagnostics(result))
+            self.diagnostics_text.setPlainText(self._format_diagnostics(result, roi_mode=active_roi_mode))
             self.result_text.setPlainText("FAST-Calib cancelled.")
             return
 
@@ -1045,7 +1372,9 @@ class CameraLidarWorkspace(QWidget):
                     "\"Include\" in the Scene Manager below to use it anyway."
                 )
 
-        self.diagnostics_text.setPlainText(self._format_diagnostics(result) + "\n\n" + "\n".join(gate_lines))
+        self.diagnostics_text.setPlainText(
+            self._format_diagnostics(result, roi_mode=active_roi_mode) + "\n\n" + "\n".join(gate_lines)
+        )
         self._render_single_scene_result(result)
 
         self._scene_counter += 1
@@ -1055,7 +1384,7 @@ class CameraLidarWorkspace(QWidget):
         # have changed (ROI settings, a newly-loaded Targetless prior, ...)
         # while the capture was in flight (§29).
         scene = self._active_capture_scene
-        roi_mode = self._active_capture_roi_mode
+        roi_mode = active_roi_mode
         captured = CapturedScene(
             scene_id=scene_id, scene=scene,
             included=included,  # Quality/Duplicate gate failures (or detection failure) default to excluded,
@@ -1067,7 +1396,17 @@ class CameraLidarWorkspace(QWidget):
         self._refresh_scene_table()
         self._update_multi_scene_enabled()
 
-    def _format_diagnostics(self, result) -> str:
+    def _format_diagnostics(self, result, roi_mode: str | None = None) -> str:
+        """roi_mode: the ROI mode actually used to produce `result`.
+        Callers showing a just-finished capture worker's result MUST pass
+        the mode that worker actually ran with (e.g. the preserved
+        self._active_capture_roi_mode) rather than letting this default to
+        the live ROI Mode combo box -- the user may have changed that combo
+        while the worker was still computing, which would otherwise make
+        the diagnostics claim a different mode than what actually ran."""
+        if roi_mode is None:
+            roi_mode = self._current_roi_mode()
+
         lines = ["CAMERA PROCESSING", f"  Topic: {self.camera_topic or '(file)'}"]
         cam = result.camera_detection
         if cam is not None:
@@ -1080,7 +1419,7 @@ class CameraLidarWorkspace(QWidget):
 
         lines.append("")
         lines.append("LIDAR PROCESSING")
-        lines.append(f"  ROI Mode: {self._current_roi_mode().upper()}")
+        lines.append(f"  ROI Mode: {roi_mode.upper()}")
         lidar = result.lidar_detection
         if lidar is not None:
             lines.append(f"  ROI Points: {lidar.roi_point_count}")
@@ -1285,7 +1624,8 @@ class CameraLidarWorkspace(QWidget):
             return
         self._render_single_scene_result(captured.detection)
         self.diagnostics_text.setPlainText(
-            f"(Viewing {captured.scene_id})\n\n" + self._format_diagnostics(captured.detection)
+            f"(Viewing {captured.scene_id})\n\n"
+            + self._format_diagnostics(captured.detection, roi_mode=captured.roi_mode)
         )
 
     def _set_selected_scene_included(self, included: bool) -> None:

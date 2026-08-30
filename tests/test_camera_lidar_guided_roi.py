@@ -102,7 +102,7 @@ def test_build_roi_from_predicted_centers_contains_all_points():
 # ---------------------------------------------------------------------------
 
 def test_margin_increases_with_distance():
-    config = GuidedROIConfig(prior=_identity_prior(), min_margin_m=0.0, max_margin_m=100.0)
+    config = GuidedROIConfig(prior=_identity_prior(), min_margin_m=0.001, max_margin_m=100.0)
     near = np.tile([0.0, 0.0, 1.0], (4, 1))
     far = np.tile([0.0, 0.0, 5.0], (4, 1))
 
@@ -150,6 +150,58 @@ def test_margin_schedule_ascending_unique_capped():
     assert all(m <= config.max_margin_m for m in schedule)
     assert schedule[0] == pytest.approx(0.6)
     assert schedule[-1] == pytest.approx(1.2)
+
+
+# ---------------------------------------------------------------------------
+# GuidedROIConfig.__post_init__ validation (hardening): tan() is not a sane
+# uncertainty model near/beyond 90 degrees, so rotation_uncertainty_deg is
+# capped at 30 degrees; margin bounds must be positive and ordered.
+# Construction-time ValueError, never silent correction.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("rotation_uncertainty_deg", [0.0, 5.0, 30.0])
+def test_guided_roi_config_accepts_boundary_rotation_values(rotation_uncertainty_deg):
+    config = GuidedROIConfig(prior=_identity_prior(), rotation_uncertainty_deg=rotation_uncertainty_deg)
+    assert config.rotation_uncertainty_deg == rotation_uncertainty_deg
+
+
+def test_guided_roi_config_accepts_valid_margin_bounds():
+    config = GuidedROIConfig(prior=_identity_prior(), min_margin_m=0.4, max_margin_m=2.0)
+    assert config.min_margin_m == 0.4
+    assert config.max_margin_m == 2.0
+
+
+@pytest.mark.parametrize("rotation_uncertainty_deg", [-0.1, 30.1, 45.0, 90.0, -10.0])
+def test_guided_roi_config_rejects_out_of_range_rotation(rotation_uncertainty_deg):
+    with pytest.raises(ValueError):
+        GuidedROIConfig(prior=_identity_prior(), rotation_uncertainty_deg=rotation_uncertainty_deg)
+
+
+def test_guided_roi_config_rejects_negative_translation_uncertainty():
+    with pytest.raises(ValueError):
+        GuidedROIConfig(prior=_identity_prior(), translation_uncertainty_m=-0.01)
+
+
+def test_guided_roi_config_rejects_negative_safety_margin():
+    with pytest.raises(ValueError):
+        GuidedROIConfig(prior=_identity_prior(), safety_margin_m=-0.01)
+
+
+@pytest.mark.parametrize("min_margin_m", [0.0, -0.5])
+def test_guided_roi_config_rejects_non_positive_min_margin(min_margin_m):
+    with pytest.raises(ValueError):
+        GuidedROIConfig(prior=_identity_prior(), min_margin_m=min_margin_m, max_margin_m=2.0)
+
+
+@pytest.mark.parametrize("max_margin_m", [0.0, -0.5])
+def test_guided_roi_config_rejects_non_positive_max_margin(max_margin_m):
+    with pytest.raises(ValueError):
+        GuidedROIConfig(prior=_identity_prior(), max_margin_m=max_margin_m)
+
+
+def test_guided_roi_config_rejects_min_greater_than_max():
+    with pytest.raises(ValueError):
+        GuidedROIConfig(prior=_identity_prior(), min_margin_m=2.0, max_margin_m=0.4)
 
 
 # ---------------------------------------------------------------------------
