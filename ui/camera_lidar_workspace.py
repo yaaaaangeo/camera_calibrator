@@ -50,7 +50,14 @@ from PySide6.QtWidgets import (
 )
 
 from calibration.calibration_io import StandardCalibration, load_standard_calibration
-from calibration.rosbag_reader import extract_pointcloud_near_timestamp
+from calibration.rosbag_reader import (
+    extract_pointcloud_near_timestamp,
+    pick_default_topic,
+    recommend_camera_info_topic,
+    scan_bag_directory_topics,
+    IMAGE_TOPIC_KEYWORD_PRIORITY,
+    POINTCLOUD_TOPIC_KEYWORD_PRIORITY,
+)
 from camera_lidar.camera_detector import COMMON_ARUCO_DICTIONARIES, detect_camera_target
 from camera_lidar.gates import compute_target_pose, evaluate_duplicate_gate, evaluate_quality_gate
 from camera_lidar.pipeline import calibrate_single_scene
@@ -74,6 +81,7 @@ from ui.camera_lidar_bag_source import CameraLidarBagSource
 from ui.camera_lidar_scene_browser import CameraLidarSceneBrowser
 from ui.theme import Theme, qcolor, set_tone
 from ui.worker import (
+    BagTopicDiscoveryWorker,
     CameraLidarCalibrationWorker,
     DirectVisualBootstrapWorker,
     MultiSceneCalibrationWorker,
@@ -148,6 +156,18 @@ class CameraLidarWorkspace(QWidget):
         self._bootstrap_thread = None
         self._bootstrap_worker: DirectVisualBootstrapWorker | None = None
         self._bootstrap_output_path_auto = True  # False once the user edits Output by hand
+
+        # Bag Directory topic auto-discovery (stage 3) -- see
+        # calibration.rosbag_reader.scan_bag_directory_topics.
+        self._bootstrap_scan_thread = None
+        self._bootstrap_scan_worker = None
+        self._bootstrap_scanning = False
+        self._bootstrap_last_scan_result = None
+        # True once the user has EXPLICITLY picked a CameraInfo topic from
+        # the dropdown (QComboBox.activated, never a programmatic
+        # setCurrentIndex) -- an auto-recommendation must never clobber
+        # that choice (§12).
+        self._bootstrap_camera_info_user_selected = False
 
         self._thread = None
         self._worker = None
@@ -633,7 +653,14 @@ class CameraLidarWorkspace(QWidget):
             return edit, row
 
         self.bootstrap_bag_edit, bag_row = path_row(self._on_browse_bootstrap_bag)
+        scan_topics_button = QPushButton("Scan Topics")
+        scan_topics_button.clicked.connect(self._on_refresh_bootstrap_topics)
+        bag_row.addWidget(scan_topics_button)
         form.addRow("Input Bag Directory", self._wrap_layout(bag_row))
+
+        self.bootstrap_scan_status_label = QLabel("")
+        self.bootstrap_scan_status_label.setWordWrap(True)
+        form.addRow("Bag Scan", self.bootstrap_scan_status_label)
 
         self.bootstrap_output_edit, output_row = path_row(self._on_browse_bootstrap_output)
         self.bootstrap_output_edit.textEdited.connect(
@@ -652,12 +679,35 @@ class CameraLidarWorkspace(QWidget):
         self.bootstrap_lidar_type_combo.addItem("Non-repetitive (Livox, ...)", "non_repetitive")
         form.addRow("LiDAR Type", self.bootstrap_lidar_type_combo)
 
-        self.bootstrap_image_topic_edit = QLineEdit()
-        form.addRow("Image Topic", self.bootstrap_image_topic_edit)
-        self.bootstrap_points_topic_edit = QLineEdit()
-        form.addRow("PointCloud Topic", self.bootstrap_points_topic_edit)
-        self.bootstrap_camera_info_topic_edit = QLineEdit()
-        form.addRow("CameraInfo Topic (optional)", self.bootstrap_camera_info_topic_edit)
+        # Image/PointCloud/CameraInfo topic candidates are auto-populated by
+        # scanning the Input Bag Directory (message-type based, see
+        # calibration.rosbag_reader.scan_bag_directory_topics) -- editable
+        # so a special-case topic can still be typed directly, but the
+        # default UX is picking from the dropdown (§13).
+        def topic_combo() -> QComboBox:
+            combo = QComboBox()
+            combo.setEditable(True)
+            combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+            return combo
+
+        self.bootstrap_image_topic_combo = topic_combo()
+        form.addRow("Image Topic", self.bootstrap_image_topic_combo)
+        self.bootstrap_points_topic_combo = topic_combo()
+        form.addRow("PointCloud Topic", self.bootstrap_points_topic_combo)
+        self.bootstrap_camera_info_topic_combo = topic_combo()
+        form.addRow("CameraInfo Topic (optional)", self.bootstrap_camera_info_topic_combo)
+
+        # currentIndexChanged (not `activated`) so this also fires after a
+        # post-scan PROGRAMMATIC default selection, not just a user pick --
+        # §12 wants the CameraInfo recommendation refreshed either way.
+        self.bootstrap_image_topic_combo.currentIndexChanged.connect(self._update_camera_info_recommendation)
+        # `activated` (not currentIndexChanged) fires ONLY on genuine user
+        # interaction, never on our own programmatic setCurrentIndex() --
+        # exactly the signal needed to know the user made an explicit
+        # CameraInfo choice that auto-recommendation must stop overriding.
+        self.bootstrap_camera_info_topic_combo.activated.connect(
+            lambda _index: setattr(self, "_bootstrap_camera_info_user_selected", True)
+        )
 
         use_bag_topics_button = QPushButton("Use Current Bag Topics")
         use_bag_topics_button.clicked.connect(self._on_use_bag_topics_for_bootstrap)
@@ -738,6 +788,147 @@ class CameraLidarWorkspace(QWidget):
         self.bootstrap_bag_edit.setText(path)
         if self._bootstrap_output_path_auto:
             self.bootstrap_output_edit.setText(self._default_bootstrap_output_dir(path))
+        self._start_bag_topic_scan(path)
+
+    def _on_refresh_bootstrap_topics(self) -> None:
+        self._start_bag_topic_scan(self.bootstrap_bag_edit.text().strip())
+
+    def _start_bag_topic_scan(self, directory: str) -> None:
+        """Browse (new directory) triggers this automatically; the "Scan
+        Topics" button re-runs it for the same directory (§14) -- both
+        paths share this one method so scan lifecycle/state handling never
+        drifts apart."""
+        if not directory or not os.path.isdir(directory):
+            QMessageBox.warning(
+                self, "Input Bag Directory 필요",
+                "Input Bag Directory must be an existing directory containing calibration bags.",
+            )
+            return
+        if self._bootstrap_scan_worker is not None:
+            return  # a scan is already running
+
+        # §25: clear stale candidates from a PREVIOUS directory immediately,
+        # before the new scan even starts -- never leave an old directory's
+        # topics looking like they're still the current selection.
+        self.bootstrap_image_topic_combo.clear()
+        self.bootstrap_points_topic_combo.clear()
+        self.bootstrap_camera_info_topic_combo.clear()
+        self._bootstrap_last_scan_result = None
+        self._bootstrap_camera_info_user_selected = False
+        self.bootstrap_scan_status_label.setText("Scanning bag topics...")
+        set_tone(self.bootstrap_scan_status_label, "warning")
+
+        self._bootstrap_scanning = True
+        self._update_bootstrap_run_button_enabled()
+
+        worker = BagTopicDiscoveryWorker(directory, list_fn=scan_bag_directory_topics, label="Bag Topics")
+        thread = run_worker_in_thread(worker, self)
+        worker.topics_ready.connect(self._on_bag_topic_scan_ready)
+        worker.error.connect(self._on_bag_topic_scan_error)
+        self._bootstrap_scan_thread, self._bootstrap_scan_worker = thread, worker
+        thread.finished.connect(lambda: setattr(self, "_bootstrap_scan_worker", None))
+        thread.finished.connect(lambda: setattr(self, "_bootstrap_scan_thread", None))
+
+        def _scan_finished() -> None:
+            self._bootstrap_scanning = False
+            self._update_bootstrap_run_button_enabled()
+
+        thread.finished.connect(_scan_finished)
+        thread.start()
+
+    def _on_bag_topic_scan_ready(self, result, _directory: str) -> None:
+        self._bootstrap_last_scan_result = result
+
+        self._populate_topic_combo(self.bootstrap_image_topic_combo, result.image_topics, allow_empty_option=False)
+        self._populate_topic_combo(
+            self.bootstrap_points_topic_combo, result.pointcloud_topics, allow_empty_option=False,
+        )
+        self._populate_topic_combo(
+            self.bootstrap_camera_info_topic_combo, result.camera_info_topics, allow_empty_option=True,
+        )
+
+        default_image = pick_default_topic(result.image_topics, IMAGE_TOPIC_KEYWORD_PRIORITY)
+        if default_image:
+            self._select_combo_value(self.bootstrap_image_topic_combo, default_image)
+        default_points = pick_default_topic(result.pointcloud_topics, POINTCLOUD_TOPIC_KEYWORD_PRIORITY)
+        if default_points:
+            self._select_combo_value(self.bootstrap_points_topic_combo, default_points)
+        self._update_camera_info_recommendation()
+
+        lines = [
+            f"Topic scan complete: {result.bag_count} bags scanned",
+            f"{len(result.image_topics)} Image topic(s), "
+            f"{len(result.pointcloud_topics)} PointCloud topic(s), "
+            f"{len(result.camera_info_topics)} CameraInfo topic(s)",
+        ]
+        tone = "good"
+        if not result.image_topics:
+            lines.append("No sensor_msgs/Image topic found.")
+            tone = "bad"
+        if not result.pointcloud_topics:
+            lines.append("No sensor_msgs/PointCloud2 topic found.")
+            tone = "bad"
+        if not result.camera_info_topics:
+            lines.append("No CameraInfo topic found. Current camera intrinsic can still be used.")
+        self.bootstrap_scan_status_label.setText("\n".join(lines))
+        set_tone(self.bootstrap_scan_status_label, tone)
+
+    def _on_bag_topic_scan_error(self, message: str) -> None:
+        self.bootstrap_scan_status_label.setText(f"Failed to scan bag topics: {message}")
+        set_tone(self.bootstrap_scan_status_label, "bad")
+
+    def _populate_topic_combo(self, combo: QComboBox, candidates: list, allow_empty_option: bool) -> None:
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            if allow_empty_option:
+                combo.addItem("(None / Use current intrinsic)", "")
+            for c in candidates:
+                index = combo.count()
+                combo.addItem(c.name, c.name)
+                # Coverage isn't shown in the visible label (kept clean),
+                # but stays available as a tooltip -- and RUN-time validation
+                # (_validate_bootstrap_topic_coverage) still checks it either way.
+                combo.setItemData(index, f"{c.bag_count} / {c.total_bags} bags", Qt.ToolTipRole)
+        finally:
+            combo.blockSignals(False)
+
+    @staticmethod
+    def _select_combo_value(combo: QComboBox, value: str) -> None:
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    @staticmethod
+    def _combo_selected_value(combo: QComboBox) -> str:
+        data = combo.currentData()
+        if data is not None:
+            return data
+        return combo.currentText().strip()
+
+    def _set_combo_free_text(self, combo: QComboBox, value: str) -> None:
+        index = combo.findData(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        else:
+            combo.insertItem(0, value, value)
+            combo.setCurrentIndex(0)
+
+    def _update_camera_info_recommendation(self) -> None:
+        """§11/§12: recommend a CameraInfo topic sharing the selected Image
+        topic's namespace, refreshed whenever the Image topic changes --
+        but never override a CameraInfo topic the user explicitly picked
+        themselves (self._bootstrap_camera_info_user_selected)."""
+        if self._bootstrap_camera_info_user_selected or self._bootstrap_last_scan_result is None:
+            return
+        image_topic = self._combo_selected_value(self.bootstrap_image_topic_combo)
+        recommended = recommend_camera_info_topic(image_topic, self._bootstrap_last_scan_result.camera_info_topics)
+        if recommended:
+            self._select_combo_value(self.bootstrap_camera_info_topic_combo, recommended)
+
+    def _update_bootstrap_run_button_enabled(self) -> None:
+        enabled = self._bootstrap_is_linux and self._bootstrap_worker is None and not self._bootstrap_scanning
+        self.bootstrap_run_button.setEnabled(enabled)
 
     def _on_browse_bootstrap_output(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "direct_visual output directory 선택")
@@ -777,9 +968,9 @@ class CameraLidarWorkspace(QWidget):
             )
             return
         if camera_topic:
-            self.bootstrap_image_topic_edit.setText(camera_topic)
+            self._set_combo_free_text(self.bootstrap_image_topic_combo, camera_topic)
         if lidar_topic:
-            self.bootstrap_points_topic_edit.setText(lidar_topic)
+            self._set_combo_free_text(self.bootstrap_points_topic_combo, lidar_topic)
         if self.bag_source.bag_path and not self.bootstrap_bag_edit.text():
             self.bootstrap_bag_edit.setText(self.bag_source.bag_path)
             if self._bootstrap_output_path_auto:
@@ -792,9 +983,9 @@ class CameraLidarWorkspace(QWidget):
             ros_version=self.bootstrap_ros_combo.currentData(),
             input_bag_path=self.bootstrap_bag_edit.text().strip(),
             output_path=self.bootstrap_output_edit.text().strip(),
-            image_topic=self.bootstrap_image_topic_edit.text().strip(),
-            points_topic=self.bootstrap_points_topic_edit.text().strip(),
-            camera_info_topic=self.bootstrap_camera_info_topic_edit.text().strip(),
+            image_topic=self._combo_selected_value(self.bootstrap_image_topic_combo),
+            points_topic=self._combo_selected_value(self.bootstrap_points_topic_combo),
+            camera_info_topic=self._combo_selected_value(self.bootstrap_camera_info_topic_combo),
             lidar_type=self.bootstrap_lidar_type_combo.currentData(),
             camera_model=self.bootstrap_camera_model_combo.currentData(),
             camera_matrix=camera_matrix,
@@ -849,6 +1040,21 @@ class CameraLidarWorkspace(QWidget):
             )
             return
 
+        if self._bootstrap_scanning:
+            return  # RUN is disabled while scanning anyway; defensive no-op
+
+        image_topic = self._combo_selected_value(self.bootstrap_image_topic_combo)
+        points_topic = self._combo_selected_value(self.bootstrap_points_topic_combo)
+        if not image_topic or not points_topic:
+            QMessageBox.warning(
+                self, "Topic 필요",
+                "Image Topic과 PointCloud Topic을 선택하세요 (CameraInfo는 optional입니다).",
+            )
+            return
+
+        if not self._validate_bootstrap_topic_coverage(image_topic, points_topic):
+            return
+
         try:
             config = self._current_direct_visual_config()
         except Exception as e:  # noqa: BLE001 -- e.g. an invalid enum-like field
@@ -873,6 +1079,33 @@ class CameraLidarWorkspace(QWidget):
         thread.finished.connect(lambda: self._set_bootstrap_busy(False))
         thread.start()
 
+    def _validate_bootstrap_topic_coverage(self, image_topic: str, points_topic: str) -> bool:
+        """§9/§22: direct_visual needs Image/PointCloud in EVERY calibration
+        bag -- block RUN (not just warn) if the selected topic is missing
+        from some of the scanned bags. CameraInfo has no such check (always
+        optional). No scan result available (e.g. combo value typed by hand
+        without ever scanning) -- nothing to validate against, so allow it
+        through; check_environment() inside the worker still runs."""
+        result = self._bootstrap_last_scan_result
+        if result is None:
+            return True
+
+        for label, topic, candidates in (
+            ("Image", image_topic, result.image_topics),
+            ("PointCloud", points_topic, result.pointcloud_topics),
+        ):
+            match = next((c for c in candidates if c.name == topic), None)
+            if match is not None and match.bag_count < match.total_bags:
+                QMessageBox.critical(
+                    self, "Topic Coverage 부족",
+                    f"Selected {label} Topic '{topic}' is available in {match.bag_count} / "
+                    f"{match.total_bags} bags.\n"
+                    f"direct_visual preprocessing requires this topic in every calibration bag.\n\n"
+                    f"Select a topic with full bag coverage, or fix the bags missing it.",
+                )
+                return False
+        return True
+
     def _on_cancel_targetless_bootstrap(self) -> None:
         if self._bootstrap_worker is not None:
             self._bootstrap_worker.request_cancel()
@@ -880,7 +1113,7 @@ class CameraLidarWorkspace(QWidget):
             self.bootstrap_status_label.setText("CANCELLING...")
 
     def _set_bootstrap_busy(self, busy: bool) -> None:
-        self.bootstrap_run_button.setEnabled(not busy and self._bootstrap_is_linux)
+        self._update_bootstrap_run_button_enabled()
         self.bootstrap_cancel_button.setVisible(busy)
         self.bootstrap_cancel_button.setEnabled(busy)
         if busy:
@@ -1045,10 +1278,10 @@ class CameraLidarWorkspace(QWidget):
         so this can safely run every time a bag scene loads. The "Use
         Current Bag Topics" button remains available for an explicit
         re-sync/overwrite."""
-        if camera_topic and not self.bootstrap_image_topic_edit.text():
-            self.bootstrap_image_topic_edit.setText(camera_topic)
-        if lidar_topic and not self.bootstrap_points_topic_edit.text():
-            self.bootstrap_points_topic_edit.setText(lidar_topic)
+        if camera_topic and not self._combo_selected_value(self.bootstrap_image_topic_combo):
+            self._set_combo_free_text(self.bootstrap_image_topic_combo, camera_topic)
+        if lidar_topic and not self._combo_selected_value(self.bootstrap_points_topic_combo):
+            self._set_combo_free_text(self.bootstrap_points_topic_combo, lidar_topic)
         if self.bag_source.bag_path and not self.bootstrap_bag_edit.text():
             self.bootstrap_bag_edit.setText(self.bag_source.bag_path)
             if self._bootstrap_output_path_auto:

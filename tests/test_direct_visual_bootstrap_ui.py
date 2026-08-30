@@ -68,8 +68,8 @@ def _prepare_workspace_for_run(workspace, monkeypatch, fake_pipeline) -> None:
     workspace.bootstrap_run_button.setEnabled(True)
     workspace.bootstrap_bag_edit.setText(str(workspace_module.__file__))  # any isdir-passing override below
     workspace.bootstrap_output_edit.setText("/tmp/out")
-    workspace.bootstrap_image_topic_edit.setText("/camera/image_raw")
-    workspace.bootstrap_points_topic_edit.setText("/points_raw")
+    workspace._set_combo_free_text(workspace.bootstrap_image_topic_combo, "/camera/image_raw")
+    workspace._set_combo_free_text(workspace.bootstrap_points_topic_combo, "/points_raw")
 
     class _FakeIntrinsics:
         camera_matrix = np.eye(3)
@@ -106,10 +106,16 @@ def test_busy_state_disables_run_and_shows_cancel(qapp):
     workspace._bootstrap_is_linux = True
     workspace.bootstrap_run_button.setEnabled(True)
 
+    # Matches the real invariant: _on_run_targetless_bootstrap() always sets
+    # self._bootstrap_worker BEFORE calling _set_bootstrap_busy(True) (and
+    # clears it BEFORE _set_bootstrap_busy(False)) -- _update_bootstrap_run_
+    # button_enabled() derives "busy" from that, not from a separate flag.
+    workspace._bootstrap_worker = object()
     workspace._set_bootstrap_busy(True)
     assert workspace.bootstrap_run_button.isEnabled() is False
     assert workspace.bootstrap_cancel_button.isVisible() is True
 
+    workspace._bootstrap_worker = None
     workspace._set_bootstrap_busy(False)
     assert workspace.bootstrap_run_button.isEnabled() is True
     assert workspace.bootstrap_cancel_button.isVisible() is False
@@ -277,8 +283,8 @@ def test_use_bag_topics_button_copies_from_bag_source(qapp):
 
     workspace._on_use_bag_topics_for_bootstrap()
 
-    assert workspace.bootstrap_image_topic_edit.text() == "/camera/image_raw"
-    assert workspace.bootstrap_points_topic_edit.text() == "/points_raw"
+    assert workspace._combo_selected_value(workspace.bootstrap_image_topic_combo) == "/camera/image_raw"
+    assert workspace._combo_selected_value(workspace.bootstrap_points_topic_combo) == "/points_raw"
 
 
 # ---------------------------------------------------------------------------
@@ -287,22 +293,22 @@ def test_use_bag_topics_button_copies_from_bag_source(qapp):
 
 def test_bag_scene_loaded_prefills_empty_bootstrap_topics():
     workspace = _make_workspace()
-    assert workspace.bootstrap_image_topic_edit.text() == ""
+    assert workspace._combo_selected_value(workspace.bootstrap_image_topic_combo) == ""
 
     workspace._prefill_bootstrap_defaults_from_bag("/camera/image_raw", "/ouster/points")
 
-    assert workspace.bootstrap_image_topic_edit.text() == "/camera/image_raw"
-    assert workspace.bootstrap_points_topic_edit.text() == "/ouster/points"
+    assert workspace._combo_selected_value(workspace.bootstrap_image_topic_combo) == "/camera/image_raw"
+    assert workspace._combo_selected_value(workspace.bootstrap_points_topic_combo) == "/ouster/points"
 
 
 def test_bag_scene_loaded_never_overwrites_a_field_the_user_already_set():
     workspace = _make_workspace()
-    workspace.bootstrap_image_topic_edit.setText("/my/custom/topic")
+    workspace._set_combo_free_text(workspace.bootstrap_image_topic_combo, "/my/custom/topic")
 
     workspace._prefill_bootstrap_defaults_from_bag("/camera/image_raw", "/ouster/points")
 
-    assert workspace.bootstrap_image_topic_edit.text() == "/my/custom/topic"  # untouched
-    assert workspace.bootstrap_points_topic_edit.text() == "/ouster/points"   # was empty, filled
+    assert workspace._combo_selected_value(workspace.bootstrap_image_topic_combo) == "/my/custom/topic"  # untouched
+    assert workspace._combo_selected_value(workspace.bootstrap_points_topic_combo) == "/ouster/points"   # was empty, filled
 
 
 # ---------------------------------------------------------------------------

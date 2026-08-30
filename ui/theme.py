@@ -192,6 +192,15 @@ QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabl
     color: {Theme.TEXT_DISABLED}; background-color: #1D1D1D; border-color: #2A2A2A;
 }}
 QComboBox::drop-down {{ border: none; width: 22px; }}
+/* 기본 스타일의 화살표는 어두운 배경 위에서 거의 안 보였다 (QSpinBox와 동일한
+   문제) - 테두리만으로 흰색 삼각형을 직접 그려서 확실히 보이게 한다. */
+QComboBox::down-arrow {{
+    width: 0px; height: 0px;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #F5F5F5;
+}}
+QComboBox::down-arrow:disabled {{ border-top-color: {Theme.TEXT_DISABLED}; }}
 QComboBox QAbstractItemView {{
     background-color: {Theme.BG_TERTIARY};
     color: {Theme.TEXT_PRIMARY};

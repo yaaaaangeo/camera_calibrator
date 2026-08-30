@@ -50,6 +50,15 @@ except ImportError:  # rosbags는 선택적 의존성 - 설치 안 해도 나머
 
 _IMAGE_MSG_TYPES = {"sensor_msgs/msg/Image", "sensor_msgs/msg/CompressedImage"}
 _POINTCLOUD_MSG_TYPES = {"sensor_msgs/msg/PointCloud2"}
+_CAMERA_INFO_MSG_TYPES = {"sensor_msgs/msg/CameraInfo"}
+
+# Targetless Bootstrap's default-topic heuristic (camera_lidar_workspace.py) --
+# a nice-to-have tiebreaker among several message-type-filtered candidates,
+# NEVER a filter: every candidate stays selectable regardless of whether its
+# name matches a keyword here. Checked in order; first keyword with any
+# match wins.
+IMAGE_TOPIC_KEYWORD_PRIORITY = ("image_raw", "image_rect", "camera", "front")
+POINTCLOUD_TOPIC_KEYWORD_PRIORITY = ("points_raw", "points", "ouster", "velodyne", "livox")
 
 
 def _portable_output_path(path: str) -> Path:
@@ -147,6 +156,166 @@ def list_pointcloud_topics(bag_path: str) -> list[TopicInfo]:
     topics = _list_topics_by_type(bag_path, _POINTCLOUD_MSG_TYPES)
     logger.info("bag에서 PointCloud2 토픽 %d개 발견: %s", len(topics), [t.name for t in topics])
     return topics
+
+
+def list_camera_info_topics(bag_path: str) -> list[TopicInfo]:
+    """bag 안에서 CameraInfo 메시지 타입인 토픽만 골라 반환 (Targetless Bootstrap의
+    optional CameraInfo topic 후보용)."""
+    logger.info("bag에서 CameraInfo 토픽 검색: %s", bag_path)
+    topics = _list_topics_by_type(bag_path, _CAMERA_INFO_MSG_TYPES)
+    logger.info("bag에서 CameraInfo 토픽 %d개 발견: %s", len(topics), [t.name for t in topics])
+    return topics
+
+
+@dataclass
+class BagTopicCoverage:
+    """One topic candidate found while scanning a directory of calibration
+    bags (Targetless Bootstrap), plus how many of those bags actually
+    contain it."""
+    name: str
+    msg_type: str
+    bag_count: int
+    total_bags: int
+
+
+@dataclass
+class BagDirectoryTopicScanResult:
+    bag_count: int
+    image_topics: list[BagTopicCoverage]
+    pointcloud_topics: list[BagTopicCoverage]
+    camera_info_topics: list[BagTopicCoverage]
+
+
+def _iter_bag_units(directory: str) -> Iterator[str]:
+    """Enumerates the individual bag paths inside a Targetless Bootstrap
+    "Input Bag Directory", which may be:
+      - a single ROS2 bag directory itself (has its own metadata.yaml), or
+      - a directory containing multiple ROS1 *.bag files and/or multiple
+        ROS2 bag subdirectories (each with metadata.yaml), or
+      - (fallback) a directory of loose *.db3/*.mcap files.
+    Each yielded path is handed to _list_topics_by_type/_open_reader
+    exactly like any single-bag path already supported elsewhere in this
+    module -- rosbags.AnyReader treats a *.bag file and a ROS2 bag
+    directory identically, so no separate ROS1-vs-ROS2 branch is needed
+    here either."""
+    directory_path = Path(directory)
+
+    if (directory_path / "metadata.yaml").exists():
+        yield str(directory_path)
+        return
+
+    entries = sorted(directory_path.iterdir())
+    found_any = False
+    for entry in entries:
+        if entry.is_file() and entry.suffix == ".bag":
+            found_any = True
+            yield str(entry)
+        elif entry.is_dir() and (entry / "metadata.yaml").exists():
+            found_any = True
+            yield str(entry)
+
+    if not found_any:
+        for entry in entries:
+            if entry.is_file() and entry.suffix in (".db3", ".mcap"):
+                yield str(entry)
+
+
+def scan_bag_directory_topics(directory: str) -> BagDirectoryTopicScanResult:
+    """Scans EVERY calibration bag inside `directory` (see _iter_bag_units)
+    and returns Image/PointCloud2/CameraInfo topic candidates with their
+    per-topic bag coverage -- Targetless Bootstrap's topic auto-discovery.
+    Classification is by ROS MESSAGE TYPE ONLY (never a topic-name
+    substring guess), reusing _list_topics_by_type (the exact same
+    metadata-only, no-message-decode helper list_image_topics/
+    list_pointcloud_topics/list_camera_info_topics already use for a
+    single bag) once per discovered bag unit.
+
+    Sort order (each topic list): bags-present descending, then name
+    alphabetical -- topics present in every bag surface first."""
+    bag_units = list(_iter_bag_units(directory))
+    if not bag_units:
+        raise ValueError(f"No ROS bag files found in directory: {directory!r}")
+
+    total = len(bag_units)
+
+    def aggregate(msg_types: set[str]) -> list[BagTopicCoverage]:
+        counts: dict[str, int] = {}
+        types: dict[str, str] = {}
+        for bag_unit in bag_units:
+            try:
+                topics = _list_topics_by_type(bag_unit, msg_types)
+            except Exception:  # noqa: BLE001 -- one unreadable bag must not abort the whole directory scan
+                logger.warning("bag 스캔 실패, 건너뜀: %s", bag_unit, exc_info=True)
+                continue
+            for t in topics:
+                counts[t.name] = counts.get(t.name, 0) + 1
+                types[t.name] = t.msg_type
+        result = [
+            BagTopicCoverage(name=name, msg_type=types[name], bag_count=counts[name], total_bags=total)
+            for name in counts
+        ]
+        result.sort(key=lambda c: (-c.bag_count, c.name))
+        return result
+
+    return BagDirectoryTopicScanResult(
+        bag_count=total,
+        image_topics=aggregate(_IMAGE_MSG_TYPES),
+        pointcloud_topics=aggregate(_POINTCLOUD_MSG_TYPES),
+        camera_info_topics=aggregate(_CAMERA_INFO_MSG_TYPES),
+    )
+
+
+def pick_default_topic(candidates: list, keyword_priority: tuple = ()) -> Optional[str]:
+    """Default-selection heuristic ONLY -- never used to filter candidates
+    (every candidate the caller has must stay independently selectable).
+    A single candidate is always the default. With several, the first
+    keyword (in priority order) that appears in ANY candidate's name wins;
+    with no keyword match, falls back to candidates[0] (already sorted by
+    bag coverage descending by scan_bag_directory_topics)."""
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0].name
+    for keyword in keyword_priority:
+        for c in candidates:
+            if keyword in c.name:
+                return c.name
+    return candidates[0].name
+
+
+def recommend_camera_info_topic(image_topic: str, camera_info_candidates: list) -> Optional[str]:
+    """Best-effort CameraInfo recommendation: prefer a CameraInfo topic
+    sharing the same namespace (parent path) as `image_topic`
+    (/camera/front/image_raw -> prefer .../camera/front/camera_info), else
+    the candidate with the longest shared path-prefix. Returns None (no
+    forced pick) if there's no candidate or no meaningful overlap at all --
+    the UI must never guess a CameraInfo pairing that shares nothing with
+    the image topic's own path."""
+    if not image_topic or not camera_info_candidates:
+        return None
+
+    image_ns = image_topic.rsplit("/", 1)[0]
+    for c in camera_info_candidates:
+        if c.name.rsplit("/", 1)[0] == image_ns:
+            return c.name
+
+    def _shared_prefix_len(a: str, b: str) -> int:
+        # strip("/") first -- otherwise "/camera/front".split("/") starts
+        # with a leading "" component that trivially "matches" the leading
+        # "" of ANY other absolute path, making every two absolute paths
+        # appear to share a prefix even with zero real overlap.
+        a_parts, b_parts = a.strip("/").split("/"), b.strip("/").split("/")
+        n = 0
+        for x, y in zip(a_parts, b_parts):
+            if x != y:
+                break
+            n += 1
+        return n
+
+    best = max(camera_info_candidates, key=lambda c: _shared_prefix_len(image_ns, c.name.rsplit("/", 1)[0]))
+    if _shared_prefix_len(image_ns, best.name.rsplit("/", 1)[0]) > 0:
+        return best.name
+    return None
 
 
 def read_bag_duration(bag_path: str) -> float:
