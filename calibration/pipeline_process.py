@@ -61,7 +61,6 @@ def run_models_and_validation(
     camera_config: CameraConfig,
     pattern_config: PatternConfig,
     test_ratio: float,
-    use_rational_model: bool,
     calibration_method: CalibrationMethod = CalibrationMethod.STANDARD,
     model_jobs: int = 2,
 ) -> tuple[
@@ -96,7 +95,6 @@ def run_models_and_validation(
     results_list = run_all_models(
         dataset,
         camera_config,
-        use_rational_model=use_rational_model,
         model_jobs=model_jobs,
     )
     calibration_results = {r.model_name: r for r in results_list}
@@ -124,7 +122,7 @@ def run_models_and_validation(
 
     validation_results = validate_all_models(
         dataset, camera_config, pattern_config,
-        test_ratio=test_ratio, use_rational_model=use_rational_model,
+        test_ratio=test_ratio,
     )
     return (
         calibration_results,
@@ -142,7 +140,6 @@ def run_outlier_pruning_and_validation(
     reference_model: CameraModelType,
     max_iterations: int,
     test_ratio: float,
-    use_rational_model: bool,
 ) -> tuple[
     Dataset,
     CalibrationResult,
@@ -171,7 +168,7 @@ def run_outlier_pruning_and_validation(
 
     ref_result, outlier_result = recalibrate_with_outlier_pruning(
         dataset, camera_config, reference_model,
-        max_iterations=max_iterations, use_rational_model=use_rational_model,
+        max_iterations=max_iterations,
     )
 
     warnings = analyze_dataset_quality(dataset, camera_config)
@@ -181,7 +178,7 @@ def run_outlier_pruning_and_validation(
 
     calibration_results, validation_results, _object_releasing_result, _object_releasing_validation, _ro_comparison = (
         run_models_and_validation(
-            dataset, camera_config, pattern_config, test_ratio, use_rational_model, model_jobs=2,
+            dataset, camera_config, pattern_config, test_ratio, model_jobs=2,
         )
     )
 

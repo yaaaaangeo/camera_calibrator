@@ -119,6 +119,10 @@ _MODEL_BY_NAME = {
     "brown-conrady": CameraModelType.BROWN_CONRADY,
     "extended_pinhole": CameraModelType.EXTENDED_PINHOLE,
     "extended": CameraModelType.EXTENDED_PINHOLE,
+    # "rational"이 정식 이름이다 - EXTENDED_PINHOLE은 항상 Rational(8계수)이므로
+    # 이 alias가 그 사실을 이름으로도 드러낸다. extended/extended_pinhole은
+    # 하위 호환을 위해 유지한다.
+    "rational": CameraModelType.EXTENDED_PINHOLE,
     "fisheye": CameraModelType.FISHEYE,
 }
 _MODEL_CLI_CHOICES = sorted(_MODEL_BY_NAME)
@@ -804,7 +808,7 @@ def run_pipeline(args) -> int:
     # --- 4. Standard camera model 계산 ---
     _log(quiet, "Ideal Pinhole / Brown-Conrady / Rational / Fisheye 계산 중...")
     results = run_all_models(
-        dataset, camera_config, use_rational_model=args.rational,
+        dataset, camera_config,
         bootstrap_jobs=args.jobs, model_jobs=args.jobs,
         persistent_cache_dir=args.cache_dir,
         models=_selected_model_types(args),
@@ -957,7 +961,7 @@ def _validate_choose_and_export(
         # 계산하는 건 중복 작업이다.
         validation_results = precomputed_validation
         scores = precomputed_scores or compute_model_scores(
-            calibration_results, validation_results, use_rational_model=args.rational
+            calibration_results, validation_results
         )
         _log(quiet, "저장된 Hold-out Validation/추천 결과를 재사용합니다 (재계산 안 함).")
     else:
@@ -965,7 +969,7 @@ def _validate_choose_and_export(
         _log(quiet, "Hold-out Validation 중...")
         validation_results = validate_all_models(
             dataset, camera_config, pattern_config, test_ratio=args.test_ratio,
-            seed=args.seed, use_rational_model=args.rational,
+            seed=args.seed,
         )
         selected_models = set(_selected_model_types(args))
         validation_results = {
@@ -979,7 +983,7 @@ def _validate_choose_and_export(
             print(format_straightness_comparison(validation_results))
 
         # --- 6. 추천 ---
-        scores = compute_model_scores(calibration_results, validation_results, use_rational_model=args.rational)
+        scores = compute_model_scores(calibration_results, validation_results)
         _log(quiet, build_recommendation_message(scores, calibration_results, validation_results))
 
     selected_model_list = _selected_model_types(args)
@@ -1027,7 +1031,7 @@ def _validate_choose_and_export(
         if args.outlier:
             ref_result, outlier_result = recalibrate_with_outlier_pruning(
                 dataset, camera_config, chosen_model,
-                max_iterations=args.max_iterations, use_rational_model=args.rational,
+                max_iterations=args.max_iterations,
             )
             if outlier_result.removed_frame_ids:
                 _log(quiet, f"  제외된 프레임: {outlier_result.removed_frame_ids}")
@@ -1040,7 +1044,7 @@ def _validate_choose_and_export(
             # 한 번 더(코너 단위로 더 세밀하게) 정리한다.
             ref_result, corner_outlier_result = recalibrate_with_corner_outlier_pruning(
                 dataset, camera_config, chosen_model,
-                max_iterations=args.max_iterations, use_rational_model=args.rational,
+                max_iterations=args.max_iterations,
             )
             if corner_outlier_result.removed_corners:
                 _log(quiet, f"  제외된 코너: {corner_outlier_result.removed_corners}")
@@ -1050,7 +1054,7 @@ def _validate_choose_and_export(
         calibration_results[chosen_model] = ref_result
         # 나머지 두 모델도 정제된 데이터셋 기준으로 재계산해야 비교표/리포트가 일관됨
         results = run_all_models(
-            dataset, camera_config, use_rational_model=args.rational,
+            dataset, camera_config,
             bootstrap_jobs=args.jobs, model_jobs=args.jobs,
             persistent_cache_dir=args.cache_dir,
             models=selected_model_list,
@@ -1068,7 +1072,7 @@ def _validate_choose_and_export(
         if args.outlier:
             _, ref_val_outlier, ref_validation = recalibrate_train_with_outlier_pruning(
                 validation_dataset, camera_config, pattern_config, chosen_model, train_ids, test_ids,
-                max_iterations=args.max_iterations, use_rational_model=args.rational,
+                max_iterations=args.max_iterations,
             )
             if ref_val_outlier.removed_frame_ids:
                 _log(
@@ -1080,7 +1084,7 @@ def _validate_choose_and_export(
         if args.corner_outlier:
             _, ref_val_corner_outlier, ref_validation = recalibrate_train_with_corner_outlier_pruning(
                 validation_dataset, camera_config, pattern_config, chosen_model, train_ids, test_ids,
-                max_iterations=args.max_iterations, use_rational_model=args.rational,
+                max_iterations=args.max_iterations,
             )
             if ref_val_corner_outlier.removed_corners:
                 _log(
@@ -1094,7 +1098,6 @@ def _validate_choose_and_export(
             # 둘 중 하나는 참이어야만 여기로 옴) - 그래도 방어적으로 처리.
             ref_validation = validate_holdout(
                 validation_dataset, camera_config, pattern_config, chosen_model, train_ids, test_ids,
-                use_rational_model=args.rational,
             )
 
         validation_results = {chosen_model: ref_validation}
@@ -1110,7 +1113,7 @@ def _validate_choose_and_export(
             fisheye_guess = pinhole_init if m == CameraModelType.FISHEYE else None
             validation_results[m] = validate_holdout(
                 validation_dataset, camera_config, pattern_config, m, train_ids, test_ids,
-                use_rational_model=args.rational, fisheye_initial_guess=fisheye_guess,
+                fisheye_initial_guess=fisheye_guess,
             )
 
         if not quiet:
@@ -1120,7 +1123,7 @@ def _validate_choose_and_export(
             print()
             print(format_straightness_comparison(validation_results))
 
-        scores = compute_model_scores(calibration_results, validation_results, use_rational_model=args.rational)
+        scores = compute_model_scores(calibration_results, validation_results)
 
         # 설계 문서 17번 - "model ranking 변화" 기록. outlier 제거 전(scores_before_outlier)과
         # 후(scores) 두 순위표를 비교해 추천 모델이 바뀌었는지 보여준다.
@@ -1181,7 +1184,7 @@ def _validate_choose_and_export(
             repeated_kfold_result = compute_repeated_kfold(
                 dataset, camera_config, pattern_config, chosen_model,
                 k=args.kfold, n_repeats=args.kfold_repeats, base_seed=args.seed,
-                use_rational_model=args.rational, n_jobs=args.jobs,
+                n_jobs=args.jobs,
             )
             if not quiet:
                 print()
@@ -1190,7 +1193,7 @@ def _validate_choose_and_export(
             _log(quiet, f"{args.kfold}-Fold Cross Validation 계산 중 ({chosen_model.value})...")
             kfold_result = compute_kfold_validation(
                 dataset, camera_config, pattern_config, chosen_model,
-                k=args.kfold, seed=args.seed, use_rational_model=args.rational, n_jobs=args.jobs,
+                k=args.kfold, seed=args.seed, n_jobs=args.jobs,
             )
             if not quiet:
                 print()
@@ -1203,7 +1206,7 @@ def _validate_choose_and_export(
         _log(quiet, f"Repeatability 측정 중 ({chosen_model.value}, {args.repeatability}회)...")
         repeatability_result = compute_repeatability(
             dataset, camera_config, chosen_model,
-            n_runs=args.repeatability, seed=args.seed, use_rational_model=args.rational, n_jobs=args.jobs,
+            n_runs=args.repeatability, seed=args.seed, n_jobs=args.jobs,
         )
         if not quiet:
             print()
@@ -1440,7 +1443,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     pipe.add_argument("--test-ratio", type=float, default=0.25, help="Hold-out validation test 비율, 기본 0.25")
     pipe.add_argument("--seed", type=int, default=42, help="train/test 분할 시드, 기본 42")
-    pipe.add_argument("--rational", action="store_true", help="Rational 모델에서 k1~k6,p1,p2 8계수 사용")
     pipe.add_argument(
         "--calibration-method",
         type=CalibrationMethod,

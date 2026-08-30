@@ -20,7 +20,6 @@ from PySide6.QtCore import QThread, QTimer, Qt
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
@@ -196,14 +195,6 @@ class MainWindow(QMainWindow):
     @outlier_result.setter
     def outlier_result(self, value):
         self.intrinsic_state.outlier_result = value
-
-    @property
-    def use_rational_model(self):
-        return self.intrinsic_state.use_rational_model
-
-    @use_rational_model.setter
-    def use_rational_model(self, value):
-        self.intrinsic_state.use_rational_model = value
 
     @property
     def calibration_method(self):
@@ -509,22 +500,14 @@ class MainWindow(QMainWindow):
         self._on_pattern_type_changed()
         outer.addLayout(pattern_form, stretch=1)
 
-        # 오른쪽 열 순서: Rational model 체크박스 -> 캘리브레이션 실행 ->
-        # Export -> 취소. Export/취소는 각각 옛 "⑦ Export" 탭과, 실행 중인
-        # 계산(코너 검출/모델 계산)을 중단하는 기능을 대체한다.
+        # 오른쪽 열 순서: 캘리브레이션 실행 -> Export -> 취소. Rational
+        # on/off 체크박스는 제거됐다 - Standard 계산은 항상 Ideal Pinhole/
+        # Brown-Conrady/Rational(8계수 k1~k6,p1,p2 고정)/Fisheye 네 모델을
+        # 함께 계산하고, ③ Model Comparison에서 모델을 고른다(모델 의미
+        # 고정 정책 - README 4번 섹션 참고). Export/취소는 각각 옛
+        # "⑦ Export" 탭과, 실행 중인 계산(코너 검출/모델 계산)을 중단하는
+        # 기능을 대체한다.
         action_layout = QVBoxLayout()
-        self.rational_checkbox = QCheckBox("Rational model 사용 (k4~k6 포함)")
-        self.rational_checkbox.setToolTip(
-            "Rational 모델에서 cv2.CALIB_RATIONAL_MODEL을 켭니다.\n"
-            "기본값(꺼짐)은 k1,k2,p1,p2,k3 5계수만 추정합니다.\n"
-            "켜면 k1~k6,p1,p2 8개를 추정합니다 (OpenCV 버전에 따라 배열 길이\n"
-            "자체는 14칸으로 나올 수 있으나, 나머지 6개(s1~s4,taux,tauy)는\n"
-            "항상 0으로 고정되고 실제 추정 자유도는 8개입니다).\n"
-            "⚠ 파라미터가 많을수록 데이터가 충분치 않으면 k4~k6 값이 불안정하게\n"
-            "튈 수 있습니다. 광각/왜곡이 매우 심한 렌즈 + 데이터가 많을 때만\n"
-            "권장하며, 켠 뒤에는 Model Score/Test RMS로 실제 개선됐는지 꼭 확인하세요.\n"
-            "(CLI의 --rational 플래그와 동일한 옵션입니다.)"
-        )
         self.run_button = QPushButton("캘리브레이션 실행")
         self.run_button.setProperty("role", "primary")
         self.run_button.clicked.connect(self._on_run_pipeline)
@@ -540,7 +523,6 @@ class MainWindow(QMainWindow):
         self.cancel_button.clicked.connect(self._on_cancel_pipeline)
         self.cancel_button.setEnabled(False)
         self._on_calibration_method_changed()
-        action_layout.addWidget(self.rational_checkbox)
         action_layout.addWidget(self.run_button)
         action_layout.addWidget(self.export_button)
         action_layout.addWidget(self.cancel_button)
@@ -937,11 +919,9 @@ class MainWindow(QMainWindow):
         self.scores = []
         self.object_releasing_result = None
 
-        self.use_rational_model = self.rational_checkbox.isChecked()
         self.calibration_method = selected_method
         worker = PipelineWorker(
             self.image_paths, self.pattern_config, self.camera_config,
-            use_rational_model=self.use_rational_model,
             calibration_method=self.calibration_method,
         )
         thread = run_worker_in_thread(worker, self)

@@ -35,7 +35,7 @@ def test_run_models_and_validation_survives_a_real_process_roundtrip(
     with ProcessPoolExecutor(max_workers=1) as executor:
         future = executor.submit(
             run_models_and_validation,
-            synthetic_dataset, camera_config, pattern_config, 0.25, False,
+            synthetic_dataset, camera_config, pattern_config, 0.25,
         )
         (
             calibration_results, validation_results, object_releasing_result,
@@ -73,7 +73,7 @@ def test_run_outlier_pruning_and_validation_survives_a_real_process_roundtrip(
         future = executor.submit(
             run_outlier_pruning_and_validation,
             synthetic_dataset, camera_config, pattern_config,
-            CameraModelType.EXTENDED_PINHOLE, 3, 0.25, False,
+            CameraModelType.EXTENDED_PINHOLE, 3, 0.25,
         )
         (
             updated_dataset, ref_result, outlier_result, warnings,
@@ -104,7 +104,6 @@ def test_object_releasing_result_does_not_overwrite_standard_results(
         camera_config,
         pattern_config,
         0.25,
-        False,
         CalibrationMethod.OBJECT_RELEASING,
     )
 

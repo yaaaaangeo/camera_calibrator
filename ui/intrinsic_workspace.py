@@ -46,7 +46,6 @@ class IntrinsicState:
     cross_dataset_results: list[CrossDatasetValidationResult] = field(default_factory=list)
     scores: list[ModelScore] = field(default_factory=list)
     outlier_result: OutlierResult | None = None
-    use_rational_model: bool = False
     calibration_method: CalibrationMethod = CalibrationMethod.STANDARD
 
 

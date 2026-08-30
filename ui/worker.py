@@ -202,7 +202,6 @@ class PipelineWorker(QObject):
         pattern_config: PatternConfig,
         camera_config: CameraConfig,
         test_ratio: float = 0.25,
-        use_rational_model: bool = False,
         calibration_method: CalibrationMethod = CalibrationMethod.STANDARD,
     ):
         super().__init__()
@@ -210,7 +209,6 @@ class PipelineWorker(QObject):
         self.pattern_config = pattern_config
         self.camera_config = camera_config
         self.test_ratio = test_ratio
-        self.use_rational_model = use_rational_model
         self.calibration_method = (
             calibration_method
             if isinstance(calibration_method, CalibrationMethod)
@@ -289,7 +287,7 @@ class PipelineWorker(QObject):
                 future = executor.submit(
                     run_models_and_validation,
                     dataset, self.camera_config, self.pattern_config,
-                    self.test_ratio, self.use_rational_model, self.calibration_method,
+                    self.test_ratio, self.calibration_method,
                 )
                 (
                     calibration_results,
@@ -335,10 +333,7 @@ class PipelineWorker(QObject):
             self.validation_ready.emit(validation_results)
 
             self.progress.emit("Model Score 계산 및 추천 생성 중...")
-            scores = compute_model_scores(
-                calibration_results, validation_results,
-                use_rational_model=self.use_rational_model,
-            )
+            scores = compute_model_scores(calibration_results, validation_results)
             message = build_recommendation_message(scores, calibration_results, validation_results)
             self.recommendation_ready.emit(scores, message)
 
@@ -499,7 +494,6 @@ class ExternalComparisonWorker(QObject):
         my_model,
         my_validation,
         external,
-        use_rational_model: bool,
     ):
         super().__init__()
         self.dataset = dataset
@@ -508,7 +502,6 @@ class ExternalComparisonWorker(QObject):
         self.my_model = my_model
         self.my_validation = my_validation
         self.external = external
-        self.use_rational_model = use_rational_model
 
     def run(self) -> None:
         try:
@@ -522,7 +515,6 @@ class ExternalComparisonWorker(QObject):
                     self.my_model,
                     self.my_validation,
                     self.external,
-                    self.use_rational_model,
                 )
                 result = _wait_with_heartbeat(
                     future, self.progress, "External Compare 계산 중...",

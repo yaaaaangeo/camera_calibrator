@@ -2126,7 +2126,6 @@ def compare_with_external_params(
     my_model: CameraModelType,
     my_validation: ValidationResult,
     external: ExternalCameraParams,
-    use_rational_model: bool = False,
     benchmark_kfold: int = 5,
     benchmark_bootstrap: int = 1000,
     generalization_datasets: dict[str, Dataset] | None = None,
@@ -2152,7 +2151,6 @@ def compare_with_external_params(
 
     mine_train_result = refit_on_train_split(
         dataset, camera_config, my_model, my_validation.train_frame_ids,
-        use_rational_model=use_rational_model,
     )
     if not mine_train_result.success:
         return ExternalComparisonResult(

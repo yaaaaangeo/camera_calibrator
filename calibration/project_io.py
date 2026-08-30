@@ -597,6 +597,18 @@ def _raw_array_len(d) -> int | None:
     return len(d)
 
 
+def _migrate_model_name_refs(container, field_name: str, should_rename: bool) -> None:
+    """container[field_name]이 문자열 "extended_pinhole"이면(그리고
+    should_rename이면) "brown_conrady"로 바꾼다. dict 하나에 대한 최소 단위
+    연산 - migrate_v1_to_v2가 여러 중첩 위치(ModelScore/CrossDatasetValidation
+    Result/DiagnosisReport 등)에 동일하게 적용하기 위한 헬퍼.
+    """
+    if not should_rename or container is None:
+        return
+    if container.get(field_name) == "extended_pinhole":
+        container[field_name] = "brown_conrady"
+
+
 def migrate_v1_to_v2(payload: dict) -> dict:
     """v1 -> v2 마이그레이션.
 
@@ -604,7 +616,19 @@ def migrate_v1_to_v2(payload: dict) -> dict:
       - distortion 5계수(k1,k2,p1,p2,k3) -> 지금의 Brown-Conrady 역할이었음
       - distortion 8계수 이상(k1~k6,p1,p2) -> 지금의 extended_pinhole(Rational)과 동일
 
-    문자열만 보고 바꾸지 않는다 - distortion 벡터 길이로 실제 의미를 판별한다.
+    문자열만 보고 바꾸지 않는다 - calibration_results["extended_pinhole"]의
+    distortion 벡터 길이로 프로젝트 전체에 딱 한 번 실제 의미를 판별한
+    (should_rename_extended_to_brown) 뒤, 그 판정을 프로젝트 안의 모든 model
+    reference(calibration_results/validation_results/model_scores/
+    cross_dataset_results/final_result 하위 전부)에 동일하게 적용한다 -
+    한 프로젝트 안에서 "extended_pinhole"이 어떤 곳에서는 Brown, 다른 곳에서는
+    Rational을 가리키는 모순된 상태가 생기지 않도록.
+
+    ModelScore/CrossDatasetValidationResult/DiagnosisReport 자체에는
+    distortion vector가 없으므로 개별적으로 재판별하지 않는다 - 위에서 정한
+    프로젝트 단위 판정을 그대로 물려받는다(사용자 스펙 6번 "Model Score
+    migration 주의" 항목과 동일한 원칙).
+
     "pinhole"/"fisheye"는 v1과 v2에서 의미가 같으므로 손대지 않는다.
     object_releasing_result가 v1 payload에 아예 없는 경우는 project_from_dict의
     기존 .get(...) 처리로 이미 None으로 정상 로드되므로 여기서 손댈 필요 없다.
@@ -613,15 +637,15 @@ def migrate_v1_to_v2(payload: dict) -> dict:
     calibration_results: dict = project.get("calibration_results", {}) or {}
     validation_results: dict = project.get("validation_results", {}) or {}
 
-    renamed_keys: set[str] = set()
+    should_rename_extended_to_brown = False
 
     legacy_entry = calibration_results.get("extended_pinhole")
     if legacy_entry is not None:
         dist_len = _raw_array_len(legacy_entry.get("distortion"))
         if dist_len == 5:
+            should_rename_extended_to_brown = True
             calibration_results["brown_conrady"] = calibration_results.pop("extended_pinhole")
             calibration_results["brown_conrady"]["model_name"] = "brown_conrady"
-            renamed_keys.add("extended_pinhole")
             logger.info(
                 "Migrated legacy project model: extended_pinhole (5 coeffs) -> brown_conrady"
             )
@@ -636,19 +660,28 @@ def migrate_v1_to_v2(payload: dict) -> dict:
                 "(%d) - left unchanged, please verify manually.", dist_len
             )
 
-    if "extended_pinhole" in renamed_keys and "extended_pinhole" in validation_results:
+    if should_rename_extended_to_brown and "extended_pinhole" in validation_results:
         validation_results["brown_conrady"] = validation_results.pop("extended_pinhole")
 
+    # 최상위 model_scores / cross_dataset_results 리스트.
+    for score in project.get("model_scores", []) or []:
+        _migrate_model_name_refs(score, "model_name", should_rename_extended_to_brown)
+    for cross_result in project.get("cross_dataset_results", []) or []:
+        _migrate_model_name_refs(cross_result, "model_name", should_rename_extended_to_brown)
+
     final_result = project.get("final_result")
-    if (
-        final_result
-        and final_result.get("chosen_model") == "extended_pinhole"
-        and "extended_pinhole" in renamed_keys
-    ):
-        final_result["chosen_model"] = "brown_conrady"
-        calibration = final_result.get("calibration")
-        if calibration and calibration.get("model_name") == "extended_pinhole":
-            calibration["model_name"] = "brown_conrady"
+    if final_result:
+        _migrate_model_name_refs(final_result, "chosen_model", should_rename_extended_to_brown)
+        _migrate_model_name_refs(final_result.get("calibration"), "model_name", should_rename_extended_to_brown)
+        for score in final_result.get("model_scores", []) or []:
+            _migrate_model_name_refs(score, "model_name", should_rename_extended_to_brown)
+        _migrate_model_name_refs(final_result.get("diagnosis"), "model_name", should_rename_extended_to_brown)
+
+    if should_rename_extended_to_brown:
+        logger.info(
+            "Migrated legacy project model references (model_scores/cross_dataset_results/"
+            "final_result): extended_pinhole -> brown_conrady"
+        )
 
     payload["format_version"] = PROJECT_FORMAT_VERSION
     return payload

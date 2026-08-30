@@ -43,10 +43,9 @@ from calibration.diagnosis import diagnose_calibration
 _DISTORTION_FREE_PARAMS = {
     CameraModelType.PINHOLE: 0,
     CameraModelType.BROWN_CONRADY: 5,
-    CameraModelType.EXTENDED_PINHOLE: 8,
+    CameraModelType.EXTENDED_PINHOLE: 8,    # Rational, 항상 8계수 (k1~k6,p1,p2)
     CameraModelType.FISHEYE: 4,             # k1~k4
 }
-_DISTORTION_FREE_PARAMS_RATIONAL = 8  # k1~k6, p1, p2
 
 # 모델 선택용 정보 기준(AIC/BIC)에 쓰는 명목 파라미터 개수.
 # 모든 모델이 공통으로 추정하는 intrinsic 4개(fx, fy, cx, cy)에 모델별
@@ -56,17 +55,18 @@ _DISTORTION_FREE_PARAMS_RATIONAL = 8  # k1~k6, p1, p2
 _INTRINSIC_FREE_PARAMS = 4
 
 
-def _complexity_counts(use_rational_model: bool) -> dict[CameraModelType, int]:
+def _complexity_counts() -> dict[CameraModelType, int]:
     return dict(_DISTORTION_FREE_PARAMS)
 
 
-def parameter_count_for_model(model: CameraModelType, use_rational_model: bool = False) -> int:
+def parameter_count_for_model(model: CameraModelType) -> int:
     """AIC/BIC에 사용할 모델별 자유 파라미터 수.
 
     Pinhole은 distortion을 전부 0으로 고정하지만 intrinsic 4개는 추정하므로
-    k=4다. Extended/Fisheye는 여기에 각 distortion 자유도를 더한다.
+    k=4다. Extended(Rational, 항상 8계수)/Fisheye는 여기에 각 distortion
+    자유도를 더한다.
     """
-    return _INTRINSIC_FREE_PARAMS + _complexity_counts(use_rational_model).get(model, 0)
+    return _INTRINSIC_FREE_PARAMS + _complexity_counts().get(model, 0)
 
 
 def compute_information_criteria(
@@ -424,7 +424,6 @@ def compute_model_scores(
     calibration_results: dict[CameraModelType, CalibrationResult],
     validation_results: dict[CameraModelType, ValidationResult],
     weights: ModelScoreWeights = ModelScoreWeights(),
-    use_rational_model: bool = False,
 ) -> list[ModelScore]:
     """Standard 4모델(Ideal Pinhole/Brown-Conrady/Rational/Fisheye)의 Score를
     계산하고, 가장 낮은(=좋은) 모델에 is_recommended=True 표시.
@@ -447,7 +446,7 @@ def compute_model_scores(
         m for m, result in calibration_results.items()
         if result.calibration_method != CalibrationMethod.OBJECT_RELEASING
     ]
-    complexity_counts = _complexity_counts(use_rational_model)
+    complexity_counts = _complexity_counts()
 
     e_train = {m: (calibration_results[m].rms_error if calibration_results[m].success else None) for m in models}
 
@@ -498,7 +497,7 @@ def compute_model_scores(
 
     scores: list[ModelScore] = []
     for m in models:
-        parameter_count = parameter_count_for_model(m, use_rational_model=use_rational_model)
+        parameter_count = parameter_count_for_model(m)
         rss, n_obs = _rss_from_result(calibration_results[m])
         aic, bic = compute_information_criteria(
             residual_sum_squares=rss,
@@ -516,7 +515,7 @@ def compute_model_scores(
     n_observability = _normalize(raw_observability)
 
     for m in models:
-        parameter_count = parameter_count_for_model(m, use_rational_model=use_rational_model)
+        parameter_count = parameter_count_for_model(m)
         rss, n_obs = _rss_from_result(calibration_results[m])
         aic, bic = compute_information_criteria(
             residual_sum_squares=rss,

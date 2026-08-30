@@ -140,7 +140,6 @@ class PersistentResultCache:
 def model_results_cache_key(
     dataset: Dataset,
     camera_config: CameraConfig,
-    use_rational_model: bool,
     estimate_fisheye_uncertainty: bool,
     bootstrap_jobs: int,
     models: tuple[str, ...] | None = None,
@@ -149,7 +148,6 @@ def model_results_cache_key(
         "run_all_models",
         dataset_fingerprint(dataset),
         camera_fingerprint(camera_config),
-        bool(use_rational_model),
         bool(estimate_fisheye_uncertainty),
         int(bootstrap_jobs),
         models,

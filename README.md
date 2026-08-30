@@ -149,10 +149,12 @@ camera-calibrator
      Dictionary/Grid type/AprilGrid variant. Object-Releasing을 고르면 지원
      대상(Checkerboard/Circle Grid)이 아닌 패턴에서는 안내 문구가 뜨고 실행이
      막힌다.
-   - **오른쪽(Actions)**: Rational model 사용(k4~k6) 체크박스 → **[캘리브레이션
-     실행]** → **[Export]**(계산된 모델을 골라 OpenCV YAML로 저장 - 예전 Export 탭과
-     동일한 기능) → **[취소]**(코너 검출/모델 계산이 진행 중일 때 즉시 중단하고,
-     원하는 데이터/설정으로 다시 실행할 수 있는 상태로 되돌림)
+   - **오른쪽(Actions)**: **[캘리브레이션 실행]** → **[Export]**(계산된 모델을
+     골라 OpenCV YAML로 저장 - 예전 Export 탭과 동일한 기능) → **[취소]**
+     (코너 검출/모델 계산이 진행 중일 때 즉시 중단하고, 원하는 데이터/설정으로
+     다시 실행할 수 있는 상태로 되돌림). Rational on/off를 고르는 체크박스는
+     없다 - Standard 계산은 항상 Ideal Pinhole/Brown-Conrady/Rational(8계수
+     고정)/Fisheye 네 모델을 함께 계산한다 (4번 섹션 참고).
 4. **[캘리브레이션 실행]** 클릭 → 검출 → Standard 4모델 계산(+ Object-Releasing을
    골랐다면 Advanced 결과도 함께) → Hold-out → 추천까지 자동 진행
 5. 탭을 넘기며 결과 확인:
@@ -183,8 +185,8 @@ camera-calibrator
 | 모델 | 계수 | 설명 |
 |---|---|---|
 | **Ideal Pinhole** | `fx fy cx cy`, D=0 | 왜곡 없음을 가정하는 특수 목적 모델. |
-| **Brown-Conrady** | `fx fy cx cy` + `k1 k2 p1 p2 k3` (5) | 일반적인 raw camera image에 쓰는 기본 모델. |
-| **Rational** (내부 식별자 `extended_pinhole`) | `fx fy cx cy` + `k1 k2 p1 p2 k3` + `k4 k5 k6` (8, `--rational`/Rational 체크박스로 활성화) | 강한 방사 왜곡을 더 정밀하게 잡는 Advanced 모델. |
+| **Brown-Conrady** | `fx fy cx cy` + `k1 k2 p1 p2 k3` (항상 5계수 - runtime toggle 없음) | 일반적인 raw camera image에 쓰는 기본 모델. |
+| **Rational** (내부 식별자 `extended_pinhole`) | `fx fy cx cy` + `k1 k2 p1 p2 k3` + `k4 k5 k6` (항상 8계수 - runtime toggle 없음) | 강한 방사 왜곡을 더 정밀하게 잡는 모델. |
 | **Fisheye** (Kannala-Brandt) | `fx fy cx cy` + `k1 k2 k3 k4` | 초광각 렌즈용 `cv2.fisheye` 모델. |
 
 네 모델을 항상 같은 데이터셋/같은 train-test 분할로 동시에 계산하고 비교한다
@@ -420,10 +422,9 @@ python -m app.cli \
 | `--calibration-method {standard,object_releasing}` | Standard 4모델(기본) 또는 Object-Releasing(Advanced, Checkerboard/Circle Grid만) |
 | `--bag`, `--topic`, `--bag-interval` | rosbag에서 이미지 추출 (`--images` 대신) |
 | `--list-topics BAG_PATH` | bag의 이미지 토픽 목록만 보고 종료 |
-| `--model {pinhole,brown_conrady,extended_pinhole,fisheye}` | 자동 추천 대신 강제로 이 모델 선택. `ideal_pinhole`/`brown-conrady`/`extended` alias도 허용 |
-| `--models MODEL [MODEL ...]` | 계산/검증할 모델 목록 (여러 개). 예: `--models pinhole brown_conrady fisheye` |
+| `--model {pinhole,brown_conrady,extended_pinhole,fisheye,rational,...}` | 자동 추천 대신 강제로 이 모델 선택. `ideal_pinhole`/`brown-conrady`/`extended`/`rational` alias도 허용 - `rational`은 `extended_pinhole`과 완전히 동일한 모델을 가리키는 정식 이름이다 (Rational은 항상 8계수, runtime toggle 없음 - `--rational` 플래그는 더 이상 존재하지 않는다) |
+| `--models MODEL [MODEL ...]` | 계산/검증할 모델 목록 (여러 개). 예: `--models pinhole brown_conrady rational` |
 | `--outlier` | 이상치 탐지 + 재계산까지 수행 |
-| `--rational` | Rational 모델(`extended_pinhole`)에서 k1~k6,p1,p2 8계수 사용 |
 | `--diagnostic` | 종합 진단 preset. 기본 5-fold CV + 100회 bootstrap + report/json/csv export |
 | `--cross-validation K` | K-Fold Cross Validation 수행 (`--kfold K`와 동일) |
 | `--bootstrap N` | 최종 선택 모델의 bootstrap 기반 Parameter CI를 N회 재표본으로 계산 |

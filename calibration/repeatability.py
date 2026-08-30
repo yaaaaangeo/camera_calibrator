@@ -62,8 +62,9 @@ def _sample_from_result(result) -> tuple[float, float, float, float, float | Non
 
 
 def _run_repeatability_sample(args: tuple) -> tuple[float, float, float, float, float | None] | None:
-    dataset, camera_config, model, order, use_rational_model = args
+    dataset, camera_config, model, order = args
     from calibration.models.pinhole import calibrate_pinhole
+    from calibration.models.brown_conrady import calibrate_brown_conrady
     from calibration.models.extended_pinhole import calibrate_extended_pinhole
     from calibration.models.fisheye import calibrate_fisheye
 
@@ -74,8 +75,10 @@ def _run_repeatability_sample(args: tuple) -> tuple[float, float, float, float, 
 
     if model == CameraModelType.PINHOLE:
         result = calibrate_pinhole(shuffled_dataset, camera_config)
+    elif model == CameraModelType.BROWN_CONRADY:
+        result = calibrate_brown_conrady(shuffled_dataset, camera_config)
     elif model == CameraModelType.EXTENDED_PINHOLE:
-        result = calibrate_extended_pinhole(shuffled_dataset, camera_config, use_rational_model=use_rational_model)
+        result = calibrate_extended_pinhole(shuffled_dataset, camera_config)
     elif model == CameraModelType.FISHEYE:
         result = calibrate_fisheye(shuffled_dataset, camera_config)
     else:
@@ -84,15 +87,18 @@ def _run_repeatability_sample(args: tuple) -> tuple[float, float, float, float, 
     return _sample_from_result(result)
 
 
-def _calibrate_reference(dataset: Dataset, camera_config: CameraConfig, model: CameraModelType, use_rational_model: bool):
+def _calibrate_reference(dataset: Dataset, camera_config: CameraConfig, model: CameraModelType):
     from calibration.models.pinhole import calibrate_pinhole
+    from calibration.models.brown_conrady import calibrate_brown_conrady
     from calibration.models.extended_pinhole import calibrate_extended_pinhole
     from calibration.models.fisheye import calibrate_fisheye
 
     if model == CameraModelType.PINHOLE:
         return calibrate_pinhole(dataset, camera_config)
+    if model == CameraModelType.BROWN_CONRADY:
+        return calibrate_brown_conrady(dataset, camera_config)
     if model == CameraModelType.EXTENDED_PINHOLE:
-        return calibrate_extended_pinhole(dataset, camera_config, use_rational_model=use_rational_model)
+        return calibrate_extended_pinhole(dataset, camera_config)
     if model == CameraModelType.FISHEYE:
         pinhole = calibrate_pinhole(dataset, camera_config)
         return calibrate_fisheye(dataset, camera_config, initial_guess=pinhole)
@@ -130,7 +136,6 @@ def _run_initial_condition_sample(args: tuple) -> tuple[float, float, float, flo
         model,
         K_init,
         D_init,
-        use_rational_model,
     ) = args
     try:
         if model == CameraModelType.FISHEYE:
@@ -143,7 +148,7 @@ def _run_initial_condition_sample(args: tuple) -> tuple[float, float, float, flo
             flags = cv2.CALIB_USE_INTRINSIC_GUESS
             if model == CameraModelType.PINHOLE:
                 flags |= _PINHOLE_FLAGS
-            elif model == CameraModelType.EXTENDED_PINHOLE and use_rational_model:
+            elif model == CameraModelType.EXTENDED_PINHOLE:
                 flags |= cv2.CALIB_RATIONAL_MODEL
             try:
                 rms, K, D, _, _ = cv2.calibrateCamera(
@@ -172,7 +177,6 @@ def compute_repeatability(
     model: CameraModelType,
     n_runs: int = 5,
     seed: int = 42,
-    use_rational_model: bool = False,
     n_jobs: int = 1,
     vary_initial_conditions: bool = True,
     initial_condition_perturbation: float = 0.05,
@@ -200,7 +204,7 @@ def compute_repeatability(
         rng.shuffle(order)
         orders.append(order)
 
-    tasks = [(dataset, camera_config, model, order, use_rational_model) for order in orders]
+    tasks = [(dataset, camera_config, model, order) for order in orders]
     workers = resolve_worker_count(n_jobs, len(tasks))
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -212,7 +216,7 @@ def compute_repeatability(
 
     initial_results = []
     if vary_initial_conditions:
-        ref = _calibrate_reference(dataset, camera_config, model, use_rational_model)
+        ref = _calibrate_reference(dataset, camera_config, model)
         if ref.success and ref.camera_matrix is not None and ref.distortion is not None:
             _, object_points, image_points = collect_calibration_inputs(dataset)
             image_size = infer_image_size(dataset, camera_config)
@@ -228,7 +232,7 @@ def compute_repeatability(
                     perturb_distortion=model != CameraModelType.PINHOLE,
                 )
                 init_tasks.append(
-                    (object_points, image_points, image_size, model, K_init, D_init, use_rational_model)
+                    (object_points, image_points, image_size, model, K_init, D_init)
                 )
             init_workers = resolve_worker_count(n_jobs, len(init_tasks))
             if init_workers > 1:

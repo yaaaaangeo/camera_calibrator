@@ -57,6 +57,7 @@ from calibration.types import (
 )
 from calibration.detector import detect_dataset
 from calibration.models.pinhole import calibrate_pinhole
+from calibration.models.brown_conrady import calibrate_brown_conrady
 from calibration.models.extended_pinhole import calibrate_extended_pinhole
 
 # --- 합성 데이터의 "정답" 카메라 파라미터 (임의로 고정, 재현 가능하게) ---
@@ -245,30 +246,42 @@ def run_pinhole_accuracy_check(
     )
 
 
-def run_extended_pinhole_accuracy_check(
-    use_rational_model: bool = False, n_images: int = DEFAULT_N_IMAGES, seed: int = DEFAULT_SEED
+def run_brown_conrady_accuracy_check(
+    n_images: int = DEFAULT_N_IMAGES, seed: int = DEFAULT_SEED
 ) -> SelfCheckResult:
-    """Extended Pinhole(Rational) 정확도 검증.
+    """Brown-Conrady(항상 5계수: k1,k2,p1,p2,k3) 정확도 검증."""
+    dataset, camera_config, _ = _generate_synthetic_dataset(n_images, seed)
+    result = calibrate_brown_conrady(dataset, camera_config)
+    return _evaluate(
+        result, "Brown-Conrady (5계수)", expected_free_param_count=5, rms_threshold=RMS_ERROR_PX_THRESHOLD
+    )
 
-    use_rational_model=True면 k1~k6,p1,p2 (자유도 8)까지 추정하는 경로(GUI의
-    "Rational model 사용" 체크박스, CLI의 --rational)를 그대로 검증한다.
+
+def run_rational_accuracy_check(
+    n_images: int = DEFAULT_N_IMAGES, seed: int = DEFAULT_SEED
+) -> SelfCheckResult:
+    """Extended Pinhole(Rational, 항상 8계수: k1~k6,p1,p2) 정확도 검증.
+
     배열 길이 자체는 OpenCV 버전에 따라 8이 아니라 14로 나올 수 있다는 게
     이미 확인됐으므로(대화 중 실측), free_param_count(0이 아닌 값의 개수)로
     "실제 추정된" 자유도를 판정한다.
     """
     dataset, camera_config, _ = _generate_synthetic_dataset(n_images, seed)
-    result = calibrate_extended_pinhole(dataset, camera_config, use_rational_model=use_rational_model)
-    label = "Extended Pinhole (Rational, 8계수)" if use_rational_model else "Extended Pinhole (5계수)"
-    expected = 8 if use_rational_model else 5
-    return _evaluate(result, label, expected_free_param_count=expected, rms_threshold=RMS_ERROR_PX_THRESHOLD)
+    result = calibrate_extended_pinhole(dataset, camera_config)
+    return _evaluate(
+        result, "Extended Pinhole (Rational, 8계수)", expected_free_param_count=8,
+        rms_threshold=RMS_ERROR_PX_THRESHOLD,
+    )
 
 
 def run_all_self_checks(
     n_images: int = DEFAULT_N_IMAGES, seed: int = DEFAULT_SEED
 ) -> list[SelfCheckResult]:
-    """GUI "자체 진단" 버튼이 호출하는 진입점 - 세 가지 검증을 한 번에 실행."""
+    """GUI "자체 진단" 버튼이 호출하는 진입점 - Ideal Pinhole/Brown-Conrady/
+    Rational 세 모델을 각자의 실제 calibrate_* 함수로 검증한다 (Fisheye는
+    별도 검증 경로가 없어 아직 포함되지 않음)."""
     return [
         run_pinhole_accuracy_check(n_images, seed),
-        run_extended_pinhole_accuracy_check(use_rational_model=False, n_images=n_images, seed=seed),
-        run_extended_pinhole_accuracy_check(use_rational_model=True, n_images=n_images, seed=seed),
+        run_brown_conrady_accuracy_check(n_images, seed),
+        run_rational_accuracy_check(n_images, seed),
     ]

@@ -224,7 +224,6 @@ def _train_model(
     train_dataset: Dataset,
     camera_config: CameraConfig,
     model: CameraModelType,
-    use_rational_model: bool = False,
     fisheye_initial_guess: CalibrationResult | None = None,
 ) -> CalibrationResult:
     if model == CameraModelType.PINHOLE:
@@ -232,9 +231,7 @@ def _train_model(
     if model == CameraModelType.BROWN_CONRADY:
         return calibrate_brown_conrady(train_dataset, camera_config)
     if model == CameraModelType.EXTENDED_PINHOLE:
-        return calibrate_extended_pinhole(
-            train_dataset, camera_config, use_rational_model=True
-        )
+        return calibrate_extended_pinhole(train_dataset, camera_config)
     if model == CameraModelType.FISHEYE:
         return calibrate_fisheye(
             train_dataset, camera_config, initial_guess=fisheye_initial_guess
@@ -247,7 +244,6 @@ def refit_on_train_split(
     camera_config: CameraConfig,
     model: CameraModelType,
     train_ids: list[str],
-    use_rational_model: bool = False,
     fisheye_initial_guess: CalibrationResult | None = None,
 ) -> CalibrationResult:
     """validate_holdout()이 내부적으로 만드는 것과 완전히 동일한
@@ -264,7 +260,6 @@ def refit_on_train_split(
     train_dataset = _subset_dataset(dataset, train_ids)
     return _train_model(
         train_dataset, camera_config, model,
-        use_rational_model=use_rational_model,
         fisheye_initial_guess=fisheye_initial_guess,
     )
 
@@ -379,7 +374,6 @@ def validate_holdout(
     model: CameraModelType,
     train_ids: list[str],
     test_ids: list[str],
-    use_rational_model: bool = False,
     fisheye_initial_guess: CalibrationResult | None = None,
 ) -> ValidationResult:
     """지정된 train/test 분할로 한 모델에 대해 Hold-out validation 수행.
@@ -402,7 +396,6 @@ def validate_holdout(
         train_dataset,
         camera_config,
         model,
-        use_rational_model=use_rational_model,
         fisheye_initial_guess=fisheye_initial_guess,
     )
 
@@ -425,7 +418,6 @@ def validate_all_models(
     pattern_config: PatternConfig,
     test_ratio: float = 0.25,
     seed: int = 42,
-    use_rational_model: bool = False,
 ) -> dict[CameraModelType, ValidationResult]:
     """Standard 4모델(Ideal Pinhole/Brown-Conrady/Rational/Fisheye)을 '동일한
     train/test 분할'로 검증. 분할을 여기서 한 번만 하고 네 모델 모두에
@@ -465,7 +457,6 @@ def validate_all_models(
         CameraModelType.EXTENDED_PINHOLE,
         train_ids,
         test_ids,
-        use_rational_model=use_rational_model,
     )
     results[CameraModelType.FISHEYE] = validate_holdout(
         dataset,
@@ -652,7 +643,6 @@ def recalibrate_train_with_outlier_pruning(
     k: float = 3.0,
     mad_scale: float = 1.0,
     user_threshold: float | None = None,
-    use_rational_model: bool = False,
     fisheye_initial_guess: CalibrationResult | None = None,
 ) -> tuple[CalibrationResult, OutlierResult, ValidationResult]:
     """Split -> Train-only Outlier Detection -> Calibration -> Test 평가,
@@ -699,7 +689,7 @@ def recalibrate_train_with_outlier_pruning(
     train_result, outlier_result = recalibrate_with_outlier_pruning(
         train_dataset, camera_config, model,
         max_iterations=max_iterations, k=k, mad_scale=mad_scale,
-        user_threshold=user_threshold, use_rational_model=use_rational_model,
+        user_threshold=user_threshold,
         fisheye_initial_guess=fisheye_initial_guess,
     )
 
@@ -726,7 +716,6 @@ def recalibrate_train_with_corner_outlier_pruning(
     max_iterations: int = 3,
     k: float = 3.0,
     mad_scale: float = 1.0,
-    use_rational_model: bool = False,
     fisheye_initial_guess: CalibrationResult | None = None,
 ) -> tuple[CalibrationResult, "CornerOutlierResult", ValidationResult]:
     """recalibrate_train_with_outlier_pruning()의 corner-level 버전 - 완전히
@@ -757,7 +746,7 @@ def recalibrate_train_with_corner_outlier_pruning(
     train_result, corner_outlier_result = recalibrate_with_corner_outlier_pruning(
         train_dataset, camera_config, model,
         max_iterations=max_iterations, k=k, mad_scale=mad_scale,
-        use_rational_model=use_rational_model, fisheye_initial_guess=fisheye_initial_guess,
+        fisheye_initial_guess=fisheye_initial_guess,
     )
 
     if not train_result.success:
@@ -779,11 +768,11 @@ def recalibrate_train_with_corner_outlier_pruning(
 
 def format_validation_table(results: dict[CameraModelType, ValidationResult]) -> str:
     """
-                      Pinhole  Extended  Fisheye
-        Train RMS        0.35      0.31     0.31
-        Test RMS         0.42      0.35     0.39
-        Edge RMS(test)   0.51      0.40     0.44
-        Gap(Test-Train)  0.07      0.04     0.08
+                      Ideal     Brown  Rational   Fisheye
+        Train RMS        0.35      0.32      0.31      0.31
+        Test RMS         0.42      0.38      0.35      0.39
+        Edge RMS(test)   0.51      0.45      0.40      0.44
+        Gap(Test-Train)  0.07      0.06      0.04      0.08
     """
     order = [CameraModelType.PINHOLE, CameraModelType.BROWN_CONRADY, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE]
     labels = {"pinhole": "Ideal", "brown_conrady": "Brown", "extended_pinhole": "Rational", "fisheye": "Fisheye"}
@@ -833,14 +822,14 @@ def format_train_test_residual_comparison(results: dict[CameraModelType, Validat
     MAE/Median/P90/P95/P99/Max를 나란히 보여준다 (코너 포인트 단위 -
     residual_stats.py, ValidationResult.train_residual_stats/test_residual_stats).
 
-                          Pinhole             Extended            Fisheye
-                       Train    Test       Train    Test       Train    Test
-    MAE               0.254   0.301      0.220   0.267      0.220   0.268
-    Median            0.219   0.255      0.180   0.221      0.180   0.219
-    P90               0.510   0.601      0.457   0.540      0.444   0.535
-    P95               0.605   0.720      0.547   0.640      0.542   0.638
-    P99               0.770   0.890      0.648   0.760      0.652   0.755
-    Max               0.923   1.050      0.898   0.990      0.901   0.985
+                          Ideal               Brown              Rational            Fisheye
+                       Train    Test       Train    Test       Train    Test       Train    Test
+    MAE               0.254   0.301      0.230   0.278      0.220   0.267      0.220   0.268
+    Median            0.219   0.255      0.195   0.235      0.180   0.221      0.180   0.219
+    P90               0.510   0.601      0.480   0.565      0.457   0.540      0.444   0.535
+    P95               0.605   0.720      0.570   0.675      0.547   0.640      0.542   0.638
+    P99               0.770   0.890      0.700   0.810      0.648   0.760      0.652   0.755
+    Max               0.923   1.050      0.910   1.010      0.898   0.990      0.901   0.985
     """
     order = [CameraModelType.PINHOLE, CameraModelType.BROWN_CONRADY, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE]
     labels = {"pinhole": "Ideal", "brown_conrady": "Brown", "extended_pinhole": "Rational", "fisheye": "Fisheye"}
@@ -879,16 +868,16 @@ def format_train_test_residual_comparison(results: dict[CameraModelType, Validat
 def format_straightness_comparison(results: dict[CameraModelType, ValidationResult]) -> str:
     """설계 문서 15번 - "Line Straightness Error를 모델 비교에 넣는다".
     format_validation_table()의 단일 Straightness 행 대신, 방향별(수평/수직/
-    대각선)·위치별(중앙/가장자리/코너) 잔차를 모델 3개 나란히 보여준다.
+    대각선)·위치별(중앙/가장자리/코너) 잔차를 Standard 4모델 나란히 보여준다.
 
-                    Pinhole  Extended  Fisheye
-    Horizontal        0.245     0.185    0.190
-    Vertical          0.251     0.190    0.195
-    Diagonal          0.298     0.221    0.230
-    Center line       0.201     0.160    0.165
-    Edge line         0.280     0.210    0.215
-    Corner line       0.298     0.221    0.230
-    Overall           0.256     0.196    0.201
+                    Ideal     Brown  Rational   Fisheye
+    Horizontal        0.245     0.210     0.185     0.190
+    Vertical          0.251     0.215     0.190     0.195
+    Diagonal          0.298     0.255     0.221     0.230
+    Center line       0.201     0.180     0.160     0.165
+    Edge line         0.280     0.240     0.210     0.215
+    Corner line       0.298     0.255     0.221     0.230
+    Overall           0.256     0.220     0.196     0.201
     """
     order = [CameraModelType.PINHOLE, CameraModelType.BROWN_CONRADY, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE]
     labels = {"pinhole": "Ideal", "brown_conrady": "Brown", "extended_pinhole": "Rational", "fisheye": "Fisheye"}

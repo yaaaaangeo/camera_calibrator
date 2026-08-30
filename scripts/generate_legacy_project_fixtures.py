@@ -27,8 +27,13 @@ from calibration.types import (
     CalibrationResult,
     CameraConfig,
     CameraModelType,
+    CrossDatasetValidationResult,
+    DiagnosisReport,
+    FinalResult,
+    ModelScore,
     PatternConfig,
     PatternType,
+    QualityGrade,
 )
 
 OUT_DIR = Path(__file__).resolve().parent.parent / "tests" / "assets" / "projects"
@@ -115,6 +120,51 @@ def build_v1_extended_rational() -> None:
     _write("v1_extended_rational.ccproj", payload)
 
 
+def build_v1_extended_5coeff_mixed_refs() -> None:
+    """Case C(사용자 스펙 P1 섹션 9) - extended_pinhole(5계수) 참조가
+    calibration_results뿐 아니라 model_scores/cross_dataset_results/
+    final_result(chosen_model/calibration/model_scores/diagnosis) 전부에
+    흩어져 있는 v1 프로젝트. migrate_v1_to_v2()가 이 모든 위치를 일관되게
+    brown_conrady로 바꾸는지 검증하기 위한 fixture.
+    """
+    calibration = CalibrationResult(
+        model_name=CameraModelType.EXTENDED_PINHOLE,
+        camera_matrix=_camera_matrix(),
+        distortion=np.array([-0.2, 0.05, 0.001, -0.001, 0.01]),  # 5 coeffs
+        rms_error=0.4,
+        success=True,
+    )
+    project = CalibrationProject(
+        project_name="legacy-extended-5coeff-mixed-refs",
+        camera_config=_camera_config(),
+        pattern_config=_pattern_config(),
+        calibration_results={CameraModelType.EXTENDED_PINHOLE: calibration},
+        model_scores=[
+            ModelScore(model_name=CameraModelType.EXTENDED_PINHOLE, score=0.42, is_recommended=True),
+            ModelScore(model_name=CameraModelType.PINHOLE, score=0.91),
+        ],
+        cross_dataset_results=[
+            CrossDatasetValidationResult(
+                source_dataset_id="A", target_dataset_id="B",
+                model_name=CameraModelType.EXTENDED_PINHOLE,
+                train_rms=0.4, test_rms=0.5,
+            ),
+        ],
+        final_result=FinalResult(
+            chosen_model=CameraModelType.EXTENDED_PINHOLE,
+            calibration=calibration,
+            overall_grade=QualityGrade.GOOD,
+            model_scores=[
+                ModelScore(model_name=CameraModelType.EXTENDED_PINHOLE, score=0.42, is_recommended=True),
+            ],
+            diagnosis=DiagnosisReport(model_name=CameraModelType.EXTENDED_PINHOLE),
+        ),
+    )
+    payload = project_to_dict(project)
+    payload["format_version"] = 1
+    _write("v1_extended_5coeff_mixed_refs.ccproj", payload)
+
+
 def build_v2_project() -> None:
     project = CalibrationProject(
         project_name="current-format",
@@ -138,4 +188,5 @@ if __name__ == "__main__":
     build_v1_pinhole()
     build_v1_extended_5coeff()
     build_v1_extended_rational()
+    build_v1_extended_5coeff_mixed_refs()
     build_v2_project()

@@ -48,8 +48,10 @@ def test_parallel_model_calibration_path_uses_pinhole_and_extended_workers(monke
         calls.append("pinhole")
         return _result(CameraModelType.PINHOLE)
 
-    def extended(dataset, camera, use_rational_model=False):
-        calls.append(f"extended:{use_rational_model}")
+    def extended(dataset, camera):
+        # calibrate_extended_pinhole()은 더 이상 use_rational_model을 받지
+        # 않는다 - 항상 Rational이다(P0-1) - 그래서 이 mock도 인자 없이 받는다.
+        calls.append("extended")
         return _result(CameraModelType.EXTENDED_PINHOLE)
 
     def fisheye(dataset, camera, initial_guess=None, **kwargs):
@@ -65,7 +67,6 @@ def test_parallel_model_calibration_path_uses_pinhole_and_extended_workers(monke
     results = run_all_models(
         _tiny_dataset(),
         CameraConfig(width=640, height=480),
-        use_rational_model=True,
         estimate_fisheye_uncertainty=False,
         model_jobs=2,
         # 이 테스트는 pinhole/extended/fisheye 워커 병렬 실행 경로만 검증한다 -
@@ -79,7 +80,7 @@ def test_parallel_model_calibration_path_uses_pinhole_and_extended_workers(monke
         CameraModelType.EXTENDED_PINHOLE,
         CameraModelType.FISHEYE,
     ]
-    assert sorted(calls[:2]) == ["extended:True", "pinhole"]
+    assert sorted(calls[:2]) == ["extended", "pinhole"]
     assert calls[-1] == "fisheye:pinhole"
 
 
@@ -90,7 +91,7 @@ def test_persistent_model_result_cache_reuses_previous_run(monkeypatch, tmp_path
         counts["pinhole"] += 1
         return _result(CameraModelType.PINHOLE)
 
-    def extended(dataset, camera, use_rational_model=False):
+    def extended(dataset, camera):
         counts["extended"] += 1
         return _result(CameraModelType.EXTENDED_PINHOLE)
 

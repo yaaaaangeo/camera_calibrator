@@ -158,6 +158,77 @@ def test_format_outlier_before_after_handles_no_removal():
 
 
 # ---------------------------------------------------------------------------
+# P0-2 - _calibrate_by_model에 BROWN_CONRADY 분기 추가 회귀 테스트.
+# 예전에는 CameraModelType.BROWN_CONRADY가 이 dispatcher를 거치면
+# ValueError("알 수 없는 모델")로 죽었다 - Frame/Corner Outlier 둘 다 확인한다.
+# ---------------------------------------------------------------------------
+
+def test_brown_conrady_frame_outlier_pruning_succeeds(synthetic_dataset, camera_config):
+    """Brown-Conrady + Frame Outlier가 ValueError 없이 정상 재계산되어야 한다."""
+    import copy
+    dataset = copy.deepcopy(synthetic_dataset)
+    result, outlier_result = recalibrate_with_outlier_pruning(
+        dataset, camera_config, CameraModelType.BROWN_CONRADY, max_iterations=2,
+    )
+    assert result.success, result.error_message
+    assert result.model_name == CameraModelType.BROWN_CONRADY
+    assert outlier_result.rms_before is not None
+    # Brown-Conrady는 항상 5계수(k1,k2,p1,p2,k3) - Outlier 재계산 후에도 유지.
+    assert result.distortion is not None
+    assert int(np.count_nonzero(result.distortion)) == 5
+
+
+def test_brown_conrady_corner_outlier_pruning_succeeds(synthetic_dataset, camera_config):
+    """Brown-Conrady + Corner Outlier가 ValueError 없이 정상 재계산되어야 한다."""
+    import copy
+    dataset = copy.deepcopy(synthetic_dataset)
+    result, corner_outlier_result = recalibrate_with_corner_outlier_pruning(
+        dataset, camera_config, CameraModelType.BROWN_CONRADY, max_iterations=2,
+    )
+    assert result.success, result.error_message
+    assert result.model_name == CameraModelType.BROWN_CONRADY
+    assert corner_outlier_result.rms_before is not None
+    assert result.distortion is not None
+    assert int(np.count_nonzero(result.distortion)) == 5
+
+
+def test_rational_outlier_pruning_keeps_8_coefficient_identity(synthetic_dataset, camera_config):
+    """P0-1 회귀 방지: Rational(EXTENDED_PINHOLE)로 Initial Calibration을
+    시작했으면, Outlier 재계산을 몇 번 거쳐도 절대 Brown 5계수로 떨어지면
+    안 된다 - 모델 의미가 runtime에 바뀌지 않는다는 정책의 핵심 검증.
+    """
+    import copy
+    dataset = copy.deepcopy(synthetic_dataset)
+    result, outlier_result = recalibrate_with_outlier_pruning(
+        dataset, camera_config, CameraModelType.EXTENDED_PINHOLE, max_iterations=2,
+    )
+    assert result.success, result.error_message
+    assert result.model_name == CameraModelType.EXTENDED_PINHOLE
+    assert result.distortion is not None
+    assert int(np.count_nonzero(result.distortion)) == 8, (
+        "Rational Outlier 재계산 후 자유도가 8이 아님 - Brown 5계수로 잘못 떨어졌을 가능성"
+    )
+
+
+def test_all_standard_models_recalibrate_without_error(synthetic_dataset, camera_config):
+    """Ideal/Brown/Rational/Fisheye 네 모델 모두 Outlier dispatcher에서
+    ValueError 없이 재계산 가능해야 한다."""
+    import copy
+    for model in (
+        CameraModelType.PINHOLE,
+        CameraModelType.BROWN_CONRADY,
+        CameraModelType.EXTENDED_PINHOLE,
+        CameraModelType.FISHEYE,
+    ):
+        dataset = copy.deepcopy(synthetic_dataset)
+        result, _outlier_result = recalibrate_with_outlier_pruning(
+            dataset, camera_config, model, max_iterations=1,
+        )
+        assert result.success, f"{model.value}: {result.error_message}"
+        assert result.model_name == model
+
+
+# ---------------------------------------------------------------------------
 # 설계 문서 16번 - Corner-level Outlier Detection
 # ---------------------------------------------------------------------------
 

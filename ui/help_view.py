@@ -87,10 +87,12 @@ class HelpView(QWidget):
             <tr>
                 <td><b>오른쪽 (Actions)</b></td>
                 <td>
-                    Rational model 사용(k4~k6) 체크박스 → <b>캘리브레이션 실행</b> →
-                    <b>Export</b>(계산된 모델을 골라 OpenCV YAML로 저장) →
-                    <b>취소</b>(코너 검출/모델 계산이 진행 중일 때 즉시 중단하고, 원하는
-                    데이터/설정으로 다시 실행할 수 있는 상태로 되돌립니다).
+                    <b>캘리브레이션 실행</b> → <b>Export</b>(계산된 모델을 골라
+                    OpenCV YAML로 저장) → <b>취소</b>(코너 검출/모델 계산이 진행
+                    중일 때 즉시 중단하고, 원하는 데이터/설정으로 다시 실행할 수
+                    있는 상태로 되돌립니다). Rational on/off 체크박스는 없습니다 -
+                    Standard 계산은 항상 Ideal Pinhole/Brown-Conrady/Rational
+                    (8계수 고정)/Fisheye 네 모델을 함께 계산합니다.
                 </td>
             </tr>
         </table>

@@ -228,6 +228,31 @@ def test_cli_load_project_conflicts_with_images():
     assert exc_info.value.code != 0
 
 
+def test_cli_rational_flag_no_longer_exists():
+    """P0-1 회귀 방지: --rational boolean 옵션이 완전히 제거됐는지 확인.
+    Rational은 이제 --model rational (또는 extended_pinhole/extended)로만
+    선택한다 - 별도 on/off 플래그가 없다.
+    """
+    parser = build_arg_parser()
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--images", "some_dir", *_base_pattern_args(), "--rational"])
+    assert exc_info.value.code != 0
+
+
+def test_cli_model_rational_alias_maps_to_extended_pinhole():
+    """--model rational이 --model extended_pinhole과 완전히 같은 모델을
+    가리키는지 확인 (README/CLI 문서에 약속한 alias)."""
+    from app.cli import _MODEL_BY_NAME
+
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        "--images", "some_dir", *_base_pattern_args(), "--model", "rational",
+    ])
+    args = _normalize_cli_args(args, parser)
+    assert args.model == "rational"
+    assert _MODEL_BY_NAME[args.model] == CameraModelType.EXTENDED_PINHOLE
+
+
 def test_cli_load_nonexistent_project_returns_exit_code_1():
     exit_code = main(["--load-project", "/nonexistent/path.ccproj"])
     assert exit_code == 1

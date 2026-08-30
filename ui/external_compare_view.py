@@ -115,7 +115,6 @@ class ExternalCompareView(QWidget):
         self._pattern_config: PatternConfig | None = None
         self._calibration_results: dict[CameraModelType, CalibrationResult] = {}
         self._validation_results: dict[CameraModelType, ValidationResult] = {}
-        self._use_rational_model = False
         self._last_result: ExternalComparisonResult | None = None
         self._loaded_yaml_path: str | None = None
         self._loaded_calibration: StandardCalibration | None = None
@@ -921,14 +920,12 @@ class ExternalCompareView(QWidget):
         pattern_config: PatternConfig,
         validation_results: dict[CameraModelType, ValidationResult],
         calibration_results: dict[CameraModelType, CalibrationResult] | None = None,
-        use_rational_model: bool = False,
     ) -> None:
         self._dataset = dataset
         self._camera_config = camera_config
         self._pattern_config = pattern_config
         self._validation_results = validation_results
         self._calibration_results = calibration_results or {}
-        self._use_rational_model = use_rational_model
         self._update_benchmark_status()
 
     # ------------------------------------------------------------------
@@ -1206,7 +1203,6 @@ class ExternalCompareView(QWidget):
         result = compare_with_external_params(
             self._dataset, self._camera_config, self._pattern_config,
             my_model, my_validation, external,
-            use_rational_model=self._use_rational_model,
         )
         self._display_comparison_result(result)
 
@@ -1225,7 +1221,6 @@ class ExternalCompareView(QWidget):
             my_model,
             my_validation,
             external,
-            self._use_rational_model,
         )
         thread = run_worker_in_thread(worker, self)
         worker.progress.connect(self.comparison_status_label.setText)
@@ -1479,7 +1474,6 @@ class ExternalCompareView(QWidget):
             scores = compute_model_scores(
                 calibration_results,
                 self._validation_results or {},
-                use_rational_model=self._use_rational_model,
             )
         except Exception:  # noqa: BLE001
             return "Model score unavailable."
@@ -1504,7 +1498,6 @@ class ExternalCompareView(QWidget):
             scores = compute_model_scores(
                 calibration_results,
                 validation_results,
-                use_rational_model=self._use_rational_model,
             )
         except Exception:  # noqa: BLE001 - UI should still show raw model status if scoring fails.
             scores = []

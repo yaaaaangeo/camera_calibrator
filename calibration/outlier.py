@@ -35,6 +35,7 @@ from calibration.types import (
 )
 from calibration.models.common import MIN_FRAMES_REQUIRED, MIN_CORNERS_PER_FRAME, compute_mad_threshold, collect_calibration_inputs
 from calibration.models.pinhole import calibrate_pinhole
+from calibration.models.brown_conrady import calibrate_brown_conrady
 from calibration.models.extended_pinhole import calibrate_extended_pinhole
 from calibration.models.fisheye import calibrate_fisheye
 from calibration.radial_profile import _project
@@ -120,13 +121,14 @@ def _calibrate_by_model(
     dataset: Dataset,
     camera_config: CameraConfig,
     model: CameraModelType,
-    use_rational_model: bool = False,
     fisheye_initial_guess: CalibrationResult | None = None,
 ) -> CalibrationResult:
     if model == CameraModelType.PINHOLE:
         return calibrate_pinhole(dataset, camera_config)
+    if model == CameraModelType.BROWN_CONRADY:
+        return calibrate_brown_conrady(dataset, camera_config)
     if model == CameraModelType.EXTENDED_PINHOLE:
-        return calibrate_extended_pinhole(dataset, camera_config, use_rational_model=use_rational_model)
+        return calibrate_extended_pinhole(dataset, camera_config)
     if model == CameraModelType.FISHEYE:
         return calibrate_fisheye(dataset, camera_config, initial_guess=fisheye_initial_guess)
     raise ValueError(f"알 수 없는 모델: {model}")
@@ -144,7 +146,6 @@ def recalibrate_with_outlier_pruning(
     k: float = 3.0,
     mad_scale: float = 1.0,
     user_threshold: float | None = None,
-    use_rational_model: bool = False,
     fisheye_initial_guess: CalibrationResult | None = None,
 ) -> tuple[CalibrationResult, OutlierResult]:
     """이상치를 반복적으로 찾아 제거하며 재계산.
@@ -155,10 +156,13 @@ def recalibrate_with_outlier_pruning(
     - max_iterations를 넘기지 않는다 (무한 반복 방지).
     - 최종적으로 실패(success=False)한 재계산 결과는 채택하지 않고,
       마지막으로 성공했던 결과로 되돌린다.
+
+    모델 의미는 초기 계산과 반복 재계산 내내 고정이다(_calibrate_by_model이
+    각 CameraModelType에 대해 항상 같은 함수를 호출) - 예를 들어 Rational로
+    시작했는데 재계산 후 Brown 5계수가 되는 일은 구조적으로 불가능하다.
     """
     result = _calibrate_by_model(
         dataset, camera_config, model,
-        use_rational_model=use_rational_model,
         fisheye_initial_guess=fisheye_initial_guess,
     )
 
@@ -209,7 +213,6 @@ def recalibrate_with_outlier_pruning(
 
         new_result = _calibrate_by_model(
             dataset, camera_config, model,
-            use_rational_model=use_rational_model,
             fisheye_initial_guess=fisheye_initial_guess,
         )
         if not new_result.success:
@@ -436,7 +439,6 @@ def recalibrate_with_corner_outlier_pruning(
     max_iterations: int = 3,
     k: float = 3.0,
     mad_scale: float = 1.0,
-    use_rational_model: bool = False,
     fisheye_initial_guess: CalibrationResult | None = None,
 ) -> tuple[CalibrationResult, CornerOutlierResult]:
     """recalibrate_with_outlier_pruning()의 corner-level 버전 - 프레임을 통째로
@@ -445,7 +447,7 @@ def recalibrate_with_corner_outlier_pruning(
     """
     result = _calibrate_by_model(
         dataset, camera_config, model,
-        use_rational_model=use_rational_model, fisheye_initial_guess=fisheye_initial_guess,
+        fisheye_initial_guess=fisheye_initial_guess,
     )
     if not result.success:
         return result, CornerOutlierResult(threshold_used=0.0, iterations=0, max_iterations=max_iterations)
@@ -496,7 +498,7 @@ def recalibrate_with_corner_outlier_pruning(
 
         new_result = _calibrate_by_model(
             dataset, camera_config, model,
-            use_rational_model=use_rational_model, fisheye_initial_guess=fisheye_initial_guess,
+            fisheye_initial_guess=fisheye_initial_guess,
         )
         if not new_result.success:
             # 롤백: 이번 반복에서 새로 제외한 인덱스만 되돌린다.

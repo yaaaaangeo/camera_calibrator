@@ -47,7 +47,6 @@ _COMPLEXITY_STARS = {
 def run_all_models(
     dataset: Dataset,
     camera_config: CameraConfig,
-    use_rational_model: bool = False,
     estimate_fisheye_uncertainty: bool = True,
     bootstrap_jobs: int = 1,
     model_jobs: int = 1,
@@ -59,6 +58,9 @@ def run_all_models(
 
     Pinhole을 가장 먼저 계산하는 이유: Fisheye 초기값으로 넘겨줘야 하기 때문
     (설계 문서 2번 발산 방지). 순서를 바꾸면 안 된다.
+
+    Rational(EXTENDED_PINHOLE)은 항상 8계수, Brown-Conrady는 항상 5계수다 -
+    두 모델의 의미는 고정이고 이 함수에 runtime toggle은 없다.
 
     estimate_fisheye_uncertainty: 기본 True. 이 함수는 "사용자에게 보여줄 결과"를
     만드는 1차 실행 경로(app/cli.py, ui/worker.py)에서만 호출되므로, 여기서는
@@ -81,7 +83,7 @@ def run_all_models(
 
     cache = PersistentResultCache(persistent_cache_dir, namespace="model-results") if persistent_cache_dir else None
     cache_key = model_results_cache_key(
-        dataset, camera_config, use_rational_model, estimate_fisheye_uncertainty, bootstrap_jobs,
+        dataset, camera_config, estimate_fisheye_uncertainty, bootstrap_jobs,
         tuple(m.value for m in requested_models),
     )
     if cache is not None:
@@ -98,9 +100,7 @@ def run_all_models(
     if needs_brown:
         brown_result = calibrate_brown_conrady(dataset, camera_config)
     if needs_extended:
-        extended_result = calibrate_extended_pinhole(
-            dataset, camera_config, use_rational_model=True
-        )
+        extended_result = calibrate_extended_pinhole(dataset, camera_config)
     fisheye_result = None
     if CameraModelType.FISHEYE in requested_set:
         fisheye_result = calibrate_fisheye(

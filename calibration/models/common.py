@@ -45,7 +45,6 @@ DEFAULT_TERM_CRITERIA = (
 
 def expected_free_param_count(
     model_name: CameraModelType,
-    use_rational_model: bool = False,
     fix_tangent_dist: bool = False,
 ) -> int:
     """설계 문서 7번 "각 모델의 parameter 수 명확화" - fx/fy/cx/cy 4개를 뺀,
@@ -55,6 +54,9 @@ def expected_free_param_count(
     플래그 설정이 잘못됐다는 신호다 (OpenCV 4.13이 rational model에서 배열을
     8이 아니라 14로 주는 것도 이 값이 아니라 배열 길이가 다른 것뿐이라는 점에
     유의 - self_check.py docstring 참고).
+
+    모델 의미가 고정이므로(EXTENDED_PINHOLE=항상 Rational 8계수,
+    BROWN_CONRADY=항상 5계수) runtime toggle 파라미터는 없다.
     """
     if model_name == CameraModelType.PINHOLE:
         return 0  # k1,k2,p1,p2,k3 전부 0으로 고정
@@ -62,8 +64,8 @@ def expected_free_param_count(
         return 4  # k1,k2,k3,k4 (Kannala-Brandt, 항상 4개)
     if model_name == CameraModelType.BROWN_CONRADY:
         return 3 if fix_tangent_dist else 5
-    # Extended Pinhole
-    count = 8 if use_rational_model else 5  # k1,k2,p1,p2,k3 [,k4,k5,k6]
+    # Extended Pinhole (Rational) - 항상 8계수
+    count = 8  # k1,k2,p1,p2,k3,k4,k5,k6
     if fix_tangent_dist:
         count -= 2  # p1, p2 제외
     return count

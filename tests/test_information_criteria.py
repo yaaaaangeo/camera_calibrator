@@ -69,11 +69,12 @@ def test_information_criteria_formula_matches_design_doc():
 
 
 def test_parameter_counts_include_intrinsics_plus_model_distortion_params():
+    # EXTENDED_PINHOLE(Rational)은 항상 8계수(k1~k6,p1,p2)다 - runtime toggle은
+    # 없다(P0-1). parameter_count_for_model()은 이제 model 하나만 받는다.
     assert parameter_count_for_model(CameraModelType.PINHOLE) == 4
     assert parameter_count_for_model(CameraModelType.BROWN_CONRADY) == 9
     assert parameter_count_for_model(CameraModelType.EXTENDED_PINHOLE) == 12
     assert parameter_count_for_model(CameraModelType.FISHEYE) == 8
-    assert parameter_count_for_model(CameraModelType.EXTENDED_PINHOLE, use_rational_model=True) == 12
 
 
 def test_compute_model_scores_populates_aic_bic_and_raw_inputs():

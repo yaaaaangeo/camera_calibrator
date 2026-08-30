@@ -52,7 +52,6 @@ def _fold_cache_key(
     model: CameraModelType,
     train_ids: list[str],
     test_ids: list[str],
-    use_rational_model: bool,
 ) -> tuple:
     return (
         "kfold_validation",
@@ -62,7 +61,6 @@ def _fold_cache_key(
         model.value,
         tuple(train_ids),
         tuple(test_ids),
-        bool(use_rational_model),
     )
 
 
@@ -74,13 +72,12 @@ def _validate_fold(args: tuple):
         model,
         train_ids,
         test_ids,
-        use_rational_model,
         cache,
     ) = args
     from calibration.validation import validate_holdout  # 순환 참조 회피
 
     key = _fold_cache_key(
-        dataset, camera_config, pattern_config, model, train_ids, test_ids, use_rational_model
+        dataset, camera_config, pattern_config, model, train_ids, test_ids
     )
     cached = cache.get(key) if cache is not None else None
     if cached is not None:
@@ -88,7 +85,6 @@ def _validate_fold(args: tuple):
 
     result = validate_holdout(
         dataset, camera_config, pattern_config, model, train_ids, test_ids,
-        use_rational_model=use_rational_model,
     )
     if cache is not None:
         cache.set(key, result)
@@ -151,7 +147,6 @@ def compute_kfold_validation(
     model: CameraModelType,
     k: int = 5,
     seed: int = 42,
-    use_rational_model: bool = False,
     n_jobs: int = 1,
     cache: ValidationCache | None = KFOLD_VALIDATION_CACHE,
 ) -> KFoldResult:
@@ -175,7 +170,6 @@ def compute_kfold_validation(
                 model,
                 train_ids,
                 test_ids,
-                use_rational_model,
                 cache,
             )
         )
@@ -214,7 +208,6 @@ def compute_repeated_kfold(
     k: int = 5,
     n_repeats: int = 5,
     base_seed: int = 42,
-    use_rational_model: bool = False,
     n_jobs: int = 1,
     cache: ValidationCache | None = KFOLD_VALIDATION_CACHE,
 ) -> RepeatedKFoldResult:
@@ -227,7 +220,7 @@ def compute_repeated_kfold(
     def _run_repeat(repeat_index: int) -> KFoldResult:
         return compute_kfold_validation(
             dataset, camera_config, pattern_config, model,
-            k=k, seed=base_seed + repeat_index, use_rational_model=use_rational_model,
+            k=k, seed=base_seed + repeat_index,
             n_jobs=1, cache=cache,
         )
 
