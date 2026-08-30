@@ -40,7 +40,7 @@ from camera_lidar.types import (
     SceneType,
     TargetlessPrior,
 )
-from geometry.transform import rpy_to_rotation_matrix, to_homogeneous
+from geometry.transform import invert_transform, rpy_to_rotation_matrix, to_homogeneous
 
 
 def _identity_prior() -> TargetlessPrior:
@@ -341,6 +341,92 @@ def test_partial_camera_scene_uses_4_for_roi_3_for_correspondence(monkeypatch):
     assert "bottom_left" not in result.common_ids
     assert result.scene_type == SceneType.VALID_PARTIAL
     assert result.camera_centers.shape == (3, 3)
+
+
+# ---------------------------------------------------------------------------
+# TRUE end-to-end integration: real detect_lidar_target_auto (real RANSAC
+# plane search + real boundary/circle fit) against a real synthetic point
+# cloud, driven entirely through calibrate_single_scene(roi_mode="guided").
+# Everything in tests 1-11 above mocks detect_lidar_target_auto itself, so
+# it only proves _detect_lidar_guided's CONTROL FLOW is wired correctly --
+# not that guided_roi.py's margin/AABB math actually integrates with the
+# real lidar_detector.py numerics on real data. This test closes that gap,
+# the same way test_lidar_detector_auto_finds_board_among_decoy_planes
+# (test_camera_lidar_core.py) does for plain AUTO ROI. Only
+# detect_camera_target is stubbed -- rendering a geometrically-correct
+# synthetic ArUco photograph is a separately-documented test-fixture gap
+# (see test_camera_lidar_core.py's module docstring), unrelated to GUIDED
+# ROI itself.
+# ---------------------------------------------------------------------------
+
+def test_guided_roi_end_to_end_real_lidar_detection_crops_decoy_plane(monkeypatch):
+    from tests.test_camera_lidar_core import _synthetic_board_points_lidar_frame
+
+    target = TargetConfig()
+    rng = np.random.default_rng(7)
+
+    # Arbitrary placement of the physical board in the LiDAR frame, and the
+    # real synthetic point cloud for it (board plate + circle-hole rings).
+    R_L = rpy_to_rotation_matrix(8, -15, 40, degrees=True)
+    t_L = np.array([2.0, 0.3, 0.5])
+    board_lidar, circle_centers_board = _synthetic_board_points_lidar_frame(target, R_L, t_L, rng, n_plate=3000)
+    lidar_centers_true = (R_L @ circle_centers_board.T).T + t_L  # (4,3), CORNER_ORDER, true LiDAR-frame centers
+
+    # Large decoy floor plane, far enough from the board that a correct
+    # GUIDED ROI must exclude it entirely.
+    n_floor = 8000
+    floor_pts = np.column_stack([
+        rng.uniform(-5, 5, n_floor), rng.uniform(-5, 5, n_floor),
+        np.full(n_floor, -1.0) + rng.normal(0, 0.005, n_floor),
+    ])
+    cloud = PointCloudFrame(
+        timestamp=0.0, points=np.concatenate([floor_pts, board_lidar], axis=0), frame_id="lidar",
+    )
+
+    # The TRUE camera<->lidar extrinsic the solver must recover -- unrelated
+    # to (and not derivable from) R_L/t_L above, which only places the board
+    # in the synthetic cloud.
+    R_CL_true = rpy_to_rotation_matrix(5, 10, -30, degrees=True)   # R_camera_from_lidar
+    t_CL_true = np.array([0.1, -0.05, 0.02])
+    camera_centers_true = (R_CL_true @ lidar_centers_true.T).T + t_CL_true
+    T_lidar_from_camera_true = invert_transform(to_homogeneous(R_CL_true, t_CL_true))
+
+    # A deliberately IMPERFECT Targetless prior (coarse rotation + translation
+    # error, well within GuidedROIConfig's default uncertainty budget) --
+    # this is the realistic case: direct_visual_lidar_calibration's estimate
+    # is coarse, not exact.
+    R_err = rpy_to_rotation_matrix(2.0, -1.0, 1.5, degrees=True)
+    t_err = np.array([0.05, -0.03, 0.02])
+    noisy_prior_T = to_homogeneous(R_err, t_err) @ T_lidar_from_camera_true
+
+    camera_result = CameraDetectionResult(
+        success=True, circle_centers=camera_centers_true, detected_ids=frozenset(CORNER_ORDER), markers_detected=4,
+    )
+    monkeypatch.setattr(pipeline, "detect_camera_target", lambda *a, **k: camera_result)
+
+    guided_config = GuidedROIConfig(
+        prior=TargetlessPrior(T_lidar_from_camera=noisy_prior_T, source_path="calib.json", source_key="T_lidar_camera"),
+    )
+    image = ImageFrame(timestamp=0.0, image=np.zeros((4, 4, 3), dtype=np.uint8))
+    scene = CalibrationScene(image=image, cloud=cloud, intrinsics=None, target=target, guided_roi=guided_config)
+
+    result = calibrate_single_scene(scene, roi_mode="guided")
+
+    assert result.success, result.failure_reason
+    diagnostics = result.guided_roi_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.fallback_to_auto_used is False  # a guided attempt found it -- no need for full-cloud AUTO
+    # Real cropping happened: far fewer points reached the detector than the
+    # whole cloud (floor_pts + board_lidar).
+    assert result.lidar_detection.roi_point_count < floor_pts.shape[0] + board_lidar.shape[0]
+    # The selected ROI actually excludes the decoy floor (z=-1.0).
+    assert diagnostics.selected_roi is not None
+    assert diagnostics.selected_roi.z_min > -1.0
+    # Final extrinsic recovered correctly -- proving the imperfect prior
+    # (only used for ROI search) did not degrade the actual solve.
+    assert np.allclose(result.R_camera_from_lidar, R_CL_true, atol=0.05)
+    assert np.allclose(result.t_camera_from_lidar, t_CL_true, atol=0.02)
+    assert result.scene_type == SceneType.VALID_FULL
 
 
 # ---------------------------------------------------------------------------
