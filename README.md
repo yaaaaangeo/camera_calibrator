@@ -97,6 +97,41 @@ source /opt/ros/humble/setup.bash
 
 자세한 전제 조건, 실행법과 카메라 현장 검증은 [JETSON.md](JETSON.md)에 있습니다.
 
+**방법 E - JetPack 5.1.2 / Jetson AGX Orin Developer Kit 64GB**
+
+JetPack 5.1.2는 Jetson Linux R35.4.1 계열, Ubuntu 20.04, aarch64 환경입니다.
+이 프로젝트의 JetPack 5.1.2 지원 기준 Python은 3.10입니다. Ubuntu 20.04 기본
+Python 3.8을 대상으로 dependency를 낮추지는 않습니다.
+
+```bash
+python3.10 -m venv venv
+source venv/bin/activate
+
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements-jetson-jp512.txt
+python -m pip install -e . --no-deps
+
+python scripts/jetson_jp512_preflight.py
+python -m app.main
+```
+
+JetPack 5.1.2 profile은 GUI를 PySide6로 띄우기 때문에 OpenCV는
+`opencv-contrib-python-headless`를 사용합니다. 이 프로젝트는 ChArUco/ArUco,
+AprilGrid, Circle Grid, fisheye, `calibrateCameraRO`를 쓰므로 contrib build가
+필요하지만, OpenCV가 번들한 Qt와 PySide6의 Qt runtime을 섞지 않기 위해 headless
+wheel을 우선합니다. JetPack system OpenCV를 같은 venv 안에 섞어 쓰지 마세요.
+
+PySide6 GUI가 시작되지 않으면 Qt/XCB runtime library를 먼저 확인하세요.
+
+```bash
+sudo apt install libxcb-cursor0 libxkbcommon-x11-0 libegl1 libgl1
+```
+
+ROS1 Noetic live topic 사용은 pip dependency가 아닙니다. `rospy`, `sensor_msgs`,
+`cv_bridge`는 ROS/apt 환경에서 관리하고, 필요할 때 ROS 환경을 source한 뒤 실행합니다.
+오프라인 bag 파일 읽기용 `rosbags`도 이 JetPack 5.1.2 core+GUI profile에는 넣지
+않았습니다.
+
 ## 3. 실행
 
 ```bash
