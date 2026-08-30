@@ -80,7 +80,7 @@ def test_full_pipeline_end_to_end(synthetic_dataset, camera_config, pattern_conf
 
     # 4. Model Evaluation - Hold-out Validation (+ Straightness)
     validation_results = validate_all_models(dataset, camera_config, pattern_config, test_ratio=0.25)
-    assert len(validation_results) == 3
+    assert len(validation_results) == 4
     for m, v in validation_results.items():
         if v.success and v.test_frame_ids:
             assert v.test_rms is not None

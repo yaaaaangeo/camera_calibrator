@@ -138,6 +138,20 @@ _PATTERN_BY_NAME = {
 }
 
 _DEFAULT_EXPORTS = ["opencv", "ros", "report"]
+
+
+def _bootstrap_flags_for_model(model: CameraModelType) -> int:
+    flags = cv2.CALIB_USE_INTRINSIC_GUESS
+    if model == CameraModelType.PINHOLE:
+        flags |= (
+            cv2.CALIB_ZERO_TANGENT_DIST
+            | cv2.CALIB_FIX_K1
+            | cv2.CALIB_FIX_K2
+            | cv2.CALIB_FIX_K3
+        )
+    elif model == CameraModelType.EXTENDED_PINHOLE:
+        flags |= cv2.CALIB_RATIONAL_MODEL
+    return flags
 _DIAGNOSTIC_EXPORTS = ["opencv", "ros", "report", "json", "csv"]
 _DIAGNOSTIC_DEFAULT_KFOLD = 5
 _DIAGNOSTIC_DEFAULT_BOOTSTRAP = 100
@@ -1228,8 +1242,7 @@ def _validate_choose_and_export(
             uncertainty_to_show = compute_parameter_bootstrap(
                 obj_pts, img_pts, image_size, chosen_model,
                 chosen_result.camera_matrix, chosen_result.distortion,
-                flags=(cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K1 | cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3
-                       if chosen_model == CameraModelType.PINHOLE else 0) | cv2.CALIB_USE_INTRINSIC_GUESS,
+                flags=_bootstrap_flags_for_model(chosen_model),
                 n_bootstrap=args.n_bootstrap, rng_seed=args.seed, n_jobs=args.jobs,
             )
             # 계산 결과를 CalibrationResult에도 남겨서 export/report에 그대로 반영되게 한다.

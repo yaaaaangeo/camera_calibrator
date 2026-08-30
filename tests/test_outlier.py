@@ -175,7 +175,7 @@ def test_brown_conrady_frame_outlier_pruning_succeeds(synthetic_dataset, camera_
     assert outlier_result.rms_before is not None
     # Brown-Conrady는 항상 5계수(k1,k2,p1,p2,k3) - Outlier 재계산 후에도 유지.
     assert result.distortion is not None
-    assert int(np.count_nonzero(result.distortion)) == 5
+    assert result.distortion.size == 5
 
 
 def test_brown_conrady_corner_outlier_pruning_succeeds(synthetic_dataset, camera_config):
@@ -189,7 +189,7 @@ def test_brown_conrady_corner_outlier_pruning_succeeds(synthetic_dataset, camera
     assert result.model_name == CameraModelType.BROWN_CONRADY
     assert corner_outlier_result.rms_before is not None
     assert result.distortion is not None
-    assert int(np.count_nonzero(result.distortion)) == 5
+    assert result.distortion.size == 5
 
 
 def test_rational_outlier_pruning_keeps_8_coefficient_identity(synthetic_dataset, camera_config):
@@ -205,7 +205,7 @@ def test_rational_outlier_pruning_keeps_8_coefficient_identity(synthetic_dataset
     assert result.success, result.error_message
     assert result.model_name == CameraModelType.EXTENDED_PINHOLE
     assert result.distortion is not None
-    assert int(np.count_nonzero(result.distortion)) == 8, (
+    assert result.distortion.size == 8, (
         "Rational Outlier 재계산 후 자유도가 8이 아님 - Brown 5계수로 잘못 떨어졌을 가능성"
     )
 

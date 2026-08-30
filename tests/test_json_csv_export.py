@@ -200,7 +200,7 @@ def test_export_json_includes_radial_profile_and_validation(full_pipeline_result
     assert "parameter_uncertainty_bootstrap" in entry
     assert "final_result" in loaded
     assert "final_calibration_summary" in loaded
-    assert "model_scores" in loaded and len(loaded["model_scores"]) == 3
+    assert "model_scores" in loaded and len(loaded["model_scores"]) == 4
 
 
 def test_export_json_handles_failed_model_gracefully(camera_config, pattern_config, tmp_path):

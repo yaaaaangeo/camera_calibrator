@@ -42,6 +42,7 @@ from calibration.models.common import (
     infer_image_size,
     compute_regional_error,
     validate_finite_calibration_output,
+    normalize_distortion_coefficients,
 )
 from calibration.radial_profile import compute_radial_error_profile, compute_radial_error_bands
 from calibration.spatial_error_map import compute_spatial_error_map
@@ -146,6 +147,13 @@ def _calibrate_extended_pinhole_core(
             success=False,
             error_message=f"cv2.calibrateCameraExtended 실패: {e}",
         )
+
+    output_model = (
+        CameraModelType.EXTENDED_PINHOLE
+        if flags & cv2.CALIB_RATIONAL_MODEL
+        else CameraModelType.BROWN_CONRADY
+    )
+    dist_coeffs = normalize_distortion_coefficients(output_model, dist_coeffs)
 
     invalid_reason = validate_finite_calibration_output(camera_matrix, dist_coeffs)
     if invalid_reason:

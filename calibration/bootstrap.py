@@ -33,7 +33,7 @@ import logging
 import cv2
 import numpy as np
 
-from calibration.models.common import distortion_coeff_labels
+from calibration.models.common import distortion_coeff_labels, expected_distortion_coeff_count
 from calibration.performance import resolve_worker_count
 from calibration.types import CameraModelType, DistortionCoeffStat, ParameterUncertainty
 
@@ -53,6 +53,7 @@ def _run_bootstrap_sample(args: tuple) -> tuple[float, float, float, float, list
         K_init,
         D_init,
         flags,
+        distortion_count,
     ) = args
     obj_sample = [object_points[int(i)] for i in idx]
     img_sample = [image_points[int(i)] for i in idx]
@@ -75,7 +76,7 @@ def _run_bootstrap_sample(args: tuple) -> tuple[float, float, float, float, list
         float(K_i[1, 1]),
         float(K_i[0, 2]),
         float(K_i[1, 2]),
-        [float(v) for v in D_i.ravel().tolist()],
+        [float(v) for v in D_i.ravel().tolist()[:distortion_count]],
     )
 
 
@@ -172,6 +173,7 @@ def compute_parameter_bootstrap(
 
     rng = np.random.default_rng(rng_seed)
     is_fisheye = model == CameraModelType.FISHEYE
+    distortion_count = expected_distortion_coeff_count(model)
 
     fx_samples: list[float] = []
     fy_samples: list[float] = []
@@ -184,7 +186,7 @@ def compute_parameter_bootstrap(
 
     indices = [rng.integers(0, n_frames, size=n_frames) for _ in range(n_bootstrap)]
     tasks = [
-        (object_points, image_points, image_size, idx, is_fisheye, K_init, D_init, flags)
+        (object_points, image_points, image_size, idx, is_fisheye, K_init, D_init, flags, distortion_count)
         for idx in indices
     ]
     workers = resolve_worker_count(n_jobs, len(tasks))

@@ -262,6 +262,24 @@ def fmt_optional(v: float | None) -> str:
     return f"{v:.3f}" if v is not None else "N/A"
 
 
+def expected_distortion_coeff_count(model_name: CameraModelType) -> int:
+    if model_name == CameraModelType.FISHEYE:
+        return 4
+    if model_name == CameraModelType.EXTENDED_PINHOLE:
+        return 8
+    return 5
+
+
+def normalize_distortion_coefficients(model_name: CameraModelType, distortion: np.ndarray) -> np.ndarray:
+    count = expected_distortion_coeff_count(model_name)
+    flat = np.asarray(distortion, dtype=np.float64).reshape(-1)
+    if flat.size >= count:
+        return flat[:count].reshape(-1, 1).copy()
+    padded = np.zeros(count, dtype=np.float64)
+    padded[: flat.size] = flat
+    return padded.reshape(-1, 1)
+
+
 def distortion_coeff_labels(model_name: CameraModelType, count: int) -> list[str]:
     """왜곡 계수 벡터(distortion.ravel())의 각 원소 이름을 순서대로 반환.
 
