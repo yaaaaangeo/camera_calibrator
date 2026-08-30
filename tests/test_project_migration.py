@@ -69,6 +69,26 @@ def test_v1_extended_rational_stays_extended_pinhole():
     assert result.distortion is not None and len(result.distortion.reshape(-1)) == 8
 
 
+@pytest.mark.parametrize(
+    "distortion",
+    [
+        [[0.1, 0.2, 0.0, 0.0, 0.01, 0.001, 0.002, 0.003]],
+        [[0.1], [0.2], [0.0], [0.0], [0.01], [0.001], [0.002], [0.003]],
+    ],
+)
+def test_v1_extended_rational_shape_is_flattened_before_classification(distortion):
+    """OpenCV can serialize D as (1, 8) or (8, 1); migration must classify both as Rational."""
+    with open(ASSETS_DIR / "v1_extended_5coeff.ccproj", "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    entry = payload["project"]["calibration_results"]["extended_pinhole"]
+    entry["distortion"] = {"__ndarray__": True, "dtype": "float64", "data": distortion}
+
+    migrated = migrate_v1_to_v2(payload)
+
+    assert "extended_pinhole" in migrated["project"]["calibration_results"]
+    assert "brown_conrady" not in migrated["project"]["calibration_results"]
+
+
 def test_v1_mixed_nested_refs_all_migrate_consistently():
     """Case C(사용자 스펙 P1 섹션 9) - extended_pinhole(5계수) 참조가
     calibration_results/validation_results뿐 아니라 model_scores,

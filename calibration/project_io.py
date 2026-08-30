@@ -594,7 +594,10 @@ def _raw_array_len(d) -> int | None:
         d = d.get("data")
     if not isinstance(d, list):
         return None
-    return len(d)
+    try:
+        return int(np.asarray(d).reshape(-1).size)
+    except (TypeError, ValueError):
+        return None
 
 
 def _migrate_model_name_refs(container, field_name: str, should_rename: bool) -> None:

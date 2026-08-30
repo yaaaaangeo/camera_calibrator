@@ -25,7 +25,7 @@ def calibrate_brown_conrady(
     result = _calibrate_extended_pinhole_core(
         dataset,
         camera_config,
-        use_rational_model=False,
+        rational_model=False,
         fix_tangent_dist=fix_tangent_dist,
         estimate_uncertainty_bootstrap=estimate_uncertainty_bootstrap,
         n_bootstrap=n_bootstrap,

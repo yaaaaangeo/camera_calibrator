@@ -422,7 +422,7 @@ python -m app.cli \
 | `--calibration-method {standard,object_releasing}` | Standard 4모델(기본) 또는 Object-Releasing(Advanced, Checkerboard/Circle Grid만) |
 | `--bag`, `--topic`, `--bag-interval` | rosbag에서 이미지 추출 (`--images` 대신) |
 | `--list-topics BAG_PATH` | bag의 이미지 토픽 목록만 보고 종료 |
-| `--model {pinhole,brown_conrady,extended_pinhole,fisheye,rational,...}` | 자동 추천 대신 강제로 이 모델 선택. `ideal_pinhole`/`brown-conrady`/`extended`/`rational` alias도 허용 - `rational`은 `extended_pinhole`과 완전히 동일한 모델을 가리키는 정식 이름이다 (Rational은 항상 8계수, runtime toggle 없음 - `--rational` 플래그는 더 이상 존재하지 않는다) |
+| `--model {pinhole,brown_conrady,extended_pinhole,fisheye,rational,...}` | 자동 추천 대신 강제로 이 모델 선택. `ideal_pinhole`/`brown-conrady`/`extended`/`rational` alias도 허용 - `rational`은 `extended_pinhole`과 완전히 동일한 모델을 가리키는 정식 이름이다 (Rational은 항상 8계수, runtime toggle 없음) |
 | `--models MODEL [MODEL ...]` | 계산/검증할 모델 목록 (여러 개). 예: `--models pinhole brown_conrady rational` |
 | `--outlier` | 이상치 탐지 + 재계산까지 수행 |
 | `--diagnostic` | 종합 진단 preset. 기본 5-fold CV + 100회 bootstrap + report/json/csv export |

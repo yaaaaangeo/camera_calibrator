@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "camera-calibrator"
 version = "0.2.0"
-description = "ChArUco 기반 카메라 캘리브레이션 도구 - Pinhole/Extended Pinhole/Fisheye 3모델 비교 + Hold-out 검증 + 근거 기반 모델 추천"
+description = "ChArUco 기반 카메라 캘리브레이션 도구 - Ideal Pinhole/Brown-Conrady/Rational/Fisheye 4모델 비교 + Hold-out 검증 + 근거 기반 모델 추천"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

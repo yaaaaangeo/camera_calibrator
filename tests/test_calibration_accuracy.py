@@ -42,7 +42,7 @@ SEEDS = [3, 7, 42]
 class TestGroundTruthAccuracy:
     """(1) 3D 회전이 충분한 잘 조건화된 합성 데이터로 fx/fy/distortion이
     정답의 임계값 이내인지 검증. Brown-Conrady(5계수)를 기준 모델로 쓴다 -
-    구버전에서 이 자리는 run_extended_pinhole_accuracy_check(use_rational_model=False)
+    구버전에서 이 자리는 extended pinhole의 rational toggle off 경로
     였는데, 그게 곧 지금의 Brown-Conrady 모델과 동일한 의미다."""
 
     @pytest.mark.parametrize("seed", SEEDS)

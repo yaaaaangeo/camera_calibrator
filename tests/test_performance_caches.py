@@ -49,7 +49,7 @@ def test_parallel_model_calibration_path_uses_pinhole_and_extended_workers(monke
         return _result(CameraModelType.PINHOLE)
 
     def extended(dataset, camera):
-        # calibrate_extended_pinhole()은 더 이상 use_rational_model을 받지
+        # calibrate_extended_pinhole()은 더 이상 rational toggle 인자를 받지
         # 않는다 - 항상 Rational이다(P0-1) - 그래서 이 mock도 인자 없이 받는다.
         calls.append("extended")
         return _result(CameraModelType.EXTENDED_PINHOLE)

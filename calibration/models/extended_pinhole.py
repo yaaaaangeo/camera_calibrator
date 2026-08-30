@@ -6,7 +6,7 @@ camera_calibrator.calibration.models.extended_pinhole
 표기, 방사 왜곡 k1~k6 + 접선 왜곡 p1,p2 - 항상 8계수).
 
 CameraModelType.EXTENDED_PINHOLE의 의미는 고정이다: 언제나 Rational
-(cv2.CALIB_RATIONAL_MODEL 켬). 과거에는 이 모듈이 use_rational_model이라는
+(cv2.CALIB_RATIONAL_MODEL 켬). 과거에는 이 모듈이 rational toggle이라는
 public runtime 파라미터로 5계수/8계수를 오갈 수 있었는데, 같은
 CameraModelType이 호출부 설정에 따라 다른 수학적 모델을 의미하게 되는
 문제가 있었다(Initial Calibration은 8계수인데 Hold-out/Outlier 재계산은
@@ -66,7 +66,7 @@ def calibrate_extended_pinhole(
     """
     return _calibrate_extended_pinhole_core(
         dataset, camera_config,
-        use_rational_model=True,
+        rational_model=True,
         fix_tangent_dist=fix_tangent_dist,
         estimate_uncertainty_bootstrap=estimate_uncertainty_bootstrap,
         n_bootstrap=n_bootstrap,
@@ -79,7 +79,7 @@ def _calibrate_extended_pinhole_core(
     dataset: Dataset,
     camera_config: CameraConfig,
     *,
-    use_rational_model: bool,
+    rational_model: bool,
     fix_tangent_dist: bool = False,
     estimate_uncertainty_bootstrap: bool = False,
     n_bootstrap: int = 20,
@@ -88,14 +88,14 @@ def _calibrate_extended_pinhole_core(
 ) -> CalibrationResult:
     """실제 계산 로직 - private, 모듈 밖에서 직접 호출하지 않는다.
 
-    calibrate_extended_pinhole()(rational=True 고정)과
-    calibration.models.brown_conrady.calibrate_brown_conrady()(rational=False
+    calibrate_extended_pinhole()(rational_model=True 고정)과
+    calibration.models.brown_conrady.calibrate_brown_conrady()(rational_model=False
     고정) 둘 다 이 함수를 감싼다 - cv2.calibrateCameraExtended 호출/후처리
     로직을 중복 구현하지 않으면서도, 두 public 함수 중 어느 쪽도 runtime에
     다른 쪽의 계수 개수로 바뀌지 않도록 각자 고정된 값만 넘긴다.
 
     Args:
-        use_rational_model: True면 k4~k6까지 추정 (CALIB_RATIONAL_MODEL).
+        rational_model: True면 k4~k6까지 추정 (CALIB_RATIONAL_MODEL).
         fix_tangent_dist: True면 접선 왜곡(p1,p2)을 0으로 고정.
             제조 공차가 좋은 렌즈는 접선 왜곡이 거의 없어 자유도를 줄이는 게
             오히려 안정적일 수 있다 (UI 고급 옵션으로 노출 예정).
@@ -118,7 +118,7 @@ def _calibrate_extended_pinhole_core(
     image_size = infer_image_size(dataset, camera_config)
 
     flags = 0
-    if use_rational_model:
+    if rational_model:
         flags |= cv2.CALIB_RATIONAL_MODEL
     if fix_tangent_dist:
         flags |= cv2.CALIB_ZERO_TANGENT_DIST

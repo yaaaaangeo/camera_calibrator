@@ -278,7 +278,7 @@ def run_all_self_checks(
     n_images: int = DEFAULT_N_IMAGES, seed: int = DEFAULT_SEED
 ) -> list[SelfCheckResult]:
     """GUI "자체 진단" 버튼이 호출하는 진입점 - Ideal Pinhole/Brown-Conrady/
-    Rational 세 모델을 각자의 실제 calibrate_* 함수로 검증한다 (Fisheye는
+    세 calibration 함수(Ideal Pinhole/Brown-Conrady/Rational)를 각자의 실제 calibrate_* 함수로 검증한다 (Fisheye는
     별도 검증 경로가 없어 아직 포함되지 않음)."""
     return [
         run_pinhole_accuracy_check(n_images, seed),

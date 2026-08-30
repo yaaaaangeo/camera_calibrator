@@ -8,9 +8,9 @@ camera_calibrator.export.ros
      (Calibration Tool -> ROS -> CameraInfo 직결)."
 
 distortion_model 필드는 ROS(sensor_msgs/CameraInfo, image_pipeline) 관례를 따른다:
-    - Pinhole / Extended Pinhole(5계수)  -> "plumb_bob"
-    - Extended Pinhole(rational, 8계수)  -> "rational_polynomial"
-    - Fisheye(Kannala-Brandt, 4계수)     -> "equidistant"
+    - Pinhole / Brown-Conrady(5계수)      -> "plumb_bob"
+    - Rational(Extended Pinhole, 8계수)   -> "rational_polynomial"
+    - Fisheye(Kannala-Brandt, 4계수)      -> "equidistant"
       (image_pipeline의 fisheye 지원 관례. ROS1 기본 camera_info는 fisheye를
        직접 표준화하진 않지만, 이 문자열이 실무에서 가장 널리 쓰인다.)
 """
@@ -28,7 +28,7 @@ from calibration.types import CalibrationResult, CameraConfig, CameraModelType
 def _distortion_model_name(model: CameraModelType, num_coeffs: int) -> str:
     if model == CameraModelType.FISHEYE:
         return "equidistant"
-    if num_coeffs >= 8:
+    if model == CameraModelType.EXTENDED_PINHOLE:
         return "rational_polynomial"
     return "plumb_bob"
 
