@@ -16,6 +16,7 @@ tests/assets/projects/*.ccproj를 사용한다 (재생성하려면 그 스크립
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,74 @@ from calibration.project_io import (
 from calibration.types import CameraModelType
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets" / "projects"
+
+
+def _load_project_payload(name: str) -> dict:
+    with open(ASSETS_DIR / name, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _add_legacy_extended_refs(payload: dict) -> dict:
+    project = payload["project"]
+    project["camera_config"]["model"] = "extended_pinhole"
+    project["validation_results"] = {
+        "extended_pinhole": {
+            "train_frame_ids": [],
+            "test_frame_ids": [],
+            "train_rms": 0.4,
+            "test_rms": 0.5,
+            "test_p95": None,
+            "edge_rms": None,
+            "straightness_residual": None,
+            "generalization_gap": None,
+            "num_train_frames": 0,
+            "num_test_frames": 0,
+            "failed_test_frame_ids": [],
+            "success": True,
+            "error_message": None,
+            "model_name": "extended_pinhole",
+        }
+    }
+    project["object_releasing_result"] = {"model_name": "extended_pinhole"}
+    project["standard_vs_object_releasing_comparison"] = {
+        "standard_result": {"model_name": "extended_pinhole"},
+        "object_releasing_result": {"model_name": "extended_pinhole"},
+    }
+    project["final_result"]["validation"] = {"model_name": "extended_pinhole"}
+    return payload
+
+
+def _assert_all_extended_refs_mapped(project: dict, expected: str) -> None:
+    calibration_results = project["calibration_results"]
+    validation_results = project["validation_results"]
+    assert expected in calibration_results
+    assert expected in validation_results
+    if expected == "extended_pinhole":
+        assert "extended_pinhole" in calibration_results
+        assert "extended_pinhole" in validation_results
+    else:
+        assert "extended_pinhole" not in calibration_results
+        assert "extended_pinhole" not in validation_results
+    assert calibration_results[expected]["model_name"] == expected
+    assert validation_results[expected]["model_name"] == expected
+    assert project["camera_config"]["model"] == expected
+    assert project["cross_dataset_results"][0]["model_name"] == expected
+    assert project["model_scores"][0]["model_name"] == expected
+    assert project["object_releasing_result"]["model_name"] == expected
+    assert (
+        project["standard_vs_object_releasing_comparison"]["standard_result"]["model_name"]
+        == expected
+    )
+    assert (
+        project["standard_vs_object_releasing_comparison"]["object_releasing_result"]["model_name"]
+        == expected
+    )
+    final = project["final_result"]
+    assert final["chosen_model"] == expected
+    assert final["calibration"]["model_name"] == expected
+    assert final["validation"]["model_name"] == expected
+    assert final["model_scores"][0]["model_name"] == expected
+    assert final["diagnosis"]["model_name"] == expected
 
 
 def test_fixtures_exist():
@@ -78,8 +147,7 @@ def test_v1_extended_rational_stays_extended_pinhole():
 )
 def test_v1_extended_rational_shape_is_flattened_before_classification(distortion):
     """OpenCV can serialize D as (1, 8) or (8, 1); migration must classify both as Rational."""
-    with open(ASSETS_DIR / "v1_extended_5coeff.ccproj", "r", encoding="utf-8") as f:
-        payload = json.load(f)
+    payload = _load_project_payload("v1_extended_5coeff.ccproj")
     entry = payload["project"]["calibration_results"]["extended_pinhole"]
     entry["distortion"] = {"__ndarray__": True, "dtype": "float64", "data": distortion}
 
@@ -118,6 +186,36 @@ def test_v1_mixed_nested_refs_all_migrate_consistently():
     assert project.final_result.model_scores[0].model_name == CameraModelType.BROWN_CONRADY
     assert project.final_result.diagnosis is not None
     assert project.final_result.diagnosis.model_name == CameraModelType.BROWN_CONRADY
+
+
+def test_v1_extended_5coeff_migrates_all_nested_references_to_brown():
+    payload = _add_legacy_extended_refs(
+        _load_project_payload("v1_extended_5coeff_mixed_refs.ccproj")
+    )
+
+    migrated = migrate_v1_to_v2(payload)
+
+    assert migrated["format_version"] == PROJECT_FORMAT_VERSION == 2
+    _assert_all_extended_refs_mapped(migrated["project"], "brown_conrady")
+
+
+def test_v1_extended_8coeff_keeps_all_nested_references_rational():
+    payload = _add_legacy_extended_refs(
+        _load_project_payload("v1_extended_5coeff_mixed_refs.ccproj")
+    )
+    entry = payload["project"]["calibration_results"]["extended_pinhole"]
+    entry["distortion"] = {
+        "__ndarray__": True,
+        "dtype": "float64",
+        "data": [-0.2, 0.05, 0.001, -0.001, 0.01, 0.02, -0.01, 0.003],
+    }
+
+    migrated = migrate_v1_to_v2(payload)
+
+    assert migrated["format_version"] == PROJECT_FORMAT_VERSION == 2
+    _assert_all_extended_refs_mapped(migrated["project"], "extended_pinhole")
+    assert "brown_conrady" not in migrated["project"]["calibration_results"]
+    assert "brown_conrady" not in migrated["project"]["validation_results"]
 
 
 def test_v2_project_loads_without_migration(monkeypatch):
@@ -159,14 +257,15 @@ def test_unsupported_format_version_still_raises():
         project_from_dict(payload)
 
 
-def test_migrate_v1_to_v2_unexpected_distortion_length_leaves_key_unchanged():
+def test_migrate_v1_to_v2_unexpected_distortion_length_warns_and_leaves_key_unchanged(caplog):
     """5도 8+도 아닌 이상한 길이는 함부로 추측해서 바꾸지 않는다."""
-    with open(ASSETS_DIR / "v1_extended_5coeff.ccproj", "r", encoding="utf-8") as f:
-        payload = json.load(f)
+    payload = _load_project_payload("v1_extended_5coeff.ccproj")
     entry = payload["project"]["calibration_results"]["extended_pinhole"]
     entry["distortion"] = {"__ndarray__": True, "dtype": "float64", "data": [0.1, 0.2, 0.3]}  # length 3
 
-    migrated = migrate_v1_to_v2(payload)
+    with caplog.at_level(logging.WARNING):
+        migrated = migrate_v1_to_v2(payload)
 
     assert "extended_pinhole" in migrated["project"]["calibration_results"]
     assert "brown_conrady" not in migrated["project"]["calibration_results"]
+    assert "unexpected distortion length" in caplog.text

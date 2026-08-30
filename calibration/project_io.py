@@ -612,6 +612,27 @@ def _migrate_model_name_refs(container, field_name: str, should_rename: bool) ->
         container[field_name] = "brown_conrady"
 
 
+def _apply_model_map_to_field(container, field_name: str, legacy_model_map: dict[str, str]) -> None:
+    if not isinstance(container, dict):
+        return
+    value = container.get(field_name)
+    if value in legacy_model_map:
+        container[field_name] = legacy_model_map[value]
+
+
+def _apply_model_map_to_keyed_dict(container: dict, legacy_model_map: dict[str, str]) -> None:
+    for old, new in list(legacy_model_map.items()):
+        if old == new or old not in container:
+            continue
+        if new in container:
+            logger.warning(
+                "Legacy project contains both %s and %s entries; keeping existing %s entry.",
+                old, new, new,
+            )
+            continue
+        container[new] = container.pop(old)
+
+
 def migrate_v1_to_v2(payload: dict) -> dict:
     """v1 -> v2 마이그레이션.
 
@@ -640,19 +661,18 @@ def migrate_v1_to_v2(payload: dict) -> dict:
     calibration_results: dict = project.get("calibration_results", {}) or {}
     validation_results: dict = project.get("validation_results", {}) or {}
 
-    should_rename_extended_to_brown = False
+    legacy_model_map: dict[str, str] = {}
 
     legacy_entry = calibration_results.get("extended_pinhole")
     if legacy_entry is not None:
         dist_len = _raw_array_len(legacy_entry.get("distortion"))
         if dist_len == 5:
-            should_rename_extended_to_brown = True
-            calibration_results["brown_conrady"] = calibration_results.pop("extended_pinhole")
-            calibration_results["brown_conrady"]["model_name"] = "brown_conrady"
+            legacy_model_map["extended_pinhole"] = "brown_conrady"
             logger.info(
                 "Migrated legacy project model: extended_pinhole (5 coeffs) -> brown_conrady"
             )
         elif dist_len is not None and dist_len >= 8:
+            legacy_model_map["extended_pinhole"] = "extended_pinhole"
             logger.info(
                 "Legacy project model extended_pinhole (%d coeffs) already matches current "
                 "Rational meaning - kept as extended_pinhole.", dist_len
@@ -662,25 +682,52 @@ def migrate_v1_to_v2(payload: dict) -> dict:
                 "Legacy project model extended_pinhole has an unexpected distortion length "
                 "(%d) - left unchanged, please verify manually.", dist_len
             )
+        else:
+            logger.warning(
+                "Legacy project model extended_pinhole has no readable distortion vector - "
+                "left unchanged, please verify manually."
+            )
 
-    if should_rename_extended_to_brown and "extended_pinhole" in validation_results:
-        validation_results["brown_conrady"] = validation_results.pop("extended_pinhole")
+    _apply_model_map_to_field(project.get("camera_config"), "model", legacy_model_map)
+
+    _apply_model_map_to_keyed_dict(calibration_results, legacy_model_map)
+    for result in calibration_results.values():
+        _apply_model_map_to_field(result, "model_name", legacy_model_map)
+
+    _apply_model_map_to_keyed_dict(validation_results, legacy_model_map)
+    for result in validation_results.values():
+        _apply_model_map_to_field(result, "model_name", legacy_model_map)
 
     # 최상위 model_scores / cross_dataset_results 리스트.
     for score in project.get("model_scores", []) or []:
-        _migrate_model_name_refs(score, "model_name", should_rename_extended_to_brown)
+        _apply_model_map_to_field(score, "model_name", legacy_model_map)
     for cross_result in project.get("cross_dataset_results", []) or []:
-        _migrate_model_name_refs(cross_result, "model_name", should_rename_extended_to_brown)
+        _apply_model_map_to_field(cross_result, "model_name", legacy_model_map)
+    _apply_model_map_to_field(project.get("object_releasing_result"), "model_name", legacy_model_map)
+
+    object_releasing_comparison = project.get("standard_vs_object_releasing_comparison")
+    if object_releasing_comparison:
+        _apply_model_map_to_field(
+            object_releasing_comparison.get("standard_result"),
+            "model_name",
+            legacy_model_map,
+        )
+        _apply_model_map_to_field(
+            object_releasing_comparison.get("object_releasing_result"),
+            "model_name",
+            legacy_model_map,
+        )
 
     final_result = project.get("final_result")
     if final_result:
-        _migrate_model_name_refs(final_result, "chosen_model", should_rename_extended_to_brown)
-        _migrate_model_name_refs(final_result.get("calibration"), "model_name", should_rename_extended_to_brown)
+        _apply_model_map_to_field(final_result, "chosen_model", legacy_model_map)
+        _apply_model_map_to_field(final_result.get("calibration"), "model_name", legacy_model_map)
+        _apply_model_map_to_field(final_result.get("validation"), "model_name", legacy_model_map)
         for score in final_result.get("model_scores", []) or []:
-            _migrate_model_name_refs(score, "model_name", should_rename_extended_to_brown)
-        _migrate_model_name_refs(final_result.get("diagnosis"), "model_name", should_rename_extended_to_brown)
+            _apply_model_map_to_field(score, "model_name", legacy_model_map)
+        _apply_model_map_to_field(final_result.get("diagnosis"), "model_name", legacy_model_map)
 
-    if should_rename_extended_to_brown:
+    if legacy_model_map.get("extended_pinhole") == "brown_conrady":
         logger.info(
             "Migrated legacy project model references (model_scores/cross_dataset_results/"
             "final_result): extended_pinhole -> brown_conrady"

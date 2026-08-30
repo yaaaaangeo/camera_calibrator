@@ -2,8 +2,8 @@
 
 [![Tests](https://github.com/yaaaaangeo/camera_calibrator/actions/workflows/tests.yml/badge.svg)](https://github.com/yaaaaangeo/camera_calibrator/actions/workflows/tests.yml)
 
-**Standard Calibration**으로 Ideal Pinhole / Brown-Conrady / Rational(Extended
-Pinhole) / Fisheye(Kannala-Brandt) 네 모델을 ChArUco·Chessboard·Circle
+**Standard Calibration**으로 Ideal Pinhole / Brown-Conrady / Rational
+(`extended_pinhole`) / Fisheye(Kannala-Brandt) 네 모델을 ChArUco·Chessboard·Circle
 Grid·AprilGrid 중 원하는 패턴으로 동시에 캘리브레이션하고, Hold-out 검증 +
 Model Score(AIC/BIC) 기반으로 근거 있는 추천을 해주는 도구. Checkerboard/Circle
 Grid에는 **Advanced Calibration(Object-Releasing)** — 카메라 파라미터와 함께
@@ -152,9 +152,9 @@ camera-calibrator
    - **오른쪽(Actions)**: **[캘리브레이션 실행]** → **[Export]**(계산된 모델을
      골라 OpenCV YAML로 저장 - 예전 Export 탭과 동일한 기능) → **[취소]**
      (코너 검출/모델 계산이 진행 중일 때 즉시 중단하고, 원하는 데이터/설정으로
-     다시 실행할 수 있는 상태로 되돌림). Rational on/off를 고르는 체크박스는
-     없다 - Standard 계산은 항상 Ideal Pinhole/Brown-Conrady/Rational(8계수
-     고정)/Fisheye 네 모델을 함께 계산한다 (4번 섹션 참고).
+     다시 실행할 수 있는 상태로 되돌림). Rational은 별도 Standard Camera Model이며
+     항상 8계수로 계산된다. Standard 계산은 Ideal Pinhole/Brown-Conrady/
+     Rational/Fisheye 네 모델을 함께 계산한다 (4번 섹션 참고).
 4. **[캘리브레이션 실행]** 클릭 → 검출 → Standard 4모델 계산(+ Object-Releasing을
    골랐다면 Advanced 결과도 함께) → Hold-out → 추천까지 자동 진행
 5. 탭을 넘기며 결과 확인:
@@ -546,7 +546,7 @@ pytest tests/test_straightness.py -v   # 특정 파일만
 **두 단계로 나뉜다:**
 - **빠른 티어** (마커 없음, `not slow`로 걸러짐): 단위 테스트 대부분 +
   `test_smoke_pipeline.py` - 3D->2D 직접 사영으로 이미지 렌더링/검출 없이,
-  Pinhole+Rational(Extended) 2모델만(Fisheye 생략, Standard 4모델 중 가장 느리고
+  Ideal Pinhole+Rational 2모델만(Fisheye 생략, Standard 4모델 중 가장 느리고
   발산 위험도 큼) 작은 데이터셋(8~10장)으로 도는 가벼운 파이프라인 스모크
   테스트. Object-Releasing 전용 검증(`test_object_releasing_validation.py`,
   `test_project_migration.py`, `test_kalibr_aprilgrid_fixture.py`)도 합성
@@ -616,7 +616,7 @@ python scripts/tune_model_score_weights.py --search /tmp/c1.pkl /tmp/c2.pkl --ho
 [`scripts/TUNING_RESULTS.md`](scripts/TUNING_RESULTS.md) 참고.
 
 가중치와 무관하게 발견한 진짜 한계도 있다: 화각이 넓지 않은 데이터에서는
-Extended Pinhole과 Fisheye가 통계적으로 구분하기 어려워질 수 있다 (근본적인
+Rational과 Fisheye가 통계적으로 구분하기 어려워질 수 있다 (근본적인
 모델 식별성 문제, 가중치 튜닝으로 해결 안 됨). `tests/test_recommender_accuracy.py`에
 이 한계를 `xfail`로 정직하게 기록해뒀다.
 

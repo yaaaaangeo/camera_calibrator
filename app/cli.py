@@ -1475,7 +1475,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     pipe.add_argument(
         "--models", nargs="+", choices=_MODEL_CLI_CHOICES, default=None,
-        help="문서 예시 호환: 계산/검증할 모델 목록. 예: --models pinhole extended fisheye",
+        help="계산/검증할 모델 목록. 예: --models pinhole brown_conrady rational fisheye",
     )
     pipe.add_argument(
         "--validate", action="store_true",

@@ -1,23 +1,26 @@
-%YAML 1.2
+%YAML:1.0
 ---
-calibration_model: extended_pinhole
+calibration_model: brown_conrady
+camera_model: brown_conrady
+calibration_method: standard
+target_type: chessboard
 image_width: 1920
 image_height: 1080
 camera_matrix: !!opencv-matrix
    rows: 3
    cols: 3
    dt: d
-   data: [ 6949.9906716511796, 0., 1060.1036040880797, 0.,
-       5902.1302788320982, 594.319336589606, 0., 0., 1. ]
+   data: [ 6817.4975334700903, 0., 1047.6110302349739, 0.,
+       5798.9216318446997, 594.60729261154381, 0., 0., 1. ]
 distortion_coefficients: !!opencv-matrix
-   rows: 1
-   cols: 5
+   rows: 5
+   cols: 1
    dt: d
-   data: [ 3.9857087937829849, 107.11649923657646, 0.26496577679597089,
-       0.10218959477533175, 6409.4645836732516 ]
+   data: [ 2.4629271694037778, 276.11702311241635, 0.2566966954580851,
+       0.091549290278067824, -367.44279488927106 ]
 distortion_coefficient_count: 5
 distortion_coefficient_order: "k1,k2,p1,p2,k3"
-rms_reprojection_error: 3.5499527082162583
+rms_reprojection_error: 3.5543461683525539
 pattern_type: chessboard
 pattern_squares_x: 7
 pattern_squares_y: 5

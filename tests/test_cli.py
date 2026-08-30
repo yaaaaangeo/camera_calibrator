@@ -228,14 +228,15 @@ def test_cli_load_project_conflicts_with_images():
     assert exc_info.value.code != 0
 
 
-def test_cli_rational_flag_no_longer_exists():
-    """P0-1 회귀 방지: --rational boolean 옵션이 완전히 제거됐는지 확인.
+def test_cli_legacy_rational_boolean_flag_no_longer_exists():
+    """P0-1 회귀 방지: legacy rational boolean 옵션이 완전히 제거됐는지 확인.
     Rational은 이제 --model rational (또는 extended_pinhole/extended)로만
     선택한다 - 별도 on/off 플래그가 없다.
     """
     parser = build_arg_parser()
+    legacy_flag = "--" + "rational"
     with pytest.raises(SystemExit) as exc_info:
-        parser.parse_args(["--images", "some_dir", *_base_pattern_args(), "--rational"])
+        parser.parse_args(["--images", "some_dir", *_base_pattern_args(), legacy_flag])
     assert exc_info.value.code != 0
 
 

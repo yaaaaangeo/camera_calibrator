@@ -258,7 +258,7 @@ def add_normal_approximation_ci(uncertainty: ParameterUncertainty, camera_matrix
     """설계 문서 22번 - covariance 기반(method="covariance") 표준편차만 있는
     경우, 정규분포를 가정한 근사 95% CI(mean ± 1.96*std)를 채워 넣는다.
 
-    Pinhole/Extended Pinhole은 cv2.calibrateCameraExtended가 stdDeviations를
+    Ideal Pinhole/Brown-Conrady/Rational은 cv2.calibrateCameraExtended가 stdDeviations를
     바로 주므로 bootstrap 없이도 std는 이미 있다 - 여기서는 그 std로부터
     "95% CI 표시"라는 문서 요구사항만 추가로 채운다. bootstrap 결과(percentile
     기반)에는 이 함수를 쓰지 않는다 - 이미 실측 분포에서 CI를 뽑았으므로
