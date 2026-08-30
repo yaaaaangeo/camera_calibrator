@@ -1,0 +1,366 @@
+"""
+Tests for camera_lidar.guided_roi (pure geometry helpers) and its
+orchestration inside camera_lidar.pipeline._detect_lidar_guided /
+calibrate_single_scene (GUIDED AUTO ROI mode).
+
+Load-bearing checks, per the GUIDED ROI design spec:
+  - the Targetless prior only ever narrows WHICH POINTS reach the existing
+    multi-plane LiDAR detector (never the final correspondence/solve);
+  - the margin schedule actually expands and is tried smallest-first;
+  - fallback to full-cloud AUTO only happens when every guided attempt
+    failed AND config.fallback_to_auto is set;
+  - a PARTIAL camera scene (3 real markers) still predicts an ROI from all
+    4 pose-inferred circle centers, while the final correspondence still
+    only uses the 3 actually-detected ids.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+import camera_lidar.pipeline as pipeline
+from camera_lidar.camera_detector import CameraDetectionResult
+from camera_lidar.guided_roi import (
+    build_margin_schedule,
+    build_roi_from_predicted_centers,
+    compute_guided_base_margin,
+    predict_circle_centers_lidar,
+)
+from camera_lidar.lidar_detector import LidarDetectionResult
+from camera_lidar.pipeline import calibrate_single_scene
+from camera_lidar.target_config import CORNER_ORDER, TargetConfig
+from camera_lidar.types import (
+    CalibrationScene,
+    FailureReason,
+    GuidedROIConfig,
+    ImageFrame,
+    PointCloudFrame,
+    ROIConfig,
+    SceneType,
+    TargetlessPrior,
+)
+from geometry.transform import rpy_to_rotation_matrix, to_homogeneous
+
+
+def _identity_prior() -> TargetlessPrior:
+    return TargetlessPrior(T_lidar_from_camera=np.eye(4), source_path="calib.json", source_key="T_lidar_camera")
+
+
+def _make_scene(guided_config) -> CalibrationScene:
+    target = TargetConfig()
+    image = ImageFrame(timestamp=0.0, image=np.zeros((4, 4, 3), dtype=np.uint8))
+    cloud = PointCloudFrame(timestamp=0.0, points=np.zeros((10, 3)))
+    return CalibrationScene(image=image, cloud=cloud, intrinsics=None, target=target, guided_roi=guided_config)
+
+
+# ---------------------------------------------------------------------------
+# TEST 1 -- camera -> lidar center prediction
+# ---------------------------------------------------------------------------
+
+def test_predict_circle_centers_lidar_applies_prior():
+    T = to_homogeneous(np.eye(3), np.array([1.0, 0.0, 0.0]))
+    camera_centers = np.array([
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ])
+    predicted = predict_circle_centers_lidar(camera_centers, T)
+    assert np.allclose(predicted, camera_centers + np.array([1.0, 0.0, 0.0]))
+
+
+def test_predict_circle_centers_lidar_rejects_bad_shapes():
+    with pytest.raises(ValueError):
+        predict_circle_centers_lidar(np.zeros((3, 3)), np.eye(4))
+    with pytest.raises(ValueError):
+        predict_circle_centers_lidar(np.zeros((4, 3)), np.zeros((3, 3)))
+
+
+# ---------------------------------------------------------------------------
+# TEST 2 -- AABB contains all 4 predicted centers
+# ---------------------------------------------------------------------------
+
+def test_build_roi_from_predicted_centers_contains_all_points():
+    centers = np.array([
+        [1.0, 2.0, 3.0],
+        [-1.0, 5.0, 3.0],
+        [1.0, 2.0, -3.0],
+        [4.0, -2.0, 0.0],
+    ])
+    roi = build_roi_from_predicted_centers(centers, margin_m=0.5)
+    assert roi.x_min <= centers[:, 0].min() and roi.x_max >= centers[:, 0].max()
+    assert roi.y_min <= centers[:, 1].min() and roi.y_max >= centers[:, 1].max()
+    assert roi.z_min <= centers[:, 2].min() and roi.z_max >= centers[:, 2].max()
+    # margin actually applied, not just coincidentally containing the points
+    assert roi.x_min == pytest.approx(centers[:, 0].min() - 0.5)
+    assert roi.x_max == pytest.approx(centers[:, 0].max() + 0.5)
+
+
+# ---------------------------------------------------------------------------
+# TEST 3 -- margin grows with predicted range (rotation uncertainty term)
+# ---------------------------------------------------------------------------
+
+def test_margin_increases_with_distance():
+    config = GuidedROIConfig(prior=_identity_prior(), min_margin_m=0.0, max_margin_m=100.0)
+    near = np.tile([0.0, 0.0, 1.0], (4, 1))
+    far = np.tile([0.0, 0.0, 5.0], (4, 1))
+
+    near_margin, near_dist = compute_guided_base_margin(near, config)
+    far_margin, far_dist = compute_guided_base_margin(far, config)
+
+    assert far_dist > near_dist
+    assert far_margin > near_margin
+
+
+# ---------------------------------------------------------------------------
+# TEST 4 -- margin clipped to [min_margin_m, max_margin_m]
+# ---------------------------------------------------------------------------
+
+def test_margin_respects_min_and_max_clip():
+    tiny_uncertainty_config = GuidedROIConfig(
+        prior=_identity_prior(),
+        translation_uncertainty_m=0.0, rotation_uncertainty_deg=0.0, safety_margin_m=0.0,
+        min_margin_m=0.4, max_margin_m=2.0,
+    )
+    centers = np.tile([0.0, 0.0, 1.0], (4, 1))
+    margin, _ = compute_guided_base_margin(centers, tiny_uncertainty_config)
+    assert margin == pytest.approx(0.4)
+
+    huge_uncertainty_config = GuidedROIConfig(
+        prior=_identity_prior(),
+        translation_uncertainty_m=100.0, rotation_uncertainty_deg=0.0, safety_margin_m=0.0,
+        min_margin_m=0.4, max_margin_m=2.0,
+    )
+    margin, _ = compute_guided_base_margin(centers, huge_uncertainty_config)
+    assert margin == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# TEST 5 -- margin schedule is ascending, unique, and capped at max_margin_m
+# ---------------------------------------------------------------------------
+
+def test_margin_schedule_ascending_unique_capped():
+    config = GuidedROIConfig(
+        prior=_identity_prior(), max_margin_m=1.2, expansion_factors=(1.0, 1.5, 2.0),
+    )
+    schedule = build_margin_schedule(0.6, config)
+    assert schedule == sorted(schedule)
+    assert len(schedule) == len(set(round(m, 6) for m in schedule))
+    assert all(m <= config.max_margin_m for m in schedule)
+    assert schedule[0] == pytest.approx(0.6)
+    assert schedule[-1] == pytest.approx(1.2)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-level orchestration tests (6-10): monkeypatch the LiDAR/camera
+# detector entry points that camera_lidar.pipeline calls, so these test
+# _detect_lidar_guided's/calibrate_single_scene's own control flow rather
+# than re-running real plane/circle detection.
+# ---------------------------------------------------------------------------
+
+def _fake_camera_result(detected_ids=frozenset(CORNER_ORDER)) -> CameraDetectionResult:
+    return CameraDetectionResult(
+        success=True,
+        circle_centers=np.array([[0.0, 0.0, 5.0]] * 4) + np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]]),
+        detected_ids=detected_ids,
+        markers_detected=len(detected_ids),
+    )
+
+
+def test_first_guided_roi_success_skips_full_cloud_auto(monkeypatch):
+    config = GuidedROIConfig(prior=_identity_prior())
+    scene = _make_scene(config)
+    camera_result = _fake_camera_result()
+
+    calls = []
+
+    def fake_auto(cloud, target, max_planes=6, rng_seed=42, cancel_check=None, on_plane_candidate=None, search_roi=None):
+        calls.append(search_roi)
+        return LidarDetectionResult(success=True, circle_centers=camera_result.circle_centers)
+
+    monkeypatch.setattr(pipeline, "detect_lidar_target_auto", fake_auto)
+
+    result, diagnostics = pipeline._detect_lidar_guided(scene, camera_result)
+
+    assert result.success
+    assert diagnostics.fallback_to_auto_used is False
+    # Every call so far must have been a restricted (non-None) search_roi --
+    # full-cloud AUTO (search_roi=None) was never invoked.
+    assert all(roi is not None for roi in calls)
+    assert len(calls) == 1
+
+
+def test_second_guided_roi_success_records_correct_margin(monkeypatch):
+    config = GuidedROIConfig(prior=_identity_prior())
+    scene = _make_scene(config)
+    camera_result = _fake_camera_result()
+
+    call_count = {"n": 0}
+
+    def fake_auto(cloud, target, max_planes=6, rng_seed=42, cancel_check=None, on_plane_candidate=None, search_roi=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return LidarDetectionResult(success=False, failure_reason=FailureReason.CIRCLES_NOT_FOUND)
+        return LidarDetectionResult(success=True, circle_centers=camera_result.circle_centers)
+
+    monkeypatch.setattr(pipeline, "detect_lidar_target_auto", fake_auto)
+
+    result, diagnostics = pipeline._detect_lidar_guided(scene, camera_result)
+
+    assert result.success
+    assert diagnostics.fallback_to_auto_used is False
+    assert len(diagnostics.attempted_margins_m) == 2
+    assert diagnostics.selected_margin_m == diagnostics.attempted_margins_m[1]
+
+
+def test_all_guided_attempts_fail_falls_back_to_full_auto_when_enabled(monkeypatch):
+    config = GuidedROIConfig(prior=_identity_prior(), fallback_to_auto=True)
+    scene = _make_scene(config)
+    camera_result = _fake_camera_result()
+
+    calls = []
+
+    def fake_auto(cloud, target, max_planes=6, rng_seed=42, cancel_check=None, on_plane_candidate=None, search_roi=None):
+        calls.append(search_roi)
+        if search_roi is None:
+            return LidarDetectionResult(success=True, circle_centers=camera_result.circle_centers)
+        return LidarDetectionResult(success=False, failure_reason=FailureReason.CIRCLES_NOT_FOUND)
+
+    monkeypatch.setattr(pipeline, "detect_lidar_target_auto", fake_auto)
+
+    result, diagnostics = pipeline._detect_lidar_guided(scene, camera_result)
+
+    assert result.success
+    assert diagnostics.fallback_to_auto_used is True
+    assert calls[-1] is None  # the final call was the unrestricted full-cloud AUTO
+
+
+def test_all_guided_attempts_fail_no_fallback_returns_last_guided_failure(monkeypatch):
+    config = GuidedROIConfig(prior=_identity_prior(), fallback_to_auto=False)
+    scene = _make_scene(config)
+    camera_result = _fake_camera_result()
+
+    calls = []
+
+    def fake_auto(cloud, target, max_planes=6, rng_seed=42, cancel_check=None, on_plane_candidate=None, search_roi=None):
+        calls.append(search_roi)
+        return LidarDetectionResult(success=False, failure_reason=FailureReason.CIRCLES_NOT_FOUND)
+
+    monkeypatch.setattr(pipeline, "detect_lidar_target_auto", fake_auto)
+
+    result, diagnostics = pipeline._detect_lidar_guided(scene, camera_result)
+
+    assert result.success is False
+    assert diagnostics.fallback_to_auto_used is False
+    assert all(roi is not None for roi in calls)  # full-cloud AUTO (None) never called
+
+
+# ---------------------------------------------------------------------------
+# TEST 10 -- Targetless prior never reaches match_partial_centers as
+# reference_transform.
+# ---------------------------------------------------------------------------
+
+def test_targetless_prior_never_becomes_reference_transform(monkeypatch):
+    config = GuidedROIConfig(prior=_identity_prior())
+    scene = _make_scene(config)
+    camera_result = _fake_camera_result()
+
+    monkeypatch.setattr(pipeline, "detect_camera_target", lambda *a, **k: camera_result)
+    monkeypatch.setattr(
+        pipeline, "detect_lidar_target_auto",
+        lambda *a, **k: LidarDetectionResult(success=True, circle_centers=camera_result.circle_centers),
+    )
+
+    captured_kwargs = {}
+    real_match = pipeline.match_partial_centers
+
+    def spy_match(camera_ids_to_centers, lidar_centers_cyclic, reference_transform=None):
+        captured_kwargs["reference_transform"] = reference_transform
+        return real_match(camera_ids_to_centers, lidar_centers_cyclic, reference_transform=reference_transform)
+
+    monkeypatch.setattr(pipeline, "match_partial_centers", spy_match)
+
+    result = calibrate_single_scene(scene, roi_mode="guided", reference_transform=None)
+
+    assert result.success
+    # The prior's rotation/translation must NEVER show up as reference_transform --
+    # only an explicit caller-supplied reference_transform may.
+    assert captured_kwargs["reference_transform"] is None
+
+
+# ---------------------------------------------------------------------------
+# TEST 11 -- PARTIAL camera scene: ROI prediction uses all 4 pose-inferred
+# centers, final correspondence uses only the 3 actually-detected ids.
+# ---------------------------------------------------------------------------
+
+def test_partial_camera_scene_uses_4_for_roi_3_for_correspondence(monkeypatch):
+    target = TargetConfig()
+    board_centers = target.circle_centers_board_frame()  # (4,3), CORNER_ORDER
+
+    R_true = rpy_to_rotation_matrix(5, -3, 90, degrees=True)
+    t_true = np.array([0.1, -0.2, 2.0])
+    camera_centers = (R_true @ board_centers.T).T + t_true  # all 4, pose-inferred
+
+    # Camera only actually detected 3 markers (missing bottom_left).
+    detected_ids = frozenset(CORNER_ORDER) - {"bottom_left"}
+    camera_result = CameraDetectionResult(
+        success=True, circle_centers=camera_centers, detected_ids=detected_ids, markers_detected=3,
+    )
+
+    # LiDAR sees all 4 physical circles regardless of which markers the
+    # camera identified -- use the board centers directly as "lidar frame".
+    lidar_centers = board_centers.copy()
+
+    config = GuidedROIConfig(prior=_identity_prior())
+    scene = _make_scene(config)
+
+    monkeypatch.setattr(pipeline, "detect_camera_target", lambda *a, **k: camera_result)
+
+    captured_predicted = {}
+    real_predict = pipeline.predict_circle_centers_lidar
+
+    def spy_predict(camera_circle_centers, T):
+        predicted = real_predict(camera_circle_centers, T)
+        captured_predicted["shape"] = predicted.shape
+        return predicted
+
+    monkeypatch.setattr(pipeline, "predict_circle_centers_lidar", spy_predict)
+    monkeypatch.setattr(
+        pipeline, "detect_lidar_target_auto",
+        lambda *a, **k: LidarDetectionResult(success=True, circle_centers=lidar_centers),
+    )
+
+    result = calibrate_single_scene(scene, roi_mode="guided", reference_transform=(R_true, t_true))
+
+    assert result.success
+    # ROI prediction used all 4 pose-inferred centers.
+    assert captured_predicted["shape"] == (4, 3)
+    # Final correspondence only used the 3 actually-detected ids.
+    assert len(result.common_ids) == 3
+    assert "bottom_left" not in result.common_ids
+    assert result.scene_type == SceneType.VALID_PARTIAL
+    assert result.camera_centers.shape == (3, 3)
+
+
+# ---------------------------------------------------------------------------
+# roi_mode validation / GUIDED_ROI_PRIOR_MISSING
+# ---------------------------------------------------------------------------
+
+def test_invalid_roi_mode_raises():
+    target = TargetConfig()
+    image = ImageFrame(timestamp=0.0, image=np.zeros((4, 4, 3), dtype=np.uint8))
+    cloud = PointCloudFrame(timestamp=0.0, points=np.zeros((10, 3)))
+    scene = CalibrationScene(image=image, cloud=cloud, intrinsics=None, target=target)
+    with pytest.raises(ValueError):
+        calibrate_single_scene(scene, roi_mode="not_a_real_mode")
+
+
+def test_guided_without_config_fails_with_specific_reason(monkeypatch):
+    scene = _make_scene(guided_config=None)
+    monkeypatch.setattr(pipeline, "detect_camera_target", lambda *a, **k: _fake_camera_result())
+
+    result = calibrate_single_scene(scene, roi_mode="guided")
+
+    assert result.success is False
+    assert result.failure_reason == FailureReason.GUIDED_ROI_PRIOR_MISSING

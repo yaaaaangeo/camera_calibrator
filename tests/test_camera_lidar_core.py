@@ -47,10 +47,13 @@ from camera_lidar.types import (
     CalibrationScene,
     CapturedScene,
     FailureReason,
+    GuidedROIConfig,
+    GuidedROIDiagnostics,
     ImageFrame,
     PointCloudFrame,
     ROIConfig,
     SceneType,
+    TargetlessPrior,
 )
 from geometry.transform import (
     invert_transform,
@@ -294,6 +297,51 @@ def test_lidar_detector_auto_finds_board_among_decoy_planes():
 
     expected = (R @ circle_centers_board.T).T + t
     correspondence = match_centers(expected, result.circle_centers)
+    assert correspondence.residual_rmse_m < 0.01
+
+
+def test_lidar_detector_auto_search_roi_crops_points():
+    """search_roi=None must remain identical to the original whole-cloud
+    AUTO search (covered by test_lidar_detector_auto_finds_board_among_decoy_planes
+    above, which never passes search_roi); this test covers the new
+    search_roi parameter itself (camera_lidar.guided_roi/GUIDED AUTO uses
+    it) -- a tight box around the board should crop out a decoy plane
+    entirely, and roi_point_count should reflect the actually-cropped
+    point count, not the whole cloud."""
+    rng = np.random.default_rng(3)
+    target = TargetConfig()
+    R = rpy_to_rotation_matrix(4, -6, 20, degrees=True)
+    t = np.array([2.0, 0.2, 0.1])
+    board_lidar, circle_centers_board = _synthetic_board_points_lidar_frame(target, R, t, rng, n_plate=3000)
+
+    n_floor = 6000
+    floor_pts = np.column_stack([
+        rng.uniform(-5, 5, n_floor), rng.uniform(-5, 5, n_floor),
+        np.full(n_floor, -1.0) + rng.normal(0, 0.005, n_floor),
+    ])
+
+    cloud = PointCloudFrame(
+        timestamp=0.0,
+        points=np.concatenate([floor_pts, board_lidar], axis=0),
+        frame_id="lidar",
+    )
+
+    margin = 0.5
+    roi = ROIConfig(
+        x_min=float(board_lidar[:, 0].min() - margin), x_max=float(board_lidar[:, 0].max() + margin),
+        y_min=float(board_lidar[:, 1].min() - margin), y_max=float(board_lidar[:, 1].max() + margin),
+        z_min=float(board_lidar[:, 2].min() - margin), z_max=float(board_lidar[:, 2].max() + margin),
+    )
+
+    result_no_roi = detect_lidar_target_auto(cloud, target, max_planes=6)
+    result_with_roi = detect_lidar_target_auto(cloud, target, max_planes=6, search_roi=roi)
+
+    assert result_with_roi.success, result_with_roi.failure_reason
+    assert result_with_roi.roi_point_count < result_no_roi.roi_point_count
+    assert result_with_roi.roi_point_count <= board_lidar.shape[0] + 10  # board only (+slack)
+
+    expected = (R @ circle_centers_board.T).T + t
+    correspondence = match_centers(expected, result_with_roi.circle_centers)
     assert correspondence.residual_rmse_m < 0.01
 
 
@@ -542,6 +590,82 @@ def test_multi_scene_fails_with_fewer_than_two_valid_scenes(monkeypatch):
     result = calibrate_multi_scene([only_one])
     assert not result.success
     assert result.failure_reason == FailureReason.NOT_ENOUGH_VALID_SCENES
+
+
+def test_multi_scene_preserves_guided_roi_prior_across_rerun(monkeypatch):
+    """Regression for the GUIDED ROI + Multi-Scene requirement (spec §36):
+    calibrate_multi_scene re-runs calibrate_single_scene per included
+    CapturedScene, and scene.guided_roi (the Targetless prior/config) must
+    still be there on that re-run -- it lives on CalibrationScene itself
+    (not just transient UI/worker state), so it cannot get silently
+    dropped between a Single-Scene capture and the Multi-Scene solve.
+
+    Unlike the other multi_scene tests above (which replace
+    calibrate_single_scene entirely), this test exercises the REAL
+    calibrate_single_scene / _detect_lidar_guided control flow, patching
+    only the camera/LiDAR detector entry points camera_lidar.pipeline
+    calls -- so a real dropped-guided_roi bug (e.g. multi_scene rebuilding
+    scenes without it) would actually surface as a GUIDED_ROI_PRIOR_MISSING
+    failure here."""
+    import camera_lidar.pipeline as pipeline_module
+
+    target = TargetConfig()
+    board_centers = target.circle_centers_board_frame()
+    R_true = rpy_to_rotation_matrix(6, -4, 35, degrees=True)
+    t_true = np.array([0.05, -0.1, 0.2])
+
+    scene_data: dict = {}
+
+    def make_captured(scene_id: str, offset: np.ndarray) -> CapturedScene:
+        lidar_centers = board_centers + offset
+        camera_centers = (R_true @ lidar_centers.T).T + t_true
+        image_array = np.zeros((2, 2, 3), dtype=np.uint8)
+        image = ImageFrame(timestamp=0.0, image=image_array)
+        cloud = PointCloudFrame(timestamp=0.0, points=np.zeros((10, 3)))
+        guided_config = GuidedROIConfig(
+            prior=TargetlessPrior(T_lidar_from_camera=np.eye(4), source_path="calib.json", source_key="T_lidar_camera")
+        )
+        scene = CalibrationScene(image=image, cloud=cloud, intrinsics=None, target=target, guided_roi=guided_config)
+        scene_data[id(image_array)] = (camera_centers, lidar_centers)
+        return CapturedScene(scene_id=scene_id, scene=scene, included=True, roi_mode="guided")
+
+    captured = [
+        make_captured("scene_01", np.array([2.0, 0.1, 0.0])),
+        make_captured("scene_02", np.array([2.5, -0.2, 0.3])),
+    ]
+
+    guided_calls = []
+
+    def fake_detect_camera_target(image, intrinsics, target_config):
+        camera_centers, _ = scene_data[id(image)]
+        return CameraDetectionResult(
+            success=True, circle_centers=camera_centers, detected_ids=frozenset(CORNER_ORDER), markers_detected=4,
+        )
+
+    def fake_detect_lidar_guided(scene, camera_result, cancel_check=None):
+        # The exact assertion this test exists for: guided_roi must still
+        # be set on the scene when multi_scene re-detects it.
+        assert scene.guided_roi is not None, "guided_roi prior was lost during multi-scene re-detection"
+        guided_calls.append(scene.guided_roi.prior.source_path)
+        _, lidar_centers = scene_data[id(scene.image.image)]
+        result = LidarDetectionResult(success=True, circle_centers=lidar_centers)
+        diagnostics = GuidedROIDiagnostics(prior_source_path=scene.guided_roi.prior.source_path)
+        return result, diagnostics
+
+    monkeypatch.setattr(pipeline_module, "detect_camera_target", fake_detect_camera_target)
+    monkeypatch.setattr(pipeline_module, "_detect_lidar_guided", fake_detect_lidar_guided)
+
+    result = calibrate_multi_scene(captured, policy="strict")
+
+    assert result.success, result.failure_reason
+    assert result.scene_count == 2
+    assert np.allclose(result.R_camera_from_lidar, R_true, atol=1e-6)
+    assert np.allclose(result.t_camera_from_lidar, t_true, atol=1e-6)
+    # _detect_lidar_guided actually ran (with the prior intact) for both scenes.
+    assert guided_calls == ["calib.json", "calib.json"]
+    for c in captured:
+        assert c.detection is not None and c.detection.success
+        assert c.detection.guided_roi_diagnostics is not None
 
 
 # ---------------------------------------------------------------------------

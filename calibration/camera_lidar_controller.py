@@ -26,6 +26,10 @@ class CameraLidarController:
         roi_mode: str = "manual",
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> CameraLidarCalibrationResult:
+        """roi_mode: "guided" | "auto" | "manual" -- see
+        camera_lidar.pipeline.calibrate_single_scene. GUIDED requires
+        scene.guided_roi to be set (a Targetless prior loaded via
+        camera_lidar.targetless_prior)."""
         return calibrate_single_scene(scene, roi_mode=roi_mode, cancel_check=cancel_check)
 
     def extract_scene_candidates(

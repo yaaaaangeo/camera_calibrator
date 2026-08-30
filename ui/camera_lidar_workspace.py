@@ -24,6 +24,7 @@ import numpy as np
 from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -48,14 +50,17 @@ from camera_lidar.camera_detector import COMMON_ARUCO_DICTIONARIES, detect_camer
 from camera_lidar.gates import compute_target_pose, evaluate_duplicate_gate, evaluate_quality_gate
 from camera_lidar.pipeline import calibrate_single_scene
 from camera_lidar.target_config import CORNER_ORDER, TargetConfig, load_target_config, save_target_config
+from camera_lidar.targetless_prior import load_direct_visual_calib
 from camera_lidar.types import (
     CalibrationScene,
     CapturedScene,
     FailureReason,
+    GuidedROIConfig,
     ImageFrame,
     PointCloudFrame,
     ROIConfig,
     SceneType,
+    TargetlessPrior,
 )
 from geometry.transform import rotation_matrix_to_quaternion, rotation_matrix_to_rpy
 from input.lidar import read_pcd, read_ply_ascii
@@ -120,6 +125,16 @@ class CameraLidarWorkspace(QWidget):
 
         self.captured_scenes: list[CapturedScene] = []
         self._scene_counter = 0
+
+        # Targetless (direct_visual_lidar_calibration) prior for GUIDED AUTO
+        # ROI (§20-21) -- see camera_lidar/targetless_prior.py.
+        self.targetless_prior: TargetlessPrior | None = None
+        # The exact scene/roi_mode the currently-running (or just-finished)
+        # capture worker used -- NOT re-derived from current UI state when
+        # building the CapturedScene, since the user may change ROI/prior
+        # settings while a capture is in flight (§29).
+        self._active_capture_scene: CalibrationScene | None = None
+        self._active_capture_roi_mode: str | None = None
 
         self._thread = None
         self._worker = None
@@ -361,11 +376,15 @@ class CameraLidarWorkspace(QWidget):
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("ROI Mode"))
         self.roi_mode_combo = QComboBox()
+        self.roi_mode_combo.addItem("GUIDED AUTO (Targetless prior → local LiDAR search)", "guided")
         self.roi_mode_combo.addItem("AUTO (LiDAR-only multi-plane search, no box needed)", "auto")
         self.roi_mode_combo.addItem("MANUAL (box below)", "manual")
+        self.roi_mode_combo.setCurrentIndex(1)  # AUTO stays the default for backward compatibility
         self.roi_mode_combo.currentIndexChanged.connect(self._on_roi_mode_changed)
         mode_row.addWidget(self.roi_mode_combo, stretch=1)
         outer.addLayout(mode_row)
+
+        outer.addWidget(self._build_guided_roi_widget())
 
         self.manual_roi_widget = QWidget()
         form = QFormLayout(self.manual_roi_widget)
@@ -395,11 +414,85 @@ class CameraLidarWorkspace(QWidget):
         reset_button.clicked.connect(lambda: self._apply_roi(ROIConfig()))
         form.addRow(reset_button)
         outer.addWidget(self.manual_roi_widget)
-        self.manual_roi_widget.setVisible(False)  # AUTO is the default mode
+        self._on_roi_mode_changed()  # sync guided/manual widget visibility to the AUTO default above
         return group
 
+    def _build_guided_roi_widget(self) -> QWidget:
+        self.guided_roi_widget = QWidget()
+        outer = QVBoxLayout(self.guided_roi_widget)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(QLabel("Targetless Prior (direct_visual_lidar_calibration)"))
+
+        load_row = QHBoxLayout()
+        load_prior_button = QPushButton("Load direct_visual calib.json...")
+        load_prior_button.clicked.connect(self._on_load_targetless_prior)
+        load_row.addWidget(load_prior_button)
+        outer.addLayout(load_row)
+
+        form = QFormLayout()
+
+        self.prior_status_label = QLabel("NOT LOADED")
+        set_tone(self.prior_status_label, "bad")
+        form.addRow("Status", self.prior_status_label)
+
+        self.prior_source_combo = QComboBox()
+        self.prior_source_combo.addItem("AUTO SELECT", "auto")
+        self.prior_source_combo.addItem("FINAL (T_lidar_camera)", "final")
+        self.prior_source_combo.addItem("AUTO INITIAL (init_T_lidar_camera_auto)", "auto_initial")
+        self.prior_source_combo.addItem("MANUAL INITIAL (init_T_lidar_camera)", "manual_initial")
+        form.addRow("Source", self.prior_source_combo)
+
+        self.prior_used_key_label = QLabel("-")
+        form.addRow("Used Key", self.prior_used_key_label)
+        self.prior_file_label = QLabel("-")
+        self.prior_file_label.setWordWrap(True)
+        form.addRow("File", self.prior_file_label)
+
+        def make_uncertainty_spin(value: float, suffix: str) -> QDoubleSpinBox:
+            spin = QDoubleSpinBox()
+            spin.setRange(0.0, 1000.0)
+            spin.setDecimals(3)
+            spin.setSuffix(suffix)
+            spin.setValue(value)
+            return spin
+
+        default = GuidedROIConfig(prior=TargetlessPrior(T_lidar_from_camera=np.eye(4)))
+        self.guided_translation_uncertainty_spin = make_uncertainty_spin(default.translation_uncertainty_m, " m")
+        self.guided_rotation_uncertainty_spin = make_uncertainty_spin(default.rotation_uncertainty_deg, " deg")
+        self.guided_safety_margin_spin = make_uncertainty_spin(default.safety_margin_m, " m")
+        self.guided_min_margin_spin = make_uncertainty_spin(default.min_margin_m, " m")
+        self.guided_max_margin_spin = make_uncertainty_spin(default.max_margin_m, " m")
+        form.addRow("Translation uncertainty", self.guided_translation_uncertainty_spin)
+        form.addRow("Rotation uncertainty", self.guided_rotation_uncertainty_spin)
+        form.addRow("Safety margin", self.guided_safety_margin_spin)
+        form.addRow("Min ROI margin", self.guided_min_margin_spin)
+        form.addRow("Max ROI margin", self.guided_max_margin_spin)
+
+        self.guided_local_planes_spin = QSpinBox()
+        self.guided_local_planes_spin.setRange(1, 50)
+        self.guided_local_planes_spin.setValue(default.max_local_planes)
+        form.addRow("Local plane candidates", self.guided_local_planes_spin)
+
+        self.guided_fallback_checkbox = QCheckBox("Fallback to LiDAR-only AUTO")
+        self.guided_fallback_checkbox.setChecked(default.fallback_to_auto)
+        form.addRow(self.guided_fallback_checkbox)
+
+        outer.addLayout(form)
+
+        self.prior_license_note_label = QLabel(
+            "Note: direct_visual automatic initial estimation may originate from its "
+            "SuperGlue-based workflow. Review the upstream model/license before commercial use."
+        )
+        self.prior_license_note_label.setWordWrap(True)
+        self.prior_license_note_label.setVisible(False)
+        outer.addWidget(self.prior_license_note_label)
+
+        return self.guided_roi_widget
+
     def _on_roi_mode_changed(self) -> None:
-        self.manual_roi_widget.setVisible(self.roi_mode_combo.currentData() == "manual")
+        mode = self._current_roi_mode()
+        self.guided_roi_widget.setVisible(mode == "guided")
+        self.manual_roi_widget.setVisible(mode == "manual")
 
     def _current_roi_mode(self) -> str:
         return self.roi_mode_combo.currentData()
@@ -417,6 +510,54 @@ class CameraLidarWorkspace(QWidget):
             x_min=self.roi_x_min_spin.value(), x_max=self.roi_x_max_spin.value(),
             y_min=self.roi_y_min_spin.value(), y_max=self.roi_y_max_spin.value(),
             z_min=self.roi_z_min_spin.value(), z_max=self.roi_z_max_spin.value(),
+        )
+
+    def _current_prior_source(self) -> str:
+        return self.prior_source_combo.currentData()
+
+    def _on_load_targetless_prior(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "direct_visual_lidar_calibration calib.json 선택", "", "JSON (*.json)"
+        )
+        if not path:
+            return
+        try:
+            prior = load_direct_visual_calib(path, source=self._current_prior_source())
+        except Exception as e:  # noqa: BLE001
+            # Loading failed -- don't silently keep whatever prior (if any)
+            # was loaded before; make the NOT LOADED state explicit.
+            self.targetless_prior = None
+            self.prior_status_label.setText("NOT LOADED")
+            set_tone(self.prior_status_label, "bad")
+            self.prior_used_key_label.setText("-")
+            self.prior_file_label.setText("-")
+            self.prior_license_note_label.setVisible(False)
+            QMessageBox.critical(self, "Targetless Prior 불러오기 실패", str(e))
+            return
+
+        self.targetless_prior = prior
+        self.prior_status_label.setText("READY")
+        set_tone(self.prior_status_label, "good")
+        self.prior_used_key_label.setText(prior.source_key)
+        self.prior_file_label.setText(prior.source_path)
+        self.prior_license_note_label.setVisible(prior.source_key == "init_T_lidar_camera_auto")
+
+        guided_index = self.roi_mode_combo.findData("guided")
+        if guided_index >= 0:
+            self.roi_mode_combo.setCurrentIndex(guided_index)
+
+    def _current_guided_roi_config(self) -> GuidedROIConfig | None:
+        if self.targetless_prior is None:
+            return None
+        return GuidedROIConfig(
+            prior=self.targetless_prior,
+            translation_uncertainty_m=self.guided_translation_uncertainty_spin.value(),
+            rotation_uncertainty_deg=self.guided_rotation_uncertainty_spin.value(),
+            safety_margin_m=self.guided_safety_margin_spin.value(),
+            min_margin_m=self.guided_min_margin_spin.value(),
+            max_margin_m=self.guided_max_margin_spin.value(),
+            max_local_planes=self.guided_local_planes_spin.value(),
+            fallback_to_auto=self.guided_fallback_checkbox.isChecked(),
         )
 
     # ------------------------------------------------------------------
@@ -621,6 +762,9 @@ class CameraLidarWorkspace(QWidget):
         if not candidates:
             return
 
+        if not self._confirm_guided_prior_ready():
+            return
+
         # Sensor-pair-changed confirmation once for the whole batch -- all
         # selected candidates share one extraction run's camera/lidar topic
         # pair, so asking per-candidate would pop a dialog for every scene.
@@ -693,9 +837,13 @@ class CameraLidarWorkspace(QWidget):
         )
         scene = CalibrationScene(
             image=image_frame, cloud=cloud_frame, intrinsics=self.intrinsics, target=target, roi=roi,
+            guided_roi=self._current_guided_roi_config(),
         )
 
-        worker = CameraLidarCalibrationWorker(scene, roi_mode=self._current_roi_mode())
+        roi_mode = self._current_roi_mode()
+        self._active_capture_scene = scene
+        self._active_capture_roi_mode = roi_mode
+        worker = CameraLidarCalibrationWorker(scene, roi_mode=roi_mode)
         thread = run_worker_in_thread(worker, self)
         worker.progress.connect(self._on_progress)
         worker.result_ready.connect(self._on_capture_result_ready)
@@ -780,6 +928,9 @@ class CameraLidarWorkspace(QWidget):
         if self.intrinsics is None or self.image is None or self.cloud_points is None:
             return
 
+        if not self._confirm_guided_prior_ready():
+            return
+
         if not self._confirm_sensor_pair_if_changed():
             return
 
@@ -796,9 +947,13 @@ class CameraLidarWorkspace(QWidget):
         )
         scene = CalibrationScene(
             image=image_frame, cloud=cloud_frame, intrinsics=self.intrinsics, target=target, roi=roi,
+            guided_roi=self._current_guided_roi_config(),
         )
 
-        worker = CameraLidarCalibrationWorker(scene, roi_mode=self._current_roi_mode())
+        roi_mode = self._current_roi_mode()
+        self._active_capture_scene = scene
+        self._active_capture_roi_mode = roi_mode
+        worker = CameraLidarCalibrationWorker(scene, roi_mode=roi_mode)
         thread = run_worker_in_thread(worker, self)
         worker.progress.connect(self._on_progress)
         worker.result_ready.connect(self._on_capture_result_ready)
@@ -809,6 +964,18 @@ class CameraLidarWorkspace(QWidget):
         thread.finished.connect(lambda: setattr(self, "_thread", None))
         thread.finished.connect(lambda: self._set_capture_busy(False))
         thread.start()
+
+    def _confirm_guided_prior_ready(self) -> bool:
+        """§27: GUIDED AUTO with no Targetless prior loaded is a
+        configuration error, not a "try and fall back" situation -- refuse
+        to start rather than silently falling back to a different mode."""
+        if self._current_roi_mode() == "guided" and self.targetless_prior is None:
+            QMessageBox.warning(
+                self, "Targetless Prior 필요",
+                "GUIDED AUTO를 사용하려면 direct_visual calib.json을 먼저 불러오세요.",
+            )
+            return False
+        return True
 
     def _confirm_sensor_pair_if_changed(self) -> bool:
         """Requirement: don't silently mix scenes captured from different
@@ -883,24 +1050,18 @@ class CameraLidarWorkspace(QWidget):
 
         self._scene_counter += 1
         scene_id = f"scene_{self._scene_counter:02d}"
-        target = self._current_target_config()
-        roi = self._current_roi()
-        image_frame = ImageFrame(timestamp=self.image_timestamp, image=self.image, frame_id="camera")
-        cloud_frame = PointCloudFrame(
-            timestamp=self.cloud_timestamp,
-            points=self.cloud_points[:, :3],
-            frame_id="lidar",
-            intensity=self.cloud_points[:, 3] if self.cloud_points.shape[1] > 3 else None,
-        )
-        scene = CalibrationScene(
-            image=image_frame, cloud=cloud_frame, intrinsics=self.intrinsics, target=target, roi=roi,
-        )
+        # Use the EXACT scene/roi_mode the worker just ran with -- not a
+        # fresh CalibrationScene rebuilt from current UI state, which may
+        # have changed (ROI settings, a newly-loaded Targetless prior, ...)
+        # while the capture was in flight (§29).
+        scene = self._active_capture_scene
+        roi_mode = self._active_capture_roi_mode
         captured = CapturedScene(
             scene_id=scene_id, scene=scene,
             included=included,  # Quality/Duplicate gate failures (or detection failure) default to excluded,
                                  # but stay visible in the Scene Manager -- "Include" lets the user force it.
             camera_topic=self.camera_topic, lidar_topic=self.lidar_topic,
-            roi_mode=self._current_roi_mode(), detection=result,
+            roi_mode=roi_mode, detection=result,
         )
         self.captured_scenes.append(captured)
         self._refresh_scene_table()
@@ -942,6 +1103,37 @@ class CameraLidarWorkspace(QWidget):
                 lines.append(f"  Circle fit errors: {errs}")
         else:
             lines.append("  (not run)")
+
+        guided = result.guided_roi_diagnostics
+        if guided is not None:
+            lines.append("")
+            lines.append("TARGETLESS PRIOR")
+            lines.append(f"  Source: {guided.prior_source_key or '-'}")
+            lines.append(f"  File: {guided.prior_source_path or '-'}")
+
+            lines.append("")
+            lines.append("GUIDED ROI")
+            if guided.predicted_board_center_lidar is not None:
+                cx, cy, cz = guided.predicted_board_center_lidar
+                lines.append(f"  Predicted board center: x={cx:.3f}  y={cy:.3f}  z={cz:.3f}")
+            if guided.predicted_board_range_m is not None:
+                lines.append(f"  Predicted range: {guided.predicted_board_range_m:.2f} m")
+            if guided.base_margin_m is not None:
+                lines.append(f"  Base margin: {guided.base_margin_m:.2f} m")
+            if guided.attempted_margins_m:
+                margins_text = ", ".join(f"{m:.2f} m" for m in guided.attempted_margins_m)
+                lines.append(f"  Attempts: {margins_text}")
+            if guided.selected_margin_m is not None:
+                lines.append(f"  Selected margin: {guided.selected_margin_m:.2f} m")
+            if guided.selected_roi is not None:
+                roi = guided.selected_roi
+                lines.append(f"  Selected ROI: X=[{roi.x_min:.2f}, {roi.x_max:.2f}]  "
+                             f"Y=[{roi.y_min:.2f}, {roi.y_max:.2f}]  Z=[{roi.z_min:.2f}, {roi.z_max:.2f}]")
+            if guided.fallback_to_auto_used:
+                lines.append("  GUIDED ROI: FAILED")
+                lines.append("  Fallback: LiDAR-only AUTO USED")
+            else:
+                lines.append("  Fallback to LiDAR-only AUTO: NO")
 
         if self.camera_topic and self.lidar_topic:
             sync_ms = abs(self.image_timestamp - self.cloud_timestamp) * 1000.0

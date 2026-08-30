@@ -68,12 +68,75 @@ class ROIConfig:
 
 
 @dataclass
+class TargetlessPrior:
+    """A coarse Camera->LiDAR extrinsic bootstrapped from an external
+    `direct_visual_lidar_calibration` run, used ONLY to narrow the LiDAR
+    ROI search region for GUIDED AUTO (camera_lidar.guided_roi) -- never
+    passed to the final FAST-Calib correspondence/solver. See
+    camera_lidar/targetless_prior.py for how this gets loaded/validated.
+
+    Convention (matches direct_visual_lidar_calibration's own
+    `results.T_lidar_camera` convention, NOT inverted here):
+        T_lidar_from_camera: shape (4, 4), direction Camera -> LiDAR.
+        p_lidar = T_lidar_from_camera @ p_camera (homogeneous)."""
+    T_lidar_from_camera: np.ndarray
+    source_path: str = ""
+    source_key: str = ""
+
+
+@dataclass
+class GuidedROIConfig:
+    """Configuration for GUIDED AUTO ROI mode (camera_lidar.guided_roi):
+    a Targetless prior is used to predict where the calibration board
+    should be in the LiDAR frame, then a spatially-constrained multi-plane
+    search is run there before falling back to full-cloud AUTO."""
+    prior: TargetlessPrior
+
+    translation_uncertainty_m: float = 0.20
+    rotation_uncertainty_deg: float = 5.0
+    safety_margin_m: float = 0.15
+
+    min_margin_m: float = 0.40
+    max_margin_m: float = 2.00
+
+    expansion_factors: tuple[float, ...] = (1.0, 1.5, 2.0)
+
+    max_local_planes: int = 6
+
+    fallback_to_auto: bool = True
+
+
+@dataclass
+class GuidedROIDiagnostics:
+    """Diagnostic trail of a GUIDED AUTO ROI search, attached to
+    CameraLidarCalibrationResult.guided_roi_diagnostics so the UI can show
+    *why* GUIDED ROI picked the region/margin it did (or why it fell back
+    to full-cloud AUTO), regardless of whether detection ultimately
+    succeeded or failed."""
+    prior_source_path: str = ""
+    prior_source_key: str = ""
+
+    predicted_circle_centers_lidar: Optional[np.ndarray] = None
+    predicted_board_center_lidar: Optional[np.ndarray] = None
+    predicted_board_range_m: Optional[float] = None
+
+    base_margin_m: Optional[float] = None
+    attempted_margins_m: list = field(default_factory=list)
+
+    selected_margin_m: Optional[float] = None
+    selected_roi: Optional["ROIConfig"] = None
+
+    fallback_to_auto_used: bool = False
+
+
+@dataclass
 class CalibrationScene:
     image: ImageFrame
     cloud: PointCloudFrame
     intrinsics: StandardCalibration
     target: TargetConfig
     roi: ROIConfig = field(default_factory=ROIConfig)
+    guided_roi: Optional[GuidedROIConfig] = None
     metadata: dict = field(default_factory=dict)
 
 
@@ -87,6 +150,8 @@ class FailureReason(Enum):
     GEOMETRY_MISMATCH = "geometry_mismatch"
     NOT_ENOUGH_VALID_SCENES = "not_enough_valid_scenes"
     INSUFFICIENT_COMMON_FEATURES = "insufficient_common_features"
+    GUIDED_ROI_PRIOR_MISSING = "guided_roi_prior_missing"
+    GUIDED_ROI_PRIOR_INVALID = "guided_roi_prior_invalid"
 
 
 _FAILURE_MESSAGES: dict[FailureReason, str] = {
@@ -132,6 +197,14 @@ _FAILURE_MESSAGES: dict[FailureReason, str] = {
         "bottom_right). A feature only counts if BOTH sensors independently "
         "detected it -- check the per-sensor diagnostics to see which corner(s) "
         "each side is missing."
+    ),
+    FailureReason.GUIDED_ROI_PRIOR_MISSING: (
+        "GUIDED ROI prior is missing. Load a valid direct_visual_lidar_calibration "
+        "calib.json or switch ROI mode."
+    ),
+    FailureReason.GUIDED_ROI_PRIOR_INVALID: (
+        "GUIDED ROI prior is invalid. Check transform direction, quaternion, "
+        "and calib.json contents."
     ),
 }
 
@@ -189,6 +262,12 @@ class CameraLidarCalibrationResult:
     # docstring. The Quality Gate treats this as an automatic fail.
     correspondence_ambiguous: bool = False
 
+    # GUIDED AUTO ROI diagnostics only (None for AUTO/MANUAL) -- see
+    # camera_lidar/guided_roi.py and camera_lidar/pipeline._detect_lidar_guided.
+    # This is diagnostic information ONLY: the Targetless prior behind it is
+    # never used as the final extrinsic or as a solver constraint.
+    guided_roi_diagnostics: Optional["GuidedROIDiagnostics"] = None
+
     @property
     def error_message(self) -> Optional[str]:
         if self.failure_reason is None:
@@ -207,7 +286,7 @@ class CapturedScene:
     included: bool = True
     camera_topic: str = ""
     lidar_topic: str = ""
-    roi_mode: str = "auto"  # "auto" | "manual"
+    roi_mode: str = "auto"  # "guided" | "auto" | "manual"
     detection: Optional[CameraLidarCalibrationResult] = None  # single-scene provisional result, for the table
 
 

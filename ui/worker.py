@@ -784,6 +784,12 @@ class CameraLidarCalibrationWorker(QObject):
     error = Signal(str)
     finished = Signal()
 
+    _PROGRESS_BY_ROI_MODE = {
+        "guided": "Camera target → Guided ROI → local LiDAR planes → correspondence → R,t",
+        "auto": "Camera target → LiDAR full-cloud AUTO → correspondence → R,t",
+        "manual": "Camera target → Manual ROI → correspondence → R,t",
+    }
+
     def __init__(self, scene, roi_mode: str = "manual"):
         super().__init__()
         self.scene = scene
@@ -796,7 +802,8 @@ class CameraLidarCalibrationWorker(QObject):
     def run(self) -> None:
         start = time.monotonic()
         try:
-            self.progress.emit("FAST-Calib 계산 중... (marker/plane 검출 -> correspondence -> R,t 계산)")
+            stage_text = self._PROGRESS_BY_ROI_MODE.get(self.roi_mode, self._PROGRESS_BY_ROI_MODE["manual"])
+            self.progress.emit(f"FAST-Calib 계산 중... ({stage_text})")
             result = CameraLidarController().calibrate(
                 self.scene,
                 roi_mode=self.roi_mode,

@@ -796,13 +796,16 @@ def detect_lidar_target_auto(
     rng_seed: int = 42,
     cancel_check: Optional[Callable[[], bool]] = None,
     on_plane_candidate: Optional[Callable[[PlaneCandidateInfo], None]] = None,
+    search_roi: Optional[ROIConfig] = None,
 ) -> LidarDetectionResult:
     """AUTO ROI: LiDAR-only geometry search, no manual box required.
 
     Iteratively RANSAC-fits up to `max_planes` planes over the *whole*
-    cloud, removing each plane's inliers before searching for the next
-    (peeling off floor/wall/vehicle-body planes so the board's own plane
-    surfaces as its own candidate). Every candidate is run through the same
+    cloud (or, if `search_roi` is given, the subset of the cloud inside
+    that box -- see camera_lidar.guided_roi/GUIDED AUTO mode), removing
+    each plane's inliers before searching for the next (peeling off
+    floor/wall/vehicle-body planes so the board's own plane surfaces as its
+    own candidate). Every candidate is run through the same
     boundary->cluster->circle-fit->geometry-check pipeline MANUAL ROI uses;
     "a RANSAC plane was found" is never treated as "the target was found"
     on its own. Among candidates whose circles do match the target
@@ -815,10 +818,15 @@ def detect_lidar_target_auto(
     export each candidate's inlier points for external visualization) beyond
     what the returned LidarDetectionResult keeps for only the winner. Has no
     effect on detection itself.
+
+    search_roi: optional ROIConfig box to pre-filter the cloud before the
+    multi-plane search -- when None (the default), behavior is identical to
+    the original whole-cloud AUTO search.
     """
     try:
         rng = np.random.default_rng(rng_seed)
-        points = _finite_points(np.asarray(cloud.points[:, :3], dtype=np.float64))
+        all_points = _finite_points(np.asarray(cloud.points[:, :3], dtype=np.float64))
+        points = all_points if search_roi is None else _apply_roi(all_points, search_roi)
 
         min_roi_points = _adaptive_min_point_count(points, target, _MIN_ROI_POINTS_FLOOR, _MIN_ROI_POINTS)
         if points.shape[0] < min_roi_points:
