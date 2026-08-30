@@ -125,7 +125,7 @@ def test_cli_full_pipeline_succeeds(synthetic_distorted_dataset_dir, tmp_path):
 
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert summary["success"] is True
-    assert summary["chosen_model"] in ("pinhole", "extended_pinhole", "fisheye")
+    assert summary["chosen_model"] in ("pinhole", "brown_conrady", "extended_pinhole", "fisheye")
     assert summary["num_images_total"] == 16
     assert summary["num_images_detected"] >= 10
 
