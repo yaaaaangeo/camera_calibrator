@@ -10,7 +10,7 @@ worker나 export 함수를 호출해서 처리한다.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QPushButton,
+    QScrollArea,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -208,6 +209,21 @@ def _format_ro_comparison_summary(comparison: StandardVsObjectReleasingCompariso
     return "\n".join(lines)
 
 
+class _PageScrollTableWidget(QTableWidget):
+    """마우스 휠을 항상 상위 페이지 스크롤로 넘기는 QTableWidget.
+
+    Model Comparison 표는 모든 행을 펼쳐서(_fit_table_to_rows) 표 자체는
+    스크롤할 필요가 없게 만들었지만, 프레임/스타일 여백 오차로 내부에
+    아주 약간의 스크롤 범위가 남으면 표 위에서 휠을 몇 번 더 굴려야
+    페이지가 움직이는 것처럼 느껴져 불편했다. 휠 이벤트를 항상 무시해서
+    표가 스스로 스크롤하지 않고 곧바로 부모 QScrollArea(페이지 전체)로
+    넘어가게 한다.
+    """
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
 class ResultView(QWidget):
     export_opencv_requested = Signal(object)  # CameraModelType
     cross_dataset_requested = Signal()
@@ -217,8 +233,18 @@ class ResultView(QWidget):
         self._calibration_results: dict[CameraModelType, CalibrationResult] = {}
         self._object_releasing_result: CalibrationResult | None = None
 
+        # DatasetView와 동일하게 탭 전체를 하나의 세로 scroll area로 감싼다.
+        # 아래 비교표가 자체적으로 세로 스크롤되면 wheel focus를 표 안으로
+        # 옮겨야 해서 불편하므로, 표는 모든 행을 펼치고 페이지 전체를 스크롤한다.
         self.model_comparison_widget = QWidget()
-        model_layout = QVBoxLayout(self.model_comparison_widget)
+        model_page_layout = QVBoxLayout(self.model_comparison_widget)
+        self.model_comparison_scroll_area = QScrollArea()
+        self.model_comparison_scroll_area.setWidgetResizable(True)
+        self.model_comparison_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.model_comparison_content = QWidget()
+        model_layout = QVBoxLayout(self.model_comparison_content)
+        self.model_comparison_scroll_area.setWidget(self.model_comparison_content)
+        model_page_layout.addWidget(self.model_comparison_scroll_area)
 
         # --- 비교/추천 테이블 ---
         compare_group = QGroupBox("Model Comparison & Validation & Score")
@@ -228,34 +254,50 @@ class ResultView(QWidget):
             "Radial Edge", "AIC", "BIC", "Stability", "Observability",
             "Undistortion", "Model Score", "Selection Conf.", "Recommend",
         ]
-        self.table = QTableWidget(len(self._row_labels), len(_MODEL_ORDER))
+        self.table = _PageScrollTableWidget(len(self._row_labels), len(_MODEL_ORDER))
         self.table.setHorizontalHeaderLabels([_MODEL_LABELS[m] for m in _MODEL_ORDER])
         self.table.setVerticalHeaderLabels(self._row_labels)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         compare_layout.addWidget(self.table)
         self.recommendation_label = QLabel("아직 계산되지 않았습니다.")
         self.recommendation_label.setWordWrap(True)
         compare_layout.addWidget(self.recommendation_label)
         model_layout.addWidget(compare_group)
-        advanced_group = QGroupBox("Advanced Calibration")
-        advanced_layout = QVBoxLayout(advanced_group)
+        self.advanced_group = QGroupBox("▶ Advanced Calibration")
+        self.advanced_group.setObjectName("advancedCalibrationPanel")
+        self.advanced_group.setCheckable(True)
+        self.advanced_group.setChecked(False)
+        self.advanced_group.setToolTip(
+            "Object-Releasing calibration을 선택한 경우에만 펼칠 수 있습니다."
+        )
+        advanced_group_layout = QVBoxLayout(self.advanced_group)
+        self.advanced_content = QWidget()
+        advanced_layout = QVBoxLayout(self.advanced_content)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_group_layout.addWidget(self.advanced_content)
         self.object_releasing_label = QLabel("Object-Releasing: Not run.")
         self.object_releasing_label.setWordWrap(True)
         advanced_layout.addWidget(self.object_releasing_label)
 
         advanced_layout.addWidget(QLabel("Standard Brown-Conrady vs Object-Releasing"))
-        self.ro_comparison_table = QTableWidget(len(_RO_COMPARISON_ROW_LABELS), 2)
+        self.ro_comparison_table = _PageScrollTableWidget(len(_RO_COMPARISON_ROW_LABELS), 2)
         self.ro_comparison_table.setHorizontalHeaderLabels(["Standard Brown", "Object-Releasing"])
         self.ro_comparison_table.setVerticalHeaderLabels(_RO_COMPARISON_ROW_LABELS)
         self.ro_comparison_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.ro_comparison_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.ro_comparison_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         advanced_layout.addWidget(self.ro_comparison_table)
         self.ro_comparison_summary_label = QLabel("Standard vs Object-Releasing comparison: Not run.")
         self.ro_comparison_summary_label.setWordWrap(True)
         advanced_layout.addWidget(self.ro_comparison_summary_label)
 
-        model_layout.addWidget(advanced_group)
+        model_layout.addWidget(self.advanced_group)
+        self.advanced_group.toggled.connect(self._on_advanced_group_toggled)
+        self.set_advanced_calibration_available(False)
+        self._fit_table_to_rows(self.table)
+        self._fit_table_to_rows(self.ro_comparison_table)
 
         self.validation_widget = QWidget()
         validation_layout = QVBoxLayout(self.validation_widget)
@@ -324,6 +366,34 @@ class ResultView(QWidget):
             layout.addWidget(tabs)
 
         self._update_model_status()
+
+    @staticmethod
+    def _fit_table_to_rows(table: QTableWidget) -> None:
+        """모든 행을 펼쳐 페이지 scroll만 사용하도록 table 높이를 맞춘다."""
+        table.resizeRowsToContents()
+        header_height = table.horizontalHeader().sizeHint().height()
+        rows_height = sum(table.rowHeight(row) for row in range(table.rowCount()))
+        table.setFixedHeight(header_height + rows_height + table.frameWidth() * 2 + 4)
+
+    def _on_advanced_group_toggled(self, expanded: bool) -> None:
+        """Advanced 내용은 Object-Releasing 사용 중일 때만 펼친다."""
+        expanded = bool(expanded and self._advanced_calibration_available)
+        if self.advanced_group.isChecked() != expanded:
+            self.advanced_group.blockSignals(True)
+            self.advanced_group.setChecked(expanded)
+            self.advanced_group.blockSignals(False)
+        self.advanced_content.setVisible(expanded)
+        self.advanced_group.setTitle(
+            "▼ Advanced Calibration" if expanded else "▶ Advanced Calibration"
+        )
+
+    def set_advanced_calibration_available(self, available: bool) -> None:
+        """Object-Releasing 선택 상태에서만 Advanced 토글을 활성화한다."""
+        self._advanced_calibration_available = bool(available)
+        self.advanced_group.setEnabled(self._advanced_calibration_available)
+        if not self._advanced_calibration_available:
+            self.advanced_group.setChecked(False)
+            self._on_advanced_group_toggled(False)
 
     # ------------------------------------------------------------------
     # 데이터 반영 (계산 없음, 표시만)
@@ -431,6 +501,7 @@ class ResultView(QWidget):
                 self.table.setItem(row, col, item)
 
         self._update_model_status()
+        self._fit_table_to_rows(self.table)
 
     def _set_ro_comparison(self, comparison: StandardVsObjectReleasingComparison | None) -> None:
         self.ro_comparison_summary_label.setText(_format_ro_comparison_summary(comparison))

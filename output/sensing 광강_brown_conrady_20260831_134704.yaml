@@ -1,0 +1,29 @@
+%YAML 1.2
+---
+calibration_model: brown_conrady
+camera_model: brown_conrady
+calibration_method: standard
+target_type: charuco
+image_width: 3840
+image_height: 2160
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 2488.3256919078608, 0., 1877.0326008788143, 0.,
+       2563.4689710465659, 783.68296892997614, 0., 0., 1. ]
+distortion_coefficients: !!opencv-matrix
+   rows: 5
+   cols: 1
+   dt: d
+   data: [ -0.07058192898911142, -0.41162390938739568,
+       0.028616030931107723, 0.0070420850026829103, 0.27611106357651266 ]
+distortion_coefficient_count: 5
+distortion_coefficient_order: "k1,k2,p1,p2,k3"
+rms_reprojection_error: 9.104691722460224
+pattern_type: charuco
+pattern_squares_x: 11
+pattern_squares_y: 8
+pattern_square_size: 0.034000000000000002
+pattern_marker_size: 0.025000000000000001
+pattern_dictionary: DICT_7X7_100

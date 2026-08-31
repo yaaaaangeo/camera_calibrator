@@ -282,6 +282,15 @@ def compute_live_coverage_bars(
     x_full_spread_ratio / y_full_spread_ratio: 이미지 너비/높이의 이 비율을
     양쪽 방향으로 확보해 전체 범위가 2배에 도달하면 만점(1.0)으로 본다.
     누적 min/max 범위 기반이라 프레임을 추가했을 때 점수가 감소하지 않는다.
+
+    실사용자 버그: X/Y를 각자 독립적으로만 보면 보드를 좌상단->우하단
+    대각선 방향으로만 쭉 옮기며 찍어도 X 범위와 Y 범위가 각각 빨리
+    100%에 도달해버린다 - 실제로는 우상단/좌하단 사분면을 한 번도
+    안 찍었는데 바는 다 찬 것처럼 보였고, 그 상태로 계산한 Coverage
+    Map(사후 그리드)에는 군데군데 빈 칸이 남았다. 이미지를 2x2
+    사분면으로 나눠 실제로 몇 개의 사분면을 찍었는지(quadrant_coverage)
+    를 X/Y coverage의 상한으로 같이 걸어서, 두 축을 함께 골고루 움직여야
+    바가 다 차게 한다.
     """
     w, h = image_size
     successful = [
@@ -301,8 +310,19 @@ def compute_live_coverage_bars(
             return 0.0
         return float(min(1.0, (max(values) - min(values)) / full_range))
 
-    x_coverage = _range_coverage(xs, w * x_full_spread_ratio * 2.0)
-    y_coverage = _range_coverage(ys, h * y_full_spread_ratio * 2.0)
+    def _quadrant_coverage(centers: list[tuple[float, float]]) -> float:
+        """중심점이 실제로 몇 개의 2x2 사분면을 찍었는지 (0~1).
+        min/max 범위와 마찬가지로 사분면 "방문 집합"은 누적이라 절대
+        줄어들지 않는다.
+        """
+        if not centers:
+            return 0.0
+        visited = {(0 if x < w / 2 else 1, 0 if y < h / 2 else 1) for x, y in centers}
+        return len(visited) / 4.0
+
+    quadrant_coverage = _quadrant_coverage(list(zip(xs, ys)))
+    x_coverage = min(_range_coverage(xs, w * x_full_spread_ratio * 2.0), quadrant_coverage)
+    y_coverage = min(_range_coverage(ys, h * y_full_spread_ratio * 2.0), quadrant_coverage)
 
     area_ratios = [f.detection.board_area_ratio for f in successful if f.detection.board_area_ratio is not None]
     if len(area_ratios) < 2 or max(area_ratios) <= 0:

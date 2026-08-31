@@ -1,0 +1,40 @@
+{
+  "run_dir": "/home/sum/c/camera_calibrator/library/sensing 광강/20260831_134704",
+  "sensor_name": "sensing 광강",
+  "created_at": "2026-08-31T13:47:04",
+  "num_images": 202,
+  "pattern_type": "charuco",
+  "project_file": "project.ccproj",
+  "sample_image": "images/bag_0183_t1787883763.789.jpg",
+  "note": "",
+  "models": {
+    "brown_conrady": {
+      "success": true,
+      "rms_error": 9.104691722460224,
+      "test_rms": 6.4168053065178885,
+      "distortion_count": 5,
+      "error_message": null
+    },
+    "extended_pinhole": {
+      "success": true,
+      "rms_error": 3.745204321303075,
+      "test_rms": 7.626225891702731,
+      "distortion_count": 8,
+      "error_message": null
+    },
+    "fisheye": {
+      "success": false,
+      "rms_error": null,
+      "test_rms": null,
+      "distortion_count": null,
+      "error_message": "Fisheye 캘리브레이션 실패: 일부 프레임에서 초기 자세 추정이 불안정합니다(OpenCV(5.0.0) /io/opencv/modules/calib/src/fisheye.cpp:806: error: (-3:Internal error) CALIB_CHECK_COND - Ill-conditioned matrix for input array 24 in function 'CalibrateExtrinsics'\n). 코너가 적거나 보드 각도가 카메라와 거의 평행한 프레임을 제외해도 안정화되지 않았습니다 - 데이터셋을 다시 확인하거나 문제 프레임을 수동으로 제외한 뒤 다시 시도하세요."
+    },
+    "pinhole": {
+      "success": true,
+      "rms_error": 20.28356010351578,
+      "test_rms": 19.24885215218338,
+      "distortion_count": 1,
+      "error_message": null
+    }
+  }
+}

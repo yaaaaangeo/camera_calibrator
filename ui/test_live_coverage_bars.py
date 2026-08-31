@@ -102,6 +102,34 @@ def test_failed_detections_are_ignored():
     assert bars_with_failed.y_coverage == bars_without_failed.y_coverage
 
 
+def test_diagonal_only_sweep_does_not_fully_fill_x_y_coverage():
+    """실사용자 버그: 보드를 좌상단->우하단 대각선으로만 이동시키며 찍으면
+    X 범위와 Y 범위가 각각 독립적으로는 빨리 100%에 도달했지만, 우상단/
+    좌하단 사분면은 한 번도 찍히지 않아 사후 Coverage Map엔 빈 칸이
+    남았다. 사분면 방문 여부를 상한으로 걸었으니 순수 대각선만으로는
+    바가 다 차면 안 된다.
+    """
+    frames = [
+        _frame(f"d{i}", 640 * 0.1 + i * (640 * 0.6 / 39), 480 * 0.1 + i * (480 * 0.6 / 39), 0.3, 0.0)
+        for i in range(40)
+    ]
+    bars = compute_live_coverage_bars(frames, image_size=(640, 480))
+    assert bars.x_coverage <= 0.5
+    assert bars.y_coverage <= 0.5
+
+
+def test_all_four_quadrants_visited_gives_full_x_y_coverage():
+    frames = [
+        _frame("tl", 100, 100, 0.3, 0.0),
+        _frame("tr", 540, 100, 0.3, 0.0),
+        _frame("bl", 100, 380, 0.3, 0.0),
+        _frame("br", 540, 380, 0.3, 0.0),
+    ]
+    bars = compute_live_coverage_bars(frames, image_size=(640, 480))
+    assert bars.x_coverage == 1.0
+    assert bars.y_coverage == 1.0
+
+
 def test_live_coverage_never_decreases_when_repetitive_frame_is_added():
     """누적 progress는 같은 자세를 더 찍었다고 이미 확보한 범위를 잃지 않는다."""
     varied = [

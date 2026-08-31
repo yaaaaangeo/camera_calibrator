@@ -76,6 +76,8 @@ def run_all_models(
         CameraModelType.EXTENDED_PINHOLE,
         CameraModelType.FISHEYE,
     ))
+    if any(model is None for model in requested_models):
+        raise ValueError("Calibration model list contains None; select a valid Camera Model.")
     requested_set = set(requested_models)
     needs_pinhole = CameraModelType.PINHOLE in requested_set or CameraModelType.FISHEYE in requested_set
     needs_brown = CameraModelType.BROWN_CONRADY in requested_set

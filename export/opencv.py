@@ -25,6 +25,9 @@ def export_opencv_yaml(
     camera_config: CameraConfig,
     pattern_config: PatternConfig,
     path: str,
+    *,
+    calibration_source: str = "original",
+    selected_frame_ids: list[str] | None = None,
 ) -> str:
     """cv2.FileStorage 포맷으로 camera_matrix / distortion_coefficients를 저장.
 
@@ -59,6 +62,10 @@ def export_opencv_yaml(
         ",".join(distortion_coeff_labels(result.model_name, int(result.distortion.size))),
     )
     fs.write("rms_reprojection_error", float(result.rms_error))
+    fs.write("calibration_source", calibration_source)
+    if selected_frame_ids is not None:
+        fs.write("subset_scene_count", len(selected_frame_ids))
+        fs.write("subset_scene_ids", ",".join(selected_frame_ids))
 
     # 패턴 메타정보 (설계 문서 10번)
     fs.write(

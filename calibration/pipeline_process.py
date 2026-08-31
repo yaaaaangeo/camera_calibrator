@@ -133,6 +133,25 @@ def run_models_and_validation(
     )
 
 
+def run_scene_subset_calibration(
+    dataset: Dataset,
+    selected_frame_ids: list[str],
+    camera_config: CameraConfig,
+    pattern_config: PatternConfig,
+    model: CameraModelType,
+    original_diversity,
+    original_coverage_pct: float,
+):
+    """ProcessPool에 전달할 수 있는 scene subset 재계산 진입점."""
+    from calibration.scene_quality import run_subset_calibration
+
+    return run_subset_calibration(
+        dataset, selected_frame_ids, camera_config, pattern_config, model,
+        original_diversity=original_diversity,
+        original_coverage_pct=original_coverage_pct,
+    )
+
+
 def run_outlier_pruning_and_validation(
     dataset: Dataset,
     camera_config: CameraConfig,

@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Callable, Optional
@@ -48,7 +48,11 @@ import cv2
 import numpy as np
 
 from calibration.image_quality import compute_contrast, compute_motion_blur_score, compute_phash, compute_saturation
-from calibration.process_control import PipelineCancelled, terminate_executor_processes
+from calibration.process_control import (
+    PipelineCancelled,
+    safe_process_pool_context,
+    terminate_executor_processes,
+)
 from calibration.types import (
     AprilGridVariant,
     CircleGridType,
@@ -750,11 +754,13 @@ def detect_dataset(
         parallel: True면 프로세스 풀 사용. 이미지 1장뿐이거나 os.cpu_count()가
             1인 환경에서는 parallel=True여도 자동으로 순차 처리로 내려간다
             (프로세스 생성 비용이 이득보다 커서).
-        max_workers: 프로세스 개수. None이면 os.cpu_count()-1(코어 하나는 GUI 몫으로
-            남겨둠 - 실사용자 버그: 코어를 전부 쓰면 이미지 수백 장 검출 중에
-            GUI 프로세스가 OS 스케줄링을 못 받아 "python3 is not responding"
-            창이 뜬다. QThread/별도 프로세스로 계산을 분리해도, OS가 CPU 자체를
-            GUI에 배분 못 하면 소용없다).
+        max_workers: 프로세스 개수. None이면 os.cpu_count()-2(코어를 GUI/OS 몫으로
+            남겨둠 - 실사용자 버그: 코어를 거의 다 쓰면 이미지 수백 장(특히
+            ROS 카메라 원본처럼 고해상도) 검출 중에 GUI 프로세스가 OS
+            스케줄링을 충분히 못 받아 "python3 is not responding" 창이 뜬다.
+            QThread/별도 프로세스로 계산을 분리해도, OS가 CPU 자체를 GUI에
+            배분 못 하면 소용없다. 코어 하나만 남기면 저사양/저코어 머신에서는
+            여전히 부족해서 둘을 남긴다).
         progress_callback: 이미지 한 장의 검출이 끝날 때마다 ``(완료 수, 전체 수)``를
             알린다. UI 진행률 표시용이며, 순차/병렬 경로 모두 마지막에 전체 수에
             도달한다.
@@ -770,8 +776,11 @@ def detect_dataset(
     if parallel and len(image_paths) > 1 and cpu_count > 1:
         # 프로세스마다 고해상도 원본 + grayscale/품질 분석용 임시 배열을
         # 동시에 보유한다. 코어 수만큼(예: 31개) 띄우면 800 MB급 데이터셋에서
-        # RAM 압박/스왑으로 GUI까지 멎으므로 UI 기본값은 4개로 제한한다.
-        effective_workers = max_workers if max_workers is not None else min(4, max(1, cpu_count - 1))
+        # RAM 압박/스왑으로 GUI까지 멎으므로 UI 기본값은 3개로 제한하고, 코어도
+        # 하나가 아니라 둘을 GUI/OS 몫으로 남긴다 - 코어 하나만 남기면 4코어급
+        # 노트북이나 4K 원본처럼 프레임당 부하가 큰 경우 그 하나도 GUI가
+        # 충분히 못 얻어 여전히 "python3 is not responding"이 뜨는 실사용자 사례가 있었다.
+        effective_workers = max_workers if max_workers is not None else min(3, max(1, cpu_count - 2))
         logger.info(
             "병렬 검출 시작: 이미지 %d장, max_workers=%s",
             len(image_paths), effective_workers,
@@ -834,6 +843,16 @@ def _detect_one_in_worker(image_path: str) -> tuple[ImageInfo, DetectionResult]:
     return detect_image_file(image_path, _worker_detect_fn)
 
 
+# 실사용자 버그: 큰(예: ROS 카메라 원본 해상도) 이미지가 많이 섞이면 첫
+# 이미지 하나의 검출조차 몇 분씩 걸릴 수 있는데, 예전에는 완료된 이미지가
+# 하나도 없으면 progress_callback이 단 한 번도 안 불려서 "코너 검출 중..."
+# 문구가 그대로 멈춰 있는 것처럼 보였다(실제로는 워커 프로세스가 계속
+# 일하고 있어도 사용자는 멎었다고 오해하기 쉬움). 아래 done/total이 안
+# 바뀌어도 이 간격마다 한 번씩 다시 progress_callback을 불러 "아직 죽지
+# 않았다"는 하트비트를 준다 - ui/worker.py의 _wait_with_heartbeat와 같은 패턴.
+_DETECTION_HEARTBEAT_SEC = 2.0
+
+
 def _detect_dataset_parallel(
     image_paths: list[str],
     pattern: PatternConfig,
@@ -846,6 +865,7 @@ def _detect_dataset_parallel(
         max_workers=max_workers,
         initializer=_init_worker,
         initargs=(pattern,),
+        mp_context=safe_process_pool_context(),
     ) as executor:
         if on_executor_ready is not None:
             # 취소 버튼을 처리하는 GUI 스레드가 이 executor를 붙잡아 둘 수
@@ -853,22 +873,28 @@ def _detect_dataset_parallel(
             # 강제 종료하기 위함).
             on_executor_ready(executor)
 
-        # executor.submit + as_completed 조합을 쓴다 - executor.map은 전체
+        # executor.submit + wait(...) 조합을 쓴다 - executor.map은 전체
         # 이미지를 한꺼번에 제출해버려서(지연 제출이 아님) 중간에 취소해도
         # 이미 제출된 나머지 작업을 그냥 기다리는 수밖에 없다. futures 딕셔너리로
         # 원래 순서를 기억해뒀다가 끝에 재정렬하면, 순차 실행과 동일한 프레임
         # 순서를 유지하면서도 완료되는 대로 진행률/취소 확인이 가능하다.
+        # as_completed()는 다음 완료를 무기한 기다리므로(타임아웃 없이) 첫
+        # 이미지가 오래 걸리면 그동안 아무 신호도 못 준다 - wait()에 짧은
+        # timeout을 줘서 주기적으로 깨어나 취소 확인 + 하트비트를 낼 수 있게 한다.
         futures = {executor.submit(_detect_one_in_worker, path): i for i, path in enumerate(image_paths)}
+        pending = set(futures)
         results: list[Optional[tuple[ImageInfo, DetectionResult]]] = [None] * len(image_paths)
         done = 0
         total = len(image_paths)
         try:
-            for future in as_completed(futures):
+            while pending:
+                completed, pending = wait(pending, timeout=_DETECTION_HEARTBEAT_SEC, return_when=FIRST_COMPLETED)
                 if cancel_check is not None and cancel_check():
                     terminate_executor_processes(executor)
                     raise PipelineCancelled("코너 검출이 취소되었습니다.")
-                results[futures[future]] = future.result()
-                done += 1
+                for future in completed:
+                    results[futures[future]] = future.result()
+                    done += 1
                 if progress_callback is not None:
                     progress_callback(done, total)
         except BrokenProcessPool:

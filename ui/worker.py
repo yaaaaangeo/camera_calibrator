@@ -46,7 +46,11 @@ from calibration.types import (
     PatternConfig,
 )
 from calibration.detector import build_detect_fn, detect_dataset, summarize_dataset
-from calibration.process_control import PipelineCancelled, terminate_executor_processes
+from calibration.process_control import (
+    PipelineCancelled,
+    safe_process_pool_context,
+    terminate_executor_processes,
+)
 from calibration.latest_frame import FrameBufferStats, LatestFrameBuffer
 from calibration.quality import analyze_dataset_quality
 from calibration.frame_quality import compute_frame_quality_scores, compute_dataset_quality_score
@@ -62,7 +66,7 @@ from calibration.rosbag_reader import (
 )
 from calibration.validation import validate_cross_datasets
 from calibration.external_compare import compare_with_external_params
-from calibration.pipeline_process import run_models_and_validation
+from calibration.pipeline_process import run_models_and_validation, run_scene_subset_calibration
 
 # 위 계산(Standard 4모델 + Hold-out 진행 상황)은 자식 프로세스 안에서 일어나므로
 # 세부 진행률 문자열을 실시간으로 받을 수 없다 - future.result()를 이 간격
@@ -248,8 +252,16 @@ class PipelineWorker(QObject):
             # 멈추지 않는다. 이미지가 충분히 많을 때만 병렬화 이득이 프로세스 생성
             # 비용을 넘어서므로, 적은 장수(<= 8)에서는 그냥 순차로 둔다.
             use_parallel = len(self.image_paths) > 8
+            detection_start = time.monotonic()
             def _on_detection_progress(done: int, total: int) -> None:
-                self.progress.emit(f"코너 검출 중... {done}/{total}장 ({done / total * 100:.0f}%)")
+                # detect_dataset()는 완료된 이미지가 없어도(예: 4K 원본처럼
+                # 첫 장 검출 자체가 오래 걸릴 때) _DETECTION_HEARTBEAT_SEC마다
+                # 이 콜백을 다시 부른다 - 경과 시간을 매번 넣어야 done/total이
+                # 그대로여도 문구가 바뀌어서 "그냥 멈춘 것"과 구분된다.
+                elapsed = time.monotonic() - detection_start
+                self.progress.emit(
+                    f"코너 검출 중... {done}/{total}장 ({done / total * 100:.0f}%) · {elapsed:.0f}초 경과"
+                )
                 self.progress_value.emit(done, total)
 
             dataset = detect_dataset(
@@ -282,7 +294,9 @@ class PipelineWorker(QObject):
             # cv2.calibrateCamera 등은 GIL을 놓아준다는 보장이 없어, 완전히
             # 별도 프로세스로 돌려서 GUI 스레드가 절대 막히지 않게 한다
             # (자세한 이유는 파일 상단 docstring 참고).
-            with ProcessPoolExecutor(max_workers=1) as executor:
+            with ProcessPoolExecutor(
+                max_workers=1, mp_context=safe_process_pool_context()
+            ) as executor:
                 self._register_executor(executor)
                 future = executor.submit(
                     run_models_and_validation,
@@ -346,6 +360,52 @@ class PipelineWorker(QObject):
             self.error.emit(f"파이프라인 실행 중 오류: {e}")
         finally:
             self._current_executor = None
+            self.finished.emit()
+
+
+class SceneSubsetCalibrationWorker(QObject):
+    """Selected scene subset을 별도 process에서 재계산한다."""
+
+    progress = Signal(str)
+    result_ready = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, dataset, selected_frame_ids, camera_config, pattern_config, model):
+        super().__init__()
+        self.dataset = dataset
+        self.selected_frame_ids = selected_frame_ids
+        self.camera_config = camera_config
+        self.pattern_config = pattern_config
+        if model is None:
+            raise ValueError("Subset Calibration model is missing.")
+        self.model = model if isinstance(model, CameraModelType) else CameraModelType(str(model))
+
+    def run(self) -> None:
+        try:
+            self.progress.emit(f"선택한 {len(self.selected_frame_ids)}개 Scene으로 재Calibration 중...")
+            with ProcessPoolExecutor(
+                max_workers=1, mp_context=safe_process_pool_context()
+            ) as executor:
+                future = executor.submit(
+                    run_scene_subset_calibration,
+                    self.dataset,
+                    self.selected_frame_ids,
+                    self.camera_config,
+                    self.pattern_config,
+                    self.model,
+                    self.dataset.diversity,
+                    coverage_percentage(self.dataset.coverage_grid),
+                )
+                result = _wait_with_heartbeat(
+                    future, self.progress, "Best Subset Calibration + Hold-out 계산 중..."
+                )
+            self.result_ready.emit(result)
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(
+                f"Subset Calibration 실패: {exc}\n\nTechnical details:\n{traceback.format_exc()}"
+            )
+        finally:
             self.finished.emit()
 
 
@@ -506,7 +566,9 @@ class ExternalComparisonWorker(QObject):
     def run(self) -> None:
         try:
             self.progress.emit("External Compare 계산 중... (재학습/K-fold/bootstrap 포함)")
-            with ProcessPoolExecutor(max_workers=1) as executor:
+            with ProcessPoolExecutor(
+                max_workers=1, mp_context=safe_process_pool_context()
+            ) as executor:
                 future = executor.submit(
                     compare_with_external_params,
                     self.dataset,

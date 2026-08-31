@@ -73,9 +73,12 @@ from calibration.types import (
     RadialErrorProfile,
     RegionalError,
     ResidualStats,
+    SceneQualityAnalysis,
+    SceneQualityEntry,
     SpatialErrorCell,
     SpatialErrorMap,
     StandardVsObjectReleasingComparison,
+    SubsetCalibrationResult,
     StraightnessBreakdown,
     UndistortionQualityReport,
     ValidationResult,
@@ -493,6 +496,42 @@ def _cross_dataset_result_from_dict(d: dict) -> CrossDatasetValidationResult:
     )
 
 
+def _scene_quality_analysis_from_dict(d) -> SceneQualityAnalysis | None:
+    if d is None:
+        return None
+    return SceneQualityAnalysis(
+        model_name=CameraModelType(d["model_name"]),
+        scenes=[SceneQualityEntry(**scene) for scene in d.get("scenes", [])],
+    )
+
+
+def _subset_calibration_result_from_dict(d) -> SubsetCalibrationResult | None:
+    if d is None:
+        return None
+    return SubsetCalibrationResult(
+        model_name=CameraModelType(d["model_name"]),
+        selected_frame_ids=d.get("selected_frame_ids", []),
+        calibration_result=(
+            _calibration_result_from_dict(d["calibration_result"])
+            if d.get("calibration_result") else None
+        ),
+        validation_result=(
+            _validation_result_from_dict(d["validation_result"])
+            if d.get("validation_result") else None
+        ),
+        original_validation_result=(
+            _validation_result_from_dict(d["original_validation_result"])
+            if d.get("original_validation_result") else None
+        ),
+        coverage_grid=[_coverage_cell_from_dict(c) for c in d.get("coverage_grid", [])],
+        diversity=_diversity_scores_from_dict(d.get("diversity")),
+        coverage_percentage=d.get("coverage_percentage", 0.0),
+        original_coverage_percentage=d.get("original_coverage_percentage", 0.0),
+        original_diversity=_diversity_scores_from_dict(d.get("original_diversity")),
+        warnings=d.get("warnings", []),
+    )
+
+
 def _model_score_from_dict(d: dict) -> ModelScore:
     return ModelScore(
         model_name=CameraModelType(d["model_name"]), score=d["score"],
@@ -782,6 +821,8 @@ def project_from_dict(payload: dict) -> CalibrationProject:
         ],
         model_scores=[_model_score_from_dict(s) for s in d.get("model_scores", [])],
         outlier_result=_outlier_result_from_dict(d.get("outlier_result")),
+        scene_quality_analysis=_scene_quality_analysis_from_dict(d.get("scene_quality_analysis")),
+        subset_calibration_result=_subset_calibration_result_from_dict(d.get("subset_calibration_result")),
         final_result=_final_result_from_dict(d.get("final_result")),
         created_at=_dt(d.get("created_at")),
         updated_at=_dt(d.get("updated_at")),

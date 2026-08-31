@@ -1,0 +1,40 @@
+{
+  "run_dir": "/home/sum/c/camera_calibrator/library/camera/20260831_164141",
+  "sensor_name": "camera",
+  "created_at": "2026-08-31T16:41:42",
+  "num_images": 428,
+  "pattern_type": "charuco",
+  "project_file": "project.ccproj",
+  "sample_image": "images/bag_0000_t1788160799.717.jpg",
+  "note": "",
+  "models": {
+    "brown_conrady": {
+      "success": true,
+      "rms_error": 2.147964475160961,
+      "test_rms": 5.0224034012533645,
+      "distortion_count": 5,
+      "error_message": null
+    },
+    "extended_pinhole": {
+      "success": true,
+      "rms_error": 0.9963873863750917,
+      "test_rms": 2.6855168672861303,
+      "distortion_count": 8,
+      "error_message": null
+    },
+    "fisheye": {
+      "success": true,
+      "rms_error": 1.007338419905204,
+      "test_rms": null,
+      "distortion_count": 4,
+      "error_message": null
+    },
+    "pinhole": {
+      "success": true,
+      "rms_error": 6.036398149323224,
+      "test_rms": 14.82366304916282,
+      "distortion_count": 1,
+      "error_message": null
+    }
+  }
+}

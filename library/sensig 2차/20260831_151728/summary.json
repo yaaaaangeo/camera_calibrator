@@ -1,0 +1,40 @@
+{
+  "run_dir": "/home/sum/c/camera_calibrator/library/sensig 2차/20260831_151728",
+  "sensor_name": "sensig 2차",
+  "created_at": "2026-08-31T15:17:28",
+  "num_images": 253,
+  "pattern_type": "charuco",
+  "project_file": "project.ccproj",
+  "sample_image": "images/bag_0000_t1788156215.214.jpg",
+  "note": "",
+  "models": {
+    "brown_conrady": {
+      "success": true,
+      "rms_error": 1.7268516087334331,
+      "test_rms": 1.204569799799752,
+      "distortion_count": 5,
+      "error_message": null
+    },
+    "extended_pinhole": {
+      "success": true,
+      "rms_error": 3.512872232848212,
+      "test_rms": 1.053182029832712,
+      "distortion_count": 8,
+      "error_message": null
+    },
+    "fisheye": {
+      "success": true,
+      "rms_error": 0.9386147774750577,
+      "test_rms": null,
+      "distortion_count": 4,
+      "error_message": null
+    },
+    "pinhole": {
+      "success": true,
+      "rms_error": 8.789139744463004,
+      "test_rms": 4.9529475981773805,
+      "distortion_count": 1,
+      "error_message": null
+    }
+  }
+}

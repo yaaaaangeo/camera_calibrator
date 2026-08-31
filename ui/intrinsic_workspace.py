@@ -24,11 +24,14 @@ from calibration.types import (
     ObjectReleasingValidationResult,
     OutlierResult,
     PatternConfig,
+    SceneQualityAnalysis,
     StandardVsObjectReleasingComparison,
+    SubsetCalibrationResult,
     ValidationResult,
 )
 from ui.dataset_view import DatasetView
 from ui.result_view import ResultView
+from ui.scene_quality_view import SceneQualityView
 from ui.undistort_straightness_view import UndistortStraightnessView
 
 
@@ -47,6 +50,8 @@ class IntrinsicState:
     scores: list[ModelScore] = field(default_factory=list)
     outlier_result: OutlierResult | None = None
     calibration_method: CalibrationMethod = CalibrationMethod.STANDARD
+    scene_quality_analysis: SceneQualityAnalysis | None = None
+    subset_calibration_result: SubsetCalibrationResult | None = None
 
 
 class IntrinsicWorkspace(QWidget):
@@ -84,6 +89,7 @@ class IntrinsicWorkspace(QWidget):
 
         owner.dataset_view = DatasetView()
         owner.result_view = ResultView(standalone=False)
+        owner.scene_quality_view = SceneQualityView()
         # Undistort Preview와 Straightness Map을 한 화면으로 합친 뷰
         # (Edge Error Map은 별도 요청으로 제거됨). preview_view라는 이름은
         # main_window.py의 기존 호출부와의 혼란을 줄이기 위해 유지한다.
@@ -91,7 +97,8 @@ class IntrinsicWorkspace(QWidget):
 
         tabs.addTab(owner.dataset_view, "① Dataset")
         tabs.addTab(owner.preview_view, "② Preview")
-        tabs.addTab(owner.result_view.model_comparison_widget, "③ Model Comparison")
+        tabs.addTab(owner.scene_quality_view, "③ Scene Ranking")
+        tabs.addTab(owner.result_view.model_comparison_widget, "④ Model Comparison")
         owner.tabs = tabs
         workspace = cls(settings_panel, tabs)
         workspace.connect_owner_handlers(owner)
@@ -100,3 +107,6 @@ class IntrinsicWorkspace(QWidget):
     def connect_owner_handlers(self, owner) -> None:
         owner.result_view.export_opencv_requested.connect(owner._on_export_opencv)
         owner.result_view.cross_dataset_requested.connect(owner._on_cross_dataset_requested)
+        owner.scene_quality_view.recalibrate_requested.connect(owner._on_subset_recalibrate_requested)
+        owner.scene_quality_view.model_changed.connect(owner._on_scene_quality_model_changed)
+        owner.scene_quality_view.export_subset_requested.connect(owner._on_export_subset_calibration)

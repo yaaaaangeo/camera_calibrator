@@ -715,6 +715,43 @@ class ValidationResult:
 
 
 @dataclass
+class SceneQualityEntry:
+    """Initial calibration을 기준으로 계산한 scene 한 장의 ranking 정보."""
+    frame_id: str
+    rank: int = 0
+    quality_score: float = 0.0
+    reprojection_error: Optional[float] = None
+    detection_ratio: float = 0.0
+    sharpness: Optional[float] = None
+    reprojection_score: float = 50.0
+    detection_score: float = 0.0
+    sharpness_score: float = 50.0
+
+
+@dataclass
+class SceneQualityAnalysis:
+    """Ranking이 어느 원본 camera model을 기준으로 했는지까지 보존."""
+    model_name: CameraModelType
+    scenes: list[SceneQualityEntry] = field(default_factory=list)
+
+
+@dataclass
+class SubsetCalibrationResult:
+    """Original을 덮어쓰지 않는 사용자 선택 subset 재캘리브레이션 결과."""
+    model_name: CameraModelType
+    selected_frame_ids: list[str] = field(default_factory=list)
+    calibration_result: Optional[CalibrationResult] = None
+    validation_result: Optional[ValidationResult] = None
+    original_validation_result: Optional[ValidationResult] = None
+    coverage_grid: list[CoverageCell] = field(default_factory=list)
+    diversity: Optional[DiversityScores] = None
+    coverage_percentage: float = 0.0
+    original_coverage_percentage: float = 0.0
+    original_diversity: Optional[DiversityScores] = None
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ObjectReleasingValidationResult:
     """Object-Releasing 전용 Hold-out 결과.
 
@@ -992,6 +1029,8 @@ class CalibrationProject:
     cross_dataset_results: list[CrossDatasetValidationResult] = field(default_factory=list)
     model_scores: list[ModelScore] = field(default_factory=list)
     outlier_result: Optional[OutlierResult] = None
+    scene_quality_analysis: Optional[SceneQualityAnalysis] = None
+    subset_calibration_result: Optional[SubsetCalibrationResult] = None
     final_result: Optional[FinalResult] = None
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)

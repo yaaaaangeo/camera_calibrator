@@ -18,7 +18,7 @@ pytest.importorskip("PySide6", reason="PySide6가 설치되어 있지 않음")
 
 from PySide6.QtWidgets import QApplication
 
-from calibration.types import CalibrationResult, CameraModelType
+from calibration.types import CalibrationMethod, CalibrationResult, CameraModelType
 
 
 @pytest.fixture(scope="module")
@@ -191,7 +191,160 @@ def test_camera_setup_panel_can_collapse_and_expand(qapp, monkeypatch):
         win.close()
 
 
+def test_advanced_calibration_only_expands_for_object_releasing(qapp, monkeypatch):
+    from ui.main_window import MainWindow
+
+    monkeypatch.setattr(MainWindow, "_offer_autosave_recovery", lambda self: None)
+    win = MainWindow()
+    try:
+        win._show_intrinsic_workspace()
+        win.show()
+        QApplication.processEvents()
+        group = win.result_view.advanced_group
+        content = win.result_view.advanced_content
+
+        assert not group.isEnabled()
+        assert not group.isChecked()
+        assert content.isHidden()
+
+        # Standard에서는 프로그램으로 checked를 요청해도 내용이 펼쳐지지 않는다.
+        group.setChecked(True)
+        assert not group.isChecked()
+        assert content.isHidden()
+
+        win.calibration_method_combo.setCurrentIndex(
+            win.calibration_method_combo.findData(CalibrationMethod.OBJECT_RELEASING)
+        )
+        assert group.isEnabled()
+        group.setChecked(True)
+        assert group.isChecked()
+        assert not content.isHidden()
+        assert "▼" in group.title()
+
+        win.calibration_method_combo.setCurrentIndex(
+            win.calibration_method_combo.findData(CalibrationMethod.STANDARD)
+        )
+        assert not group.isEnabled()
+        assert not group.isChecked()
+        assert content.isHidden()
+        assert "▶" in group.title()
+    finally:
+        win.close()
+
+
+def test_subset_recalibration_falls_back_to_ranking_model_when_combo_data_is_none(qapp):
+    """Qt combo가 일시적으로 빈 상태여도 None model을 worker로 보내지 않아야 한다."""
+    from calibration.types import (
+        Dataset, SceneQualityAnalysis, SceneQualityEntry,
+    )
+    from ui.scene_quality_view import SceneQualityView
+
+    view = SceneQualityView()
+    try:
+        model = CameraModelType.BROWN_CONRADY
+        result = CalibrationResult(model_name=model, success=True)
+        analysis = SceneQualityAnalysis(
+            model_name=model,
+            scenes=[
+                SceneQualityEntry(f"scene-{index}", rank=index, quality_score=90 - index)
+                for index in range(1, 4)
+            ],
+        )
+        view.set_context(Dataset(), None, {model: result}, analysis, None)
+        view._set_all_checked(True)
+        emitted = []
+        view.recalibrate_requested.connect(
+            lambda frame_ids, selected_model: emitted.append((frame_ids, selected_model))
+        )
+
+        view.model_combo.clear()  # currentData() == None 재현
+        view._request_recalibration()
+
+        assert emitted
+        assert emitted[0][1] == model
+        assert len(emitted[0][0]) == 3
+    finally:
+        view.close()
+
+
+def test_scene_ranking_compares_full_and_best_subset_undistortion(qapp, tmp_path):
+    import cv2
+    import numpy as np
+    from calibration.types import (
+        CameraConfig, Dataset, DetectionResult, Frame, FrameStatus, ImageInfo,
+        SceneQualityAnalysis, SceneQualityEntry, SubsetCalibrationResult,
+    )
+    from ui.scene_quality_view import SceneQualityView
+
+    image_path = tmp_path / "scene.png"
+    yy, xx = np.indices((240, 320))
+    source = np.dstack((xx % 256, yy % 256, (xx + yy) % 256)).astype(np.uint8)
+    cv2.imwrite(str(image_path), source)
+    corners = np.array([[80, 60], [240, 60], [80, 180], [240, 180]], dtype=np.float32).reshape(-1, 1, 2)
+    frame = Frame(
+        image_info=ImageInfo("scene-1", str(image_path), 320, 240, sharpness=500),
+        detection=DetectionResult(
+            "scene-1", True, corners=corners, num_corners=len(corners),
+        ),
+        status=FrameStatus.DETECTED,
+    )
+    model = CameraModelType.BROWN_CONRADY
+    K = np.array([[260.0, 0.0, 160.0], [0.0, 260.0, 120.0], [0.0, 0.0, 1.0]])
+    original_result = CalibrationResult(
+        model_name=model,
+        camera_matrix=K.copy(),
+        distortion=np.array([[-0.25], [0.08], [0.0], [0.0], [0.0]]),
+        per_frame_error={"scene-1": 0.8},
+        success=True,
+    )
+    subset_result = SubsetCalibrationResult(
+        model_name=model,
+        selected_frame_ids=["scene-1"],
+        calibration_result=CalibrationResult(
+            model_name=model,
+            camera_matrix=K.copy(),
+            distortion=np.array([[-0.08], [0.01], [0.0], [0.0], [0.0]]),
+            success=True,
+        ),
+    )
+    analysis = SceneQualityAnalysis(
+        model_name=model,
+        scenes=[SceneQualityEntry("scene-1", rank=1, quality_score=90)],
+    )
+    view = SceneQualityView()
+    try:
+        view.resize(1000, 700)
+        view.show()
+        view.set_context(
+            Dataset(frames=[frame]), CameraConfig(320, 240),
+            {model: original_result}, analysis, None,
+        )
+        QApplication.processEvents()
+        assert view.original_preview_label.pixmap() is not None
+        assert view.best_subset_preview_label.pixmap().isNull()
+        assert "Re-Calibrate Selected Scenes" in view.best_subset_preview_label.text()
+
+        view.set_context(
+            Dataset(frames=[frame]), CameraConfig(320, 240),
+            {model: original_result}, analysis, subset_result,
+        )
+        QApplication.processEvents()
+
+        assert view.original_preview_label.pixmap() is not None
+        assert view.best_subset_preview_label.pixmap() is not None
+        assert (
+            view.original_preview_label.pixmap().cacheKey()
+            != view.best_subset_preview_label.pixmap().cacheKey()
+        )
+        assert view.original_calibration_group.title() == "Original Calibration (1 scenes)"
+        assert view.best_subset_calibration_group.title() == "Best Subset Calibration (1 scenes)"
+        assert "Same source image undistorted with each calibration" in view.preview_status_label.text()
+    finally:
+        view.close()
+
+
 def test_main_window_uses_documented_top_level_tabs(qapp):
+    from PySide6.QtCore import Qt
     from ui.main_window import MainWindow
 
     win = MainWindow()
@@ -207,8 +360,20 @@ def test_main_window_uses_documented_top_level_tabs(qapp):
         assert labels == [
             "① Dataset",
             "② Preview",
-            "③ Model Comparison",
+            "③ Scene Ranking",
+            "④ Model Comparison",
         ]
+        assert win.result_view.model_comparison_scroll_area.widgetResizable()
+        assert (
+            win.result_view.model_comparison_scroll_area.widget()
+            is win.result_view.model_comparison_content
+        )
+        assert win.result_view.table.verticalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+        expected_rows_height = sum(
+            win.result_view.table.rowHeight(row)
+            for row in range(win.result_view.table.rowCount())
+        )
+        assert win.result_view.table.height() >= expected_rows_height
     finally:
         win.close()
 

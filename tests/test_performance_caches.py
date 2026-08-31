@@ -160,4 +160,4 @@ def test_parallel_detection_caps_default_worker_count_for_large_inputs(monkeypat
 
     detect_dataset([f"image_{i}.jpg" for i in range(100)], pattern, parallel=True)
 
-    assert observed == [4]
+    assert observed == [3]

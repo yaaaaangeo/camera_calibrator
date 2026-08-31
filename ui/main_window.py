@@ -73,8 +73,10 @@ from ui.worker import (
     BagTopicDiscoveryWorker,
     BagExtractionWorker,
     LibrarySaveWorker,
+    SceneSubsetCalibrationWorker,
     run_worker_in_thread,
 )
+from calibration.scene_quality import add_original_comparison_warnings, compute_scene_quality_analysis
 from ui.library_view import LibraryView
 
 logger = logging.getLogger(__name__)
@@ -203,6 +205,22 @@ class MainWindow(QMainWindow):
     @calibration_method.setter
     def calibration_method(self, value):
         self.intrinsic_state.calibration_method = value
+
+    @property
+    def scene_quality_analysis(self):
+        return self.intrinsic_state.scene_quality_analysis
+
+    @scene_quality_analysis.setter
+    def scene_quality_analysis(self, value):
+        self.intrinsic_state.scene_quality_analysis = value
+
+    @property
+    def subset_calibration_result(self):
+        return self.intrinsic_state.subset_calibration_result
+
+    @subset_calibration_result.setter
+    def subset_calibration_result(self, value):
+        self.intrinsic_state.subset_calibration_result = value
 
     def __init__(self):
         super().__init__()
@@ -811,6 +829,10 @@ class MainWindow(QMainWindow):
     def _on_calibration_method_changed(self) -> None:
         method = self.calibration_method_combo.currentData()
         method = method if isinstance(method, CalibrationMethod) else CalibrationMethod(str(method))
+        if hasattr(self, "result_view"):
+            self.result_view.set_advanced_calibration_available(
+                method == CalibrationMethod.OBJECT_RELEASING
+            )
         self._set_pattern_type_options_for_method(method)
         pattern_type = self.pattern_type_combo.currentData()
         if method != CalibrationMethod.OBJECT_RELEASING:
@@ -918,6 +940,12 @@ class MainWindow(QMainWindow):
         self.cross_dataset_results = []
         self.scores = []
         self.object_releasing_result = None
+        self.scene_quality_analysis = None
+        self.subset_calibration_result = None
+        if hasattr(self, "scene_quality_view"):
+            self.scene_quality_view.set_context(
+                self.dataset, self.camera_config, {}, None, None
+            )
 
         self.calibration_method = selected_method
         worker = PipelineWorker(
@@ -1018,6 +1046,9 @@ class MainWindow(QMainWindow):
         self.object_releasing_result = object_releasing_result
         self.object_releasing_validation_result = object_releasing_validation_result
         self.standard_vs_object_releasing_comparison = standard_vs_object_releasing_comparison
+        # Ranking은 sanity check와 독립적이다. 자체 진단에서 예외가 나더라도
+        # Initial Calibration 결과는 즉시 Ranking 탭에 반영되어야 한다.
+        self._update_scene_quality_analysis()
         if object_releasing_result is not None:
             self.status_label.setText(
                 object_releasing_result.warning_message
@@ -1029,8 +1060,11 @@ class MainWindow(QMainWindow):
             self.dataset_view.set_dataset(self.dataset)  # per_frame_error 채워졌으니 갱신
             # 설계 문서 8번 - Standard 4모델 계산이 끝날 때마다 sanity check도 함께 갱신한다
             # (RMS가 낮아 보여도 결과가 물리적으로 이상할 수 있으므로 항상 확인).
-            checks = run_sanity_checks(list(results.values()), self.camera_config)
-            self.result_view.set_sanity_checks(checks)
+            try:
+                checks = run_sanity_checks(list(results.values()), self.camera_config)
+                self.result_view.set_sanity_checks(checks)
+            except Exception:  # noqa: BLE001 - 진단 실패가 결과 UI 전체를 막지 않게 한다.
+                logger.exception("Sanity check failed after calibration; keeping result views available")
         self._refresh_result_view()
 
     def _on_validation_ready(self, results: dict[CameraModelType, ValidationResult]) -> None:
@@ -1044,6 +1078,9 @@ class MainWindow(QMainWindow):
         if recommended is not None:
             self.result_view.select_model(recommended)
             self.preview_view.select_model(recommended)
+            self._update_scene_quality_analysis(recommended)
+        else:
+            self._update_scene_quality_analysis()
         self._refresh_result_view()
         # 계산이 완전히 끝난 시점(추천까지 나온 시점)이라 여기서 조용히
         # 자동 저장한다 - 다음에 앱이 비정상 종료돼도 이 결과는 남는다.
@@ -1080,6 +1117,8 @@ class MainWindow(QMainWindow):
                 cross_dataset_results=self.cross_dataset_results,
                 model_scores=self.scores,
                 outlier_result=self.outlier_result,
+                scene_quality_analysis=self.scene_quality_analysis,
+                subset_calibration_result=self.subset_calibration_result,
             )
             save_project(project, str(_AUTOSAVE_PATH))
             logger.debug("자동 저장 완료: %s", _AUTOSAVE_PATH)
@@ -1224,6 +1263,10 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
 
     def _refresh_result_view(self) -> None:
+        method = self.calibration_method_combo.currentData()
+        self.result_view.set_advanced_calibration_available(
+            method == CalibrationMethod.OBJECT_RELEASING
+        )
         self.result_view.set_comparison(
             self.calibration_results,
             self.validation_results,
@@ -1233,6 +1276,116 @@ class MainWindow(QMainWindow):
             standard_vs_object_releasing=self.standard_vs_object_releasing_comparison,
         )
         self.result_view.set_cross_dataset_results(self.cross_dataset_results)
+
+    def _update_scene_quality_analysis(self, model: CameraModelType | None = None) -> None:
+        if self.dataset is None or self.pattern_config is None:
+            return
+        if model is None:
+            result = next((r for r in self.calibration_results.values() if r.success), None)
+            model = result.model_name if result is not None else None
+        else:
+            try:
+                model = model if isinstance(model, CameraModelType) else CameraModelType(str(model))
+            except (TypeError, ValueError):
+                model = None
+            result = next(
+                (
+                    value for key, value in self.calibration_results.items()
+                    if value.success and (
+                        value.model_name == model
+                        or key == model
+                        or str(key) == (model.value if model is not None else "")
+                    )
+                ),
+                None,
+            )
+        if result is not None and result.success:
+            self.scene_quality_analysis = compute_scene_quality_analysis(
+                self.dataset, result, self.pattern_config
+            )
+        else:
+            self.scene_quality_analysis = None
+        self.scene_quality_view.set_context(
+            self.dataset, self.camera_config, self.calibration_results,
+            self.scene_quality_analysis, self.subset_calibration_result,
+        )
+
+    def _on_scene_quality_model_changed(self, model: CameraModelType) -> None:
+        self._update_scene_quality_analysis(model)
+
+    def _on_subset_recalibrate_requested(self, frame_ids: list[str], model: CameraModelType) -> None:
+        if self.dataset is None or self.camera_config is None or self.pattern_config is None:
+            QMessageBox.warning(self, "Subset Calibration 불가", "먼저 Initial Calibration을 실행하세요.")
+            return
+        if model is None and self.scene_quality_analysis is not None:
+            model = self.scene_quality_analysis.model_name
+        try:
+            model = model if isinstance(model, CameraModelType) else CameraModelType(str(model))
+        except (TypeError, ValueError):
+            QMessageBox.warning(
+                self, "Subset Calibration 불가",
+                "선택된 Camera Model이 없습니다. Initial Calibration을 다시 실행하세요.",
+            )
+            return
+        original = next(
+            (
+                value for key, value in self.calibration_results.items()
+                if value.model_name == model or key == model or str(key) == model.value
+            ),
+            None,
+        )
+        if original is None or not original.success:
+            QMessageBox.warning(
+                self, "Subset Calibration 불가",
+                f"{model.value} Initial Calibration 결과가 없거나 실패했습니다.",
+            )
+            return
+        worker = SceneSubsetCalibrationWorker(
+            self.dataset, frame_ids, self.camera_config, self.pattern_config, model
+        )
+        thread = run_worker_in_thread(worker, self)
+        worker.progress.connect(self.status_label.setText)
+        worker.result_ready.connect(self._on_subset_calibration_ready)
+        worker.error.connect(self._on_error)
+        self.scene_quality_view.recalibrate_button.setEnabled(False)
+        thread.finished.connect(lambda: self.scene_quality_view.recalibrate_button.setEnabled(True))
+        self._subset_thread, self._subset_worker = thread, worker
+        thread.start()
+
+    def _on_subset_calibration_ready(self, result) -> None:
+        result.original_validation_result = next(
+            (
+                value for key, value in self.validation_results.items()
+                if key == result.model_name or str(key) == result.model_name.value
+            ),
+            None,
+        )
+        add_original_comparison_warnings(
+            result,
+            next(
+                (
+                    value for key, value in self.calibration_results.items()
+                    if value.model_name == result.model_name
+                    or key == result.model_name
+                    or str(key) == result.model_name.value
+                ),
+                None,
+            ),
+            result.original_validation_result,
+        )
+        self.subset_calibration_result = result
+        if result.calibration_result and result.calibration_result.success:
+            self.status_label.setText(
+                f"Subset Calibration 완료: {len(result.selected_frame_ids)} scenes, "
+                f"RMS {result.calibration_result.rms_error:.3f}px"
+            )
+        elif result.calibration_result:
+            self.status_label.setText(f"Subset Calibration 실패: {result.calibration_result.error_message}")
+        self.scene_quality_view.set_context(
+            self.dataset, self.camera_config, self.calibration_results,
+            self.scene_quality_analysis, self.subset_calibration_result,
+        )
+        self._autosave()
 
     def _image_paths_from_directory(self, directory: str) -> list[str]:
         paths: list[str] = []
@@ -1333,6 +1486,38 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Export 실패", str(e))
 
+    def _on_export_subset_calibration(self) -> None:
+        subset = self.subset_calibration_result
+        result = subset.calibration_result if subset is not None else None
+        if (
+            subset is None or result is None or not result.success
+            or self.camera_config is None or self.pattern_config is None
+        ):
+            QMessageBox.warning(
+                self, "Subset Export 불가",
+                "먼저 Scene을 선택해 Re-Calibration을 완료하세요.",
+            )
+            return
+        default_name = f"camera_subset_{result.model_name.value}.yaml"
+        path = self.result_view.prompt_save_path(default_name, "YAML (*.yaml *.yml)")
+        if not path:
+            return
+        try:
+            export_opencv_yaml(
+                result,
+                self.camera_config,
+                self.pattern_config,
+                path,
+                calibration_source="best_subset",
+                selected_frame_ids=subset.selected_frame_ids,
+            )
+            self.status_label.setText(
+                f"Subset OpenCV YAML 저장 완료: {path} "
+                f"({len(subset.selected_frame_ids)} scenes)"
+            )
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Subset Export 실패", str(exc))
+
     # ------------------------------------------------------------------
     # 프로젝트 저장/불러오기 (.ccproj)
     # ------------------------------------------------------------------
@@ -1364,6 +1549,8 @@ class MainWindow(QMainWindow):
             cross_dataset_results=self.cross_dataset_results,
             model_scores=self.scores,
             outlier_result=self.outlier_result,
+            scene_quality_analysis=self.scene_quality_analysis,
+            subset_calibration_result=self.subset_calibration_result,
         )
         try:
             saved_path = save_project(project, path)
@@ -1398,6 +1585,8 @@ class MainWindow(QMainWindow):
         self.cross_dataset_results = project.cross_dataset_results
         self.scores = project.model_scores
         self.outlier_result = project.outlier_result
+        self.scene_quality_analysis = project.scene_quality_analysis
+        self.subset_calibration_result = project.subset_calibration_result
         self.image_paths = [f.image_info.path for f in project.dataset.frames]
         IntrinsicWorkspace.sync_owner_state(self)
 
@@ -1409,6 +1598,19 @@ class MainWindow(QMainWindow):
         self.squares_y_spin.setValue(self.pattern_config.squares_y)
         # pattern_config는 항상 미터(m) 단위로 저장돼 있으니, mm 입력 위젯에는 변환해서 넣는다.
         self.square_size_spin.setValue(self.pattern_config.square_size * 1000.0)
+        loaded_method = (
+            CalibrationMethod.OBJECT_RELEASING
+            if any((
+                self.object_releasing_result is not None,
+                self.object_releasing_validation_result is not None,
+                self.standard_vs_object_releasing_comparison is not None,
+            ))
+            else CalibrationMethod.STANDARD
+        )
+        idx = self.calibration_method_combo.findData(loaded_method)
+        if idx >= 0:
+            self.calibration_method_combo.setCurrentIndex(idx)
+        self.calibration_method = loaded_method
         idx = self.pattern_type_combo.findData(self.pattern_config.type)
         if idx >= 0:
             self.pattern_type_combo.setCurrentIndex(idx)  # _on_pattern_type_changed가 자동으로 행 토글
@@ -1429,6 +1631,9 @@ class MainWindow(QMainWindow):
         if self.calibration_results:
             self.preview_view.set_context(self.dataset, self.camera_config, self.calibration_results, self.pattern_config)
         self._refresh_result_view()
+        self._update_scene_quality_analysis(
+            self.scene_quality_analysis.model_name if self.scene_quality_analysis else None
+        )
         if self.scores:
             recommended = next((s.model_name for s in self.scores if s.is_recommended), None)
             if recommended is not None:

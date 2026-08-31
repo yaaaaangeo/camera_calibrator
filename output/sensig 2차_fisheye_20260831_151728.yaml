@@ -1,0 +1,30 @@
+%YAML 1.2
+---
+calibration_model: fisheye
+camera_model: fisheye
+calibration_method: standard
+target_type: charuco
+image_width: 3840
+image_height: 2160
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1892.0860866821752, 0., 1921.2865751646991, 0.,
+       1900.4170475589162, 1092.7855272543823, 0., 0., 1. ]
+distortion_coefficients: !!opencv-matrix
+   rows: 4
+   cols: 1
+   dt: d
+   data: [ -0.013382466436034832, -0.036567839189436194,
+       0.023782949724039579, -0.0056298398542450282 ]
+distortion_coefficient_count: 4
+distortion_coefficient_order: "k1,k2,k3,k4"
+rms_reprojection_error: 0.93861477747505773
+calibration_source: original
+pattern_type: charuco
+pattern_squares_x: 11
+pattern_squares_y: 8
+pattern_square_size: 0.034000000000000002
+pattern_marker_size: 0.025000000000000001
+pattern_dictionary: DICT_7X7_50

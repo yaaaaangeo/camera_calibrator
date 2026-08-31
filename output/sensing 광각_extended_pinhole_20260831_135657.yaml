@@ -1,0 +1,32 @@
+%YAML 1.2
+---
+calibration_model: extended_pinhole
+camera_model: extended_pinhole
+calibration_method: standard
+target_type: charuco
+image_width: 3840
+image_height: 2160
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 1911.1372335917056, 0., 1924.2324286364947, 0.,
+       1918.5496443659517, 1084.5935953178753, 0., 0., 1. ]
+distortion_coefficients: !!opencv-matrix
+   rows: 8
+   cols: 1
+   dt: d
+   data: [ 2.9024735162715407, 1.3236867245703379,
+       -9.3341020564740191e-05, -0.00027597745978435892,
+       0.058186643091176674, 3.2571170924219435, 2.2912470785550494,
+       0.31331504317016151 ]
+distortion_coefficient_count: 8
+distortion_coefficient_order: "k1,k2,p1,p2,k3,k4,k5,k6"
+rms_reprojection_error: 1.7838840466034891
+calibration_source: original
+pattern_type: charuco
+pattern_squares_x: 11
+pattern_squares_y: 8
+pattern_square_size: 0.034000000000000002
+pattern_marker_size: 0.025000000000000001
+pattern_dictionary: DICT_7X7_50

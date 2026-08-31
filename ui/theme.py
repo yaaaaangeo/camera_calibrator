@@ -131,6 +131,8 @@ QGroupBox::title {{
 QGroupBox#settingsPanel {{ background-color: {Theme.BG_SECONDARY}; }}
 QGroupBox#settingsPanel::indicator {{ width: 0px; height: 0px; image: none; }}
 QGroupBox#settingsPanel::title {{ color: {Theme.ACCENT}; }}
+QGroupBox#advancedCalibrationPanel::indicator {{ width: 0px; height: 0px; image: none; }}
+QGroupBox#advancedCalibrationPanel::title {{ color: {Theme.ACCENT}; }}
 
 QTabWidget::pane {{
     border: 1px solid {Theme.BORDER};

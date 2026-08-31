@@ -26,13 +26,20 @@ from calibration.pipeline_process import (
     run_models_and_validation,
     run_outlier_pruning_and_validation,
 )
+from calibration.process_control import safe_process_pool_context
 from calibration.types import CalibrationMethod, CameraModelType, Dataset, FrameStatus
 
 
 def test_run_models_and_validation_survives_a_real_process_roundtrip(
     synthetic_dataset, camera_config, pattern_config
 ):
-    with ProcessPoolExecutor(max_workers=1) as executor:
+    # GUI production path와 동일한 spawn context로 실제 왕복한다. Qt/QThread가
+    # 살아 있는 Linux process에서 기본 fork를 쓰면 복구 후 첫 계산이 교착되는
+    # 회귀를 이 테스트가 놓치게 된다.
+    assert safe_process_pool_context().get_start_method() == "spawn"
+    with ProcessPoolExecutor(
+        max_workers=1, mp_context=safe_process_pool_context()
+    ) as executor:
         future = executor.submit(
             run_models_and_validation,
             synthetic_dataset, camera_config, pattern_config, 0.25,
@@ -69,7 +76,9 @@ def test_run_outlier_pruning_and_validation_survives_a_real_process_roundtrip(
     자식 프로세스 왕복 후에도 반환된 Dataset 객체에 반영돼 있는지가 핵심 -
     이게 깨지면 '이상치 제외'가 화면에 조용히 반영 안 되는 버그가 생긴다.
     """
-    with ProcessPoolExecutor(max_workers=1) as executor:
+    with ProcessPoolExecutor(
+        max_workers=1, mp_context=safe_process_pool_context()
+    ) as executor:
         future = executor.submit(
             run_outlier_pruning_and_validation,
             synthetic_dataset, camera_config, pattern_config,
