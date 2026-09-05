@@ -1,0 +1,388 @@
+{
+  "bootstrap_stability": {
+    "extended_pinhole": {
+      "available": true,
+      "has_distortion_stats": false,
+      "keys": [
+        "available",
+        "cx_std",
+        "cy_std",
+        "distortion_stats",
+        "fx_std",
+        "fy_std",
+        "method",
+        "n_bootstrap_success",
+        "overall_stability"
+      ],
+      "method": "covariance"
+    },
+    "fisheye": {
+      "available": false,
+      "has_distortion_stats": false,
+      "keys": [
+        "available",
+        "cx_std",
+        "cy_std",
+        "distortion_stats",
+        "fx_std",
+        "fy_std",
+        "method",
+        "n_bootstrap_success",
+        "overall_stability"
+      ],
+      "method": null
+    },
+    "pinhole": {
+      "available": true,
+      "has_distortion_stats": false,
+      "keys": [
+        "available",
+        "cx_std",
+        "cy_std",
+        "distortion_stats",
+        "fx_std",
+        "fy_std",
+        "method",
+        "n_bootstrap_success",
+        "overall_stability"
+      ],
+      "method": "covariance"
+    }
+  },
+  "camera": {
+    "fps": null,
+    "height": 1080,
+    "width": 1920
+  },
+  "chosen_model": "extended_pinhole",
+  "cross_validation": {
+    "holdout": {
+      "extended_pinhole": {
+        "has_test_residual_stats": true,
+        "has_train_residual_stats": true,
+        "keys": [
+          "edge_rms_px",
+          "error_message",
+          "failed_test_frame_ids",
+          "straightness_breakdown",
+          "straightness_residual_px",
+          "success",
+          "test_frame_ids",
+          "test_residual_stats",
+          "test_rms_px",
+          "train_frame_ids",
+          "train_residual_stats",
+          "train_rms_px"
+        ],
+        "num_test_frames": 3,
+        "num_train_frames": 13,
+        "success": true
+      },
+      "fisheye": {
+        "has_test_residual_stats": false,
+        "has_train_residual_stats": false,
+        "keys": [
+          "edge_rms_px",
+          "error_message",
+          "failed_test_frame_ids",
+          "straightness_breakdown",
+          "straightness_residual_px",
+          "success",
+          "test_frame_ids",
+          "test_residual_stats",
+          "test_rms_px",
+          "train_frame_ids",
+          "train_residual_stats",
+          "train_rms_px"
+        ],
+        "num_test_frames": 3,
+        "num_train_frames": 13,
+        "success": false
+      },
+      "pinhole": {
+        "has_test_residual_stats": true,
+        "has_train_residual_stats": true,
+        "keys": [
+          "edge_rms_px",
+          "error_message",
+          "failed_test_frame_ids",
+          "straightness_breakdown",
+          "straightness_residual_px",
+          "success",
+          "test_frame_ids",
+          "test_residual_stats",
+          "test_rms_px",
+          "train_frame_ids",
+          "train_residual_stats",
+          "train_rms_px"
+        ],
+        "num_test_frames": 3,
+        "num_train_frames": 13,
+        "success": true
+      }
+    },
+    "holdout_models": [
+      "extended_pinhole",
+      "fisheye",
+      "pinhole"
+    ],
+    "keys": [
+      "holdout",
+      "kfold",
+      "repeated_kfold"
+    ]
+  },
+  "dataset": {
+    "keys": [
+      "avg_board_area_ratio",
+      "avg_board_tilt_deg",
+      "avg_detected_corners",
+      "avg_frame_quality",
+      "coverage_grid",
+      "coverage_pct",
+      "detection_success_rate_pct",
+      "diversity",
+      "failure_reasons",
+      "frame_quality_components",
+      "num_detected",
+      "num_failed",
+      "num_total",
+      "num_used",
+      "quality_score"
+    ],
+    "num_detected": 16,
+    "num_total": 16,
+    "num_used": 16
+  },
+  "export_format_version": 1,
+  "final_calibration_summary": {
+    "chosen_model": "extended_pinhole",
+    "has_confidence": true,
+    "has_diagnosis": true,
+    "has_observability": true,
+    "has_undistortion_quality": true,
+    "keys": [
+      "chosen_model",
+      "confidence",
+      "dataset_coverage_pct",
+      "diagnosis",
+      "edge_rms_px",
+      "observability",
+      "overall_grade",
+      "straightness_residual_px",
+      "test_p95_px",
+      "test_rms_px",
+      "train_rms_px",
+      "undistortion_quality"
+    ],
+    "overall_grade": "poor"
+  },
+  "final_result": {
+    "chosen_model": "extended_pinhole",
+    "has_confidence": true,
+    "has_diagnosis": true,
+    "keys": [
+      "chosen_model",
+      "confidence",
+      "dataset_coverage_pct",
+      "diagnosis",
+      "overall_grade"
+    ],
+    "overall_grade": "poor"
+  },
+  "model_scores": [
+    {
+      "component_keys": [
+        "aic",
+        "bic",
+        "complexity",
+        "edge",
+        "line",
+        "observability",
+        "p95",
+        "radial",
+        "stability",
+        "test",
+        "train"
+      ],
+      "has_aic": true,
+      "has_bic": true,
+      "has_selection_reasons": false,
+      "is_recommended": false,
+      "keys": [
+        "aic",
+        "bic",
+        "components",
+        "is_recommended",
+        "model",
+        "num_observations",
+        "parameter_count",
+        "residual_sum_squares",
+        "score",
+        "selection_confidence",
+        "selection_confidence_level",
+        "selection_confidence_reason",
+        "selection_reasons"
+      ],
+      "model": "pinhole"
+    },
+    {
+      "component_keys": [
+        "aic",
+        "bic",
+        "complexity",
+        "edge",
+        "line",
+        "observability",
+        "p95",
+        "radial",
+        "stability",
+        "test",
+        "train"
+      ],
+      "has_aic": true,
+      "has_bic": true,
+      "has_selection_reasons": true,
+      "is_recommended": true,
+      "keys": [
+        "aic",
+        "bic",
+        "components",
+        "is_recommended",
+        "model",
+        "num_observations",
+        "parameter_count",
+        "residual_sum_squares",
+        "score",
+        "selection_confidence",
+        "selection_confidence_level",
+        "selection_confidence_reason",
+        "selection_reasons"
+      ],
+      "model": "extended_pinhole"
+    },
+    {
+      "component_keys": [
+        "aic",
+        "bic",
+        "complexity",
+        "edge",
+        "line",
+        "observability",
+        "p95",
+        "radial",
+        "stability",
+        "test",
+        "train"
+      ],
+      "has_aic": false,
+      "has_bic": false,
+      "has_selection_reasons": false,
+      "is_recommended": false,
+      "keys": [
+        "aic",
+        "bic",
+        "components",
+        "is_recommended",
+        "model",
+        "num_observations",
+        "parameter_count",
+        "residual_sum_squares",
+        "score",
+        "selection_confidence",
+        "selection_confidence_level",
+        "selection_confidence_reason",
+        "selection_reasons"
+      ],
+      "model": "fisheye"
+    }
+  ],
+  "models": {
+    "extended_pinhole": {
+      "distortion_coefficient_count": 5,
+      "has_camera_matrix": true,
+      "has_observability": true,
+      "has_residual_stats": true,
+      "has_undistortion_quality": true,
+      "keys": [
+        "camera_matrix",
+        "distortion_coefficient_count",
+        "distortion_coefficients",
+        "error_message",
+        "observability",
+        "parameter_uncertainty",
+        "parameter_uncertainty_bootstrap",
+        "per_frame_error_px",
+        "radial_error_profile",
+        "regional_error_px",
+        "residual_stats",
+        "rms_reprojection_error_px",
+        "success",
+        "undistortion_quality",
+        "validation"
+      ],
+      "success": true
+    },
+    "fisheye": {
+      "distortion_coefficient_count": null,
+      "has_camera_matrix": false,
+      "has_observability": false,
+      "has_residual_stats": false,
+      "has_undistortion_quality": false,
+      "keys": [
+        "error_message",
+        "success",
+        "validation"
+      ],
+      "success": false
+    },
+    "pinhole": {
+      "distortion_coefficient_count": 5,
+      "has_camera_matrix": true,
+      "has_observability": true,
+      "has_residual_stats": true,
+      "has_undistortion_quality": true,
+      "keys": [
+        "camera_matrix",
+        "distortion_coefficient_count",
+        "distortion_coefficients",
+        "error_message",
+        "observability",
+        "parameter_uncertainty",
+        "parameter_uncertainty_bootstrap",
+        "per_frame_error_px",
+        "radial_error_profile",
+        "regional_error_px",
+        "residual_stats",
+        "rms_reprojection_error_px",
+        "success",
+        "undistortion_quality",
+        "validation"
+      ],
+      "success": true
+    }
+  },
+  "pattern": {
+    "dictionary": "DICT_5X5_100",
+    "marker_size_m": 0.03,
+    "square_size_m": 0.04,
+    "squares_x": 7,
+    "squares_y": 5,
+    "type": "charuco"
+  },
+  "top_level_keys": [
+    "bootstrap_stability",
+    "camera",
+    "chosen_model",
+    "cross_validation",
+    "dataset",
+    "export_format_version",
+    "final_calibration_summary",
+    "final_result",
+    "generated_at",
+    "model_scores",
+    "models",
+    "pattern",
+    "sensor_name"
+  ]
+}

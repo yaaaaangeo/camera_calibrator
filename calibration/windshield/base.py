@@ -1,0 +1,131 @@
+"""
+camera_calibrator.calibration.windshield.base
+==================================================
+
+Windshield Refraction Calibration의 공용 타입.
+
+핵심 설계 원칙(사용자 스펙 1/3번, 반드시 지켜야 함):
+
+    Camera -> Base Camera Model(K,D) -> Windshield Correction -> Corrected Projection
+
+Windshield는 calibration.types.CameraModelType에 들어가는 5번째 렌즈 모델이
+아니다 - 카메라 자체(Pinhole/Brown-Conrady/Rational/Fisheye)와 완전히 분리된,
+그 "뒤"에 있는 별도 광학 계층이다. 그래서 WindshieldModelType은 별도 Enum으로
+두고, Base Intrinsic(K,D,base model)은 이 패키지의 어떤 함수도 절대
+재최적화하지 않는다 - WindshieldConfig.base_camera_matrix/base_distortion은
+항상 이미 확정된 CalibrationResult에서 그대로 스냅샷(.copy())해온 고정값이다.
+
+이 파일은 calibration.types의 기존 타입(Dataset/ResidualStats/RegionalError/
+RadialErrorProfile/SpatialErrorMap)을 참조만 하고 새로 정의하지 않는다 -
+Baseline의 residual 계산이 그 타입들을 계산하는 기존 함수(residual_stats.py,
+radial_profile.py, spatial_error_map.py, models/common.py)를 그대로 재사용하기
+때문이다.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+import numpy as np
+
+from calibration.types import (
+    CameraModelType,
+    RadialErrorProfile,
+    RegionalError,
+    ResidualStats,
+    SpatialErrorMap,
+)
+
+
+class WindshieldModelType(str, Enum):
+    """Windshield 보정 모델. calibration.types.CameraModelType과 절대 섞지
+    않는다 - Windshield는 카메라 모델이 아니라 카메라 뒤에 있는 별도 계층이다.
+    """
+    BASELINE = "baseline"          # Phase 1 - 보정 없음(항등), 순수 측정 용도
+    SPHERICAL = "spherical"        # Phase 2 - 미구현 (Snell 굴절 + 구면 근사)
+    RESIDUAL_RAY = "residual_ray"  # Phase 3 - 미구현 (Residual Grid/RBF)
+    SPLINE = "spline"              # Phase 4 - 미구현 (Advanced, Spline surface)
+
+
+class WindshieldModel(ABC):
+    """모든 Windshield 모델(Baseline/Spherical/Residual Ray/Spline)이 구현해야
+    하는 런타임 API. Calibration UI 안에서만 쓰는 임시 함수가 아니라, 향후
+    Camera-LiDAR 프로젝션처럼 Calibration 과정과 무관하게 "이미 계산된 결과로
+    좌표만 변환하고 싶은" 런타임 사용처가 재사용할 것을 전제로 설계한다
+    (사용자 스펙 17번).
+    """
+
+    @abstractmethod
+    def project_point(self, x: float, y: float, z: float) -> tuple[float, float]:
+        """카메라 좌표계의 3D 점(x, y, z) -> Windshield 보정을 반영한 픽셀(u, v)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def unproject_pixel(self, u: float, v: float) -> tuple[float, float, float]:
+        """픽셀(u, v) -> 카메라 좌표계에서 이 픽셀이 가리키는 정규화된 광선
+        방향(dx, dy, dz) (단위 벡터, Windshield 굴절을 반영)."""
+        raise NotImplementedError
+
+
+@dataclass
+class WindshieldConfig:
+    """Windshield Calibration 실행에 필요한 고정 입력.
+
+    base_camera_matrix/base_distortion/base_model_name은 이미 확정된
+    Camera Intrinsic Calibration 결과의 스냅샷이다 - 이 패키지의 어떤 함수도
+    이 세 값을 다시 추정하지 않는다(사용자 스펙 3번 핵심 원칙). UI는 이 값을
+    읽기 전용으로 표시하고 "Base K,D fixed" 표시를 해야 한다.
+    """
+    base_model_name: CameraModelType
+    base_camera_matrix: np.ndarray
+    base_distortion: np.ndarray
+    windshield_model: WindshieldModelType = WindshieldModelType.BASELINE
+    test_ratio: float = 0.25
+    split_seed: int = 42
+    # Phase 2+ (Spherical) 전용 고정 파라미터 자리. 지금은 아무 함수도 읽지
+    # 않지만, 나중에 스키마를 또 바꾸지 않도록 미리 선언해둔다(사용자 스펙
+    # 9번 - n_air/n_glass/glass_thickness는 "처음부터 자동 최적화하지 않는다").
+    glass_refractive_index: Optional[float] = None
+    glass_thickness_m: Optional[float] = None
+    windshield_position_hint: Optional[dict[str, float]] = None
+
+
+@dataclass
+class WindshieldCalibrationResult:
+    """Windshield Calibration 한 번 실행(한 모델)의 결과.
+
+    calibration.types.CalibrationResult와 구조를 의도적으로 비슷하게 맞췄다
+    (residual_stats/regional_error/radial_profile/spatial_error_map 등 같은
+    이름) - 기존 UI 컴포넌트(_PageScrollTableWidget, RadialProfileChartWidget
+    등)가 이 결과도 거의 그대로 표시할 수 있게 하기 위함. 다만 CalibrationResult
+    자체를 재사용하지 않고 별도 타입으로 둔 이유는, camera_matrix/distortion이
+    "이번에 추정한 값"이 아니라 "고정하고 빌려온 값"이라는 의미 차이를 필드
+    이름(base_camera_matrix/base_distortion)으로 명확히 구분하기 위함이다.
+    """
+    windshield_model: WindshieldModelType
+    base_model_name: CameraModelType
+    base_camera_matrix: np.ndarray
+    base_distortion: np.ndarray
+    train_frame_ids: list[str] = field(default_factory=list)
+    test_frame_ids: list[str] = field(default_factory=list)
+    failed_frame_ids: list[str] = field(default_factory=list)
+    per_frame_error: dict[str, float] = field(default_factory=dict)
+    residual_stats: Optional[ResidualStats] = None          # Train
+    test_residual_stats: Optional[ResidualStats] = None     # Hold-out
+    regional_error: Optional[RegionalError] = None
+    radial_profile: Optional[RadialErrorProfile] = None
+    radial_bands: Optional[RadialErrorProfile] = None
+    spatial_error_map: Optional[SpatialErrorMap] = None      # dx/dy vector field 데이터 소스도 겸함
+    mean_dx: Optional[float] = None
+    mean_dy: Optional[float] = None
+    # Baseline은 항상 빈 dict - Phase 2+(Spherical의 sphere_center/radius,
+    # Residual Ray의 grid 참조, Spline의 control point 등)가 여기 채워진다.
+    # ModelScore.components와 같은 패턴(범용 dict)을 써서, Phase 2 설계가
+    # 확정되기 전에 스키마를 미리 고정하지 않는다.
+    fitted_params: dict[str, float] = field(default_factory=dict)
+    success: bool = False
+    error_message: Optional[str] = None
+    warning_message: Optional[str] = None

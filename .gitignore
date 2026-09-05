@@ -1,0 +1,16 @@
+﻿venv/
+
+# 대용량 확장자/폴더 예시
+*.mp4
+*.avi
+*.pt
+*.pth
+*.onnx
+*.zip
+
+# 데이터/결과 폴더 예시
+runs/
+output/
+data/
+calib_data/
+library/

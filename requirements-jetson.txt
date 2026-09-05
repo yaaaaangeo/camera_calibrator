@@ -1,0 +1,25 @@
+# JetPack 6.2.1 / Ubuntu 22.04 / Python 3.10 / aarch64 검증용 고정 조합.
+# 반드시 scripts/install_jetson.sh로 설치하거나, 프로젝트 자체는 --no-deps로
+# 설치한다. 일반 requirements.txt와 동시에 설치하면 OpenCV GUI wheel이 겹친다.
+
+# ROS Humble apt 패키지와 호환성이 안정적인 NumPy 1.x를 유지한다.
+numpy==1.26.4
+
+# pyproject.toml의 핵심 의존성인데 이 파일에는 빠져 있었다 - calibration/
+# external_compare.py 등 여러 모듈이 scipy를 필수로 import해서, 이 파일만으로
+# 설치하면 "ModuleNotFoundError: No module named 'scipy'"로 실행 시점에
+# 실패했다. NumPy 1.26 계열과 호환되는 1.x를 고정한다.
+scipy==1.13.1
+
+# 앱 GUI는 PySide6이 담당하므로 OpenCV 자체 Qt5는 필요 없다. headless wheel을
+# 써야 Qt5/Qt6 plugin 충돌로 인한 abort/segmentation fault 가능성도 줄어든다.
+opencv-contrib-python-headless==4.10.0.84
+
+PyYAML==6.0.2
+
+# 6.7.3 aarch64 wheel은 manylinux_2_31이라 JetPack 6의 glibc 2.35에서 동작한다.
+# 6.8.3+ 최신 aarch64 wheel은 manylinux_2_39라 Ubuntu 22.04에서 설치할 수 없다.
+PySide6==6.7.3
+
+# rosbag 입력 기능. 실시간 rclpy는 ROS Humble apt 설치에서 제공된다.
+rosbags>=0.9,<1

@@ -1,0 +1,105 @@
+{
+  "format_version": 2,
+  "project": {
+    "project_name": "current-format",
+    "camera_config": {
+      "width": 640,
+      "height": 480,
+      "fps": null,
+      "model": null,
+      "sensor_name": null,
+      "hfov_deg": null,
+      "vfov_deg": null
+    },
+    "pattern_config": {
+      "type": "charuco",
+      "squares_x": 7,
+      "squares_y": 5,
+      "square_size": 0.04,
+      "marker_size": 0.03,
+      "dictionary": "DICT_5X5_100",
+      "circle_grid_type": "symmetric",
+      "aprilgrid_variant": "opencv_apriltag3"
+    },
+    "dataset": {
+      "frames": [],
+      "coverage_grid": [],
+      "diversity": null,
+      "quality_score": null
+    },
+    "calibration_results": {
+      "brown_conrady": {
+        "model_name": "brown_conrady",
+        "camera_matrix": {
+          "__ndarray__": true,
+          "dtype": "float64",
+          "data": [
+            [
+              600.0,
+              0.0,
+              320.0
+            ],
+            [
+              0.0,
+              600.0,
+              240.0
+            ],
+            [
+              0.0,
+              0.0,
+              1.0
+            ]
+          ]
+        },
+        "distortion": {
+          "__ndarray__": true,
+          "dtype": "float64",
+          "data": [
+            -0.2,
+            0.05,
+            0.001,
+            -0.001,
+            0.01
+          ]
+        },
+        "rvecs": [],
+        "tvecs": [],
+        "rms_error": 0.32,
+        "per_frame_error": {},
+        "regional_error": null,
+        "radial_profile": null,
+        "radial_bands": null,
+        "spatial_error_map": null,
+        "param_uncertainty": null,
+        "param_uncertainty_bootstrap": null,
+        "residual_stats": null,
+        "observability": null,
+        "undistortion_quality": null,
+        "calibration_method": "standard",
+        "refined_object_points": null,
+        "target_geometry_refinement": null,
+        "object_releasing_diagnostics": [],
+        "success": true,
+        "error_message": null,
+        "warning_message": null
+      }
+    },
+    "object_releasing_result": null,
+    "object_releasing_validation_result": null,
+    "standard_vs_object_releasing_comparison": null,
+    "validation_results": {},
+    "cross_dataset_results": [],
+    "model_scores": [],
+    "outlier_result": null,
+    "final_result": null,
+    "created_at": {
+      "__datetime__": true,
+      "iso": "2026-08-30T19:48:16.166382"
+    },
+    "updated_at": {
+      "__datetime__": true,
+      "iso": "2026-08-30T19:48:16.166382"
+    },
+    "export_paths": {}
+  }
+}

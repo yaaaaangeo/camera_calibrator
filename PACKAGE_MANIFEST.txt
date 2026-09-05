@@ -1,0 +1,6 @@
+camera_calibrator GitHub source package
+Created: 2026-08-24T03:31:50.7151905+09:00
+Source HEAD: 2b26892
+Includes current working tree source files.
+Excluded: .git, .venv, .pytest_cache, calibration_output, __pycache__, *.pyc, *.pyo
+File count before manifest: 137

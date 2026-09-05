@@ -1,0 +1,26 @@
+# NVIDIA Jetson AGX Orin Developer Kit 64GB
+# JetPack 5.1.2 / Jetson Linux R35.4.1 / Ubuntu 20.04 / aarch64
+# Python 3.10 only. Ubuntu 20.04's default Python 3.8 is not targeted.
+#
+# Keep ROS out of this file. ROS1 Noetic packages such as rospy,
+# sensor_msgs and cv_bridge are managed by apt / the sourced ROS environment.
+#
+# OpenCV note:
+# - This project uses cv2.aruco, CharucoBoard, findCirclesGrid,
+#   calibrateCameraRO and cv2.fisheye, so a contrib build is required.
+# - Use the headless wheel with PySide6 to avoid mixing OpenCV's bundled Qt
+#   plugin stack with the Qt6 runtime used by the GUI.
+
+numpy==1.26.4
+scipy==1.11.4
+opencv-contrib-python-headless==4.10.0.84
+matplotlib==3.8.4
+PyYAML==6.0.2
+jsonschema==4.22.0
+
+# Qt for Python. 6.5.3 provides cp37-abi3 manylinux_2_31_aarch64 wheels,
+# matching Ubuntu 20.04's glibc 2.31 baseline.
+shiboken6==6.5.3
+PySide6-Essentials==6.5.3
+PySide6-Addons==6.5.3
+PySide6==6.5.3
