@@ -14,11 +14,24 @@ windshield_results 필드의 저장/불러오기 검증.
 
 from __future__ import annotations
 
-from calibration.project_io import PROJECT_FORMAT_VERSION, project_from_dict, project_to_dict, save_project, load_project
+import pytest
+
+from calibration.project_io import (
+    PROJECT_FORMAT_VERSION,
+    _windshield_calibration_result_from_dict,
+    project_from_dict,
+    project_to_dict,
+    save_project,
+    load_project,
+)
+from calibration.json_utils import json_safe
+import dataclasses
 from calibration.types import CalibrationProject, CameraConfig, PatternConfig, PatternType
 from calibration.windshield.base import WindshieldConfig, WindshieldModelType
 from calibration.windshield.baseline import calibrate_baseline
+from calibration.windshield.spherical import calibrate_spherical
 from tests._windshield_test_utils import (
+    build_synthetic_spherical_windshield_dataset,
     build_synthetic_windshield_dataset,
     default_camera_config,
     default_camera_matrix_distortion,
@@ -77,6 +90,84 @@ def test_windshield_fields_round_trip_through_disk(tmp_path):
 
     assert restored.windshield_config is not None
     assert WindshieldModelType.BASELINE in restored.windshield_results
+
+
+def test_baseline_test_side_fields_round_trip():
+    """STEP1 -> STEP2 backfill(test_regional_error 등)이 실제로 채워지고
+    저장/복원되는지 확인 - Train/Test 분할이 있는 데이터셋으로 baseline을
+    돌린다."""
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_windshield_dataset(K, D, shear_k=0.02)
+    camera_config = default_camera_config()
+    config = WindshieldConfig(base_model_name=CameraModelType.BROWN_CONRADY, base_camera_matrix=K, base_distortion=D)
+    ids = [f.image_info.image_id for f in dataset.frames]
+    train_ids, test_ids = ids[: len(ids) - 2], ids[len(ids) - 2 :]
+    result = calibrate_baseline(dataset, config, camera_config, train_ids, test_ids)
+    assert result.test_regional_error is not None
+    assert result.test_mean_dx is not None
+
+    d = json_safe(dataclasses.asdict(result))
+    restored = _windshield_calibration_result_from_dict(d)
+
+    assert restored.test_regional_error is not None
+    assert restored.test_mean_dx == result.test_mean_dx
+    assert restored.test_mean_dy == result.test_mean_dy
+    assert restored.ray_angular_error_deg == result.ray_angular_error_deg  # Baseline은 항상 None
+
+
+def test_spherical_result_with_new_fields_round_trips():
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_spherical_windshield_dataset(K, D)
+    camera_config = default_camera_config()
+    config = WindshieldConfig(
+        base_model_name=CameraModelType.BROWN_CONRADY, base_camera_matrix=K, base_distortion=D,
+        windshield_model=WindshieldModelType.SPHERICAL,
+        windshield_position_hint={"sphere_center_z": -8.0, "sphere_radius": 9.0},
+    )
+    ids = [f.image_info.image_id for f in dataset.frames]
+    train_ids, test_ids = ids[:-2], ids[-2:]
+    result = calibrate_spherical(dataset, config, camera_config, train_ids, test_ids)
+    assert result.success
+
+    project = CalibrationProject(
+        project_name="spherical-test",
+        camera_config=camera_config,
+        pattern_config=PatternConfig(type=PatternType.CHARUCO, squares_x=6, squares_y=5, square_size=0.04),
+        windshield_config=config,
+        windshield_dataset=dataset,
+        windshield_results={WindshieldModelType.SPHERICAL: result},
+    )
+    restored = project_from_dict(project_to_dict(project))
+    restored_result = restored.windshield_results[WindshieldModelType.SPHERICAL]
+
+    assert restored_result.fitted_params["sphere_radius"] == pytest.approx(result.fitted_params["sphere_radius"])
+    assert restored_result.ray_angular_error_deg == pytest.approx(result.ray_angular_error_deg)
+    if result.test_ray_angular_error_deg is not None:
+        assert restored_result.test_ray_angular_error_deg == pytest.approx(result.test_ray_angular_error_deg)
+
+
+def test_windshield_result_missing_new_fields_loads_with_none_defaults():
+    """새 8개 필드가 없는(STEP1 시절) 저장된 결과 dict도 그대로 로드되어야 한다."""
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_windshield_dataset(K, D)
+    camera_config = default_camera_config()
+    config = WindshieldConfig(base_model_name=CameraModelType.BROWN_CONRADY, base_camera_matrix=K, base_distortion=D)
+    train_ids = [f.image_info.image_id for f in dataset.frames]
+    result = calibrate_baseline(dataset, config, camera_config, train_ids, [])
+
+    d = json_safe(dataclasses.asdict(result))
+    for key in (
+        "test_regional_error", "test_radial_profile", "test_radial_bands",
+        "test_spatial_error_map", "test_mean_dx", "test_mean_dy",
+        "ray_angular_error_deg", "test_ray_angular_error_deg",
+    ):
+        del d[key]
+
+    restored = _windshield_calibration_result_from_dict(d)
+    assert restored.test_regional_error is None
+    assert restored.test_mean_dx is None
+    assert restored.ray_angular_error_deg is None
+    assert restored.test_ray_angular_error_deg is None
 
 
 def test_old_project_without_windshield_fields_loads_with_none_defaults():

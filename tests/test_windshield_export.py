@@ -11,11 +11,16 @@ test_windshield_regression_existing_features.py에서 확인한다.
 
 from __future__ import annotations
 
+import pytest
+
 from calibration.types import CameraModelType
 from calibration.windshield.base import WindshieldConfig, WindshieldModelType
 from calibration.windshield.baseline import calibrate_baseline
-from export.windshield import export_windshield_yaml, load_windshield_yaml
+from calibration.windshield.projection import build_projector
+from calibration.windshield.spherical import calibrate_spherical
+from export.windshield import export_windshield_yaml, load_windshield_yaml, windshield_model_from_yaml
 from tests._windshield_test_utils import (
+    build_synthetic_spherical_windshield_dataset,
     build_synthetic_windshield_dataset,
     default_camera_config,
     default_camera_matrix_distortion,
@@ -44,6 +49,36 @@ def test_export_windshield_yaml_round_trip(tmp_path):
     assert data["base_camera"]["image_width"] == camera_config.width
     assert data["windshield"]["model"] == WindshieldModelType.BASELINE.value
     assert data["windshield"]["train_rms"] >= 0.0
+
+
+def test_export_windshield_yaml_round_trip_spherical(tmp_path):
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_spherical_windshield_dataset(K, D)
+    camera_config = default_camera_config()
+    config = WindshieldConfig(
+        base_model_name=CameraModelType.BROWN_CONRADY, base_camera_matrix=K, base_distortion=D,
+        windshield_model=WindshieldModelType.SPHERICAL,
+        windshield_position_hint={"sphere_center_z": -8.0, "sphere_radius": 9.0},
+    )
+    train_ids = [f.image_info.image_id for f in dataset.frames]
+    result = calibrate_spherical(dataset, config, camera_config, train_ids, [])
+    assert result.success
+
+    path = str(tmp_path / "windshield_spherical.yml")
+    export_windshield_yaml(result, camera_config, path)
+    data = load_windshield_yaml(path)
+
+    assert data["windshield"]["model"] == WindshieldModelType.SPHERICAL.value
+    assert data["windshield"]["fitted_params"]["sphere_radius"] == pytest.approx(
+        result.fitted_params["sphere_radius"]
+    )
+
+    reconstructed = windshield_model_from_yaml(path)
+    test_point = (0.2, 0.15, 5.0)
+    original_model = build_projector(result)
+    assert reconstructed.project_point(*test_point) == pytest.approx(
+        original_model.project_point(*test_point), abs=1e-6
+    )
 
 
 def test_export_windshield_yaml_rejects_failed_result(tmp_path):

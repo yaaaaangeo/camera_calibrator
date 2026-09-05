@@ -28,8 +28,8 @@ from pathlib import Path
 import cv2
 
 from calibration.models.common import distortion_coeff_labels
-from calibration.types import CameraConfig
-from calibration.windshield.base import WindshieldCalibrationResult, WindshieldModelType
+from calibration.types import CameraConfig, CameraModelType
+from calibration.windshield.base import WindshieldCalibrationResult, WindshieldModel, WindshieldModelType
 
 
 def export_windshield_yaml(
@@ -39,9 +39,9 @@ def export_windshield_yaml(
 ) -> str:
     """WindshieldCalibrationResult를 base_camera/windshield 두 섹션으로 저장한다.
 
-    Baseline(WindshieldModelType.BASELINE) 외의 모델은 fitted_params 스키마가
-    아직 확정되지 않았으므로(Phase 2/3/4 미구현), 지금은 success=False인
-    결과와 마찬가지로 export를 거부한다.
+    fitted_params는 모델과 무관하게 flat한 이름->float 값의 dict라는 계약만
+    지키면(Baseline/Spherical 둘 다 이 계약을 지킨다) 스키마 변경 없이 그대로
+    저장된다 - success=False인 결과만 export를 거부한다.
     """
     if not result.success or result.base_camera_matrix is None or result.base_distortion is None:
         raise ValueError(f"실패한 WindshieldCalibrationResult는 export할 수 없습니다: {result.error_message}")
@@ -78,10 +78,22 @@ def export_windshield_yaml(
 
 
 def load_windshield_yaml(path: str) -> dict:
-    """저장한 파일을 다시 읽어 dict로 반환 (재현성 검증/round-trip 테스트용)."""
+    """저장한 파일을 다시 읽어 dict로 반환 (재현성 검증/round-trip 테스트용).
+
+    fitted_param_names(콤마로 구분된 키 목록) + fitted_param_<key>(각 float
+    값)를 다시 하나의 fitted_params dict로 복원한다 - export_windshield_yaml
+    이 쓴 것과 대칭인 읽기.
+    """
     fs = cv2.FileStorage(path, cv2.FILE_STORAGE_READ)
     base_node = fs.getNode("base_camera")
     windshield_node = fs.getNode("windshield")
+
+    names_raw = windshield_node.getNode("fitted_param_names").string() or ""
+    fitted_param_keys = [k for k in names_raw.split(",") if k]
+    fitted_params = {
+        key: windshield_node.getNode(f"fitted_param_{key}").real() for key in fitted_param_keys
+    }
+
     data = {
         "base_camera": {
             "camera_model": base_node.getNode("camera_model").string(),
@@ -94,7 +106,35 @@ def load_windshield_yaml(path: str) -> dict:
             "model": windshield_node.getNode("model").string(),
             "train_rms": windshield_node.getNode("train_rms").real(),
             "test_rms": windshield_node.getNode("test_rms").real(),
+            "fitted_params": fitted_params,
         },
     }
     fs.release()
     return data
+
+
+def windshield_model_from_yaml(path: str) -> WindshieldModel:
+    """Windshield YAML을 다시 읽어 실행 가능한 WindshieldModel로 재구성한다
+    (project_point/unproject_pixel 바로 호출 가능) - 저장만 하고 못 쓰는
+    일회성 export가 아니라 runtime에서 재사용 가능해야 한다는 요구사항.
+
+    BASELINE/SPHERICAL 분기 로직을 여기서 새로 만들지 않고,
+    calibration.windshield.projection.build_projector() 하나에만 위임한다 -
+    Calibration 도중에 만든 결과든 YAML에서 막 불러온 결과든 같은 dispatch
+    경로 하나로 모델을 얻는다.
+    """
+    from calibration.windshield.projection import build_projector
+
+    data = load_windshield_yaml(path)
+    base = data["base_camera"]
+    ws = data["windshield"]
+
+    result = WindshieldCalibrationResult(
+        windshield_model=WindshieldModelType(ws["model"]),
+        base_model_name=CameraModelType(base["camera_model"]),
+        base_camera_matrix=base["camera_matrix"],
+        base_distortion=base["distortion_coefficients"],
+        fitted_params=ws["fitted_params"],
+        success=True,
+    )
+    return build_projector(result)

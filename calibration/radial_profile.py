@@ -146,6 +146,44 @@ def _radial_bin_stats(errors_in_bin: np.ndarray) -> dict:
     )
 
 
+def bin_radial_errors(
+    radii: np.ndarray,
+    errors: np.ndarray,
+    max_radius: float,
+    num_bins: int = 8,
+) -> RadialErrorProfile:
+    """이미 계산된 (반지름, 오차) 포인트 배열을 반지름 구간별 통계(Mean/Median/
+    RMS/P95/Max)로 묶는다 - 투영 방식과 무관한 순수 집계 로직이다.
+
+    compute_radial_error_profile()이 이 함수를 감싸는 얇은 wrapper다(central
+    카메라 모델의 cv2.projectPoints 기반 투영으로 radii/errors를 구해서 넘김).
+    Windshield Spherical처럼 투영 방식 자체가 다른 경우, 자기 방식으로 계산한
+    radii/errors 배열을 이 함수에 직접 넘겨 같은 집계 로직을 재사용한다 -
+    "구간 나누고 통계 내는" 로직이 두 곳에 따로 있으면 하나가 바뀔 때 다른
+    쪽을 깜빡 놓치기 쉽다.
+    """
+    if max_radius <= 0:
+        return RadialErrorProfile(bins=[], max_radius=max_radius)
+    if radii.size == 0:
+        return RadialErrorProfile(bins=[], max_radius=max_radius)
+
+    bin_edges = np.linspace(0.0, max_radius, num_bins + 1)
+    bins: list[RadialBin] = []
+    for i in range(num_bins):
+        lo, hi = float(bin_edges[i]), float(bin_edges[i + 1])
+        # 마지막 구간만 상한 포함 (딱 코너에 걸리는 포인트 포함시키기 위함)
+        if i < num_bins - 1:
+            mask = (radii >= lo) & (radii < hi)
+        else:
+            mask = (radii >= lo) & (radii <= hi)
+
+        count = int(mask.sum())
+        stats = _radial_bin_stats(errors[mask])
+        bins.append(RadialBin(radius_min=lo, radius_max=hi, num_points=count, **stats))
+
+    return RadialErrorProfile(bins=bins, max_radius=max_radius)
+
+
 def compute_radial_error_profile(
     frames: list[Frame],
     rvecs: list[np.ndarray],
@@ -176,31 +214,10 @@ def compute_radial_error_profile(
     w, h = image_size
     max_radius = float(np.hypot(w / 2.0, h / 2.0))  # 이미지 대각선의 절반 (코너까지 거리)
 
-    if max_radius <= 0:
-        return RadialErrorProfile(bins=[], max_radius=max_radius)
-
     radii_arr, errors_arr = collect_per_point_residuals(
         frames, rvecs, tvecs, camera_matrix, distortion, image_size, model
     )
-
-    if radii_arr.size == 0:
-        return RadialErrorProfile(bins=[], max_radius=max_radius)
-
-    bin_edges = np.linspace(0.0, max_radius, num_bins + 1)
-    bins: list[RadialBin] = []
-    for i in range(num_bins):
-        lo, hi = float(bin_edges[i]), float(bin_edges[i + 1])
-        # 마지막 구간만 상한 포함 (딱 코너에 걸리는 포인트 포함시키기 위함)
-        if i < num_bins - 1:
-            mask = (radii_arr >= lo) & (radii_arr < hi)
-        else:
-            mask = (radii_arr >= lo) & (radii_arr <= hi)
-
-        count = int(mask.sum())
-        stats = _radial_bin_stats(errors_arr[mask])
-        bins.append(RadialBin(radius_min=lo, radius_max=hi, num_points=count, **stats))
-
-    return RadialErrorProfile(bins=bins, max_radius=max_radius)
+    return bin_radial_errors(radii_arr, errors_arr, max_radius, num_bins=num_bins)
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +229,36 @@ def compute_radial_error_profile(
 # (예: 1920x1080에서 max_radius~1100px, Corner 대역은 916~1100px).
 _RADIAL_BAND_LABELS = ["Center", "Inner", "Middle", "Outer", "Edge", "Corner"]
 _RADIAL_BAND_BOUNDARIES = [0.0, 1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6, 1.0]
+
+
+def bin_radial_error_bands(
+    radii: np.ndarray,
+    errors: np.ndarray,
+    max_radius: float,
+) -> RadialErrorProfile:
+    """이미 계산된 (반지름, 오차) 포인트 배열을 Center/Inner/Middle/Outer/Edge/
+    Corner 6단계 명명된 대역으로 묶는다 - bin_radial_errors()와 같은 이유로
+    투영 로직에서 집계 로직을 분리했다(Windshield Spherical 재사용 목적).
+    """
+    if max_radius <= 0:
+        return RadialErrorProfile(bins=[], max_radius=max_radius)
+    if radii.size == 0:
+        return RadialErrorProfile(bins=[], max_radius=max_radius)
+
+    bins: list[RadialBin] = []
+    for i, label in enumerate(_RADIAL_BAND_LABELS):
+        lo = _RADIAL_BAND_BOUNDARIES[i] * max_radius
+        hi = _RADIAL_BAND_BOUNDARIES[i + 1] * max_radius
+        if i < len(_RADIAL_BAND_LABELS) - 1:
+            mask = (radii >= lo) & (radii < hi)
+        else:
+            mask = (radii >= lo) & (radii <= hi)
+
+        count = int(mask.sum())
+        stats = _radial_bin_stats(errors[mask])
+        bins.append(RadialBin(radius_min=lo, radius_max=hi, num_points=count, label=label, **stats))
+
+    return RadialErrorProfile(bins=bins, max_radius=max_radius)
 
 
 def compute_radial_error_bands(
@@ -230,29 +277,11 @@ def compute_radial_error_bands(
     """
     w, h = image_size
     max_radius = float(np.hypot(w / 2.0, h / 2.0))
-    if max_radius <= 0:
-        return RadialErrorProfile(bins=[], max_radius=max_radius)
 
     radii_arr, errors_arr = collect_per_point_residuals(
         frames, rvecs, tvecs, camera_matrix, distortion, image_size, model
     )
-    if radii_arr.size == 0:
-        return RadialErrorProfile(bins=[], max_radius=max_radius)
-
-    bins: list[RadialBin] = []
-    for i, label in enumerate(_RADIAL_BAND_LABELS):
-        lo = _RADIAL_BAND_BOUNDARIES[i] * max_radius
-        hi = _RADIAL_BAND_BOUNDARIES[i + 1] * max_radius
-        if i < len(_RADIAL_BAND_LABELS) - 1:
-            mask = (radii_arr >= lo) & (radii_arr < hi)
-        else:
-            mask = (radii_arr >= lo) & (radii_arr <= hi)
-
-        count = int(mask.sum())
-        stats = _radial_bin_stats(errors_arr[mask])
-        bins.append(RadialBin(radius_min=lo, radius_max=hi, num_points=count, label=label, **stats))
-
-    return RadialErrorProfile(bins=bins, max_radius=max_radius)
+    return bin_radial_error_bands(radii_arr, errors_arr, max_radius)
 
 
 # ---------------------------------------------------------------------------

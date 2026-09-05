@@ -185,6 +185,12 @@ def calibrate_baseline(
         if test_frames:
             test_outcome = _evaluate_frames(test_frames, K, D, model, image_size)
             result.test_residual_stats = test_outcome.residual_stats
+            result.test_regional_error = test_outcome.regional_error
+            result.test_radial_profile = test_outcome.radial_profile
+            result.test_radial_bands = test_outcome.radial_bands
+            result.test_spatial_error_map = test_outcome.spatial_error_map
+            result.test_mean_dx = test_outcome.mean_dx
+            result.test_mean_dy = test_outcome.mean_dy
             for fid in test_outcome.failed_frame_ids:
                 if fid not in result.failed_frame_ids:
                     result.failed_frame_ids.append(fid)

@@ -18,6 +18,7 @@ from calibration.windshield.base import (
 )
 from calibration.windshield.baseline import BaselineWindshieldModel
 from calibration.windshield.projection import build_projector
+from calibration.windshield.spherical import SphericalWindshieldModel
 
 
 def _make_config() -> WindshieldConfig:
@@ -65,9 +66,28 @@ def test_build_projector_baseline_returns_baseline_model():
     assert isinstance(model, BaselineWindshieldModel)
 
 
+def test_build_projector_spherical_returns_spherical_model():
+    """Phase 2(Spherical)는 STEP 2에서 실제 구현됐다 - fitted_params가 채워진
+    결과라면 build_projector가 실제 SphericalWindshieldModel을 만들어야 한다."""
+    cfg = _make_config()
+    result = WindshieldCalibrationResult(
+        windshield_model=WindshieldModelType.SPHERICAL,
+        base_model_name=cfg.base_model_name,
+        base_camera_matrix=cfg.base_camera_matrix,
+        base_distortion=cfg.base_distortion,
+        fitted_params={
+            "sphere_center_x": 0.0, "sphere_center_y": 0.0, "sphere_center_z": -9.7,
+            "sphere_radius": 10.0,
+        },
+        success=True,
+    )
+    model = build_projector(result)
+    assert isinstance(model, SphericalWindshieldModel)
+
+
 @pytest.mark.parametrize(
     "windshield_model",
-    [WindshieldModelType.SPHERICAL, WindshieldModelType.RESIDUAL_RAY, WindshieldModelType.SPLINE],
+    [WindshieldModelType.RESIDUAL_RAY, WindshieldModelType.SPLINE],
 )
 def test_build_projector_unimplemented_models_raise_not_implemented(windshield_model):
     cfg = _make_config()

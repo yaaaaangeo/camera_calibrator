@@ -121,6 +121,23 @@ class WindshieldCalibrationResult:
     spatial_error_map: Optional[SpatialErrorMap] = None      # dx/dy vector field 데이터 소스도 겸함
     mean_dx: Optional[float] = None
     mean_dy: Optional[float] = None
+    # Hold-out(Test) 쪽 Regional/Radial/Spatial/mean dx,dy - STEP 1(Baseline)
+    # 구현 당시 test_residual_stats만 저장하고 나머지는 빠뜨렸던 것을 STEP 2에서
+    # 추가(additive) - 계산 자체는 이미 하고 있었으므로 Baseline도 이 필드들을
+    # 채우도록 함께 고쳤다(baseline.py 참고, 로직 자체를 바꾸는 게 아니라
+    # 저장 누락을 보완하는 수정).
+    test_regional_error: Optional[RegionalError] = None
+    test_radial_profile: Optional[RadialErrorProfile] = None
+    test_radial_bands: Optional[RadialErrorProfile] = None
+    test_spatial_error_map: Optional[SpatialErrorMap] = None
+    test_mean_dx: Optional[float] = None
+    test_mean_dy: Optional[float] = None
+    # Ray Angular Error(도) - Windshield 모델이 "관측 픽셀의 굴절 광선"과
+    # "카메라 좌표계의 실제 목표점 방향" 사이의 각도로 표현한 잔차. Baseline은
+    # 굴절 지점(exit point)이라는 개념 자체가 없어 의미 있게 정의할 수 없으므로
+    # 항상 None으로 둔다(값을 억지로 만들지 않는다) - Spherical만 채운다.
+    ray_angular_error_deg: Optional[float] = None
+    test_ray_angular_error_deg: Optional[float] = None
     # Baseline은 항상 빈 dict - Phase 2+(Spherical의 sphere_center/radius,
     # Residual Ray의 grid 참조, Spline의 control point 등)가 여기 채워진다.
     # ModelScore.components와 같은 패턴(범용 dict)을 써서, Phase 2 설계가

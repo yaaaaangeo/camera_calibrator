@@ -100,3 +100,82 @@ def build_synthetic_windshield_dataset(
         )
         frames.append(frame)
     return Dataset(frames=frames)
+
+
+# 기본 windshield sphere - _POSES의 보드 깊이(0.5~0.8m)보다 windshield가 카메라
+# 쪽에 훨씬 가까이 있고(안쪽 표면 z ~= 0.3m), 곡률(radius)이 커서(10m) 실제
+# 자동차 windshield처럼 완만하다. calibration/windshield/spherical.py의
+# refraction.py 기반 forward model로 직접 생성하므로 "알려진 정답"이 명확하다.
+DEFAULT_SPHERE_CENTER = np.array([0.0, 0.0, -9.7])
+DEFAULT_SPHERE_RADIUS = 10.0
+DEFAULT_GLASS_THICKNESS_M = 0.005
+DEFAULT_AIR_INDEX = 1.0
+DEFAULT_GLASS_INDEX = 1.52
+
+
+def build_synthetic_spherical_windshield_dataset(
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray,
+    *,
+    sphere_center: np.ndarray = DEFAULT_SPHERE_CENTER,
+    sphere_radius: float = DEFAULT_SPHERE_RADIUS,
+    n_air: float = DEFAULT_AIR_INDEX,
+    n_glass: float = DEFAULT_GLASS_INDEX,
+    thickness: float = DEFAULT_GLASS_THICKNESS_M,
+    model=None,
+) -> Dataset:
+    """known sphere+두 표면 Snell 굴절을 통해 "관측" 코너를 만든다(모두
+    calibration/windshield/refraction.py와 spherical.py의 실제 forward model
+    (SphericalWindshieldModel.project_point)을 그대로 사용) - Baseline용
+    build_synthetic_windshield_dataset()과 달리 진짜 굴절 geometry를 통과시킨다.
+
+    자기 자신의 구현(refraction.py/spherical.py)으로 정답 데이터를 만드는
+    self-consistency 테스트라는 한계가 있다 - Snell 굴절 공식 자체의 정오는
+    tests/test_windshield_refraction.py의 손으로 계산한 독립적인 각도
+    검증이 담당한다.
+    """
+    from calibration.types import CameraModelType
+    from calibration.windshield.spherical import SphericalWindshieldModel
+
+    model = model or CameraModelType.BROWN_CONRADY
+    true_model = SphericalWindshieldModel(
+        camera_matrix, distortion, model, sphere_center, sphere_radius, n_air, n_glass, thickness
+    )
+
+    obj = _object_grid()
+    frames: list[Frame] = []
+    for i, (rvec, tvec) in enumerate(_POSES):
+        frame_id = f"sph_{i:02d}"
+        R, _ = cv2.Rodrigues(rvec)
+        cam_pts = (R @ obj.reshape(-1, 3).T).T + tvec.reshape(1, 3)
+
+        pixels = []
+        ok = True
+        for p in cam_pts:
+            try:
+                u, v = true_model.project_point(float(p[0]), float(p[1]), float(p[2]))
+            except ValueError:
+                ok = False
+                break
+            pixels.append([u, v])
+        if not ok:
+            continue
+
+        corners = np.array(pixels, dtype=np.float32).reshape(-1, 1, 2)
+        center = corners.reshape(-1, 2).mean(axis=0)
+        detection = DetectionResult(
+            image_id=frame_id,
+            success=True,
+            corners=corners,
+            object_points=obj.astype(np.float32),
+            num_corners=corners.shape[0],
+            board_area_ratio=0.2,
+            board_center_px=(float(center[0]), float(center[1])),
+        )
+        frame = Frame(
+            image_info=ImageInfo(image_id=frame_id, path=f"synthetic://{frame_id}", width=IMG_W, height=IMG_H),
+            detection=detection,
+            status=FrameStatus.DETECTED,
+        )
+        frames.append(frame)
+    return Dataset(frames=frames)

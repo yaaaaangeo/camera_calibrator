@@ -30,27 +30,29 @@ from calibration.radial_profile import collect_per_point_vectors
 from calibration.types import CameraModelType, Frame, SpatialErrorCell, SpatialErrorMap
 
 
-def compute_spatial_error_map(
-    frames: list[Frame],
-    rvecs: list[np.ndarray],
-    tvecs: list[np.ndarray],
-    camera_matrix: np.ndarray,
-    distortion: np.ndarray,
+def bin_spatial_errors(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    dxs: np.ndarray,
+    dys: np.ndarray,
     image_size: tuple[int, int],
-    model: CameraModelType,
     rows: int = 4,
     cols: int = 4,
 ) -> SpatialErrorMap:
-    """이미지를 rows x cols 그리드로 나누고, 각 칸에 찍힌 코너들의
-    재투영 오차를 RMS/P95/평균 방향(dx, dy, 각도)으로 요약한다.
+    """이미 계산된 (검출 위치, dx, dy) 포인트 배열을 rows x cols 그리드로
+    버킷팅해서 칸별 RMS/P95/평균 방향(dx, dy, 각도)으로 요약한다 - 투영 방식과
+    무관한 순수 집계 로직이다.
+
+    compute_spatial_error_map()이 이 함수를 감싸는 얇은 wrapper다(central
+    카메라 모델 투영으로 xs/ys/dxs/dys를 구해서 넘김). Windshield Spherical처럼
+    투영 방식 자체가 다른 경우, 자기 방식으로 계산한 벡터 배열을 이 함수에
+    직접 넘겨 같은 집계 로직을 재사용한다.
 
     quality.compute_coverage_grid()와 같은 그리드 좌표 규칙(행=위->아래,
     열=왼쪽->오른쪽)을 쓴다 - 두 그리드를 나란히 봤을 때 셀 위치가 헷갈리지
     않도록.
     """
     w, h = image_size
-    xs, ys, dxs, dys = collect_per_point_vectors(frames, rvecs, tvecs, camera_matrix, distortion, model)
-
     cells: list[SpatialErrorCell] = []
     if xs.size == 0 or w <= 0 or h <= 0:
         # 계산할 포인트가 없어도 빈 셀 그리드 구조는 유지한다 - 호출부가
@@ -88,6 +90,24 @@ def compute_spatial_error_map(
             ))
 
     return SpatialErrorMap(cells=cells, rows=rows, cols=cols)
+
+
+def compute_spatial_error_map(
+    frames: list[Frame],
+    rvecs: list[np.ndarray],
+    tvecs: list[np.ndarray],
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray,
+    image_size: tuple[int, int],
+    model: CameraModelType,
+    rows: int = 4,
+    cols: int = 4,
+) -> SpatialErrorMap:
+    """이미지를 rows x cols 그리드로 나누고, 각 칸에 찍힌 코너들의
+    재투영 오차를 RMS/P95/평균 방향(dx, dy, 각도)으로 요약한다.
+    """
+    xs, ys, dxs, dys = collect_per_point_vectors(frames, rvecs, tvecs, camera_matrix, distortion, model)
+    return bin_spatial_errors(xs, ys, dxs, dys, image_size, rows=rows, cols=cols)
 
 
 # ---------------------------------------------------------------------------
