@@ -14,8 +14,20 @@ Phase 3-A - "Base Ray + Residual Correction" 모델. 정확한 Windshield CAD나
     d_corrected = normalize(d_base + Delta_d(u, v))
 
 Delta_d(u,v)는 이미지 위에 성긴 control grid(기본 6행 x 8열 "node")를 두고
-bilinear interpolation으로 임의의 픽셀에서 값을 구한다 - Neural Network나
-RBF는 이번 단계(3-A)에서 다루지 않는다(3-B/5에서 별도 구현).
+bilinear interpolation으로 임의의 픽셀에서 값을 구한다 - 이 모듈은 그 중
+"Grid + Bilinear" variant만 구현한다. RBF 기반 variant(STEP 3-B)는
+`calibration/windshield/residual_rbf.py`에 별도로 구현돼 있고, 두 variant
+모두 같은 `WindshieldModelType.RESIDUAL_RAY` 아래에서
+`WindshieldConfig.residual_ray_hint["method"]`("grid" 기본값 / "rbf")로만
+구분된다(WindshieldModelType에 새 멤버를 추가하지 않는다) - dispatch는
+`calibration/windshield/validation.py::run_windshield_calibration`과
+`ui/windshield_worker.py`에 있다.
+
+Grid/RBF가 공유해야 하는 부분(pose refinement 정책, corrected-ray angular
+stability, pixel-domain evaluation, Repeated Hold-out 요약 형태)은
+`calibration/windshield/residual_common.py`에 있다 - 이 파일은 그 공유
+유틸을 가져다 쓰고, Grid 고유의 fitting 로직(bilinear interpolation +
+least_squares)만 갖고 있다.
 
 설계 선택 - Delta_d를 3D 자유 벡터로 둔 이유:
     Delta_d를 "d_base에 수직인 tangent-plane 위의 2-DoF 보정"으로 제한하는
@@ -47,12 +59,14 @@ STEP 3-A 안정화(2차 라운드) - 이번에 추가된 것:
     같은 ray-alignment residual을 쓰므로(project_point()의 중첩 root-solve
     없이) 계산이 여전히 저렴하다. STAGE B가 실제 pixel RMS를 개선하지
     못하면 조용히 무시하지 않고 STAGE A로 되돌아가며 warning_message에
-    남긴다(Spherical과 동일한 정책).
+    남긴다(Spherical과 동일한 정책). 최적화 자체의 residual은 ray-domain,
+    STAGE A/B 최종 채택 여부 판단 기준은 실제 pixel-domain RMS다.
 
     추가로 Repeated Hold-out(여러 split 평균/표준편차), Grid Resolution
     Comparison + AUTO 선택(Hold-out RMS가 비슷하면 parameter가 적은 쪽
-    선택), Grid Stability metric(split 간 fitted grid 변동), 그리고
-    runtime/calibration parameter 수 구분 표기를 추가했다.
+    선택), corrected-ray angular stability(split 간 fitted grid 변동을
+    물리적 각도로 측정), 그리고 runtime/calibration parameter 수 구분
+    표기를 추가했다.
 """
 
 from __future__ import annotations
@@ -66,25 +80,26 @@ import cv2
 import numpy as np
 from scipy.optimize import least_squares
 
-from calibration.models.common import MIN_FRAMES_REQUIRED, compute_regional_error, infer_image_size
-from calibration.radial_profile import bin_radial_error_bands, bin_radial_errors
-from calibration.residual_stats import compute_residual_stats
-from calibration.spatial_error_map import bin_spatial_errors
-from calibration.types import (
-    CameraConfig,
-    CameraModelType,
-    Dataset,
-    Frame,
-    RadialErrorProfile,
-    RegionalError,
-    ResidualStats,
-    SpatialErrorMap,
-)
+from calibration.models.common import MIN_FRAMES_REQUIRED, infer_image_size
+from calibration.types import CameraConfig, CameraModelType, Dataset, Frame
 from calibration.validation import split_train_test
 from calibration.windshield.base import WindshieldCalibrationResult, WindshieldConfig, WindshieldModel, WindshieldModelType
 from calibration.windshield.base_projection import solve_poses_fixed_intrinsics
 from calibration.windshield.baseline import BaselineWindshieldModel
 from calibration.windshield.refraction import normalize
+from calibration.windshield.residual_common import (
+    DEFAULT_REPEATED_HOLDOUT_SEEDS,
+    POSE_ROTATION_REG_WEIGHT,
+    POSE_TRANSLATION_REG_WEIGHT,
+    MAX_PROJECT_POINT_ANGULAR_ERROR_DEG,
+    RepeatedHoldoutSummary,
+    collect_corner_arrays,
+    compute_ray_stability_deg,
+    evaluate_residual_ray_model,
+    populate_pose_diagnostics,
+    populate_repeated_holdout_diagnostics,
+    refine_frame_pose_ray_domain,
+)
 
 # ---------------------------------------------------------------------------
 # 고정 상수 - residual_ray_hint로 덮어쓸 수 있고, 코드 여러 곳에 하드코딩하지
@@ -101,22 +116,14 @@ DEFAULT_LAMBDA_SMOOTH = 1e-2
 MIN_CORNERS_PER_NODE = 2
 
 MAX_ACCEPTABLE_CORNER_FAILURE_RATE = 0.10
-MAX_PROJECT_POINT_ANGULAR_ERROR_DEG = 2.0
 _PROJECT_PENALTY = 5.0
 
-# STAGE B - pose가 initial solvePnP에서 너무 멀리 벗어나지 않도록 하는 weak
-# prior 가중치. Spherical의 calibrate_spherical()과 정확히 같은 값/의미다 -
-# residual 단위가 ray-alignment 단위(대략 라디안 스케일)이므로 "정확한 pixel
-# 환산"이 아니라 "그쪽으로 크게 끌리지 않게 하는" 정도의 세기다.
-POSE_ROTATION_REG_WEIGHT = 2.0    # per radian
-POSE_TRANSLATION_REG_WEIGHT = 2.0  # per meter
 GRID_STAGE_B_NUM_ROUNDS = 2
 
 # Grid Resolution Comparison / AUTO 선택(사용자 스펙 7/8번) 기본 후보 -
 # (rows, cols) 순서는 기존 convention(bilinear_interpolate_grid의 grid.shape
 # == (rows, cols, 3))과 맞춘다.
 DEFAULT_GRID_CANDIDATES: list[tuple[int, int]] = [(3, 4), (4, 6), (6, 8), (8, 12)]
-DEFAULT_REPEATED_HOLDOUT_SEEDS: tuple[int, ...] = (1, 2, 3, 4, 5)
 # Hold-out RMS가 이 비율 이내로 비슷하면(사용자 스펙 8번 "거의 같은 경우")
 # parameter가 더 적은 후보를 선택한다.
 GRID_SELECTION_TIE_TOLERANCE = 0.05
@@ -147,7 +154,7 @@ def bilinear_interpolate_grid(
     위치에 있다 - 그래서 node (0,0)은 (0,0), node (rows-1,cols-1)은
     (image_width,image_height)에 정확히 대응한다.
 
-    이미지 밖의 픽셀이 들어와도 gridxt 범위 안으로 clamp해서(외삽 대신 가장
+    이미지 밖의 픽셀이 들어와도 grid 범위 안으로 clamp해서(외삽 대신 가장
     가까운 경계 셀의 보간값을 사용) crash 없이 안정적으로 동작한다.
     """
     rows, cols = grid.shape[0], grid.shape[1]
@@ -315,63 +322,6 @@ def _fit_residual_grid(
 # STAGE B - Grid + per-frame pose joint refinement (ray-domain, alternating)
 # ---------------------------------------------------------------------------
 
-def refine_frame_pose_ray_domain_grid(
-    frame: Frame,
-    observed_pixels: np.ndarray,
-    d_obs: np.ndarray,
-    grid: np.ndarray,
-    image_width: float,
-    image_height: float,
-    initial_rvec: np.ndarray,
-    initial_tvec: np.ndarray,
-    *,
-    regularize: bool = True,
-):
-    """한 프레임의 pose(rvec,tvec)만 ray-alignment residual로 refine한다.
-    Grid는 고정(호출부가 넘긴 값 그대로) - 이 함수는 절대 grid를 수정하지
-    않는다. calibration.windshield.spherical.refine_frame_pose_ray_domain과
-    완전히 같은 구조 - Train의 STAGE B alternating refinement와 Test의
-    pose-only hold-out refinement 양쪽이 이 함수 하나를 재사용한다.
-
-    observed_pixels: (N,2) - 이 프레임 코너들의 관측 픽셀(u,v). grid에서
-        Δd를 읽어오는 위치는 항상 "관측 픽셀"이지 목표점을 투영한 위치가
-        아니다(project_point()의 정의와 일치시키기 위함).
-    d_obs: (N,3) - 각 코너의 observed_pixels에서 Base K,D로 구한 광선(고정,
-        pose/grid 어느 쪽에도 의존하지 않음 - 미리 한 번만 계산해 재사용).
-
-    initial_rvec/initial_tvec은 항상 "이 프레임의 원래 Standard solvePnP
-    추정값"이다(라운드가 반복돼도 계속 같은 기준점) - 매 라운드의 이전
-    결과가 아니라 고정된 최초 추정값을 향한 weak prior여야 "너무 멀리
-    도망가지 마라"는 의미가 유지된다.
-    """
-    det = frame.detection
-    obj = det.object_points.reshape(-1, 3).astype(np.float64)
-    initial_rvec = np.asarray(initial_rvec, dtype=np.float64).ravel()
-    initial_tvec = np.asarray(initial_tvec, dtype=np.float64).ravel()
-
-    def residual(params: np.ndarray) -> np.ndarray:
-        rvec, tvec = params[:3], params[3:6]
-        R, _ = cv2.Rodrigues(rvec)
-        cam_pts = (R @ obj.T).T + tvec.reshape(1, 3)
-        out = np.empty((len(cam_pts), 3))
-        for i in range(len(cam_pts)):
-            u, v = observed_pixels[i]
-            delta = bilinear_interpolate_grid(grid, u, v, image_width, image_height)
-            corrected = normalize(d_obs[i] + delta)
-            out[i] = normalize(cam_pts[i]) - corrected
-        flat = out.ravel()
-        if regularize:
-            reg = np.concatenate([
-                POSE_ROTATION_REG_WEIGHT * (rvec - initial_rvec),
-                POSE_TRANSLATION_REG_WEIGHT * (tvec - initial_tvec),
-            ])
-            flat = np.concatenate([flat, reg])
-        return flat
-
-    x0 = np.concatenate([initial_rvec, initial_tvec])
-    return least_squares(residual, x0=x0, method="trf", loss="soft_l1", f_scale=0.05, max_nfev=100)
-
-
 @dataclass
 class _JointGridRefinementOutcome:
     grid: np.ndarray
@@ -398,7 +348,10 @@ def _joint_refine_grid_and_poses(
     """STAGE B - alternating(block-coordinate) 방식으로 grid와 프레임별
     pose를 번갈아 refine한다. 한 라운드 = (모든 프레임 pose refine) ->
     (grid refine, 최신 pose로 재계산한 p_cam 사용). calibration.windshield.
-    spherical._joint_refine_sphere_and_poses와 완전히 동일한 패턴."""
+    spherical._joint_refine_sphere_and_poses와 완전히 동일한 패턴.
+
+    pose refine 자체는 residual_common.refine_frame_pose_ray_domain(공유)에
+    위임한다 - Grid는 그 콜백으로 bilinear_interpolate_grid를 넘긴다."""
     rvecs = [np.asarray(r, dtype=np.float64).copy() for r in initial_rvecs]
     tvecs = [np.asarray(t, dtype=np.float64).copy() for t in initial_tvecs]
     grid = np.asarray(initial_grid, dtype=np.float64).copy()
@@ -406,8 +359,9 @@ def _joint_refine_grid_and_poses(
 
     for _ in range(num_rounds):
         for i, frame in enumerate(ok_frames):
-            pose_fit = refine_frame_pose_ray_domain_grid(
-                frame, observed_pixels_per_frame[i], d_obs_per_frame[i], grid, image_width, image_height,
+            delta_fn = lambda u, v, g=grid: bilinear_interpolate_grid(g, u, v, image_width, image_height)  # noqa: E731
+            pose_fit = refine_frame_pose_ray_domain(
+                frame, observed_pixels_per_frame[i], d_obs_per_frame[i], delta_fn,
                 initial_rvecs[i], initial_tvecs[i],
             )
             if pose_fit.success and np.all(np.isfinite(pose_fit.x)):
@@ -441,101 +395,6 @@ def _joint_refine_grid_and_poses(
     return _JointGridRefinementOutcome(grid=grid, rvecs=rvecs, tvecs=tvecs, converged_cleanly=converged_cleanly)
 
 
-@dataclass
-class _ResidualRayEvalOutcome:
-    per_frame_error: dict[str, float]
-    residual_stats: ResidualStats
-    regional_error: RegionalError
-    radial_profile: RadialErrorProfile
-    radial_bands: RadialErrorProfile
-    spatial_error_map: SpatialErrorMap
-    mean_dx: Optional[float]
-    mean_dy: Optional[float]
-    ray_angular_error_deg: Optional[float]
-    num_points_ok: int
-    num_points_failed: int
-
-
-def _evaluate_residual_ray(
-    frames: list[Frame],
-    rvecs: list[np.ndarray],
-    tvecs: list[np.ndarray],
-    model: ResidualRayWindshieldModel,
-    image_size: tuple[int, int],
-) -> _ResidualRayEvalOutcome:
-    """Residual Ray 모델로 프레임들을 평가한다 - Spherical의
-    _evaluate_spherical()과 동일한 패턴(진짜 project_point() 기반 pixel 평가,
-    투영-무관 집계 함수 재사용)."""
-    per_frame_error: dict[str, float] = {}
-    all_x: list[float] = []
-    all_y: list[float] = []
-    all_dx: list[float] = []
-    all_dy: list[float] = []
-    angles: list[float] = []
-    num_failed = 0
-
-    for frame, rvec, tvec in zip(frames, rvecs, tvecs):
-        det = frame.detection
-        R, _ = cv2.Rodrigues(rvec)
-        obj = det.object_points.reshape(-1, 3).astype(np.float64)
-        cam_pts = (R @ obj.T).T + tvec.reshape(1, 3)
-        corners = det.corners.reshape(-1, 2)
-
-        per_point_errors: list[float] = []
-        for (ox, oy), p_cam in zip(corners, cam_pts):
-            ox, oy = float(ox), float(oy)
-            try:
-                pu, pv = model.project_point(float(p_cam[0]), float(p_cam[1]), float(p_cam[2]))
-            except ValueError:
-                num_failed += 1
-                continue
-            dx, dy = ox - pu, oy - pv
-            all_x.append(ox)
-            all_y.append(oy)
-            all_dx.append(dx)
-            all_dy.append(dy)
-            per_point_errors.append(math.hypot(dx, dy))
-
-            angle = model.ray_angular_error_deg(ox, oy, p_cam)
-            if angle is not None:
-                angles.append(angle)
-
-        if per_point_errors:
-            per_frame_error[frame.image_info.image_id] = float(
-                np.sqrt(np.mean(np.square(per_point_errors)))
-            )
-
-    xs, ys = np.array(all_x), np.array(all_y)
-    dxs, dys = np.array(all_dx), np.array(all_dy)
-    errors = np.hypot(dxs, dys)
-
-    residual_stats = compute_residual_stats(errors)
-
-    w, h = image_size
-    max_radius = float(math.hypot(w / 2.0, h / 2.0))
-    radii = np.hypot(xs - w / 2.0, ys - h / 2.0) if xs.size else np.array([])
-    radial_profile = bin_radial_errors(radii, errors, max_radius, num_bins=8)
-    radial_bands = bin_radial_error_bands(radii, errors, max_radius)
-    spatial_map = bin_spatial_errors(xs, ys, dxs, dys, image_size)
-
-    frames_with_error = [f for f in frames if f.image_info.image_id in per_frame_error]
-    regional_error = compute_regional_error(frames_with_error, per_frame_error, image_size)
-
-    return _ResidualRayEvalOutcome(
-        per_frame_error=per_frame_error,
-        residual_stats=residual_stats,
-        regional_error=regional_error,
-        radial_profile=radial_profile,
-        radial_bands=radial_bands,
-        spatial_error_map=spatial_map,
-        mean_dx=float(dxs.mean()) if dxs.size else None,
-        mean_dy=float(dys.mean()) if dys.size else None,
-        ray_angular_error_deg=float(np.mean(angles)) if angles else None,
-        num_points_ok=len(all_x),
-        num_points_failed=num_failed,
-    )
-
-
 def _failure_result(config: WindshieldConfig, train_ids: list[str], test_ids: list[str], message: str) -> WindshieldCalibrationResult:
     return WindshieldCalibrationResult(
         windshield_model=WindshieldModelType.RESIDUAL_RAY,
@@ -547,41 +406,6 @@ def _failure_result(config: WindshieldConfig, train_ids: list[str], test_ids: li
         success=False,
         error_message=message,
     )
-
-
-def _collect_corner_arrays(
-    frames: list[Frame],
-    rvecs: list[np.ndarray],
-    tvecs: list[np.ndarray],
-    baseline_model: BaselineWindshieldModel,
-) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
-    """프레임마다 (관측 픽셀, base ray, 목표점) per-frame 배열을 만든다 -
-    STAGE A는 이걸 펼쳐서(concat) 쓰고, STAGE B는 프레임 단위 그대로
-    (pose refine이 프레임별이므로) 쓴다."""
-    observed_pixels_per_frame: list[np.ndarray] = []
-    d_obs_per_frame: list[np.ndarray] = []
-    p_cam_per_frame: list[np.ndarray] = []
-    for frame, rvec, tvec in zip(frames, rvecs, tvecs):
-        det = frame.detection
-        R, _ = cv2.Rodrigues(rvec)
-        obj = det.object_points.reshape(-1, 3).astype(np.float64)
-        cam_pts = (R @ obj.T).T + tvec.reshape(1, 3)
-        corners = det.corners.reshape(-1, 2)
-
-        pixels, rays, targets = [], [], []
-        for (px, py), p_cam in zip(corners, cam_pts):
-            try:
-                d = baseline_model.unproject_pixel(float(px), float(py))
-            except Exception:  # noqa: BLE001
-                continue
-            pixels.append([px, py])
-            rays.append(d)
-            targets.append(p_cam)
-        observed_pixels_per_frame.append(np.array(pixels, dtype=np.float64))
-        d_obs_per_frame.append(np.array(rays, dtype=np.float64))
-        p_cam_per_frame.append(np.array(targets, dtype=np.float64))
-
-    return observed_pixels_per_frame, d_obs_per_frame, p_cam_per_frame
 
 
 def calibrate_residual_ray(
@@ -629,7 +453,7 @@ def calibrate_residual_ray(
         return _failure_result(config, train_ids, test_ids, "Train 프레임에서 pose를 하나도 구하지 못했습니다.")
 
     baseline_model = BaselineWindshieldModel(K, D, model)
-    observed_pixels_per_frame, d_obs_per_frame, p_cam_per_frame = _collect_corner_arrays(
+    observed_pixels_per_frame, d_obs_per_frame, p_cam_per_frame = collect_corner_arrays(
         ok_frames, rvecs, tvecs, baseline_model
     )
 
@@ -654,7 +478,7 @@ def calibrate_residual_ray(
 
     stage_a_grid = stage_a_fit.x.reshape(rows, cols, 3).copy()
     stage_a_model = ResidualRayWindshieldModel(K, D, model, stage_a_grid, width, height)
-    stage_a_outcome = _evaluate_residual_ray(ok_frames, rvecs, tvecs, stage_a_model, image_size)
+    stage_a_outcome = evaluate_residual_ray_model(ok_frames, rvecs, tvecs, stage_a_model, image_size)
 
     # --- STAGE B: grid + per-frame pose joint refinement (ray-domain) ---
     joint = _joint_refine_grid_and_poses(
@@ -669,7 +493,7 @@ def calibrate_residual_ray(
     refinement_note = ""
 
     stage_b_model = ResidualRayWindshieldModel(K, D, model, joint.grid, width, height)
-    stage_b_outcome = _evaluate_residual_ray(ok_frames, joint.rvecs, joint.tvecs, stage_b_model, image_size)
+    stage_b_outcome = evaluate_residual_ray_model(ok_frames, joint.rvecs, joint.tvecs, stage_b_model, image_size)
 
     stage_a_rmse = stage_a_outcome.residual_stats.rmse
     stage_b_rmse = stage_b_outcome.residual_stats.rmse
@@ -688,8 +512,10 @@ def calibrate_residual_ray(
             refinement_note = "STAGE B 일부 sub-fit이 수렴하지 않아 해당 프레임/라운드는 이전 값을 유지했습니다. "
     else:
         refinement_note = (
-            "STAGE B(joint pixel-domain refinement)가 STAGE A(grid-only initial fit)보다 "
+            "STAGE B(ray-domain alternating grid/pose refinement)가 STAGE A(grid-only initial fit)보다 "
             "실제 pixel RMS를 개선하지 못해 STAGE A 결과를 최종으로 사용했습니다. "
+            "(참고: 최적화 자체의 residual은 ray-domain이고, 이 STAGE A/B 채택 여부 판단 기준만 "
+            "실제 pixel-domain RMS를 사용합니다.) "
         )
 
     final_model = ResidualRayWindshieldModel(K, D, model, final_grid, width, height)
@@ -710,6 +536,7 @@ def calibrate_residual_ray(
     pose_param_count_train = len(ok_frames) * 6
 
     fitted_params: dict[str, float] = {
+        "residual_ray_method": 0.0,  # 0.0 = Grid + Bilinear, 1.0 = RBF(residual_rbf.py) - build_projector가 이 값으로 분기
         "grid_rows": float(rows),
         "grid_cols": float(cols),
         "image_width": float(width),
@@ -722,6 +549,10 @@ def calibrate_residual_ray(
         "pose_param_count_train": float(pose_param_count_train),
         "stage_used_is_joint_refined": 1.0 if stage_used_is_joint_refined else 0.0,
     }
+    # Pose 진단(사용자 스펙 4번) - STAGE B가 initial solvePnP pose에서 실제로
+    # 얼마나 움직였는지를 직접 계산한다(STAGE A가 최종으로 채택됐다면
+    # final_rvecs/final_tvecs가 rvecs/tvecs와 동일한 객체라 델타는 항상 0).
+    populate_pose_diagnostics(fitted_params, rvecs, tvecs, final_rvecs, final_tvecs)
     for r in range(rows):
         for c in range(cols):
             fitted_params[f"grid_dx_{r}_{c}"] = float(final_grid[r, c, 0])
@@ -759,14 +590,15 @@ def calibrate_residual_ray(
                 # grid 기준으로 pose만 다시 refine한다 - grid/K/D는 여기서 절대
                 # 건드리지 않는다(leakage 없음).
                 t_rvecs, t_tvecs = [], []
-                t_obs_pixels, t_d_obs, _t_p_cam = _collect_corner_arrays(
+                t_obs_pixels, t_d_obs, _t_p_cam = collect_corner_arrays(
                     t_ok_frames, t_init_rvecs, t_init_tvecs, baseline_model
                 )
+                grid_delta_fn = lambda u, v: bilinear_interpolate_grid(final_grid, u, v, width, height)  # noqa: E731
                 for frame, init_rvec, init_tvec, obs_px, d_obs in zip(
                     t_ok_frames, t_init_rvecs, t_init_tvecs, t_obs_pixels, t_d_obs
                 ):
-                    pose_fit = refine_frame_pose_ray_domain_grid(
-                        frame, obs_px, d_obs, final_grid, width, height, init_rvec, init_tvec, regularize=True,
+                    pose_fit = refine_frame_pose_ray_domain(
+                        frame, obs_px, d_obs, grid_delta_fn, init_rvec, init_tvec, regularize=True,
                     )
                     if pose_fit.success and np.all(np.isfinite(pose_fit.x)):
                         t_rvecs.append(pose_fit.x[:3].reshape(3, 1))
@@ -775,7 +607,7 @@ def calibrate_residual_ray(
                         t_rvecs.append(init_rvec)
                         t_tvecs.append(init_tvec)
 
-                test_outcome = _evaluate_residual_ray(t_ok_frames, t_rvecs, t_tvecs, final_model, image_size)
+                test_outcome = evaluate_residual_ray_model(t_ok_frames, t_rvecs, t_tvecs, final_model, image_size)
                 result.test_residual_stats = test_outcome.residual_stats
                 result.test_regional_error = test_outcome.regional_error
                 result.test_radial_profile = test_outcome.radial_profile
@@ -819,19 +651,6 @@ def _grid_from_fitted_params(fitted_params: dict[str, float]) -> np.ndarray:
     return grid
 
 
-@dataclass
-class RepeatedHoldoutSummary:
-    """여러 Train/Test split에서 반복 평가한 결과 요약(사용자 스펙 9번) +
-    split마다 fitted grid가 얼마나 달라지는지(안정성, 사용자 스펙 10번)."""
-    seeds_used: list[int]
-    n_successful: int
-    mean_test_rmse: Optional[float] = None
-    std_test_rmse: Optional[float] = None
-    mean_test_p95: Optional[float] = None
-    mean_edge_rms: Optional[float] = None
-    grid_stability: Optional[float] = None  # split 간 fitted grid의 평균 pairwise L2 거리
-
-
 def run_repeated_holdout_residual_ray(
     windshield_dataset: Dataset,
     config: WindshieldConfig,
@@ -847,7 +666,11 @@ def run_repeated_holdout_residual_ray(
     test_p95s: list[float] = []
     edge_rmses: list[float] = []
     grids: list[np.ndarray] = []
+    models: list[WindshieldModel] = []
     successful_seeds: list[int] = []
+
+    K, D, model_name = config.base_camera_matrix, config.base_distortion, config.base_model_name
+    width, height = infer_image_size(windshield_dataset, camera_config)
 
     for seed in seeds:
         train_ids, test_ids = split_train_test(windshield_dataset, camera_config, test_ratio, seed)
@@ -861,15 +684,23 @@ def run_repeated_holdout_residual_ray(
         edge = regional_edge_average(result.test_regional_error) if result.test_regional_error else None
         if edge is not None:
             edge_rmses.append(edge)
-        grids.append(_grid_from_fitted_params(result.fitted_params))
+        grid = _grid_from_fitted_params(result.fitted_params)
+        grids.append(grid)
+        models.append(ResidualRayWindshieldModel(
+            K, D, model_name, grid,
+            result.fitted_params["image_width"], result.fitted_params["image_height"],
+        ))
 
-    grid_stability = None
+    grid_stability_l2 = None
     if len(grids) >= 2:
         distances = []
         for i in range(len(grids)):
             for j in range(i + 1, len(grids)):
-                distances.append(float(np.linalg.norm(grids[i] - grids[j])))
-        grid_stability = float(np.mean(distances)) if distances else None
+                if grids[i].shape == grids[j].shape:
+                    distances.append(float(np.linalg.norm(grids[i] - grids[j])))
+        grid_stability_l2 = float(np.mean(distances)) if distances else None
+
+    ray_stability_mean_deg, ray_stability_p95_deg = compute_ray_stability_deg(models, width, height)
 
     return RepeatedHoldoutSummary(
         seeds_used=successful_seeds,
@@ -878,7 +709,9 @@ def run_repeated_holdout_residual_ray(
         std_test_rmse=float(np.std(test_rmses)) if test_rmses else None,
         mean_test_p95=float(np.mean(test_p95s)) if test_p95s else None,
         mean_edge_rms=float(np.mean(edge_rmses)) if edge_rmses else None,
-        grid_stability=grid_stability,
+        grid_stability_l2=grid_stability_l2,
+        ray_stability_mean_deg=ray_stability_mean_deg,
+        ray_stability_p95_deg=ray_stability_p95_deg,
     )
 
 
@@ -947,3 +780,56 @@ def select_best_grid_resolution(
     close_enough = [c for c in valid if c.summary.mean_test_rmse <= best_rmse * (1.0 + tie_tolerance)]
     chosen = min(close_enough, key=lambda c: c.param_count)
     return (chosen.rows, chosen.cols), candidate_results
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics orchestrator - UI/worker가 호출하는 단일 진입점
+# ---------------------------------------------------------------------------
+
+def run_residual_ray_calibration_with_diagnostics(
+    windshield_dataset: Dataset,
+    config: WindshieldConfig,
+    camera_config: CameraConfig,
+    train_ids: list[str],
+    test_ids: list[str],
+    *,
+    compute_repeated_holdout: bool = True,
+    repeated_holdout_seeds: tuple[int, ...] = DEFAULT_REPEATED_HOLDOUT_SEEDS,
+    repeated_holdout_test_ratio: float = 0.25,
+) -> WindshieldCalibrationResult:
+    """calibrate_residual_ray()에 Repeated Hold-out + Ray Stability 진단을
+    더한 결과를 반환한다 - UI(및 그 뒤의 worker)가 Residual Ray(Grid) 모델을
+    실행할 때 호출하는 단일 진입점(사용자 스펙 2번, "UI는 backend가 계산해
+    둔 값만 표시한다"는 요구사항을 만족시키는 지점이 바로 여기다).
+
+    본 계산(calibrate_residual_ray)이 AUTO 모드로 grid 해상도를 스스로
+    고른 경우, 여기서 다시 반복 계산할 때는 그 선택된 해상도를 "고정"한
+    resolved config로 Repeated Hold-out을 돌린다 - 그렇지 않으면 (a) 매
+    반복 seed마다 AUTO의 select_best_grid_resolution이 다시 실행돼 비용이
+    기하급수적으로 커지고, (b) split마다 grid 크기 자체가 달라져서 Ray
+    Stability 비교가 "같은 해상도끼리"가 아니게 되어 의미가 없어진다.
+    """
+    hint = config.residual_ray_hint or {}
+    was_auto = hint.get("auto_grid", 0.0) > 0
+
+    result = calibrate_residual_ray(windshield_dataset, config, camera_config, train_ids, test_ids)
+    if not result.success:
+        return result
+
+    result.fitted_params["diag_selection_mode_is_auto"] = 1.0 if was_auto else 0.0
+
+    if compute_repeated_holdout:
+        resolved_hint = {
+            **hint,
+            "auto_grid": 0.0,
+            "grid_rows": result.fitted_params["grid_rows"],
+            "grid_cols": result.fitted_params["grid_cols"],
+        }
+        resolved_config = dataclasses.replace(config, residual_ray_hint=resolved_hint)
+        summary = run_repeated_holdout_residual_ray(
+            windshield_dataset, resolved_config, camera_config,
+            seeds=repeated_holdout_seeds, test_ratio=repeated_holdout_test_ratio,
+        )
+        populate_repeated_holdout_diagnostics(result.fitted_params, summary, len(repeated_holdout_seeds))
+
+    return result

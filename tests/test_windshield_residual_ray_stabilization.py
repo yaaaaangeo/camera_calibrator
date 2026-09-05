@@ -84,10 +84,15 @@ def test_final_result_never_worse_than_stage_a():
 
 def test_pose_moves_within_reasonable_bounds_during_stage_b():
     """weak prior가 걸려 있으므로 pose가 initial solvePnP에서 과도하게
-    벗어나면 안 된다(간접 검증 - 결과가 발산하지 않고 성공으로 끝난다는 것
-    자체가 prior가 poses를 억제하고 있다는 신호. 직접 pose 값을 비교하려면
-    내부 함수를 호출해야 하므로, 여기서는 여러 시드에 걸쳐 안정적으로
-    수렴하는지를 함께 확인한다)."""
+    벗어나면 안 된다 - fitted_params에 직접 기록된 diag_pose_delta_r_*_deg/
+    diag_pose_delta_t_*_mm(STAGE B의 initial vs final pose 델타, calibrate_
+    residual_ray 내부에서 _rotation_angle_deg/_translation_delta_mm로 계산됨)
+    을 읽어 유한하고 발산하지 않았는지 직접 검증한다(사용자 스펙 4번 - 이전
+    라운드의 "성공/수렴 여부만 보는" 간접 검증을 대체).
+
+    Bound는 이 synthetic fixture(부드러운 low-order distortion, 8프레임)
+    기준으로 "명백한 발산"만 잡아내도록 넉넉하게 잡는다(과도하게 타이트한
+    threshold로 flaky test를 만들지 않는다는 요구사항)."""
     K, D = default_camera_matrix_distortion()
     delta_fn = default_residual_delta_fn(K)
     dataset = build_synthetic_residual_ray_dataset(K, D, delta_fn)
@@ -99,6 +104,25 @@ def test_pose_moves_within_reasonable_bounds_during_stage_b():
         result = calibrate_residual_ray(dataset, config, camera_config, train_ids, test_ids)
         assert result.success, result.error_message
         assert np.isfinite(result.residual_stats.rmse)
+
+        for key in (
+            "diag_pose_delta_r_median_deg", "diag_pose_delta_r_p95_deg",
+            "diag_pose_delta_t_median_mm", "diag_pose_delta_t_p95_mm",
+        ):
+            assert key in result.fitted_params
+            assert np.isfinite(result.fitted_params[key])
+
+        assert result.fitted_params["diag_pose_delta_r_median_deg"] < 30.0
+        assert result.fitted_params["diag_pose_delta_r_p95_deg"] < 30.0
+        assert result.fitted_params["diag_pose_delta_t_median_mm"] < 500.0
+        assert result.fitted_params["diag_pose_delta_t_p95_mm"] < 500.0
+        assert result.fitted_params["diag_pose_delta_r_p95_deg"] >= result.fitted_params["diag_pose_delta_r_median_deg"] - 1e-9
+        assert result.fitted_params["diag_pose_delta_t_p95_mm"] >= result.fitted_params["diag_pose_delta_t_median_mm"] - 1e-9
+
+        if result.fitted_params["stage_used_is_joint_refined"] == 0.0:
+            # STAGE A가 채택됐다면 final==initial pose이므로 델타는 정확히 0이어야 한다.
+            assert result.fitted_params["diag_pose_delta_r_median_deg"] == pytest.approx(0.0, abs=1e-9)
+            assert result.fitted_params["diag_pose_delta_t_median_mm"] == pytest.approx(0.0, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -118,10 +142,15 @@ def test_repeated_holdout_aggregates_multiple_seeds():
     assert summary.mean_test_rmse is not None
     assert summary.mean_test_rmse > 0
     assert summary.std_test_rmse is not None and summary.std_test_rmse >= 0
-    # 3개 이상 성공했으면 grid_stability(pairwise 거리 평균)도 계산됐어야 한다.
+    # 3개 이상 성공했으면 legacy grid_stability_l2(pairwise 거리 평균)와
+    # 새 ray_stability_mean_deg/p95_deg(물리적 각도 단위)가 둘 다 계산됐어야 한다.
     if summary.n_successful >= 2:
-        assert summary.grid_stability is not None
-        assert summary.grid_stability >= 0
+        assert summary.grid_stability_l2 is not None
+        assert summary.grid_stability_l2 >= 0
+        assert summary.ray_stability_mean_deg is not None
+        assert summary.ray_stability_mean_deg >= 0
+        assert summary.ray_stability_p95_deg is not None
+        assert summary.ray_stability_p95_deg >= summary.ray_stability_mean_deg - 1e-9
 
 
 def test_repeated_holdout_keeps_base_intrinsics_immutable():

@@ -39,7 +39,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QComboBox,
     QRadioButton,
+    QSpinBox,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -60,7 +62,8 @@ from calibration.types import (
     PatternConfig,
 )
 from calibration.windshield.base import WindshieldCalibrationResult, WindshieldConfig, WindshieldModelType
-from calibration.windshield.validation import run_windshield_calibration
+from calibration.windshield.residual_ray import DEFAULT_GRID_COLS, DEFAULT_GRID_ROWS, DEFAULT_LAMBDA_MAG, DEFAULT_LAMBDA_SMOOTH
+from calibration.windshield.residual_rbf import DEFAULT_RBF_NUM_CENTERS, DEFAULT_RBF_SMOOTHING
 from export.opencv import (
     detect_model_hint_from_opencv_yaml,
     load_camera_matrix_and_distortion_from_opencv_yaml,
@@ -69,6 +72,8 @@ from export.windshield import export_windshield_yaml
 from ui.radial_profile_view import RadialProfileChartWidget
 from ui.theme import Theme
 from ui.windshield_vector_field_view import VectorFieldChartWidget
+from ui.windshield_worker import WindshieldCalibrationWorker
+from ui.worker import run_worker_in_thread
 
 _MODEL_LABELS = {
     CameraModelType.PINHOLE: "Ideal Pinhole",
@@ -461,6 +466,8 @@ class WindshieldWorkspace(QWidget):
                 radio.setToolTip("Coming soon - 아직 구현되지 않았습니다.")
             if model == WindshieldModelType.SPHERICAL:
                 radio.toggled.connect(self._on_spherical_radio_toggled)
+            if model == WindshieldModelType.RESIDUAL_RAY:
+                radio.toggled.connect(self._on_residual_ray_radio_toggled)
             self._model_button_group.addButton(radio)
             model_layout.addWidget(radio)
         layout.addWidget(model_group)
@@ -487,6 +494,103 @@ class WindshieldWorkspace(QWidget):
         self.standoff_spin.setValue(_UNSET_SPINBOX_VALUE)
         advanced_form.addRow("Initial standoff distance (m):", self.standoff_spin)
         layout.addWidget(self.spherical_advanced_group)
+
+        self.residual_ray_advanced_group = QGroupBox("Advanced (Residual Ray)")
+        self.residual_ray_advanced_group.setVisible(False)
+        rr_layout = QVBoxLayout(self.residual_ray_advanced_group)
+
+        method_row = QHBoxLayout()
+        self._residual_ray_method_button_group = QButtonGroup(self)
+        self.residual_ray_method_grid_radio = QRadioButton("Grid")
+        self.residual_ray_method_grid_radio.setChecked(True)
+        self.residual_ray_method_rbf_radio = QRadioButton("RBF")
+        self._residual_ray_method_button_group.addButton(self.residual_ray_method_grid_radio)
+        self._residual_ray_method_button_group.addButton(self.residual_ray_method_rbf_radio)
+        method_row.addWidget(QLabel("Method"))
+        method_row.addWidget(self.residual_ray_method_grid_radio)
+        method_row.addWidget(self.residual_ray_method_rbf_radio)
+        method_row.addStretch(1)
+        rr_layout.addLayout(method_row)
+
+        self.residual_grid_settings_group = QGroupBox("Grid Settings")
+        grid_settings_layout = QVBoxLayout(self.residual_grid_settings_group)
+
+        mode_row = QHBoxLayout()
+        self._grid_mode_button_group = QButtonGroup(self)
+        self.grid_mode_auto_radio = QRadioButton("AUTO (권장)")
+        self.grid_mode_auto_radio.setChecked(True)
+        self.grid_mode_manual_radio = QRadioButton("Manual")
+        self._grid_mode_button_group.addButton(self.grid_mode_auto_radio)
+        self._grid_mode_button_group.addButton(self.grid_mode_manual_radio)
+        mode_row.addWidget(self.grid_mode_auto_radio)
+        mode_row.addWidget(self.grid_mode_manual_radio)
+        mode_row.addStretch(1)
+        grid_settings_layout.addLayout(mode_row)
+
+        rr_form = QFormLayout()
+        self.grid_rows_spin = QSpinBox()
+        self.grid_rows_spin.setRange(2, 20)
+        self.grid_rows_spin.setValue(DEFAULT_GRID_ROWS)
+        self.grid_rows_spin.setEnabled(False)
+        rr_form.addRow("Grid Rows:", self.grid_rows_spin)
+        self.grid_cols_spin = QSpinBox()
+        self.grid_cols_spin.setRange(2, 30)
+        self.grid_cols_spin.setValue(DEFAULT_GRID_COLS)
+        self.grid_cols_spin.setEnabled(False)
+        rr_form.addRow("Grid Cols:", self.grid_cols_spin)
+        self.lambda_mag_spin = QDoubleSpinBox()
+        self.lambda_mag_spin.setRange(0.0, 10.0)
+        self.lambda_mag_spin.setDecimals(6)
+        self.lambda_mag_spin.setSingleStep(0.0001)
+        self.lambda_mag_spin.setValue(DEFAULT_LAMBDA_MAG)
+        rr_form.addRow("Magnitude λ:", self.lambda_mag_spin)
+        self.lambda_smooth_spin = QDoubleSpinBox()
+        self.lambda_smooth_spin.setRange(0.0, 10.0)
+        self.lambda_smooth_spin.setDecimals(6)
+        self.lambda_smooth_spin.setSingleStep(0.001)
+        self.lambda_smooth_spin.setValue(DEFAULT_LAMBDA_SMOOTH)
+        rr_form.addRow("Smoothness λ:", self.lambda_smooth_spin)
+        grid_settings_layout.addLayout(rr_form)
+        rr_layout.addWidget(self.residual_grid_settings_group)
+
+        self.residual_rbf_settings_group = QGroupBox("RBF Settings")
+        self.residual_rbf_settings_group.setVisible(False)
+        rbf_form = QFormLayout(self.residual_rbf_settings_group)
+        self.rbf_kernel_combo = QComboBox()
+        self.rbf_kernel_combo.addItem("Thin Plate Spline", "thin_plate_spline")
+        rbf_form.addRow("Kernel:", self.rbf_kernel_combo)
+        self.rbf_mode_auto_radio = QRadioButton("AUTO")
+        self.rbf_mode_auto_radio.setChecked(True)
+        self.rbf_mode_manual_radio = QRadioButton("Manual")
+        self._rbf_mode_button_group = QButtonGroup(self)
+        self._rbf_mode_button_group.addButton(self.rbf_mode_auto_radio)
+        self._rbf_mode_button_group.addButton(self.rbf_mode_manual_radio)
+        rbf_mode_row = QHBoxLayout()
+        rbf_mode_row.addWidget(self.rbf_mode_auto_radio)
+        rbf_mode_row.addWidget(self.rbf_mode_manual_radio)
+        rbf_mode_row.addStretch(1)
+        rbf_form.addRow("Centers/Smoothing:", rbf_mode_row)
+        self.rbf_centers_spin = QSpinBox()
+        self.rbf_centers_spin.setRange(3, 512)
+        self.rbf_centers_spin.setValue(DEFAULT_RBF_NUM_CENTERS)
+        self.rbf_centers_spin.setEnabled(False)
+        rbf_form.addRow("Centers:", self.rbf_centers_spin)
+        self.rbf_smoothing_spin = QDoubleSpinBox()
+        self.rbf_smoothing_spin.setRange(0.0, 1.0)
+        self.rbf_smoothing_spin.setDecimals(6)
+        self.rbf_smoothing_spin.setSingleStep(0.0001)
+        self.rbf_smoothing_spin.setValue(DEFAULT_RBF_SMOOTHING)
+        self.rbf_smoothing_spin.setEnabled(False)
+        rbf_form.addRow("Smoothing:", self.rbf_smoothing_spin)
+        rr_layout.addWidget(self.residual_rbf_settings_group)
+
+        self.grid_mode_manual_radio.toggled.connect(self.grid_rows_spin.setEnabled)
+        self.grid_mode_manual_radio.toggled.connect(self.grid_cols_spin.setEnabled)
+        self.rbf_mode_manual_radio.toggled.connect(self.rbf_centers_spin.setEnabled)
+        self.rbf_mode_manual_radio.toggled.connect(self.rbf_smoothing_spin.setEnabled)
+        self.residual_ray_method_grid_radio.toggled.connect(self.residual_grid_settings_group.setVisible)
+        self.residual_ray_method_rbf_radio.toggled.connect(self.residual_rbf_settings_group.setVisible)
+        layout.addWidget(self.residual_ray_advanced_group)
 
         run_row = QHBoxLayout()
         self.run_button = QPushButton("Run")
@@ -523,7 +627,32 @@ class WindshieldWorkspace(QWidget):
         charts_row.addWidget(self.vector_field_chart, stretch=1)
         result_layout.addLayout(charts_row)
 
-        layout.addWidget(result_group, stretch=1)
+        layout.addWidget(result_group)
+
+        self.residual_ray_diagnostics_group = QGroupBox("RESIDUAL RAY DIAGNOSTICS")
+        self.residual_ray_diagnostics_group.setVisible(False)
+        diag_form = QFormLayout(self.residual_ray_diagnostics_group)
+        self.diag_residual_method_label = QLabel("N/A")
+        diag_form.addRow("Method:", self.diag_residual_method_label)
+        self.diag_selected_grid_label = QLabel("N/A")
+        diag_form.addRow("Selected Grid:", self.diag_selected_grid_label)
+        self.diag_rbf_settings_label = QLabel("N/A")
+        diag_form.addRow("RBF Settings:", self.diag_rbf_settings_label)
+        self.diag_selection_mode_label = QLabel("N/A")
+        diag_form.addRow("Selection Mode:", self.diag_selection_mode_label)
+        self.diag_runtime_params_label = QLabel("N/A")
+        diag_form.addRow("Runtime Param Count:", self.diag_runtime_params_label)
+        self.diag_pose_params_label = QLabel("N/A")
+        diag_form.addRow("Train Pose Param Count:", self.diag_pose_params_label)
+        self.diag_holdout_label = QLabel("N/A")
+        diag_form.addRow("Repeated Hold-out:", self.diag_holdout_label)
+        self.diag_ray_stability_label = QLabel("N/A")
+        diag_form.addRow("Ray Stability:", self.diag_ray_stability_label)
+        self.diag_pose_movement_label = QLabel("N/A")
+        diag_form.addRow("Pose Movement (STAGE B):", self.diag_pose_movement_label)
+        layout.addWidget(self.residual_ray_diagnostics_group)
+
+        layout.addStretch(1)
         return page
 
     def _selected_windshield_model(self) -> WindshieldModelType:
@@ -534,6 +663,47 @@ class WindshieldWorkspace(QWidget):
 
     def _on_spherical_radio_toggled(self, checked: bool) -> None:
         self.spherical_advanced_group.setVisible(checked)
+
+    def _on_residual_ray_radio_toggled(self, checked: bool) -> None:
+        self.residual_ray_advanced_group.setVisible(checked)
+
+    def _apply_residual_ray_advanced_settings(self) -> None:
+        """Advanced (Residual Ray) 위젯 값을 self._windshield_config.residual_ray_hint에
+        반영한다 - _apply_spherical_advanced_settings()와 별도 helper로 둔다
+        (사용자 스펙 1번, 두 모델의 advanced 설정을 섞지 않는다).
+
+        AUTO가 선택돼 있으면 auto_grid=1.0만 쓰고 grid_rows/cols는 아예
+        넣지 않는다(calibrate_residual_ray가 auto_grid>0이면 select_best_
+        grid_resolution으로 스스로 해상도를 고르고, 그 결과로 config를
+        새로 만들어 쓴다 - 여기서 미리 grid_rows/cols를 채워 넣으면 오히려
+        혼란을 준다). Manual이면 auto_grid=0.0 + 사용자가 고른 rows/cols를
+        명시적으로 넣는다. λ 값은 AUTO/Manual 여부와 무관하게 항상 포함한다.
+        """
+        assert self._windshield_config is not None
+        if self.residual_ray_method_rbf_radio.isChecked():
+            hint: dict[str, object] = {
+                "method": "rbf",
+                "rbf_kernel": self.rbf_kernel_combo.currentData(),
+            }
+            if self.rbf_mode_auto_radio.isChecked():
+                hint["auto_rbf"] = 1.0
+            else:
+                hint["auto_rbf"] = 0.0
+                hint["rbf_num_centers"] = float(self.rbf_centers_spin.value())
+                hint["rbf_smoothing"] = float(self.rbf_smoothing_spin.value())
+        else:
+            hint = {
+                "method": "grid",
+                "lambda_mag": self.lambda_mag_spin.value(),
+                "lambda_smooth": self.lambda_smooth_spin.value(),
+            }
+            if self.grid_mode_auto_radio.isChecked():
+                hint["auto_grid"] = 1.0
+            else:
+                hint["auto_grid"] = 0.0
+                hint["grid_rows"] = float(self.grid_rows_spin.value())
+                hint["grid_cols"] = float(self.grid_cols_spin.value())
+        self._windshield_config.residual_ray_hint = hint
 
     def _apply_spherical_advanced_settings(self) -> None:
         """Advanced (Spherical) spinbox 값을 self._windshield_config에 반영한다.
@@ -569,25 +739,48 @@ class WindshieldWorkspace(QWidget):
         self._windshield_config.windshield_model = selected_model
         if selected_model == WindshieldModelType.SPHERICAL:
             self._apply_spherical_advanced_settings()
+        if selected_model == WindshieldModelType.RESIDUAL_RAY:
+            self._apply_residual_ray_advanced_settings()
 
-        try:
-            result = run_windshield_calibration(self._windshield_dataset, self._windshield_config, self._camera_config)
-        except NotImplementedError as e:
-            QMessageBox.information(self, "Windshield Calibration", str(e))
-            return
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.critical(self, "Windshield Calibration", f"계산 실패: {e}")
-            return
+        # Residual Ray의 STAGE A/B + Repeated Hold-out은 수 초~수십 초가 걸릴
+        # 수 있어 GUI 스레드에서 직접 돌리면 그동안 창 이동/크기 조절/다른 탭
+        # 렌더링이 전부 멈춘다 - ui/worker.py의 기존 QObject worker +
+        # run_worker_in_thread() 패턴을 그대로 재사용해 백그라운드로 옮긴다
+        # (ui/windshield_worker.py 참고). 여기서 워커에 넘기는 건 순수 data
+        # object(Dataset/WindshieldConfig/CameraConfig)뿐이고, Qt 위젯은 결과
+        # signal을 받는 아래 핸들러들(항상 main thread에서 실행됨) 안에서만
+        # 만진다.
+        self.run_button.setEnabled(False)
+        self.run_summary_label.setText("Running...")
 
+        worker = WindshieldCalibrationWorker(self._windshield_dataset, self._windshield_config, self._camera_config)
+        thread = run_worker_in_thread(worker, self)
+        worker.result_ready.connect(self._on_windshield_calibration_finished)
+        worker.not_implemented.connect(self._on_windshield_calibration_not_implemented)
+        worker.error.connect(self._on_windshield_calibration_error)
+        self._windshield_thread, self._windshield_worker = thread, worker
+        thread.finished.connect(lambda: self.run_button.setEnabled(True))
+        thread.start()
+
+    def _on_windshield_calibration_finished(self, result: WindshieldCalibrationResult) -> None:
         self._windshield_results[result.windshield_model] = result
         self._display_result(result)
         self._refresh_comparison_table()
+
+    def _on_windshield_calibration_not_implemented(self, message: str) -> None:
+        self.run_summary_label.setText("")
+        QMessageBox.information(self, "Windshield Calibration", message)
+
+    def _on_windshield_calibration_error(self, message: str) -> None:
+        self.run_summary_label.setText(f"실패: {message}")
+        QMessageBox.critical(self, "Windshield Calibration", message)
 
     def _display_result(self, result: WindshieldCalibrationResult) -> None:
         self._current_displayed_model = result.windshield_model
         if not result.success:
             self.run_summary_label.setText(f"실패: {result.error_message}")
             self.export_button.setEnabled(False)
+            self.residual_ray_diagnostics_group.setVisible(False)
             return
 
         note = result.warning_message or ""
@@ -633,6 +826,73 @@ class WindshieldWorkspace(QWidget):
 
         self.radial_chart.set_profile(result.radial_profile)
         self.vector_field_chart.set_spatial_error_map(result.spatial_error_map)
+
+        self._update_residual_ray_diagnostics(result)
+
+    def _update_residual_ray_diagnostics(self, result: WindshieldCalibrationResult) -> None:
+        """Residual Ray 결과의 fitted_params에 이미 backend(calibration.windshield.
+        residual_ray.calibrate_residual_ray/run_residual_ray_calibration_with_
+        diagnostics)가 계산해 둔 값만 그대로 읽어 표시한다 - 여기서 새로
+        계산/추정하는 값은 하나도 없다(사용자 스펙 2번 하드 요구사항).
+        Baseline/Spherical 결과에서는 이 개념 자체가 없으므로 패널을 숨긴다."""
+        if result.windshield_model != WindshieldModelType.RESIDUAL_RAY:
+            self.residual_ray_diagnostics_group.setVisible(False)
+            return
+        self.residual_ray_diagnostics_group.setVisible(True)
+
+        fp = result.fitted_params
+        method_code = fp.get("residual_ray_method", 0.0)
+        is_rbf = method_code == 1.0
+        self.diag_residual_method_label.setText("RBF" if is_rbf else "Grid")
+        rows, cols = fp.get("grid_rows"), fp.get("grid_cols")
+        self.diag_selected_grid_label.setText(
+            f"{int(rows)} x {int(cols)}" if not is_rbf and rows is not None and cols is not None else "N/A"
+        )
+        if is_rbf:
+            centers = fp.get("rbf_num_centers")
+            smoothing = fp.get("rbf_smoothing")
+            self.diag_rbf_settings_label.setText(
+                f"Thin Plate Spline, centers {int(centers)}, smoothing {_fmt(smoothing)}"
+                if centers is not None and smoothing is not None else "N/A"
+            )
+        else:
+            self.diag_rbf_settings_label.setText("N/A")
+
+        is_auto = fp.get("diag_selection_mode_is_auto")
+        self.diag_selection_mode_label.setText(
+            "AUTO" if is_auto == 1.0 else "Manual" if is_auto == 0.0 else "N/A"
+        )
+
+        self.diag_runtime_params_label.setText(_fmt(fp.get("runtime_param_count")))
+        self.diag_pose_params_label.setText(_fmt(fp.get("pose_param_count_train")))
+
+        n_req, n_ok = fp.get("diag_repeated_n_requested"), fp.get("diag_repeated_n_successful")
+        if n_req is not None and n_ok is not None:
+            self.diag_holdout_label.setText(
+                f"{int(n_ok)}/{int(n_req)} successful · "
+                f"Mean Test RMS {_fmt(fp.get('diag_repeated_mean_test_rmse'))} "
+                f"(±{_fmt(fp.get('diag_repeated_std_test_rmse'))}) · "
+                f"Mean P95 {_fmt(fp.get('diag_repeated_mean_test_p95'))} · "
+                f"Mean Edge RMS {_fmt(fp.get('diag_repeated_mean_edge_rms'))}"
+            )
+        else:
+            self.diag_holdout_label.setText("N/A")
+
+        ray_mean, ray_p95 = fp.get("diag_ray_stability_mean_deg"), fp.get("diag_ray_stability_p95_deg")
+        if ray_mean is not None or ray_p95 is not None:
+            self.diag_ray_stability_label.setText(f"Mean {_fmt_deg(ray_mean)} · P95 {_fmt_deg(ray_p95)}")
+        else:
+            self.diag_ray_stability_label.setText("N/A")
+
+        pose_r_med, pose_r_p95 = fp.get("diag_pose_delta_r_median_deg"), fp.get("diag_pose_delta_r_p95_deg")
+        pose_t_med, pose_t_p95 = fp.get("diag_pose_delta_t_median_mm"), fp.get("diag_pose_delta_t_p95_mm")
+        if pose_r_med is not None and pose_t_med is not None:
+            self.diag_pose_movement_label.setText(
+                f"ΔR median {_fmt_deg(pose_r_med)} / P95 {_fmt_deg(pose_r_p95)} · "
+                f"Δt median {_fmt(pose_t_med)}mm / P95 {_fmt(pose_t_p95)}mm"
+            )
+        else:
+            self.diag_pose_movement_label.setText("N/A")
 
     def _on_export_windshield_yaml(self) -> None:
         result = self._windshield_results.get(self._current_displayed_model)

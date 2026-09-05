@@ -51,6 +51,10 @@ def run_windshield_calibration(
         return calibrate_spherical(windshield_dataset, config, camera_config, train_ids, test_ids)
 
     if config.windshield_model == WindshieldModelType.RESIDUAL_RAY:
+        hint = config.residual_ray_hint or {}
+        if str(hint.get("method", "grid")).lower() == "rbf":
+            from calibration.windshield.residual_rbf import calibrate_residual_rbf
+            return calibrate_residual_rbf(windshield_dataset, config, camera_config, train_ids, test_ids)
         from calibration.windshield.residual_ray import calibrate_residual_ray
         return calibrate_residual_ray(windshield_dataset, config, camera_config, train_ids, test_ids)
 

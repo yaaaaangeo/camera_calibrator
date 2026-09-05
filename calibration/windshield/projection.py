@@ -17,6 +17,7 @@ import numpy as np
 from calibration.windshield.base import WindshieldCalibrationResult, WindshieldModel, WindshieldModelType
 from calibration.windshield.baseline import BaselineWindshieldModel
 from calibration.windshield.residual_ray import ResidualRayWindshieldModel
+from calibration.windshield.residual_rbf import build_residual_rbf_model_from_fitted_params
 from calibration.windshield.spherical import (
     DEFAULT_AIR_REFRACTIVE_INDEX,
     DEFAULT_GLASS_REFRACTIVE_INDEX,
@@ -46,6 +47,13 @@ def build_projector(result: WindshieldCalibrationResult) -> WindshieldModel:
         )
     if result.windshield_model == WindshieldModelType.RESIDUAL_RAY:
         fp = result.fitted_params
+        if fp.get("residual_ray_method", 0.0) == 1.0:
+            return build_residual_rbf_model_from_fitted_params(
+                result.base_camera_matrix,
+                result.base_distortion,
+                result.base_model_name,
+                fp,
+            )
         rows, cols = int(fp["grid_rows"]), int(fp["grid_cols"])
         grid = np.zeros((rows, cols, 3), dtype=np.float64)
         for r in range(rows):

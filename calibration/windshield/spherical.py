@@ -785,8 +785,10 @@ def calibrate_spherical(
                 refinement_note = "STAGE B 일부 sub-fit이 수렴하지 않아 해당 프레임/라운드는 이전 값을 유지했습니다. "
         else:
             refinement_note = (
-                "STAGE B(joint pixel-domain refinement)가 STAGE A(ray-based initial fit)보다 "
+                "STAGE B(ray-domain alternating sphere/pose refinement)가 STAGE A(ray-based initial fit)보다 "
                 "실제 pixel RMS를 개선하지 못해 STAGE A 결과를 최종으로 사용했습니다. "
+                "(참고: 최적화 자체의 residual은 ray-domain이고, 이 STAGE A/B 채택 여부 판단 기준만 "
+                "실제 pixel-domain RMS를 사용합니다.) "
             )
     else:
         refinement_note = (
