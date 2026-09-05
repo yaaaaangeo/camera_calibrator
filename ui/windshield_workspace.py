@@ -72,6 +72,18 @@ from calibration.windshield.base import (
 )
 from calibration.windshield.residual_ray import DEFAULT_GRID_COLS, DEFAULT_GRID_ROWS, DEFAULT_LAMBDA_MAG, DEFAULT_LAMBDA_SMOOTH
 from calibration.windshield.residual_rbf import DEFAULT_RBF_NUM_CENTERS, DEFAULT_RBF_SMOOTHING
+# neural_residual.py는 PyTorch가 없어도 import 자체는 항상 성공한다(모듈
+# docstring 참고) - 이 상수들은 순수 Python 값이라 여기서 top-level import해도
+# 안전하다. 실제 학습/추론 함수만 호출 시점에 torch를 요구한다.
+from calibration.windshield.neural_residual import (
+    DEFAULT_NEURAL_ACTIVATION,
+    DEFAULT_NEURAL_HIDDEN_DIMS,
+    DEFAULT_NEURAL_LEARNING_RATE,
+    DEFAULT_NEURAL_MAX_EPOCHS,
+    DEFAULT_NEURAL_PATIENCE,
+    DEFAULT_NEURAL_SEED,
+    DEFAULT_NEURAL_WEIGHT_DECAY,
+)
 from calibration.windshield.spline import (
     DEFAULT_LAMBDA_CURVE as SPLINE_DEFAULT_LAMBDA_CURVE,
     DEFAULT_LAMBDA_MAG as SPLINE_DEFAULT_LAMBDA_MAG,
@@ -522,11 +534,14 @@ class WindshieldWorkspace(QWidget):
         self.residual_ray_method_grid_radio = QRadioButton("Grid")
         self.residual_ray_method_grid_radio.setChecked(True)
         self.residual_ray_method_rbf_radio = QRadioButton("RBF")
+        self.residual_ray_method_neural_radio = QRadioButton("Neural")
         self._residual_ray_method_button_group.addButton(self.residual_ray_method_grid_radio)
         self._residual_ray_method_button_group.addButton(self.residual_ray_method_rbf_radio)
+        self._residual_ray_method_button_group.addButton(self.residual_ray_method_neural_radio)
         method_row.addWidget(QLabel("Method"))
         method_row.addWidget(self.residual_ray_method_grid_radio)
         method_row.addWidget(self.residual_ray_method_rbf_radio)
+        method_row.addWidget(self.residual_ray_method_neural_radio)
         method_row.addStretch(1)
         rr_layout.addLayout(method_row)
 
@@ -602,12 +617,63 @@ class WindshieldWorkspace(QWidget):
         rbf_form.addRow("Smoothing:", self.rbf_smoothing_spin)
         rr_layout.addWidget(self.residual_rbf_settings_group)
 
+        # NEURAL SETTINGS - Advanced 항목은 QFormLayout 하나에 전부 넣는다
+        # (RBF/Grid보다 옵션이 많지만, "너무 많은 옵션은 Advanced에 숨겨도
+        # 된다"는 요구사항에 따라 별도 collapsible 위젯은 만들지 않는다 -
+        # 이 그룹 자체가 이미 method==Neural일 때만 보인다).
+        self.residual_neural_settings_group = QGroupBox("NEURAL SETTINGS")
+        self.residual_neural_settings_group.setVisible(False)
+        neural_form = QFormLayout(self.residual_neural_settings_group)
+        neural_form.addRow("Architecture:", QLabel("Tiny MLP (2 → 32 → 64 → 32 → 3, SiLU)"))
+        self.neural_epochs_spin = QSpinBox()
+        self.neural_epochs_spin.setRange(10, 5000)
+        self.neural_epochs_spin.setValue(DEFAULT_NEURAL_MAX_EPOCHS)
+        neural_form.addRow("Epochs (max):", self.neural_epochs_spin)
+        self.neural_lr_spin = QDoubleSpinBox()
+        self.neural_lr_spin.setRange(1e-6, 1.0)
+        self.neural_lr_spin.setDecimals(6)
+        self.neural_lr_spin.setSingleStep(0.0001)
+        self.neural_lr_spin.setValue(DEFAULT_NEURAL_LEARNING_RATE)
+        neural_form.addRow("Learning Rate:", self.neural_lr_spin)
+        self.neural_weight_decay_spin = QDoubleSpinBox()
+        self.neural_weight_decay_spin.setRange(0.0, 1.0)
+        self.neural_weight_decay_spin.setDecimals(6)
+        self.neural_weight_decay_spin.setSingleStep(0.0001)
+        self.neural_weight_decay_spin.setValue(DEFAULT_NEURAL_WEIGHT_DECAY)
+        neural_form.addRow("Weight Decay:", self.neural_weight_decay_spin)
+        self.neural_lambda_mag_spin = QDoubleSpinBox()
+        self.neural_lambda_mag_spin.setRange(0.0, 10.0)
+        self.neural_lambda_mag_spin.setDecimals(6)
+        self.neural_lambda_mag_spin.setSingleStep(0.001)
+        self.neural_lambda_mag_spin.setValue(0.01)
+        neural_form.addRow("Magnitude λ:", self.neural_lambda_mag_spin)
+        self.neural_lambda_smooth_spin = QDoubleSpinBox()
+        self.neural_lambda_smooth_spin.setRange(0.0, 10.0)
+        self.neural_lambda_smooth_spin.setDecimals(6)
+        self.neural_lambda_smooth_spin.setSingleStep(0.001)
+        self.neural_lambda_smooth_spin.setValue(0.01)
+        neural_form.addRow("Smoothness λ:", self.neural_lambda_smooth_spin)
+        self.neural_early_stop_check = QRadioButton("ON")
+        self.neural_early_stop_check.setChecked(True)
+        self.neural_early_stop_check.setEnabled(False)  # 이번 라운드는 항상 ON(요구사항)
+        neural_form.addRow("Early Stop:", self.neural_early_stop_check)
+        self.neural_patience_spin = QSpinBox()
+        self.neural_patience_spin.setRange(1, 500)
+        self.neural_patience_spin.setValue(DEFAULT_NEURAL_PATIENCE)
+        neural_form.addRow("Patience:", self.neural_patience_spin)
+        self.neural_seed_spin = QSpinBox()
+        self.neural_seed_spin.setRange(0, 2**31 - 1)
+        self.neural_seed_spin.setValue(DEFAULT_NEURAL_SEED)
+        neural_form.addRow("Seed:", self.neural_seed_spin)
+        rr_layout.addWidget(self.residual_neural_settings_group)
+
         self.grid_mode_manual_radio.toggled.connect(self.grid_rows_spin.setEnabled)
         self.grid_mode_manual_radio.toggled.connect(self.grid_cols_spin.setEnabled)
         self.rbf_mode_manual_radio.toggled.connect(self.rbf_centers_spin.setEnabled)
         self.rbf_mode_manual_radio.toggled.connect(self.rbf_smoothing_spin.setEnabled)
         self.residual_ray_method_grid_radio.toggled.connect(self.residual_grid_settings_group.setVisible)
         self.residual_ray_method_rbf_radio.toggled.connect(self.residual_rbf_settings_group.setVisible)
+        self.residual_ray_method_neural_radio.toggled.connect(self.residual_neural_settings_group.setVisible)
         layout.addWidget(self.residual_ray_advanced_group)
 
         self.spline_advanced_group = QGroupBox("Advanced (Spline)")
@@ -716,6 +782,12 @@ class WindshieldWorkspace(QWidget):
         diag_form.addRow("Selected Grid:", self.diag_selected_grid_label)
         self.diag_rbf_settings_label = QLabel("N/A")
         diag_form.addRow("RBF Settings:", self.diag_rbf_settings_label)
+        self.diag_neural_architecture_label = QLabel("N/A")
+        diag_form.addRow("Neural Architecture:", self.diag_neural_architecture_label)
+        self.diag_neural_training_label = QLabel("N/A")
+        diag_form.addRow("Neural Training:", self.diag_neural_training_label)
+        self.diag_neural_seed_stability_label = QLabel("N/A")
+        diag_form.addRow("Seed Stability:", self.diag_neural_seed_stability_label)
         self.diag_selection_mode_label = QLabel("N/A")
         diag_form.addRow("Selection Mode:", self.diag_selection_mode_label)
         self.diag_runtime_params_label = QLabel("N/A")
@@ -822,6 +894,22 @@ class WindshieldWorkspace(QWidget):
                 hint["auto_rbf"] = 0.0
                 hint["rbf_num_centers"] = float(self.rbf_centers_spin.value())
                 hint["rbf_smoothing"] = float(self.rbf_smoothing_spin.value())
+        elif self.residual_ray_method_neural_radio.isChecked():
+            # Neural은 이번 라운드에 AUTO architecture search가 없다(사용자
+            # 스펙 27/28번) - Grid/RBF의 AUTO/Manual 라디오와 달리 위젯 값이
+            # 항상 곧바로 적용되는 "Manual"뿐이다.
+            hint = {
+                "method": "neural",
+                "neural_hidden_dims": list(DEFAULT_NEURAL_HIDDEN_DIMS),
+                "neural_activation": DEFAULT_NEURAL_ACTIVATION,
+                "neural_max_epochs": float(self.neural_epochs_spin.value()),
+                "neural_learning_rate": float(self.neural_lr_spin.value()),
+                "neural_weight_decay": float(self.neural_weight_decay_spin.value()),
+                "neural_lambda_mag": float(self.neural_lambda_mag_spin.value()),
+                "neural_lambda_smooth": float(self.neural_lambda_smooth_spin.value()),
+                "neural_patience": float(self.neural_patience_spin.value()),
+                "neural_seed": float(self.neural_seed_spin.value()),
+            }
         else:
             hint = {
                 "method": "grid",
@@ -1050,10 +1138,11 @@ class WindshieldWorkspace(QWidget):
         fp = result.fitted_params
         method_code = fp.get("residual_ray_method", 0.0)
         is_rbf = method_code == 1.0
-        self.diag_residual_method_label.setText("RBF" if is_rbf else "Grid")
+        is_neural = method_code == 2.0
+        self.diag_residual_method_label.setText("Neural" if is_neural else "RBF" if is_rbf else "Grid")
         rows, cols = fp.get("grid_rows"), fp.get("grid_cols")
         self.diag_selected_grid_label.setText(
-            f"{int(rows)} x {int(cols)}" if not is_rbf and rows is not None and cols is not None else "N/A"
+            f"{int(rows)} x {int(cols)}" if not is_rbf and not is_neural and rows is not None and cols is not None else "N/A"
         )
         if is_rbf:
             centers = fp.get("rbf_num_centers")
@@ -1064,6 +1153,32 @@ class WindshieldWorkspace(QWidget):
             )
         else:
             self.diag_rbf_settings_label.setText("N/A")
+
+        if is_neural:
+            n_hidden = fp.get("neural_num_hidden_layers")
+            if n_hidden is not None:
+                hidden = " → ".join(str(int(fp.get(f"neural_hidden_dim_{i}", 0))) for i in range(int(n_hidden)))
+                self.diag_neural_architecture_label.setText(f"2 → {hidden} → 3 · Params {_fmt(fp.get('neural_param_count'))}")
+            else:
+                self.diag_neural_architecture_label.setText("N/A")
+            best_epoch = fp.get("neural_best_epoch")
+            train_loss = fp.get("neural_final_train_loss")
+            val_loss = fp.get("neural_final_val_loss")
+            if best_epoch is not None:
+                self.diag_neural_training_label.setText(
+                    f"Best Epoch {int(best_epoch)} · Train Loss {_fmt(train_loss)} · Val Loss {_fmt(val_loss)}"
+                )
+            else:
+                self.diag_neural_training_label.setText("N/A")
+            seed_mean, seed_p95 = fp.get("diag_seed_stability_mean_deg"), fp.get("diag_seed_stability_p95_deg")
+            if seed_mean is not None or seed_p95 is not None:
+                self.diag_neural_seed_stability_label.setText(f"Mean {_fmt_deg(seed_mean)} · P95 {_fmt_deg(seed_p95)}")
+            else:
+                self.diag_neural_seed_stability_label.setText("N/A")
+        else:
+            self.diag_neural_architecture_label.setText("N/A")
+            self.diag_neural_training_label.setText("N/A")
+            self.diag_neural_seed_stability_label.setText("N/A")
 
         is_auto = fp.get("diag_selection_mode_is_auto")
         self.diag_selection_mode_label.setText(
@@ -1155,6 +1270,7 @@ class WindshieldWorkspace(QWidget):
             WindshieldModelType.SPHERICAL,
             windshield_result_key(WindshieldModelType.RESIDUAL_RAY, "grid"),
             windshield_result_key(WindshieldModelType.RESIDUAL_RAY, "rbf"),
+            windshield_result_key(WindshieldModelType.RESIDUAL_RAY, "neural"),
             WindshieldModelType.SPLINE,
         ]
         present = [m for m in order if m in self._windshield_results]

@@ -4,3 +4,10 @@ scipy>=1.11
 matplotlib>=3.8
 PyYAML>=6.0
 jsonschema>=4.0
+
+# Optional - only required for the "Neural Residual" Windshield model
+# (calibration/windshield/neural_residual.py, residual_ray_hint["method"]=="neural").
+# All other calibration features (Baseline/Spherical/Residual Grid/Residual
+# RBF/Spline) work without it. Install a CPU or CUDA build matching your
+# platform, e.g.: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# torch>=2.0

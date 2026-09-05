@@ -66,8 +66,18 @@ class WindshieldCalibrationWorker(QObject):
                     self._dataset, self._camera_config, self._config.test_ratio, self._config.split_seed,
                 )
                 hint = self._config.residual_ray_hint or {}
-                if str(hint.get("method", "grid")).lower() == "rbf":
+                method = str(hint.get("method", "grid")).lower()
+                if method == "rbf":
                     result = run_residual_rbf_calibration_with_diagnostics(
+                        self._dataset, self._config, self._camera_config, train_ids, test_ids,
+                    )
+                elif method == "neural":
+                    # torch는 선택적 의존성이라 여기서만 lazy import한다 - Neural을
+                    # 실제로 선택했을 때만 이 import를 거치므로, PyTorch가 없는
+                    # 환경에서도 Grid/RBF/다른 모델은 정상 동작한다(ImportError는
+                    # 아래 광범위 except가 잡아 명확한 메시지로 UI에 보여준다).
+                    from calibration.windshield.neural_residual import run_neural_residual_calibration_with_diagnostics
+                    result = run_neural_residual_calibration_with_diagnostics(
                         self._dataset, self._config, self._camera_config, train_ids, test_ids,
                     )
                 else:

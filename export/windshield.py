@@ -19,10 +19,20 @@ Calibration을 분리한다").
       train_rms: ...
       test_rms: ...
       fitted_params: {}   # Baseline은 항상 비어 있음
+      neural_state_dict_file: <sibling .pt 파일명>   # Residual Ray Neural(STEP 5)에서만 존재
+
+Residual Ray Neural은 fitted_params(flat float dict)에 학습된 weight를
+직접 펼쳐 넣지 않는다(사용자 스펙 36번, "float key 수천 개로 넣지 마라") -
+`result.neural_state_dict_b64`(base64로 인코딩된 PyTorch state_dict)가
+있으면 별도 sibling 파일(`<yaml 파일명 stem>_neural.pt`)에 raw bytes로
+저장하고, YAML에는 그 파일명(문자열)만 `neural_state_dict_file` 키로
+남긴다. 나머지 fitted_params(architecture 메타데이터/hyperparameter/진단
+값)는 기존과 동일하게 flat float로 저장된다.
 """
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import cv2
@@ -71,6 +81,11 @@ def export_windshield_yaml(
     fs.write("fitted_param_names", ",".join(fitted_param_keys))
     for key in fitted_param_keys:
         fs.write(f"fitted_param_{key}", float(result.fitted_params[key]))
+    if result.neural_state_dict_b64:
+        neural_filename = Path(path).stem + "_neural.pt"
+        neural_path = Path(path).parent / neural_filename
+        neural_path.write_bytes(base64.b64decode(result.neural_state_dict_b64.encode("ascii")))
+        fs.write("neural_state_dict_file", neural_filename)
     fs.endWriteStruct()
 
     fs.release()
@@ -94,6 +109,13 @@ def load_windshield_yaml(path: str) -> dict:
         key: windshield_node.getNode(f"fitted_param_{key}").real() for key in fitted_param_keys
     }
 
+    neural_state_dict_b64 = None
+    neural_node = windshield_node.getNode("neural_state_dict_file")
+    neural_filename = neural_node.string() if not neural_node.empty() else None
+    if neural_filename:
+        neural_path = Path(path).parent / neural_filename
+        neural_state_dict_b64 = base64.b64encode(neural_path.read_bytes()).decode("ascii")
+
     data = {
         "base_camera": {
             "camera_model": base_node.getNode("camera_model").string(),
@@ -107,6 +129,7 @@ def load_windshield_yaml(path: str) -> dict:
             "train_rms": windshield_node.getNode("train_rms").real(),
             "test_rms": windshield_node.getNode("test_rms").real(),
             "fitted_params": fitted_params,
+            "neural_state_dict_b64": neural_state_dict_b64,
         },
     }
     fs.release()
@@ -136,5 +159,6 @@ def windshield_model_from_yaml(path: str) -> WindshieldModel:
         base_distortion=base["distortion_coefficients"],
         fitted_params=ws["fitted_params"],
         success=True,
+        neural_state_dict_b64=ws.get("neural_state_dict_b64"),
     )
     return build_projector(result)

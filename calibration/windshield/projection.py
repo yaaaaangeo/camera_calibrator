@@ -48,12 +48,26 @@ def build_projector(result: WindshieldCalibrationResult) -> WindshieldModel:
         )
     if result.windshield_model == WindshieldModelType.RESIDUAL_RAY:
         fp = result.fitted_params
-        if fp.get("residual_ray_method", 0.0) == 1.0:
+        method_code = fp.get("residual_ray_method", 0.0)
+        if method_code == 1.0:
             return build_residual_rbf_model_from_fitted_params(
                 result.base_camera_matrix,
                 result.base_distortion,
                 result.base_model_name,
                 fp,
+            )
+        if method_code == 2.0:
+            # torch는 선택적 의존성이라 여기서만 lazy import한다 - Neural
+            # 결과를 재구성할 때만 필요하고, 다른 모델은 이 import를 절대
+            # 거치지 않는다(neural_residual.py 자체는 torch 없이도 import
+            # 가능하지만, 실제 재구성은 torch가 있어야만 가능하다).
+            from calibration.windshield.neural_residual import build_neural_residual_model_from_fitted_params
+            return build_neural_residual_model_from_fitted_params(
+                result.base_camera_matrix,
+                result.base_distortion,
+                result.base_model_name,
+                fp,
+                result.neural_state_dict_b64,
             )
         rows, cols = int(fp["grid_rows"]), int(fp["grid_cols"])
         grid = np.zeros((rows, cols, 3), dtype=np.float64)

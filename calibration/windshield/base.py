@@ -56,7 +56,12 @@ WindshieldResultKey: TypeAlias = str | WindshieldModelType | tuple[WindshieldMod
 def residual_ray_variant_from_params(fitted_params: dict[str, float] | None) -> str:
     if not fitted_params:
         return "grid"
-    return "rbf" if fitted_params.get("residual_ray_method", 0.0) == 1.0 else "grid"
+    method_code = fitted_params.get("residual_ray_method", 0.0)
+    if method_code == 1.0:
+        return "rbf"
+    if method_code == 2.0:
+        return "neural"
+    return "grid"
 
 
 def windshield_result_key(model: WindshieldModelType, variant: str = "") -> WindshieldResultKey:
@@ -94,7 +99,11 @@ def windshield_result_key_from_storage(value: str) -> WindshieldResultKey:
 def windshield_result_key_label(key: WindshieldResultKey) -> str:
     if isinstance(key, tuple):
         _model, variant = key
-        return "Residual RBF" if variant == "rbf" else "Residual Grid"
+        if variant == "rbf":
+            return "Residual RBF"
+        if variant == "neural":
+            return "Residual Neural"
+        return "Residual Grid"
     labels = {
         WindshieldModelType.BASELINE: "Baseline",
         WindshieldModelType.SPHERICAL: "Spherical",
@@ -208,3 +217,10 @@ class WindshieldCalibrationResult:
     success: bool = False
     error_message: Optional[str] = None
     warning_message: Optional[str] = None
+    # Residual Ray Neural(STEP 5) 전용 - 학습된 PyTorch state_dict를 base64
+    # 문자열로 인코딩해 담는다. fitted_params는 flat float dict 계약을
+    # 유지해야 하므로(YAML export가 모든 값을 float로 쓴다), 실제 weight
+    # blob은 여기 별도 필드에 둔다 - "float key 수천 개로 펼치지 않는다"는
+    # 요구사항(calibration/windshield/neural_residual.py 모듈 docstring 참고).
+    # Grid/RBF/Spline/Baseline/Spherical 결과에서는 항상 None이다.
+    neural_state_dict_b64: Optional[str] = None

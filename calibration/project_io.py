@@ -686,6 +686,10 @@ def _windshield_calibration_result_from_dict(d) -> WindshieldCalibrationResult |
         success=d.get("success", False),
         error_message=d.get("error_message"),
         warning_message=d.get("warning_message"),
+        # STEP 5(Neural Residual) 전용 - 학습된 state_dict(base64 문자열).
+        # 다른 모델 결과에서는 항상 None(dataclasses.asdict 기반 write
+        # 경로는 이미 이 필드를 자동으로 직렬화한다 - project_to_dict 참고).
+        neural_state_dict_b64=d.get("neural_state_dict_b64"),
     )
 
 
