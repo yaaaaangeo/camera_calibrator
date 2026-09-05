@@ -27,7 +27,7 @@ from calibration.project_io import (
 from calibration.json_utils import json_safe
 import dataclasses
 from calibration.types import CalibrationProject, CameraConfig, PatternConfig, PatternType
-from calibration.windshield.base import WindshieldConfig, WindshieldModelType
+from calibration.windshield.base import WindshieldConfig, WindshieldModelType, windshield_result_key
 from calibration.windshield.baseline import calibrate_baseline
 from calibration.windshield.spherical import calibrate_spherical
 from tests._windshield_test_utils import (
@@ -90,6 +90,38 @@ def test_windshield_fields_round_trip_through_disk(tmp_path):
 
     assert restored.windshield_config is not None
     assert WindshieldModelType.BASELINE in restored.windshield_results
+
+
+def test_residual_grid_and_rbf_results_round_trip_as_separate_entries():
+    project = _project_with_windshield_data()
+    baseline_result = project.windshield_results[WindshieldModelType.BASELINE]
+    grid_key = windshield_result_key(WindshieldModelType.RESIDUAL_RAY, "grid")
+    rbf_key = windshield_result_key(WindshieldModelType.RESIDUAL_RAY, "rbf")
+    grid_result = dataclasses.replace(
+        baseline_result,
+        windshield_model=WindshieldModelType.RESIDUAL_RAY,
+        fitted_params={"residual_ray_method": 0.0, "runtime_param_count": 12.0},
+    )
+    rbf_result = dataclasses.replace(
+        baseline_result,
+        windshield_model=WindshieldModelType.RESIDUAL_RAY,
+        fitted_params={
+            "residual_ray_method": 1.0,
+            "runtime_param_count": 24.0,
+            "residual_value_param_count": 24.0,
+            "serialized_numeric_value_count": 40.0,
+        },
+    )
+    project.windshield_results = {grid_key: grid_result, rbf_key: rbf_result}
+
+    payload = project_to_dict(project)
+    assert set(payload["project"]["windshield_results"]) == {"residual_ray:grid", "residual_ray:rbf"}
+
+    restored = project_from_dict(payload)
+
+    assert set(restored.windshield_results) == {grid_key, rbf_key}
+    assert restored.windshield_results[grid_key].fitted_params["residual_ray_method"] == 0.0
+    assert restored.windshield_results[rbf_key].fitted_params["residual_ray_method"] == 1.0
 
 
 def test_baseline_test_side_fields_round_trip():

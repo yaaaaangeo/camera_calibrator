@@ -1039,7 +1039,7 @@ class CalibrationProject:
     # 문제 없이 동작하고, 실제 클래스는 project_io.py에서만 import한다.
     windshield_config: Optional["WindshieldConfig"] = None
     windshield_dataset: Optional[Dataset] = None
-    windshield_results: dict["WindshieldModelType", "WindshieldCalibrationResult"] = field(default_factory=dict)
+    windshield_results: dict["WindshieldResultKey", "WindshieldCalibrationResult"] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     export_paths: dict[ExportFormat, str] = field(default_factory=dict)

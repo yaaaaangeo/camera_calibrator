@@ -27,7 +27,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Optional, TypeAlias
 
 import numpy as np
 
@@ -48,6 +48,59 @@ class WindshieldModelType(str, Enum):
     SPHERICAL = "spherical"        # Phase 2 - 미구현 (Snell 굴절 + 구면 근사)
     RESIDUAL_RAY = "residual_ray"  # Phase 3 - 미구현 (Residual Grid/RBF)
     SPLINE = "spline"              # Phase 4 - 미구현 (Advanced, Spline surface)
+
+
+WindshieldResultKey: TypeAlias = str | WindshieldModelType | tuple[WindshieldModelType, str]
+
+
+def residual_ray_variant_from_params(fitted_params: dict[str, float] | None) -> str:
+    if not fitted_params:
+        return "grid"
+    return "rbf" if fitted_params.get("residual_ray_method", 0.0) == 1.0 else "grid"
+
+
+def windshield_result_key(model: WindshieldModelType, variant: str = "") -> WindshieldResultKey:
+    if model == WindshieldModelType.RESIDUAL_RAY:
+        return (model, (variant or "grid").lower())
+    return model
+
+
+def windshield_result_key_for_result(result: "WindshieldCalibrationResult") -> WindshieldResultKey:
+    return windshield_result_key(
+        result.windshield_model,
+        residual_ray_variant_from_params(result.fitted_params),
+    )
+
+
+def windshield_result_key_to_storage(key: WindshieldResultKey) -> str:
+    if isinstance(key, str):
+        return key
+    if isinstance(key, tuple):
+        model, variant = key
+        return f"{model.value}:{variant or 'grid'}"
+    return key.value
+
+
+def windshield_result_key_from_storage(value: str) -> WindshieldResultKey:
+    if ":" in value:
+        model_value, variant = value.split(":", 1)
+        return windshield_result_key(WindshieldModelType(model_value), variant)
+    model = WindshieldModelType(value)
+    if model == WindshieldModelType.RESIDUAL_RAY:
+        return windshield_result_key(model, "grid")
+    return model
+
+
+def windshield_result_key_label(key: WindshieldResultKey) -> str:
+    if isinstance(key, tuple):
+        _model, variant = key
+        return "Residual RBF" if variant == "rbf" else "Residual Grid"
+    labels = {
+        WindshieldModelType.BASELINE: "Baseline",
+        WindshieldModelType.SPHERICAL: "Spherical",
+        WindshieldModelType.SPLINE: "Spline [Advanced]",
+    }
+    return labels.get(key, key.value)
 
 
 class WindshieldModel(ABC):

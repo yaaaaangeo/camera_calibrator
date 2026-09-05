@@ -125,6 +125,23 @@ _KERNEL_TO_CODE: dict[str, float] = {"thin_plate_spline": 0.0}
 _CODE_TO_KERNEL: dict[float, str] = {0.0: "thin_plate_spline"}
 
 
+def evaluate_rbf_delta(
+    rbf: RBFInterpolator,
+    u: float,
+    v: float,
+    image_width: float,
+    image_height: float,
+) -> np.ndarray:
+    un, vn = normalize_pixel_coordinates(u, v, image_width, image_height)
+    raw = np.asarray(rbf(np.array([[un, vn]]))[0], dtype=np.float64)
+    if not np.all(np.isfinite(raw)):
+        return np.zeros(3)
+    norm = float(np.linalg.norm(raw))
+    if norm > MAX_CORRECTION_MAGNITUDE:
+        raw = raw * (MAX_CORRECTION_MAGNITUDE / norm)
+    return raw
+
+
 def _subset_frames(dataset: Dataset, frame_ids: list[str]) -> list[Frame]:
     id_set = set(frame_ids)
     return [f for f in dataset.frames if f.image_info.image_id in id_set]
@@ -178,17 +195,10 @@ class ResidualRBFWindshieldModel(WindshieldModel):
         self._baseline = BaselineWindshieldModel(camera_matrix, distortion, model)
 
     def _delta(self, u: float, v: float) -> np.ndarray:
-        un, vn = normalize_pixel_coordinates(u, v, self._image_width, self._image_height)
-        raw = np.asarray(self._rbf(np.array([[un, vn]]))[0], dtype=np.float64)
-        if not np.all(np.isfinite(raw)):
-            # RBFInterpolator 자체는 정상 입력에서 NaN/Inf를 내지 않지만,
-            # 학습 영역을 크게 벗어난 extrapolation에 대한 방어(사용자 스펙
-            # 35번) - 조용히 "보정 없음"으로 대체한다.
-            return np.zeros(3)
-        norm = float(np.linalg.norm(raw))
-        if norm > MAX_CORRECTION_MAGNITUDE:
-            raw = raw * (MAX_CORRECTION_MAGNITUDE / norm)
-        return raw
+        return evaluate_rbf_delta(self._rbf, u, v, self._image_width, self._image_height)
+
+    def evaluate_delta(self, u: float, v: float) -> np.ndarray:
+        return self._delta(u, v)
 
     def unproject_pixel(self, u: float, v: float) -> tuple[float, float, float]:
         d_base = np.asarray(self._baseline.unproject_pixel(u, v), dtype=np.float64)
@@ -388,9 +398,7 @@ def _joint_refine_rbf_and_poses(
             break
 
         def delta_fn(u: float, v: float, _rbf=current_rbf) -> np.ndarray:
-            un, vn = normalize_pixel_coordinates(u, v, image_width, image_height)
-            raw = np.asarray(_rbf(np.array([[un, vn]]))[0], dtype=np.float64)
-            return raw if np.all(np.isfinite(raw)) else np.zeros(3)
+            return evaluate_rbf_delta(_rbf, u, v, image_width, image_height)
 
         for i, frame in enumerate(ok_frames):
             pose_fit = refine_frame_pose_ray_domain(
@@ -582,6 +590,9 @@ def calibrate_residual_rbf(
         "rbf_num_centers": float(final_num_centers),
         "num_fit_points": float(total_corners),
         "runtime_param_count": float(runtime_param_count),
+        "residual_value_param_count": float(final_num_centers * 3),
+        "rbf_center_count": float(final_num_centers),
+        "serialized_numeric_value_count": float(final_num_centers * 5),
         "pose_param_count_train": float(pose_param_count_train),
         "stage_used_is_joint_refined": 1.0 if stage_used_is_joint_refined else 0.0,
     }
@@ -628,16 +639,11 @@ def calibrate_residual_rbf(
                     t_ok_frames, t_init_rvecs, t_init_tvecs, baseline_model
                 )
 
-                def rbf_delta_fn(u: float, v: float) -> np.ndarray:
-                    un, vn = normalize_pixel_coordinates(u, v, width, height)
-                    raw = np.asarray(final_model._rbf(np.array([[un, vn]]))[0], dtype=np.float64)  # noqa: SLF001
-                    return raw if np.all(np.isfinite(raw)) else np.zeros(3)
-
                 for frame, init_rvec, init_tvec, obs_px, d_obs in zip(
                     t_ok_frames, t_init_rvecs, t_init_tvecs, t_obs_pixels, t_d_obs
                 ):
                     pose_fit = refine_frame_pose_ray_domain(
-                        frame, obs_px, d_obs, rbf_delta_fn, init_rvec, init_tvec, regularize=True,
+                        frame, obs_px, d_obs, final_model.evaluate_delta, init_rvec, init_tvec, regularize=True,
                     )
                     if pose_fit.success and np.all(np.isfinite(pose_fit.x)):
                         t_rvecs.append(pose_fit.x[:3].reshape(3, 1))
@@ -832,6 +838,7 @@ def run_residual_rbf_calibration_with_diagnostics(
     result.fitted_params["diag_selection_mode_is_auto"] = 1.0 if was_auto else 0.0
 
     if compute_repeated_holdout:
+        outer_train_dataset = Dataset(frames=_subset_frames(windshield_dataset, train_ids))
         resolved_hint = {
             **hint,
             "auto_rbf": 0.0,
@@ -840,7 +847,7 @@ def run_residual_rbf_calibration_with_diagnostics(
         }
         resolved_config = dataclasses.replace(config, residual_ray_hint=resolved_hint)
         summary = run_repeated_holdout_residual_rbf(
-            windshield_dataset, resolved_config, camera_config,
+            outer_train_dataset, resolved_config, camera_config,
             seeds=repeated_holdout_seeds, test_ratio=repeated_holdout_test_ratio,
         )
         populate_repeated_holdout_diagnostics(result.fitted_params, summary, len(repeated_holdout_seeds))

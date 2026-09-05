@@ -819,6 +819,7 @@ def run_residual_ray_calibration_with_diagnostics(
     result.fitted_params["diag_selection_mode_is_auto"] = 1.0 if was_auto else 0.0
 
     if compute_repeated_holdout:
+        outer_train_dataset = Dataset(frames=_subset_frames(windshield_dataset, train_ids))
         resolved_hint = {
             **hint,
             "auto_grid": 0.0,
@@ -827,7 +828,7 @@ def run_residual_ray_calibration_with_diagnostics(
         }
         resolved_config = dataclasses.replace(config, residual_ray_hint=resolved_hint)
         summary = run_repeated_holdout_residual_ray(
-            windshield_dataset, resolved_config, camera_config,
+            outer_train_dataset, resolved_config, camera_config,
             seeds=repeated_holdout_seeds, test_ratio=repeated_holdout_test_ratio,
         )
         populate_repeated_holdout_diagnostics(result.fitted_params, summary, len(repeated_holdout_seeds))

@@ -87,6 +87,8 @@ from calibration.windshield.base import (
     WindshieldCalibrationResult,
     WindshieldConfig,
     WindshieldModelType,
+    windshield_result_key_from_storage,
+    windshield_result_key_to_storage,
 )
 
 PROJECT_FORMAT_VERSION = 2
@@ -97,6 +99,11 @@ logger = logging.getLogger(__name__)
 
 def project_to_dict(project: CalibrationProject) -> dict:
     raw = dataclasses.asdict(project)
+    if raw.get("windshield_results"):
+        raw["windshield_results"] = {
+            windshield_result_key_to_storage(k): v
+            for k, v in raw["windshield_results"].items()
+        }
     safe = json_safe(raw)
     return {"format_version": PROJECT_FORMAT_VERSION, "project": safe}
 
@@ -883,7 +890,7 @@ def project_from_dict(payload: dict) -> CalibrationProject:
         windshield_config=_windshield_config_from_dict(d.get("windshield_config")),
         windshield_dataset=_dataset_from_dict(d["windshield_dataset"]) if d.get("windshield_dataset") else None,
         windshield_results={
-            WindshieldModelType(k): _windshield_calibration_result_from_dict(v)
+            windshield_result_key_from_storage(k): _windshield_calibration_result_from_dict(v)
             for k, v in d.get("windshield_results", {}).items()
         },
         created_at=_dt(d.get("created_at")),

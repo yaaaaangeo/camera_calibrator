@@ -61,7 +61,15 @@ from calibration.types import (
     Dataset,
     PatternConfig,
 )
-from calibration.windshield.base import WindshieldCalibrationResult, WindshieldConfig, WindshieldModelType
+from calibration.windshield.base import (
+    WindshieldCalibrationResult,
+    WindshieldConfig,
+    WindshieldModelType,
+    WindshieldResultKey,
+    windshield_result_key,
+    windshield_result_key_for_result,
+    windshield_result_key_label,
+)
 from calibration.windshield.residual_ray import DEFAULT_GRID_COLS, DEFAULT_GRID_ROWS, DEFAULT_LAMBDA_MAG, DEFAULT_LAMBDA_SMOOTH
 from calibration.windshield.residual_rbf import DEFAULT_RBF_NUM_CENTERS, DEFAULT_RBF_SMOOTHING
 from export.opencv import (
@@ -140,11 +148,11 @@ class WindshieldWorkspace(QWidget):
         self._pattern_config: PatternConfig | None = None
         self._windshield_dataset: Dataset | None = None
         self._windshield_config: WindshieldConfig | None = None
-        self._windshield_results: dict[WindshieldModelType, WindshieldCalibrationResult] = {}
+        self._windshield_results: dict[WindshieldResultKey, WindshieldCalibrationResult] = {}
         # 마지막으로 화면에 표시된(=Export 대상) 모델 - export_button과
         # _on_export_windshield_yaml이 특정 모델(예: Baseline)에 고정되지
         # 않고 "방금 실행/표시한 결과"를 export하도록 추적한다.
-        self._current_displayed_model: WindshieldModelType | None = None
+        self._current_displayed_model: WindshieldResultKey | None = None
 
         # MainWindow가 load_base_from_calibration_results()로 넘겨주는,
         # 현재 세션에서 이미 계산된 Standard 4모델 결과 (Base Camera 탭의
@@ -214,7 +222,7 @@ class WindshieldWorkspace(QWidget):
 
     def export_state(
         self,
-    ) -> tuple[WindshieldConfig | None, Dataset | None, dict[WindshieldModelType, WindshieldCalibrationResult]]:
+    ) -> tuple[WindshieldConfig | None, Dataset | None, dict[WindshieldResultKey, WindshieldCalibrationResult]]:
         return self._windshield_config, self._windshield_dataset, self._windshield_results
 
     # ------------------------------------------------------------------
@@ -641,7 +649,9 @@ class WindshieldWorkspace(QWidget):
         self.diag_selection_mode_label = QLabel("N/A")
         diag_form.addRow("Selection Mode:", self.diag_selection_mode_label)
         self.diag_runtime_params_label = QLabel("N/A")
-        diag_form.addRow("Runtime Param Count:", self.diag_runtime_params_label)
+        diag_form.addRow("Residual Value Params:", self.diag_runtime_params_label)
+        self.diag_storage_params_label = QLabel("N/A")
+        diag_form.addRow("Stored Numeric Values:", self.diag_storage_params_label)
         self.diag_pose_params_label = QLabel("N/A")
         diag_form.addRow("Train Pose Param Count:", self.diag_pose_params_label)
         self.diag_holdout_label = QLabel("N/A")
@@ -763,7 +773,7 @@ class WindshieldWorkspace(QWidget):
         thread.start()
 
     def _on_windshield_calibration_finished(self, result: WindshieldCalibrationResult) -> None:
-        self._windshield_results[result.windshield_model] = result
+        self._windshield_results[windshield_result_key_for_result(result)] = result
         self._display_result(result)
         self._refresh_comparison_table()
 
@@ -776,7 +786,7 @@ class WindshieldWorkspace(QWidget):
         QMessageBox.critical(self, "Windshield Calibration", message)
 
     def _display_result(self, result: WindshieldCalibrationResult) -> None:
-        self._current_displayed_model = result.windshield_model
+        self._current_displayed_model = windshield_result_key_for_result(result)
         if not result.success:
             self.run_summary_label.setText(f"실패: {result.error_message}")
             self.export_button.setEnabled(False)
@@ -863,7 +873,19 @@ class WindshieldWorkspace(QWidget):
             "AUTO" if is_auto == 1.0 else "Manual" if is_auto == 0.0 else "N/A"
         )
 
-        self.diag_runtime_params_label.setText(_fmt(fp.get("runtime_param_count")))
+        if is_rbf:
+            residual_values = fp.get("residual_value_param_count", fp.get("runtime_param_count"))
+            centers = fp.get("rbf_center_count", fp.get("rbf_num_centers"))
+            stored_values = fp.get("serialized_numeric_value_count")
+            self.diag_runtime_params_label.setText(
+                f"{_fmt(residual_values)} (3 x {int(centers)})" if centers is not None else _fmt(residual_values)
+            )
+            self.diag_storage_params_label.setText(
+                f"{_fmt(stored_values)} (5 x {int(centers)})" if stored_values is not None and centers is not None else "N/A"
+            )
+        else:
+            self.diag_runtime_params_label.setText(_fmt(fp.get("runtime_param_count")))
+            self.diag_storage_params_label.setText(_fmt(fp.get("runtime_param_count")))
         self.diag_pose_params_label.setText(_fmt(fp.get("pose_param_count_train")))
 
         n_req, n_ok = fp.get("diag_repeated_n_requested"), fp.get("diag_repeated_n_successful")
@@ -931,15 +953,16 @@ class WindshieldWorkspace(QWidget):
         return page
 
     def _refresh_comparison_table(self) -> None:
-        order = [
+        order: list[WindshieldResultKey] = [
             WindshieldModelType.BASELINE,
             WindshieldModelType.SPHERICAL,
-            WindshieldModelType.RESIDUAL_RAY,
+            windshield_result_key(WindshieldModelType.RESIDUAL_RAY, "grid"),
+            windshield_result_key(WindshieldModelType.RESIDUAL_RAY, "rbf"),
             WindshieldModelType.SPLINE,
         ]
         present = [m for m in order if m in self._windshield_results]
         self.comparison_table.setColumnCount(len(present))
-        self.comparison_table.setHorizontalHeaderLabels([_WINDSHIELD_MODEL_LABELS[m] for m in present])
+        self.comparison_table.setHorizontalHeaderLabels([windshield_result_key_label(m) for m in present])
 
         baseline = self._windshield_results.get(WindshieldModelType.BASELINE)
         baseline_rms = (
