@@ -1307,7 +1307,7 @@ class WindshieldWorkspace(QWidget):
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        mode_group = QGroupBox("REFLECTION EVALUATION")
+        mode_group = QGroupBox("PHOTOMETRIC QUALITY")
         mode_layout = QVBoxLayout(mode_group)
         mode_row = QHBoxLayout()
         self.reflection_reference_radio = QRadioButton("Reference Pair")
@@ -1356,12 +1356,13 @@ class WindshieldWorkspace(QWidget):
         mode_layout.addWidget(self.reflection_status_label)
         layout.addWidget(mode_group)
 
-        self.reflection_metrics_table = _ScrollTable(13, 1)
+        self.reflection_metrics_table = _ScrollTable(15, 1)
         self.reflection_metrics_table.setHorizontalHeaderLabels(["Value"])
         self.reflection_metrics_table.setVerticalHeaderLabels([
-            "Mode", "Alignment", "Mean", "Median", "P95", "P99", "Coverage",
+            "Mode", "Alignment", "Reflection Mean", "Reflection Median", "Reflection P95", "Reflection P99", "Reflection Coverage",
+            "Reflection Likelihood",
             "Bottom Mean", "Bottom Coverage", "Contrast Retention",
-            "Edge Retention", "Saturation", "Glare",
+            "Edge Retention", "Saturation Coverage", "Glare Coverage", "Glare Strength",
         ])
         layout.addWidget(self.reflection_metrics_table)
 
@@ -1425,24 +1426,28 @@ class WindshieldWorkspace(QWidget):
         if result is None:
             self.reflection_status_label.setText(dataset_result.error_message or "No reflection result.")
             return
-        self.reflection_status_label.setText(
-            f"Metric v{result.metric_version} · "
-            + ("No-reference likelihood only." if result.mode == "no_reference" else "Reference difference metrics.")
+        status_suffix = (
+            "Reflection Likelihood: no-reference heuristic, not ground truth."
+            if result.mode == "no_reference"
+            else "Reference reflection evaluation after alignment and photometric normalization."
         )
+        self.reflection_status_label.setText(f"Metric v{result.metric_version} | {status_suffix}")
         values = [
             result.mode,
             f"{result.alignment_status} ({_fmt(result.alignment_score)})",
-            f"{result.mean_strength * 100.0:.2f}%",
-            f"{result.median_strength * 100.0:.2f}%",
-            f"{result.p95_strength * 100.0:.2f}%",
-            f"{result.p99_strength * 100.0:.2f}%",
-            f"{result.coverage * 100.0:.2f}%",
+            f"{result.reflection_mean * 100.0:.2f}%" if result.reflection_mean is not None else "N/A",
+            f"{result.reflection_median * 100.0:.2f}%" if result.reflection_median is not None else "N/A",
+            f"{result.reflection_p95 * 100.0:.2f}%" if result.reflection_p95 is not None else "N/A",
+            f"{result.reflection_p99 * 100.0:.2f}%" if result.reflection_p99 is not None else "N/A",
+            f"{result.reflection_coverage * 100.0:.2f}%" if result.reflection_coverage is not None else "N/A",
+            f"{result.reflection_likelihood * 100.0:.2f}%" if result.reflection_likelihood is not None else "N/A",
             f"{(result.bottom_roi_mean_strength or 0.0) * 100.0:.2f}%",
             f"{(result.bottom_roi_coverage or 0.0) * 100.0:.2f}%",
             f"{result.contrast_retention * 100.0:.2f}%" if result.contrast_retention is not None else "N/A",
             f"{result.edge_retention * 100.0:.2f}%" if result.edge_retention is not None else "N/A",
             f"{result.saturation_coverage * 100.0:.2f}%",
             f"{(result.glare_coverage or 0.0) * 100.0:.2f}%",
+            f"{(result.glare_strength or 0.0) * 100.0:.2f}%",
         ]
         for row, value in enumerate(values):
             self.reflection_metrics_table.setItem(row, 0, QTableWidgetItem(value))

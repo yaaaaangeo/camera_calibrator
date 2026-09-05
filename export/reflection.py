@@ -45,7 +45,7 @@ def export_reflection_html(result: ReflectionEvaluationResult | ReflectionDatase
 <body>
   <h1>{html.escape(title)}</h1>
   <table>{body_rows}</table>
-  <p class="note">Photometric windshield reflection metrics are separate from geometry calibration. Severity is experimental and requires real-world threshold validation.</p>
+  <p class="note">Photometric windshield reflection metrics are separate from geometry calibration. No-reference results are heuristic likelihood estimates and do not provide reflection ground truth. Severity is experimental and requires real-world threshold validation.</p>
 </body>
 </html>
 """
@@ -60,11 +60,26 @@ def _summary_rows(payload: dict) -> list[tuple[str, str]]:
         "mode",
         "metric_version",
         "pair_id",
+        "reflection_mean",
+        "reflection_median",
+        "reflection_p95",
+        "reflection_p99",
+        "reflection_coverage",
+        "reflection_likelihood",
+        "no_reference_is_likelihood",
         "mean_strength",
         "median_strength",
         "p95_strength",
         "coverage",
         "coverage_threshold",
+        "alignment_method",
+        "alignment_score",
+        "photometric_normalized",
+        "photometric_gain",
+        "photometric_bias",
+        "glare_coverage",
+        "glare_strength",
+        "saturation_coverage",
         "severity_score",
         "worst_pair_id",
         "success",

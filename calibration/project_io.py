@@ -719,18 +719,32 @@ def _reflection_spatial_cell_from_dict(d) -> ReflectionSpatialCell:
 
 
 def _reflection_evaluation_result_from_dict(d) -> ReflectionEvaluationResult:
+    mean_strength = d.get("mean_strength", 0.0)
+    median_strength = d.get("median_strength", 0.0)
+    p95_strength = d.get("p95_strength", 0.0)
+    p99_strength = d.get("p99_strength", 0.0)
+    max_strength = d.get("max_strength", 0.0)
+    coverage = d.get("coverage", 0.0)
     return ReflectionEvaluationResult(
         mode=d.get("mode", "reference"),
         metric_version=d.get("metric_version", 1),
         pair_id=d.get("pair_id", ""),
-        mean_strength=d.get("mean_strength", 0.0),
-        median_strength=d.get("median_strength", 0.0),
-        p95_strength=d.get("p95_strength", 0.0),
-        p99_strength=d.get("p99_strength", 0.0),
-        max_strength=d.get("max_strength", 0.0),
+        reflection_mean=d.get("reflection_mean", mean_strength if d.get("mode", "reference") == "reference" else None),
+        reflection_median=d.get("reflection_median", median_strength if d.get("mode", "reference") == "reference" else None),
+        reflection_p95=d.get("reflection_p95", p95_strength if d.get("mode", "reference") == "reference" else None),
+        reflection_p99=d.get("reflection_p99", p99_strength if d.get("mode", "reference") == "reference" else None),
+        reflection_max=d.get("reflection_max", max_strength if d.get("mode", "reference") == "reference" else None),
+        reflection_coverage=d.get("reflection_coverage", coverage if d.get("mode", "reference") == "reference" else None),
+        reflection_likelihood=d.get("reflection_likelihood"),
+        no_reference_is_likelihood=d.get("no_reference_is_likelihood", False),
+        mean_strength=mean_strength,
+        median_strength=median_strength,
+        p95_strength=p95_strength,
+        p99_strength=p99_strength,
+        max_strength=max_strength,
         positive_mean_strength=d.get("positive_mean_strength", 0.0),
         positive_p95_strength=d.get("positive_p95_strength", 0.0),
-        coverage=d.get("coverage", 0.0),
+        coverage=coverage,
         coverage_threshold=d.get("coverage_threshold", 0.08),
         saturation_threshold=d.get("saturation_threshold", 250.0),
         glare_luminance_threshold=d.get("glare_luminance_threshold", 220.0),
@@ -738,6 +752,7 @@ def _reflection_evaluation_result_from_dict(d) -> ReflectionEvaluationResult:
         severity_score=d.get("severity_score"),
         saturation_coverage=d.get("saturation_coverage", 0.0),
         glare_coverage=d.get("glare_coverage"),
+        glare_strength=d.get("glare_strength"),
         contrast_retention=d.get("contrast_retention"),
         edge_retention=d.get("edge_retention"),
         bottom_roi_mean_strength=d.get("bottom_roi_mean_strength"),

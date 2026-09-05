@@ -62,6 +62,20 @@ class ReflectionEvaluationResult:
     mode: str
     metric_version: int = REFLECTION_METRIC_VERSION
     pair_id: str = ""
+
+    # Canonical reference-mode reflection metrics. These mirror the legacy
+    # *_strength fields below so downstream callers can use explicit names.
+    reflection_mean: Optional[float] = None
+    reflection_median: Optional[float] = None
+    reflection_p95: Optional[float] = None
+    reflection_p99: Optional[float] = None
+    reflection_max: Optional[float] = None
+    reflection_coverage: Optional[float] = None
+
+    # No-reference mode is a heuristic likelihood, not ground truth.
+    reflection_likelihood: Optional[float] = None
+    no_reference_is_likelihood: bool = False
+
     mean_strength: float = 0.0
     median_strength: float = 0.0
     p95_strength: float = 0.0
@@ -77,6 +91,7 @@ class ReflectionEvaluationResult:
     severity_score: Optional[float] = None
     saturation_coverage: float = 0.0
     glare_coverage: Optional[float] = None
+    glare_strength: Optional[float] = None
     contrast_retention: Optional[float] = None
     edge_retention: Optional[float] = None
     bottom_roi_mean_strength: Optional[float] = None

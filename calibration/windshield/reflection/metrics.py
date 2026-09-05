@@ -105,6 +105,15 @@ def glare_coverage(luma: np.ndarray, config: ReflectionEvaluationConfig) -> floa
     return float(np.mean(mask))
 
 
+def glare_strength(luma: np.ndarray, config: ReflectionEvaluationConfig) -> float:
+    contrast = local_contrast(luma)
+    mask = (luma >= config.glare_luminance_threshold) & (contrast <= config.glare_contrast_threshold)
+    if int(np.count_nonzero(mask)) == 0:
+        return 0.0
+    excess = (luma[mask].astype(np.float32) - config.glare_luminance_threshold) / max(255.0 - config.glare_luminance_threshold, EPS)
+    return float(np.mean(np.clip(excess, 0.0, 1.0)))
+
+
 def severity_from_metrics(mean_strength: float, p95_strength: float, coverage: float) -> float:
     raw = 100.0 * (0.35 * mean_strength / 0.20 + 0.40 * p95_strength / 0.50 + 0.25 * coverage / 0.30)
     return float(np.clip(raw, 0.0, 100.0))

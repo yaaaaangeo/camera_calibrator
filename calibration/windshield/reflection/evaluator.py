@@ -14,6 +14,7 @@ from calibration.windshield.reflection.metrics import (
     downsample_map,
     edge_retention,
     glare_coverage,
+    glare_strength,
     gradient_magnitude,
     normalize_reflection_map,
     region_metrics,
@@ -61,6 +62,7 @@ def evaluate_reflection_reference(
         return ReflectionEvaluationResult(
             mode="reference",
             pair_id=pair_id,
+            no_reference_is_likelihood=False,
             alignment_status="invalid",
             success=False,
             error_message="normal/reference images must have the same resolution",
@@ -78,6 +80,7 @@ def evaluate_reflection_reference(
         return ReflectionEvaluationResult(
             mode="reference",
             pair_id=pair_id,
+            no_reference_is_likelihood=False,
             alignment_score=alignment.score,
             alignment_error_px=alignment.error_px,
             alignment_status=alignment.status,
@@ -135,6 +138,7 @@ def evaluate_reflection_no_reference(
         pair_id=pair_id,
         alignment_status="not_run",
         alignment_method="none",
+        no_reference_is_likelihood=True,
         warning_message="No-reference mode reports GT-free reflection likelihood only.",
         contrast_retention_value=None,
         edge_retention_value=None,
@@ -221,6 +225,7 @@ def _result_from_map(
     alignment_error_px: float | None = None,
     alignment_status: str = "not_run",
     alignment_method: str = "none",
+    no_reference_is_likelihood: bool = False,
     photometric_gain: float | None = None,
     photometric_bias: float | None = None,
     warning_message: str | None = None,
@@ -230,25 +235,41 @@ def _result_from_map(
     m = np.asarray(reflection_map, dtype=np.float32)
     p = np.asarray(positive_map, dtype=np.float32)
     bottom_mean, bottom_coverage = bottom_roi_metrics(m, config.coverage_threshold, config.automotive_bottom_roi_fraction)
+    mean_strength = float(np.mean(m))
+    median_strength = float(np.median(m))
+    p95_strength = float(np.percentile(m, 95.0))
+    p99_strength = float(np.percentile(m, 99.0))
+    max_strength = float(np.max(m))
+    coverage = float(np.mean(m > config.coverage_threshold))
+    likelihood = mean_strength if mode == "no_reference" else None
     return ReflectionEvaluationResult(
         mode=mode,
         metric_version=REFLECTION_METRIC_VERSION,
         pair_id=pair_id,
-        mean_strength=float(np.mean(m)),
-        median_strength=float(np.median(m)),
-        p95_strength=float(np.percentile(m, 95.0)),
-        p99_strength=float(np.percentile(m, 99.0)),
-        max_strength=float(np.max(m)),
+        reflection_mean=mean_strength if mode == "reference" else None,
+        reflection_median=median_strength if mode == "reference" else None,
+        reflection_p95=p95_strength if mode == "reference" else None,
+        reflection_p99=p99_strength if mode == "reference" else None,
+        reflection_max=max_strength if mode == "reference" else None,
+        reflection_coverage=coverage if mode == "reference" else None,
+        reflection_likelihood=likelihood,
+        no_reference_is_likelihood=no_reference_is_likelihood,
+        mean_strength=mean_strength,
+        median_strength=median_strength,
+        p95_strength=p95_strength,
+        p99_strength=p99_strength,
+        max_strength=max_strength,
         positive_mean_strength=float(np.mean(p)),
         positive_p95_strength=float(np.percentile(p, 95.0)),
-        coverage=float(np.mean(m > config.coverage_threshold)),
+        coverage=coverage,
         coverage_threshold=config.coverage_threshold,
         saturation_threshold=config.saturation_threshold,
         glare_luminance_threshold=config.glare_luminance_threshold,
         glare_contrast_threshold=config.glare_contrast_threshold,
-        severity_score=severity_from_metrics(float(np.mean(m)), float(np.percentile(m, 95.0)), float(np.mean(m > config.coverage_threshold))),
+        severity_score=severity_from_metrics(mean_strength, p95_strength, coverage),
         saturation_coverage=saturation_coverage(normal_image, config.saturation_threshold),
         glare_coverage=glare_coverage(normal_luma, config),
+        glare_strength=glare_strength(normal_luma, config),
         contrast_retention=contrast_retention_value,
         edge_retention=edge_retention_value,
         bottom_roi_mean_strength=bottom_mean,

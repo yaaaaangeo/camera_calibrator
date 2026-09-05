@@ -169,6 +169,36 @@ def test_reference_saturation_coverage_matches_known_patch():
     assert result.saturation_coverage == pytest.approx(0.20, abs=0.01)
 
 
+def test_reflection_glare_and_saturation_metrics_remain_separate():
+    reference = np.full((100, 100, 3), 100, dtype=np.uint8)
+    reflection_only = reference.copy()
+    reflection_only[:20, :, :] = 135
+    glare_only = reference.copy()
+    glare_only[20:40, :, :] = 235
+    saturation_only = reference.copy()
+    saturation_only[40:60, :, :] = 255
+    cfg = ReflectionEvaluationConfig(
+        align=False,
+        photometric_normalize=False,
+        coverage_threshold=0.08,
+        glare_luminance_threshold=220,
+        glare_contrast_threshold=80,
+        saturation_threshold=250,
+    )
+
+    reflection = evaluate_reflection_reference(reflection_only, reference, cfg)
+    glare = evaluate_reflection_reference(glare_only, reference, cfg)
+    saturation = evaluate_reflection_reference(saturation_only, reference, cfg)
+
+    assert reflection.reflection_coverage == pytest.approx(0.20, abs=0.01)
+    assert reflection.glare_coverage == pytest.approx(0.0, abs=0.01)
+    assert reflection.saturation_coverage == pytest.approx(0.0, abs=0.01)
+    assert glare.glare_coverage == pytest.approx(0.20, abs=0.02)
+    assert glare.glare_strength > 0.0
+    assert glare.saturation_coverage == pytest.approx(0.0, abs=0.01)
+    assert saturation.saturation_coverage == pytest.approx(0.20, abs=0.01)
+
+
 def test_no_reference_likelihood_is_higher_for_bright_low_contrast_overlay():
     clean = _base_image()
     reflected = clean.copy()
@@ -178,8 +208,23 @@ def test_no_reference_likelihood_is_higher_for_bright_low_contrast_overlay():
     reflected_result = evaluate_reflection(reflected, config=ReflectionEvaluationConfig(mode="no_reference"))
 
     assert reflected_result.mode == "no_reference"
+    assert reflected_result.reflection_likelihood is not None
+    assert reflected_result.reflection_mean is None
+    assert reflected_result.no_reference_is_likelihood
     assert "likelihood" in reflected_result.warning_message.lower()
     assert reflected_result.mean_strength > clean_result.mean_strength
+
+
+def test_reflection_evaluator_does_not_mutate_input_images():
+    reference = _base_image()
+    normal = _overlay_rect(reference)
+    reference_before = reference.copy()
+    normal_before = normal.copy()
+
+    evaluate_reflection_reference(normal, reference)
+
+    assert np.array_equal(reference, reference_before)
+    assert np.array_equal(normal, normal_before)
 
 
 def test_reference_input_resolution_mismatch_is_invalid():
@@ -247,6 +292,7 @@ def test_reflection_project_io_and_yaml_export_round_trip(tmp_path):
     restored_result = restored.reflection_results["latest"]
     assert restored_result.metric_version == REFLECTION_METRIC_VERSION
     assert restored_result.pair_results[0].mean_strength == pytest.approx(pair_result.mean_strength)
+    assert restored_result.pair_results[0].reflection_mean == pytest.approx(pair_result.mean_strength)
     assert restored_result.pair_results[0].coverage_threshold == pytest.approx(0.08)
     assert restored_result.pair_results[0].photometric_normalized
     assert restored_result.pair_results[0].spatial_map
@@ -268,5 +314,7 @@ def test_reflection_result_dataclass_round_trips_with_asdict():
     raw = dataclasses.asdict(result)
 
     assert raw["metric_version"] == REFLECTION_METRIC_VERSION
+    assert raw["reflection_mean"] == pytest.approx(result.mean_strength)
+    assert raw["no_reference_is_likelihood"] is False
     assert raw["coverage_threshold"] == pytest.approx(0.08)
     assert raw["regional_metrics"]["bottom"]["mean_strength"] > raw["regional_metrics"]["top"]["mean_strength"]

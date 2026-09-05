@@ -30,17 +30,19 @@ def test_reflection_ui_keeps_raw_metric_labels_and_no_reference_wording():
     source = _WORKSPACE.read_text(encoding="utf-8")
 
     for label in (
-        "Mean",
-        "P95",
-        "Coverage",
+        "Reflection Mean",
+        "Reflection P95",
+        "Reflection Coverage",
+        "Reflection Likelihood",
         "Bottom Mean",
         "Contrast Retention",
         "Edge Retention",
-        "Saturation",
-        "Glare",
+        "Saturation Coverage",
+        "Glare Coverage",
+        "Glare Strength",
     ):
         assert label in source
-    assert "No-reference likelihood only" in source
+    assert "no-reference heuristic, not ground truth" in source
     assert "GOOD / BAD" not in source
 
 
