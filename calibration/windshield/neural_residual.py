@@ -18,12 +18,7 @@ STEP 5 - Residual Ray의 세 번째 variant: 작은 MLP(Tiny Neural Network) 기
 있다). `fitted_params["residual_ray_method"]`에 숫자 코드(0.0=grid, 1.0=rbf,
 2.0=neural)를 남긴다.
 
-PyTorch는 선택적(soft) 의존성이다 - 이 모듈은 torch가 없어도 import 자체는
-항상 성공한다(다른 Windshield 모델이 PyTorch import 실패로 실행 불가능해지면
-안 된다는 요구사항). 실제로 Neural 기능을 "사용"하려는 순간(모델 생성/학습/
-런타임 재구성)에만 `_require_torch()`가 명확한 ImportError를 낸다.
-
-Architecture(고정, 이번 라운드에서는 Architecture Search를 하지 않는다):
+Architecture(고정, 이번 라운드에서도 Architecture Search를 하지 않는다):
 
     Input(2, normalized u,v) -> Linear(2,32) -> SiLU
                               -> Linear(32,64) -> SiLU
@@ -44,9 +39,18 @@ Loss:
     L        = L_ray + lambda_mag * L_mag + lambda_smooth * L_smooth
 
 Train/Validation/Early Stopping: Outer Train 코너를 (seed로 결정론적인)
-random split으로 NN Train/NN Validation으로 나눈다. Validation ray loss가
-`patience` epoch 동안 개선되지 않으면 조기 종료하고, 마지막 epoch가 아니라
-**best validation epoch의 weight**(state_dict)를 최종으로 쓴다.
+random split으로 NN Train/NN Validation으로 나눈다. **매 epoch 끝(가중치
+업데이트가 모두 끝난 뒤)** eval 모드에서 Train 전체/Validation 전체를 각각
+한 번씩 `_loss()`로 평가해 (ray loss, total loss) 쌍을 얻는다 - Train
+diagnostics와 Val diagnostics가 항상 "같은 정의(ray loss/total loss)를 같은
+시점(그 epoch이 끝난 뒤의 고정된 weight)에 평가한 값"이 되도록 하기 위함이다
+(STEP 5 안정화 라운드 항목 4 - 이전에는 train 쪽은 "미니배치별 total loss의
+평균"(경사 하강 도중의 값, epoch마다 다른 weight들이 섞여 있음)이었고 val
+쪽은 "그 epoch 끝의 ray loss"라 두 숫자가 서로 다른 정의/다른 시점을 섞고
+있었다). Validation ray loss가 `patience` epoch 동안 개선되지 않으면 조기
+종료하고, 마지막 epoch가 아니라 **best validation epoch의 weight**
+(state_dict)를 최종으로 쓴다 - 그 epoch의 (train ray/val ray/train total/
+val total) 4개 숫자를 전부 그 순간에 같이 저장한다(`_NeuralTrainingOutcome`).
 
 STAGE A/B/Pose prior/Repeated Hold-out(Outer Train subset만)/Ray Stability는
 Grid/RBF와 완전히 동일한 정책을 `residual_common.py`의 공유 함수로 재사용한다.
@@ -54,12 +58,25 @@ Neural 고유 추가 진단은 Seed Stability(같은 split, 다른 학습 seed�
 ray 차이) - `compute_ray_stability_deg`를 그대로 재사용해서 "비교 대상이
 split이냐 seed냐"만 다르게 호출한다.
 
-직렬화(사용자 스펙 36-39번, "float key 수천 개로 펼치지 않는다"): 학습된
-`state_dict`는 base64 문자열 하나로 인코딩해 `WindshieldCalibrationResult.
-neural_state_dict_b64`(fitted_params와 별도 필드)에 담는다. fitted_params에는
-아키텍처 메타데이터(hidden dims, activation, hyperparameter, 진단 값)만
-float로 남긴다 - 재구성에 필요한 값은 전부 이 안에 있다(SciPy/PyTorch 내부
-객체 상태를 직렬화하지 않는다는 기존 원칙과 동일).
+직렬화("float key 수천 개로 펼치지 않는다"): 학습된 `state_dict`는 base64
+문자열 하나로 인코딩해 `WindshieldCalibrationResult.neural_state_dict_b64`
+(fitted_params와 별도 필드)에 담는다. fitted_params에는 아키텍처 메타데이터
+(hidden dims, activation, hyperparameter, 진단 값 - `neural_batch_size` 포함)만
+float로 남긴다 - 재구성에 필요한 값은 전부 이 안에 있다.
+
+Lazy PyTorch import(STEP 5 안정화 라운드 항목 1, 중요): 이 모듈은 최상단에서
+`import torch`를 실행하지 않는다. `torch`/`nn`은 이 모듈의 전역에 `None`으로
+시작하고, `_require_torch()`가 실제로 호출되는 시점(=Neural 모델을 실제로
+학습/평가/재구성하려는 시점)에 처음 import된다. 순수 상수(hidden dims,
+learning rate 등, PyTorch가 전혀 필요 없는 값)는 `calibration.windshield.
+neural_config`에 있다 - `ui/windshield_workspace.py`는 그 모듈만 import하므로
+Neural UI 옵션을 표시하는 것만으로는 PyTorch가 로드되지 않는다.
+
+이 모듈은 또한 `KMP_DUPLICATE_LIB_OK` 같은 프로세스 전역 환경변수를 자동으로
+설정하지 않는다 - Windows/Anaconda 환경에서 numpy(Intel MKL)와 PyTorch가
+OpenMP 런타임을 중복 로드해 충돌하는 경우가 있는데, 그 완화는 사용자가
+명시적으로 선택해야 하는 프로세스 전역 설정이라 라이브러리가 대신 결정하면
+안 된다(`_require_torch()`의 ImportError 메시지에 안내만 포함한다).
 """
 
 from __future__ import annotations
@@ -68,7 +85,10 @@ import base64
 import dataclasses
 import io
 import math
+import os
 import random
+import sys
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -81,6 +101,28 @@ from calibration.validation import split_train_test
 from calibration.windshield.base import WindshieldCalibrationResult, WindshieldConfig, WindshieldModel, WindshieldModelType
 from calibration.windshield.base_projection import solve_poses_fixed_intrinsics
 from calibration.windshield.baseline import BaselineWindshieldModel
+from calibration.windshield.neural_config import (
+    ACTIVATION_TO_CODE,
+    CODE_TO_ACTIVATION,
+    DEFAULT_NEURAL_ACTIVATION,
+    DEFAULT_NEURAL_BATCH_SIZE,
+    DEFAULT_NEURAL_HIDDEN_DIMS,
+    DEFAULT_NEURAL_LAMBDA_MAG,
+    DEFAULT_NEURAL_LAMBDA_SMOOTH,
+    DEFAULT_NEURAL_LEARNING_RATE,
+    DEFAULT_NEURAL_MAX_EPOCHS,
+    DEFAULT_NEURAL_PATIENCE,
+    DEFAULT_NEURAL_SEED,
+    DEFAULT_NEURAL_SEED_STABILITY_SEEDS,
+    DEFAULT_NEURAL_VALIDATION_RATIO,
+    DEFAULT_NEURAL_WEIGHT_DECAY,
+    MAX_ACCEPTABLE_CORNER_FAILURE_RATE,
+    MAX_CORRECTION_MAGNITUDE,
+    MIN_CORNERS_FOR_TRAINING,
+    NEURAL_SMOOTHNESS_EPS,
+    NEURAL_STAGE_B_MAX_EPOCHS,
+    NEURAL_STAGE_B_NUM_ROUNDS,
+)
 from calibration.windshield.refraction import normalize
 from calibration.windshield.residual_common import (
     DEFAULT_REPEATED_HOLDOUT_SEEDS,
@@ -96,81 +138,63 @@ from calibration.windshield.residual_common import (
     residual_ray_failure_result,
 )
 
-import os
-
-# Anaconda(numpy/scipy가 끌어오는 Intel MKL)와 PyTorch CPU wheel이 각각 자체
-# OpenMP 런타임(libiomp5md.dll)을 들고 있어, 같은 프로세스에 둘 다 로드되면
-# Windows에서 "OMP: Error #15: ... already initialized"로 즉시 죽는 경우가
-# 있다(이 프로젝트의 Anaconda 환경에서 실제로 재현됨). torch를 import하기
-# *직전에만* 이미 설정돼 있지 않은 경우에 한해 완화 플래그를 켠다 - 다른
-# 모델(Grid/RBF/Spline 등)은 이 모듈을 아예 import하지 않으므로 영향이 없고,
-# Neural을 실제로 쓰는 프로세스에만 적용된다. Trade-off(사용자 스펙 24번):
-# 이 플래그는 "중복 OpenMP 런타임이 있어도 그냥 진행"이라는 뜻이라 극단적으로
-# 드문 경우 성능 저하/스레딩 이상이 있을 수 있지만, 이 모듈이 다루는
-# 데이터/모델 규모(수백 코너, 수천 파라미터의 Tiny MLP)에서는 실질적인
-# 위험이 거의 없다 - 아무 설정도 안 하면 아예 실행이 안 되는 쪽이 더 나쁘다.
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-
-try:
-    import torch
-    import torch.nn as nn
-
-    _TORCH_AVAILABLE = True
-    _TORCH_IMPORT_ERROR: Optional[BaseException] = None
-except ImportError as _e:  # pragma: no cover - exercised only in torch-less environments
-    torch = None  # type: ignore[assignment]
-    nn = None  # type: ignore[assignment]
-    _TORCH_AVAILABLE = False
-    _TORCH_IMPORT_ERROR = _e
+# torch/nn은 진짜로 필요해지는 순간(_require_torch() 호출 시점)까지 이
+# 모듈의 전역에도, sys.modules에도 존재하지 않는다 - `import calibration.
+# windshield.neural_residual`만으로는 절대 PyTorch를 로드하지 않는다.
+torch = None  # type: ignore[assignment]
+nn = None  # type: ignore[assignment]
+_TORCH_IMPORT_ERROR: Optional[BaseException] = None
 
 
 def _require_torch() -> None:
-    if not _TORCH_AVAILABLE:
+    """PyTorch를 실제로 필요로 하는 첫 호출 시점에만 import한다(진짜 lazy
+    import) - 이미 로드됐으면 즉시 반환한다(멱등, 매 호출마다 재import하지
+    않는다)."""
+    global torch, nn, _TORCH_IMPORT_ERROR
+    if torch is not None:
+        return
+    try:
+        import torch as _torch
+        import torch.nn as _nn
+    except ImportError as e:
+        _TORCH_IMPORT_ERROR = e
         raise ImportError(
             "Neural Residual Windshield 모델을 사용하려면 PyTorch가 필요합니다. "
-            "`pip install torch`(또는 프로젝트 환경에 맞는 CPU/GPU wheel)로 설치한 뒤 "
-            "다시 시도하세요. 다른 Windshield 모델(Baseline/Spherical/Residual Grid/"
-            "Residual RBF/Spline)은 PyTorch 없이도 정상 동작합니다."
-        ) from _TORCH_IMPORT_ERROR
+            '`pip install torch` (또는 `pip install -e ".[neural]"`, 프로젝트 환경에 '
+            "맞는 CPU/GPU wheel)로 설치한 뒤 다시 시도하세요. 다른 Windshield 모델"
+            "(Baseline/Spherical/Residual Grid/Residual RBF/Spline)은 PyTorch 없이도 "
+            "정상 동작합니다.\n\n"
+            "참고(Windows/Anaconda): numpy(Intel MKL)와 PyTorch가 서로 다른 OpenMP "
+            "런타임(libiomp5md.dll)을 중복 로드해 'OMP: Error #15: ... already "
+            "initialized'로 죽는 경우가 있습니다 - 이 경우 실행 전에 환경변수 "
+            "KMP_DUPLICATE_LIB_OK=TRUE 를 직접 설정한 뒤 다시 시도하세요(이 "
+            "라이브러리는 프로세스 전체에 영향을 주는 이 환경변수를 자동으로 "
+            "설정하지 않습니다 - 명시적인 사용자 선택이어야 합니다)."
+        ) from e
+    torch = _torch
+    nn = _nn
+
+    # 참고: numpy(Intel MKL)와 PyTorch가 서로 다른 OpenMP 런타임을 중복
+    # 로드해 충돌하면 Intel의 OpenMP 런타임이 프로세스를 그 자리에서 강제
+    # 종료한다(네이티브 abort - 일반 Python 예외가 아니라서 try/except로
+    # 잡을 수 없다. 그래서 "실제 충돌이 발생하면 명확한 에러를 낸다"를
+    # 문자 그대로 구현할 수 없고, 대신 충돌이 일어나기 전에 미리 경고를
+    # 남기는 것이 우리가 할 수 있는 최선이다). 이 경고는 실제로 충돌이
+    # 일어난다는 뜻이 아니라 Windows에서 일어날 *수 있다*는 사전 안내다.
+    if sys.platform == "win32" and os.environ.get("KMP_DUPLICATE_LIB_OK") != "TRUE":
+        warnings.warn(
+            "Neural Residual 모델이 PyTorch를 로드했습니다. 이 환경(Windows)에서 "
+            "numpy(Intel MKL)와 PyTorch가 OpenMP 런타임을 중복 로드해 충돌하면 "
+            "'OMP: Error #15'와 함께 프로세스가 즉시 종료될 수 있습니다(이 경고 "
+            "직후 아무 메시지 없이 종료된다면 이 문제일 가능성이 높습니다). 이런 "
+            "일이 발생하면 실행 전에 환경변수 KMP_DUPLICATE_LIB_OK=TRUE를 직접 "
+            "설정한 뒤 다시 시도하세요.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
-# ---------------------------------------------------------------------------
-# 고정 상수 - residual_ray_hint로 덮어쓸 수 있다(Grid/RBF와 동일 원칙).
-# ---------------------------------------------------------------------------
-DEFAULT_NEURAL_HIDDEN_DIMS: list[int] = [32, 64, 32]
-DEFAULT_NEURAL_ACTIVATION = "silu"
-DEFAULT_NEURAL_LEARNING_RATE = 1e-3
-DEFAULT_NEURAL_WEIGHT_DECAY = 1e-4
-DEFAULT_NEURAL_LAMBDA_MAG = 1e-2
-DEFAULT_NEURAL_LAMBDA_SMOOTH = 1e-2
-DEFAULT_NEURAL_MAX_EPOCHS = 500
-DEFAULT_NEURAL_PATIENCE = 30
-DEFAULT_NEURAL_SEED = 42
-DEFAULT_NEURAL_BATCH_SIZE = 128
-DEFAULT_NEURAL_VALIDATION_RATIO = 0.2
-
-# STAGE B는 매 라운드 처음부터 재학습하지 않고 현재 weight에서 fine-tune
-# 계속한다(비용 억제) - 완전 재학습 대비 훨씬 적은 epoch 상한을 둔다.
-NEURAL_STAGE_B_NUM_ROUNDS = 2
-NEURAL_STAGE_B_MAX_EPOCHS = 100
-
-# 정규화 좌표계([-1,1]) 기준 smoothness finite-neighbor epsilon.
-NEURAL_SMOOTHNESS_EPS = 0.02
-
-MIN_CORNERS_FOR_TRAINING = 20
-MAX_ACCEPTABLE_CORNER_FAILURE_RATE = 0.10
-
-# Runtime/training 공통 correction guard(RBF의 MAX_CORRECTION_MAGNITUDE와
-# 동일 철학 - 병적인 extrapolation/NaN만 잡아낸다).
-MAX_CORRECTION_MAGNITUDE = 1.0
-
-DEFAULT_NEURAL_SEED_STABILITY_SEEDS: tuple[int, ...] = (1, 2, 3)
-
-_ACTIVATION_TO_CODE: dict[str, float] = {"silu": 0.0, "tanh": 1.0, "relu": 2.0}
-_CODE_TO_ACTIVATION: dict[float, str] = {0.0: "silu", 1.0: "tanh", 2.0: "relu"}
-
-
-def _activation_classes() -> dict[str, "type[nn.Module]"]:
+def _activation_classes() -> dict:
     return {"silu": nn.SiLU, "tanh": nn.Tanh, "relu": nn.ReLU}
 
 
@@ -180,18 +204,19 @@ def _subset_frames(dataset: Dataset, frame_ids: list[str]) -> list[Frame]:
 
 
 def _set_all_seeds(seed: int) -> None:
+    _require_torch()
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
 
-def _build_mlp(hidden_dims: list[int], activation: str) -> "nn.Module":
+def _build_mlp(hidden_dims: list[int], activation: str):
     """고정 architecture: Input(2) -> hidden_dims... -> Output(3). 첫 버전은
     Tiny MLP 하나만 지원한다(대규모 architecture search를 하지 않는다는
     요구사항) - hidden_dims/activation만 hint로 바꿀 수 있다."""
     _require_torch()
     act_cls = _activation_classes().get(activation, nn.SiLU)
-    layers: list[nn.Module] = []
+    layers = []
     prev = 2
     for h in hidden_dims:
         layers.append(nn.Linear(prev, h))
@@ -202,22 +227,25 @@ def _build_mlp(hidden_dims: list[int], activation: str) -> "nn.Module":
 
 
 def _encode_state_dict(state_dict: dict) -> str:
+    _require_torch()
     buf = io.BytesIO()
     torch.save(state_dict, buf)
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 def _decode_state_dict(state_dict_b64: str) -> dict:
+    _require_torch()
     raw = base64.b64decode(state_dict_b64.encode("ascii"))
     buf = io.BytesIO(raw)
     return torch.load(buf, map_location="cpu", weights_only=True)
 
 
-def _evaluate_net_delta(net: "nn.Module", u: float, v: float, image_width: float, image_height: float) -> np.ndarray:
+def _evaluate_net_delta(net, u: float, v: float, image_width: float, image_height: float) -> np.ndarray:
     """학습된 net 하나로 한 픽셀의 ΔRay를 평가한다 - runtime API
     (NeuralResidualWindshieldModel._delta)와 STAGE B pose refinement의
     delta_fn 콜백이 이 함수 하나를 공유한다(Training과 Runtime이 서로 다른
     correction policy를 쓰지 않는다는 요구사항)."""
+    _require_torch()
     un, vn = normalize_pixel_coordinates(u, v, image_width, image_height)
     with torch.no_grad():
         raw = net(torch.tensor([[un, vn]], dtype=torch.float32)).numpy()[0].astype(np.float64)
@@ -236,7 +264,7 @@ def _evaluate_net_delta(net: "nn.Module", u: float, v: float, image_width: float
 class NeuralResidualWindshieldModel(WindshieldModel):
     """작은 MLP가 학습한 `(u,v) -> ΔRay`를 Base Ray에 더하는 모델.
     project_point()/unproject_pixel() 모두 이 보정을 실제로 반영한다. CPU
-    inference만으로 동작한다(GPU 불필요, 사용자 스펙 R번)."""
+    inference만으로 동작한다(GPU 불필요)."""
 
     def __init__(
         self,
@@ -326,7 +354,7 @@ def build_neural_residual_model_from_fitted_params(
     fp = fitted_params
     n_hidden = int(fp["neural_num_hidden_layers"])
     hidden_dims = [int(fp[f"neural_hidden_dim_{i}"]) for i in range(n_hidden)]
-    activation = _CODE_TO_ACTIVATION.get(fp.get("neural_activation_code", 0.0), DEFAULT_NEURAL_ACTIVATION)
+    activation = CODE_TO_ACTIVATION.get(fp.get("neural_activation_code", 0.0), DEFAULT_NEURAL_ACTIVATION)
     state_dict = _decode_state_dict(state_dict_b64)
     return NeuralResidualWindshieldModel(
         camera_matrix, distortion, model, state_dict, hidden_dims, activation,
@@ -359,8 +387,8 @@ def _neural_settings(config: WindshieldConfig) -> _NeuralSettings:
     if not hidden_dims:
         raise ValueError("residual_ray_hint neural_hidden_dims는 최소 1개 이상의 hidden layer가 필요합니다.")
     activation = str(hint.get("neural_activation", DEFAULT_NEURAL_ACTIVATION)).lower()
-    if activation not in _ACTIVATION_TO_CODE:
-        raise ValueError(f"지원하지 않는 neural_activation: {activation} (지원: {sorted(_ACTIVATION_TO_CODE)}).")
+    if activation not in ACTIVATION_TO_CODE:
+        raise ValueError(f"지원하지 않는 neural_activation: {activation} (지원: {sorted(ACTIVATION_TO_CODE)}).")
     return _NeuralSettings(
         hidden_dims=hidden_dims,
         activation=activation,
@@ -377,11 +405,11 @@ def _neural_settings(config: WindshieldConfig) -> _NeuralSettings:
 
 
 def _split_train_validation(n: int, validation_ratio: float, seed: int) -> tuple[np.ndarray, np.ndarray]:
-    """Outer Train 코너를 NN Train/NN Validation으로 나눈다(사용자 스펙
-    22번) - Outer Test는 이 함수 어디에도 등장하지 않는다(호출부가 항상
-    Outer Train 코너만 넘긴다). n이 너무 작아 validation이 0개가 되면(작은
-    합성 fixture 등) train 전체를 validation으로도 재사용하는 fallback은
-    `_train_mlp`가 담당한다(여기서는 인덱스만 나눈다)."""
+    """Outer Train 코너를 NN Train/NN Validation으로 나눈다 - Outer Test는
+    이 함수 어디에도 등장하지 않는다(호출부가 항상 Outer Train 코너만
+    넘긴다). n이 너무 작아 validation이 0개가 되면(작은 합성 fixture 등)
+    train 전체를 validation으로도 재사용하는 fallback은 `_train_mlp`가
+    담당한다(여기서는 인덱스만 나눈다)."""
     rng = np.random.default_rng(seed)
     idx = rng.permutation(n)
     n_val = int(round(n * validation_ratio))
@@ -391,10 +419,16 @@ def _split_train_validation(n: int, validation_ratio: float, seed: int) -> tuple
 
 @dataclass
 class _NeuralTrainingOutcome:
+    """best validation-epoch checkpoint 하나의 상태 + 그 시점의 4개 loss
+    지표. 네 값 모두 **같은 epoch**(best_epoch, 그 epoch의 최적화가 끝난
+    뒤)에 **같은 `_loss()` 함수**로 eval 모드에서 계산된다 - Train과 Val이
+    서로 다른 시점/다른 정의를 섞지 않는다(STEP 5 안정화 라운드 항목 4)."""
     state_dict: dict
     best_epoch: int
-    final_train_loss: float
-    final_val_loss: float
+    best_train_ray_loss: float
+    best_val_ray_loss: float
+    best_train_total_loss: float
+    best_val_total_loss: float
     stopped_early: bool
 
 
@@ -404,10 +438,17 @@ def _train_mlp(
     settings: _NeuralSettings,
     max_epochs: Optional[int] = None,
     initial_state_dict: Optional[dict] = None,
+    history: Optional[list[float]] = None,
 ) -> _NeuralTrainingOutcome:
     """STAGE A(from-scratch) / STAGE B(fine-tune continuation)이 공유하는
     학습 루프. Validation ray loss 기준 early stopping + best checkpoint
-    restore(사용자 스펙 23번) - 마지막 epoch weight를 쓰지 않는다."""
+    restore - 마지막 epoch weight를 쓰지 않는다.
+
+    `history`(선택, 테스트 전용): 넘기면 매 epoch의 validation ray loss를
+    그 리스트에 그대로 append한다 - production 경로는 이 인자를 쓰지 않고,
+    테스트가 "best_epoch가 실제로 validation loss의 argmin과 일치하는지"를
+    직접 검증할 때만 사용한다(Production API 자체를 더럽히지 않는 선택적
+    debug hook)."""
     _require_torch()
     _set_all_seeds(settings.seed)
     net = _build_mlp(settings.hidden_dims, settings.activation)
@@ -428,7 +469,7 @@ def _train_mlp(
     eff_batch = max(1, min(settings.batch_size, n_train))
     epochs = settings.max_epochs if max_epochs is None else max_epochs
 
-    def _loss(uv_t: "torch.Tensor", d_base_t: "torch.Tensor", target_t: "torch.Tensor"):
+    def _loss(uv_t, d_base_t, target_t):
         delta = net(uv_t)
         corrected = d_base_t + delta
         corrected = corrected / corrected.norm(dim=1, keepdim=True).clamp_min(1e-9)
@@ -444,11 +485,13 @@ def _train_mlp(
         total = ray_loss + settings.lambda_mag * mag_loss + settings.lambda_smooth * smooth_loss
         return total, ray_loss
 
-    best_val = float("inf")
+    best_val_ray_loss = float("inf")
     best_state = {k: v.clone() for k, v in net.state_dict().items()}
     best_epoch = 0
+    best_train_ray_loss = float("nan")
+    best_train_total_loss = float("nan")
+    best_val_total_loss = float("nan")
     epochs_without_improvement = 0
-    final_train_loss = float("nan")
     stopped_early = False
 
     rng = np.random.default_rng(settings.seed)
@@ -456,7 +499,6 @@ def _train_mlp(
     for epoch in range(epochs):
         net.train()
         perm = rng.permutation(n_train)
-        epoch_losses = []
         for start in range(0, n_train, eff_batch):
             idx = perm[start:start + eff_batch]
             idx_t = torch.from_numpy(idx.copy()).long()
@@ -464,22 +506,31 @@ def _train_mlp(
             loss, _ray_loss = _loss(train_uv_t[idx_t], train_d_base_t[idx_t], train_target_t[idx_t])
             loss.backward()
             optimizer.step()
-            epoch_losses.append(float(loss.item()))
-        final_train_loss = float(np.mean(epoch_losses)) if epoch_losses else float("nan")
 
+        # 미니배치 최적화가 끝난 뒤(=이 epoch의 최종 weight로) Train
+        # 전체/Validation 전체를 eval 모드에서 각각 한 번씩 평가한다 - Train
+        # diagnostics를 "학습 도중 미니배치 평균"이 아니라 Val과 완전히
+        # 같은 방식(같은 _loss 함수, 같은 시점의 weight)으로 만든다.
         net.eval()
         with torch.no_grad():
+            train_total_eval, train_ray_eval = _loss(train_uv_t, train_d_base_t, train_target_t)
             if has_val:
-                _total, ray_loss_eval = _loss(val_uv_t, val_d_base_t, val_target_t)
+                val_total_eval, val_ray_eval = _loss(val_uv_t, val_d_base_t, val_target_t)
             else:
                 # Validation split이 0개가 될 만큼 데이터가 작으면(합성
-                # fixture 등) train ray loss를 조기 종료 기준으로 대신
-                # 쓴다(명시적 fallback, 값을 억지로 만들지 않는다).
-                _total, ray_loss_eval = _loss(train_uv_t, train_d_base_t, train_target_t)
-            val_metric = float(ray_loss_eval.item())
+                # fixture 등) train 전체를 validation 대신 쓴다(명시적
+                # fallback) - 이 경우 train/val 지표가 우연히 같아도 그건
+                # "같은 데이터로 계산했다"는 뜻이지 버그가 아니다.
+                val_total_eval, val_ray_eval = train_total_eval, train_ray_eval
 
-        if val_metric < best_val - 1e-12:
-            best_val = val_metric
+        val_ray_loss = float(val_ray_eval.item())
+        if history is not None:
+            history.append(val_ray_loss)
+        if val_ray_loss < best_val_ray_loss - 1e-12:
+            best_val_ray_loss = val_ray_loss
+            best_val_total_loss = float(val_total_eval.item())
+            best_train_ray_loss = float(train_ray_eval.item())
+            best_train_total_loss = float(train_total_eval.item())
             best_state = {k: v.clone() for k, v in net.state_dict().items()}
             best_epoch = epoch
             epochs_without_improvement = 0
@@ -490,8 +541,12 @@ def _train_mlp(
                 break
 
     return _NeuralTrainingOutcome(
-        state_dict=best_state, best_epoch=best_epoch,
-        final_train_loss=final_train_loss, final_val_loss=best_val,
+        state_dict=best_state,
+        best_epoch=best_epoch,
+        best_train_ray_loss=best_train_ray_loss,
+        best_val_ray_loss=best_val_ray_loss,
+        best_train_total_loss=best_train_total_loss,
+        best_val_total_loss=best_val_total_loss,
         stopped_early=stopped_early,
     )
 
@@ -499,6 +554,7 @@ def _train_mlp(
 def _fit_neural_stage_a(
     observed_pixels: np.ndarray, d_obs: np.ndarray, p_cam: np.ndarray,
     image_width: float, image_height: float, settings: _NeuralSettings,
+    history: Optional[list[float]] = None,
 ) -> _NeuralTrainingOutcome:
     """STAGE A - pose 고정 상태에서 NN을 처음부터(from-scratch) 학습한다."""
     target_dirs = np.array([normalize(p) for p in p_cam])
@@ -510,7 +566,7 @@ def _fit_neural_stage_a(
     return _train_mlp(
         uv_norm[train_idx], d_obs[train_idx], target_dirs[train_idx],
         uv_norm[val_idx], d_obs[val_idx], target_dirs[val_idx],
-        settings,
+        settings, history=history,
     )
 
 
@@ -525,8 +581,10 @@ class _JointNeuralRefinementOutcome:
     tvecs: list
     converged_cleanly: bool
     best_epoch: int
-    final_train_loss: float
-    final_val_loss: float
+    best_train_ray_loss: float
+    best_val_ray_loss: float
+    best_train_total_loss: float
+    best_val_total_loss: float
 
 
 def _joint_refine_neural_and_poses(
@@ -550,7 +608,8 @@ def _joint_refine_neural_and_poses(
     tvecs = [np.asarray(t, dtype=np.float64).copy() for t in initial_tvecs]
     state_dict = initial_state_dict
     converged_cleanly = True
-    best_epoch, final_train_loss, final_val_loss = 0, float("nan"), float("nan")
+    best_epoch = 0
+    best_train_ray_loss = best_val_ray_loss = best_train_total_loss = best_val_total_loss = float("nan")
 
     for _ in range(num_rounds):
         net = _build_mlp(settings.hidden_dims, settings.activation)
@@ -595,11 +654,17 @@ def _joint_refine_neural_and_poses(
             settings, max_epochs=NEURAL_STAGE_B_MAX_EPOCHS, initial_state_dict=state_dict,
         )
         state_dict = outcome.state_dict
-        best_epoch, final_train_loss, final_val_loss = outcome.best_epoch, outcome.final_train_loss, outcome.final_val_loss
+        best_epoch = outcome.best_epoch
+        best_train_ray_loss = outcome.best_train_ray_loss
+        best_val_ray_loss = outcome.best_val_ray_loss
+        best_train_total_loss = outcome.best_train_total_loss
+        best_val_total_loss = outcome.best_val_total_loss
 
     return _JointNeuralRefinementOutcome(
         state_dict=state_dict, rvecs=rvecs, tvecs=tvecs, converged_cleanly=converged_cleanly,
-        best_epoch=best_epoch, final_train_loss=final_train_loss, final_val_loss=final_val_loss,
+        best_epoch=best_epoch,
+        best_train_ray_loss=best_train_ray_loss, best_val_ray_loss=best_val_ray_loss,
+        best_train_total_loss=best_train_total_loss, best_val_total_loss=best_val_total_loss,
     )
 
 
@@ -621,7 +686,7 @@ def calibrate_neural_residual(
     stopping) -> STAGE B(NN+pose joint, ray-domain alternating fine-tune) ->
     두 stage의 실제 pixel RMS를 비교해 더 나은 쪽을 최종으로 채택 -> Train
     평가 -> Test는 최종 NN을 완전히 고정한 채 자기 pose만 별도로 refine한 뒤
-    평가(leakage 없음, 사용자 스펙 15번).
+    평가(leakage 없음).
     """
     _require_torch()
     K, D, model = config.base_camera_matrix, config.base_distortion, config.base_model_name
@@ -678,9 +743,11 @@ def calibrate_neural_residual(
     final_state_dict = stage_a_training.state_dict
     final_rvecs, final_tvecs = rvecs, tvecs
     final_outcome = stage_a_outcome
-    final_best_epoch, final_train_loss, final_val_loss = (
-        stage_a_training.best_epoch, stage_a_training.final_train_loss, stage_a_training.final_val_loss,
-    )
+    final_best_epoch = stage_a_training.best_epoch
+    final_best_train_ray_loss = stage_a_training.best_train_ray_loss
+    final_best_val_ray_loss = stage_a_training.best_val_ray_loss
+    final_best_train_total_loss = stage_a_training.best_train_total_loss
+    final_best_val_total_loss = stage_a_training.best_val_total_loss
     refinement_note = ""
 
     stage_b_model = NeuralResidualWindshieldModel(
@@ -702,7 +769,11 @@ def calibrate_neural_residual(
         final_state_dict = joint.state_dict
         final_rvecs, final_tvecs = joint.rvecs, joint.tvecs
         final_outcome = stage_b_outcome
-        final_best_epoch, final_train_loss, final_val_loss = joint.best_epoch, joint.final_train_loss, joint.final_val_loss
+        final_best_epoch = joint.best_epoch
+        final_best_train_ray_loss = joint.best_train_ray_loss
+        final_best_val_ray_loss = joint.best_val_ray_loss
+        final_best_train_total_loss = joint.best_train_total_loss
+        final_best_val_total_loss = joint.best_val_total_loss
         if not joint.converged_cleanly:
             refinement_note = "STAGE B 일부 sub-fit이 수렴하지 않아 해당 프레임/라운드는 이전 값을 유지했습니다. "
     else:
@@ -734,7 +805,7 @@ def calibrate_neural_residual(
         "neural_input_dim": 2.0,
         "neural_output_dim": 3.0,
         "neural_num_hidden_layers": float(len(settings.hidden_dims)),
-        "neural_activation_code": _ACTIVATION_TO_CODE[settings.activation],
+        "neural_activation_code": ACTIVATION_TO_CODE[settings.activation],
         "neural_seed": float(settings.seed),
         "neural_learning_rate": settings.learning_rate,
         "neural_weight_decay": settings.weight_decay,
@@ -743,9 +814,23 @@ def calibrate_neural_residual(
         "neural_max_epochs": float(settings.max_epochs),
         "neural_patience": float(settings.patience),
         "neural_validation_ratio": settings.validation_ratio,
+        # STEP 5 안정화 라운드 항목 3 - batch_size는 실제 training에 쓰이는
+        # 값인데도 이전에는 fitted_params에 저장되지 않아 재현/Repeated
+        # Hold-out에서 기본값(128)으로 조용히 되돌아갈 수 있었다.
+        "neural_batch_size": float(settings.batch_size),
+        # STEP 5 안정화 라운드 항목 4 - best checkpoint(위 neural_best_epoch)
+        # 기준으로 Train/Val 양쪽을 "같은 정의(ray loss/total loss)"로 저장한다.
         "neural_best_epoch": float(final_best_epoch),
-        "neural_final_train_loss": float(final_train_loss),
-        "neural_final_val_loss": float(final_val_loss),
+        "neural_best_train_ray_loss": float(final_best_train_ray_loss),
+        "neural_best_val_ray_loss": float(final_best_val_ray_loss),
+        "neural_best_train_total_loss": float(final_best_train_total_loss),
+        "neural_best_val_total_loss": float(final_best_val_total_loss),
+        # Deprecated aliases(하위 호환) - 이전 라운드에 저장하던 이름을
+        # 그대로 유지하되, 이제는 위 best-checkpoint 값들과 자기 일관적인
+        # 정의를 쓴다(전에는 train=마지막 epoch total, val=best epoch ray로
+        # 서로 다른 시점/정의였다). 새 코드는 neural_best_* 키를 써야 한다.
+        "neural_final_train_loss": float(final_best_train_total_loss),
+        "neural_final_val_loss": float(final_best_val_ray_loss),
         "neural_param_count": float(param_count),
         "num_fit_points": float(total_corners),
         "runtime_param_count": float(param_count),
@@ -786,7 +871,7 @@ def calibrate_neural_residual(
             if t_ok_frames:
                 # Test pose는 Standard solvePnP를 초기값으로 삼아, 최종(고정된)
                 # Neural 기준으로 pose만 다시 refine한다 - Neural weight/K/D는
-                # 여기서 절대 건드리지 않는다(leakage 없음, 사용자 스펙 15번).
+                # 여기서 절대 건드리지 않는다(leakage 없음).
                 t_rvecs, t_tvecs = [], []
                 t_obs_pixels, t_d_obs, _t_p_cam = collect_corner_arrays(
                     t_ok_frames, t_init_rvecs, t_init_tvecs, baseline_model
@@ -848,8 +933,7 @@ def run_repeated_holdout_neural_residual(
     """windshield_dataset을 여러 (다른 seed의) Train/Test로 나눠 반복
     평가한다 - Grid/RBF의 run_repeated_holdout_residual_*와 평행한 구조. 매
     split마다 `calibrate_neural_residual`을 새로 호출하므로, NN도 매번
-    새로 초기화되고 새로 학습된다(같은 trained model을 재사용하지 않는다,
-    사용자 스펙 34번)."""
+    새로 초기화되고 새로 학습된다(같은 trained model을 재사용하지 않는다)."""
     from calibration.models.common import regional_edge_average
 
     test_rmses: list[float] = []
@@ -893,7 +977,7 @@ def run_repeated_holdout_neural_residual(
 
 
 # ---------------------------------------------------------------------------
-# Seed Stability (Neural 전용, 사용자 스펙 35-B번) - 같은 split, 다른 학습 seed
+# Seed Stability (Neural 전용) - 같은 split, 다른 학습 seed
 # ---------------------------------------------------------------------------
 
 def compute_seed_stability_deg(
@@ -948,13 +1032,15 @@ def run_neural_residual_calibration_with_diagnostics(
     Seed Stability 진단을 더한 결과를 반환한다 - Grid/RBF의 run_residual_*_
     calibration_with_diagnostics와 평행 구조(UI/worker의 단일 진입점).
 
-    이번 라운드에서는 Neural hyperparameter/architecture AUTO search를
-    구현하지 않는다(사용자 스펙 27/28번, "처음부터 Architecture Search 하지
-    마라") - `diag_selection_mode_is_auto`는 항상 0.0(Manual)이다.
+    이번 라운드에서도 Neural hyperparameter/architecture AUTO search를
+    구현하지 않는다 - `diag_selection_mode_is_auto`는 항상 0.0(Manual)이다.
 
     Repeated Hold-out은 Spline/Grid/RBF와 동일하게 Outer Train subset만
     받는다(`outer_train_dataset`) - `windshield_dataset` 전체를 절대 그대로
-    넘기지 않는다(leakage 방지)."""
+    넘기지 않는다(leakage 방지). resolved_hint는 main fit이 실제로 쓴
+    모든 training-policy 값(batch_size 포함, STEP 5 안정화 라운드 항목 3)을
+    그대로 옮겨 담는다 - 그렇지 않으면 Repeated Hold-out이 기본값(128)으로
+    조용히 되돌아가 "같은 설정으로 반복 평가한다"는 계약이 깨진다."""
     result = calibrate_neural_residual(windshield_dataset, config, camera_config, train_ids, test_ids)
     if not result.success:
         return result
@@ -968,7 +1054,7 @@ def run_neural_residual_calibration_with_diagnostics(
             **hint,
             "method": "neural",
             "neural_hidden_dims": [int(result.fitted_params[f"neural_hidden_dim_{i}"]) for i in range(int(result.fitted_params["neural_num_hidden_layers"]))],
-            "neural_activation": _CODE_TO_ACTIVATION.get(result.fitted_params["neural_activation_code"], DEFAULT_NEURAL_ACTIVATION),
+            "neural_activation": CODE_TO_ACTIVATION.get(result.fitted_params["neural_activation_code"], DEFAULT_NEURAL_ACTIVATION),
             "neural_learning_rate": result.fitted_params["neural_learning_rate"],
             "neural_weight_decay": result.fitted_params["neural_weight_decay"],
             "neural_lambda_mag": result.fitted_params["neural_lambda_mag"],
@@ -976,6 +1062,7 @@ def run_neural_residual_calibration_with_diagnostics(
             "neural_max_epochs": result.fitted_params["neural_max_epochs"],
             "neural_patience": result.fitted_params["neural_patience"],
             "neural_validation_ratio": result.fitted_params["neural_validation_ratio"],
+            "neural_batch_size": result.fitted_params["neural_batch_size"],
             "neural_seed": result.fitted_params["neural_seed"],
         }
         resolved_config = dataclasses.replace(config, residual_ray_hint=resolved_hint)

@@ -72,11 +72,13 @@ from calibration.windshield.base import (
 )
 from calibration.windshield.residual_ray import DEFAULT_GRID_COLS, DEFAULT_GRID_ROWS, DEFAULT_LAMBDA_MAG, DEFAULT_LAMBDA_SMOOTH
 from calibration.windshield.residual_rbf import DEFAULT_RBF_NUM_CENTERS, DEFAULT_RBF_SMOOTHING
-# neural_residual.py는 PyTorch가 없어도 import 자체는 항상 성공한다(모듈
-# docstring 참고) - 이 상수들은 순수 Python 값이라 여기서 top-level import해도
-# 안전하다. 실제 학습/추론 함수만 호출 시점에 torch를 요구한다.
-from calibration.windshield.neural_residual import (
+# UI는 neural_residual.py를 절대 import하지 않는다(STEP 5 안정화 라운드
+# 항목 1) - neural_config.py는 PyTorch를 전혀 import하지 않는 순수 Python
+# 상수 모듈이라, "Neural 기본값을 UI에 표시하는 것만으로 PyTorch가 로드"
+# 되는 문제 없이 이 값들을 쓸 수 있다.
+from calibration.windshield.neural_config import (
     DEFAULT_NEURAL_ACTIVATION,
+    DEFAULT_NEURAL_BATCH_SIZE,
     DEFAULT_NEURAL_HIDDEN_DIMS,
     DEFAULT_NEURAL_LEARNING_RATE,
     DEFAULT_NEURAL_MAX_EPOCHS,
@@ -665,6 +667,10 @@ class WindshieldWorkspace(QWidget):
         self.neural_seed_spin.setRange(0, 2**31 - 1)
         self.neural_seed_spin.setValue(DEFAULT_NEURAL_SEED)
         neural_form.addRow("Seed:", self.neural_seed_spin)
+        self.neural_batch_size_spin = QSpinBox()
+        self.neural_batch_size_spin.setRange(16, 4096)
+        self.neural_batch_size_spin.setValue(DEFAULT_NEURAL_BATCH_SIZE)
+        neural_form.addRow("Batch Size:", self.neural_batch_size_spin)
         rr_layout.addWidget(self.residual_neural_settings_group)
 
         self.grid_mode_manual_radio.toggled.connect(self.grid_rows_spin.setEnabled)
@@ -786,6 +792,8 @@ class WindshieldWorkspace(QWidget):
         diag_form.addRow("Neural Architecture:", self.diag_neural_architecture_label)
         self.diag_neural_training_label = QLabel("N/A")
         diag_form.addRow("Neural Training:", self.diag_neural_training_label)
+        self.diag_neural_total_loss_label = QLabel("N/A")
+        diag_form.addRow("Neural Total Loss:", self.diag_neural_total_loss_label)
         self.diag_neural_seed_stability_label = QLabel("N/A")
         diag_form.addRow("Seed Stability:", self.diag_neural_seed_stability_label)
         self.diag_selection_mode_label = QLabel("N/A")
@@ -909,6 +917,7 @@ class WindshieldWorkspace(QWidget):
                 "neural_lambda_smooth": float(self.neural_lambda_smooth_spin.value()),
                 "neural_patience": float(self.neural_patience_spin.value()),
                 "neural_seed": float(self.neural_seed_spin.value()),
+                "neural_batch_size": float(self.neural_batch_size_spin.value()),
             }
         else:
             hint = {
@@ -1161,15 +1170,31 @@ class WindshieldWorkspace(QWidget):
                 self.diag_neural_architecture_label.setText(f"2 → {hidden} → 3 · Params {_fmt(fp.get('neural_param_count'))}")
             else:
                 self.diag_neural_architecture_label.setText("N/A")
+            # STEP 5 안정화 라운드 항목 4/5 - Train/Val 둘 다 "같은 best
+            # checkpoint epoch에서, 같은 정의(Ray Loss)로" 계산된 값이다
+            # (neural_best_train_ray_loss/neural_best_val_ray_loss). 예전
+            # neural_final_train_loss(마지막 epoch total)/neural_final_val_loss
+            # (best epoch ray)처럼 서로 다른 시점/정의를 섞지 않는다.
             best_epoch = fp.get("neural_best_epoch")
-            train_loss = fp.get("neural_final_train_loss")
-            val_loss = fp.get("neural_final_val_loss")
+            train_ray_loss = fp.get("neural_best_train_ray_loss")
+            val_ray_loss = fp.get("neural_best_val_ray_loss")
+            batch_size = fp.get("neural_batch_size")
             if best_epoch is not None:
                 self.diag_neural_training_label.setText(
-                    f"Best Epoch {int(best_epoch)} · Train Loss {_fmt(train_loss)} · Val Loss {_fmt(val_loss)}"
+                    f"Best Epoch {int(best_epoch)} · Train Ray Loss {_fmt(train_ray_loss)} · "
+                    f"Val Ray Loss {_fmt(val_ray_loss)}"
+                    + (f" · Batch Size {int(batch_size)}" if batch_size is not None else "")
                 )
             else:
                 self.diag_neural_training_label.setText("N/A")
+            train_total_loss = fp.get("neural_best_train_total_loss")
+            val_total_loss = fp.get("neural_best_val_total_loss")
+            if train_total_loss is not None or val_total_loss is not None:
+                self.diag_neural_total_loss_label.setText(
+                    f"Train Total Loss {_fmt(train_total_loss)} · Val Total Loss {_fmt(val_total_loss)}"
+                )
+            else:
+                self.diag_neural_total_loss_label.setText("N/A")
             seed_mean, seed_p95 = fp.get("diag_seed_stability_mean_deg"), fp.get("diag_seed_stability_p95_deg")
             if seed_mean is not None or seed_p95 is not None:
                 self.diag_neural_seed_stability_label.setText(f"Mean {_fmt_deg(seed_mean)} · P95 {_fmt_deg(seed_p95)}")
@@ -1178,6 +1203,7 @@ class WindshieldWorkspace(QWidget):
         else:
             self.diag_neural_architecture_label.setText("N/A")
             self.diag_neural_training_label.setText("N/A")
+            self.diag_neural_total_loss_label.setText("N/A")
             self.diag_neural_seed_stability_label.setText("N/A")
 
         is_auto = fp.get("diag_selection_mode_is_auto")

@@ -13,26 +13,32 @@ PyTorch가 없는 환경에서는 이 파일 전체를 skip한다.
 from __future__ import annotations
 
 import copy
+import dataclasses
 
 import numpy as np
 import pytest
 
 pytest.importorskip("torch")
+import torch  # noqa: E402 - importorskip 이후에만 안전하게 import
 
 from calibration.types import CameraModelType, Dataset
 from calibration.validation import split_train_test
 from calibration.windshield.base import WindshieldConfig, WindshieldModelType
 from calibration.windshield.neural_residual import (
     DEFAULT_NEURAL_HIDDEN_DIMS,
+    _decode_state_dict,
     _fit_neural_stage_a,
     _neural_settings,
+    _split_train_validation,
+    _train_mlp,
     calibrate_neural_residual,
     compute_seed_stability_deg,
     run_neural_residual_calibration_with_diagnostics,
     run_repeated_holdout_neural_residual,
 )
 from calibration.windshield.projection import build_projector
-from calibration.windshield.residual_common import collect_corner_arrays, compute_ray_stability_deg
+from calibration.windshield.refraction import normalize
+from calibration.windshield.residual_common import collect_corner_arrays, compute_ray_stability_deg, normalize_pixel_coordinates
 from calibration.windshield.residual_rbf import calibrate_residual_rbf
 from calibration.windshield.residual_ray import calibrate_residual_ray
 from calibration.windshield.base_projection import solve_poses_fixed_intrinsics
@@ -79,6 +85,10 @@ def _dataset_pair_with_shifted_test_corners(K, D):
 # ---------------------------------------------------------------------------
 
 def test_outer_test_corruption_does_not_change_trained_weights():
+    """Test A(사용자 스펙 5-A번) - 예측값 몇 점 비교로 끝내지 않고, 학습된
+    state_dict의 모든 tensor를 직접(key별로) 비교한다. 같은 seed + CPU
+    deterministic path이므로 완전히 동일해야 한다(rtol=0, 아주 작은 atol만
+    부동소수점 유도 오차를 흡수)."""
     K, D = default_camera_matrix_distortion()
     dataset_a, dataset_b, train_ids, test_ids = _dataset_pair_with_shifted_test_corners(K, D)
     camera_config = default_camera_config()
@@ -89,9 +99,17 @@ def test_outer_test_corruption_does_not_change_trained_weights():
     assert result_a.success and result_b.success
     for key in (
         "neural_num_hidden_layers", "neural_activation_code", "neural_best_epoch",
-        "neural_final_train_loss", "stage_used_is_joint_refined",
+        "neural_best_train_ray_loss", "neural_best_val_ray_loss",
+        "neural_best_train_total_loss", "neural_best_val_total_loss",
+        "stage_used_is_joint_refined",
     ):
         assert result_a.fitted_params[key] == pytest.approx(result_b.fitted_params[key], abs=1e-9)
+
+    state_a = _decode_state_dict(result_a.neural_state_dict_b64)
+    state_b = _decode_state_dict(result_b.neural_state_dict_b64)
+    assert state_a.keys() == state_b.keys()
+    for key in state_a:
+        torch.testing.assert_close(state_a[key], state_b[key], rtol=0, atol=1e-6)
 
     model_a = build_projector(result_a)
     model_b = build_projector(result_b)
@@ -159,7 +177,54 @@ def test_best_checkpoint_is_not_necessarily_the_last_epoch():
     # 계약만 확인한다(flaky한 절대 epoch 수 assertion을 피한다).
     if outcome.stopped_early:
         assert outcome.best_epoch < settings.max_epochs - 1
-    assert np.isfinite(outcome.final_val_loss)
+    assert np.isfinite(outcome.best_val_ray_loss)
+
+
+def test_best_checkpoint_matches_argmin_of_validation_history_and_exact_weights():
+    """Test H(사용자 스펙 5-B번, 강화) - 두 가지를 직접 증명한다:
+
+    1. `outcome.best_epoch`가 진짜로 매 epoch validation ray loss 기록의
+       argmin과 일치하는지(`history` debug hook으로 직접 기록).
+    2. 반환된 `state_dict`가 정말 그 epoch의 weight인지 - 같은 seed/데이터로
+       정확히 `best_epoch+1` epoch만(그 사이에 조기 종료가 끼어들지 못하게
+       patience를 크게 줘서) 다시 학습했을 때 나오는 state_dict와 완전히
+       (bit-level로) 같아야 한다. CPU 결정론적 경로이므로 정확히 재현된다.
+    """
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_residual_ray_dataset(K, D, default_residual_delta_fn(K))
+    train_frames = dataset.frames[:-2]
+
+    ok_frames, rvecs, tvecs, _failed = solve_poses_fixed_intrinsics(train_frames, K, D, _MODEL)
+    baseline = BaselineWindshieldModel(K, D, _MODEL)
+    observed_pixels_per_frame, d_obs_per_frame, p_cam_per_frame = collect_corner_arrays(ok_frames, rvecs, tvecs, baseline)
+    observed_pixels_arr = np.concatenate(observed_pixels_per_frame, axis=0)
+    d_obs_arr = np.concatenate(d_obs_per_frame, axis=0)
+    p_cam_arr = np.concatenate(p_cam_per_frame, axis=0)
+
+    config = _neural_config(K, D, {"neural_max_epochs": 150, "neural_patience": 12})
+    settings = _neural_settings(config)
+    history: list[float] = []
+    outcome = _fit_neural_stage_a(observed_pixels_arr, d_obs_arr, p_cam_arr, 1280.0, 800.0, settings, history=history)
+
+    assert len(history) >= 1
+    assert outcome.best_epoch == int(np.argmin(history))
+    assert outcome.best_val_ray_loss == pytest.approx(history[outcome.best_epoch], abs=1e-9)
+
+    # 2. 같은 지점까지 재학습해서 나온 weight가 정확히 같은지 직접 비교.
+    truncated_settings = dataclasses.replace(settings, patience=10**6)
+    n = observed_pixels_arr.shape[0]
+    train_idx, val_idx = _split_train_validation(n, settings.validation_ratio, settings.seed)
+    target_dirs = np.array([normalize(p) for p in p_cam_arr])
+    uv_norm = np.array([normalize_pixel_coordinates(u, v, 1280.0, 800.0) for u, v in observed_pixels_arr])
+    truncated_outcome = _train_mlp(
+        uv_norm[train_idx], d_obs_arr[train_idx], target_dirs[train_idx],
+        uv_norm[val_idx], d_obs_arr[val_idx], target_dirs[val_idx],
+        truncated_settings, max_epochs=outcome.best_epoch + 1,
+    )
+
+    assert truncated_outcome.state_dict.keys() == outcome.state_dict.keys()
+    for key in outcome.state_dict:
+        torch.testing.assert_close(outcome.state_dict[key], truncated_outcome.state_dict[key], rtol=0, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -391,3 +456,78 @@ def test_neural_diagnostics_seed_stability_never_receives_outer_test_ids(monkeyp
     assert len(captured_train_ids) == 2
     for captured in captured_train_ids:
         assert set(captured) == set(train_ids)
+
+
+# ---------------------------------------------------------------------------
+# neural_batch_size 재현성 (STEP 5 안정화 라운드 항목 3)
+# ---------------------------------------------------------------------------
+
+def test_neural_batch_size_is_persisted_in_fitted_params():
+    """항목 3-1 - 실제 학습에 쓰인 batch_size가 fitted_params에 저장돼야
+    재현/재구성 시 기본값(128)으로 조용히 되돌아가지 않는다."""
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_residual_ray_dataset(K, D, default_residual_delta_fn(K))
+    camera_config = default_camera_config()
+    train_ids = [f.image_info.image_id for f in dataset.frames[:-2]]
+    test_ids = [f.image_info.image_id for f in dataset.frames[-2:]]
+
+    result = calibrate_neural_residual(
+        dataset, _neural_config(K, D, {"neural_batch_size": 32}), camera_config, train_ids, test_ids,
+    )
+
+    assert result.success, result.error_message
+    assert result.fitted_params["neural_batch_size"] == 32.0
+
+
+def test_neural_batch_size_is_forwarded_to_repeated_holdout_resolved_config(monkeypatch):
+    """항목 3-2 - Main fit이 batch_size=32로 학습했다면, Repeated Hold-out에
+    실제로 넘어가는 resolved_config도 32여야 한다(기본 128로 되돌아가면
+    안 된다). run_repeated_holdout_neural_residual을 monkeypatch해서 실제로
+    받는 config.residual_ray_hint를 직접 캡처한다."""
+    import calibration.windshield.neural_residual as neural_module
+
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_residual_ray_dataset(K, D, default_residual_delta_fn(K))
+    camera_config = default_camera_config()
+    ids = [f.image_info.image_id for f in dataset.frames]
+    train_ids, test_ids = ids[:-2], ids[-2:]
+    captured_hints: list[dict] = []
+
+    def fake_repeated(inner_dataset, config, camera_config_arg, seeds, test_ratio):
+        captured_hints.append(dict(config.residual_ray_hint))
+        from calibration.windshield.residual_common import RepeatedHoldoutSummary
+
+        return RepeatedHoldoutSummary(seeds_used=list(seeds), n_successful=0)
+
+    monkeypatch.setattr(neural_module, "run_repeated_holdout_neural_residual", fake_repeated)
+
+    result = run_neural_residual_calibration_with_diagnostics(
+        dataset, _neural_config(K, D, {"neural_batch_size": 32}), camera_config, train_ids, test_ids,
+        compute_repeated_holdout=True, repeated_holdout_seeds=(1,),
+        compute_seed_stability=False,
+    )
+
+    assert result.success, result.error_message
+    assert result.fitted_params["neural_batch_size"] == 32.0
+    assert len(captured_hints) == 1
+    assert captured_hints[0]["neural_batch_size"] == 32.0
+
+
+def test_neural_batch_size_smaller_than_dataset_still_trains_correctly():
+    """작은 batch_size(<n_train)로도 mini-batch 루프가 정상 동작하는지 -
+    `eff_batch = min(batch_size, n_train)` 정책이 실제로 mini-batch를 여러
+    번 도는 경로를 taken하는지 확인(batch_size=8이면 대부분의 합성
+    fixture에서 코너 수보다 훨씬 작다)."""
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_residual_ray_dataset(K, D, default_residual_delta_fn(K))
+    camera_config = default_camera_config()
+    train_ids = [f.image_info.image_id for f in dataset.frames[:-2]]
+    test_ids = [f.image_info.image_id for f in dataset.frames[-2:]]
+
+    result = calibrate_neural_residual(
+        dataset, _neural_config(K, D, {"neural_batch_size": 8}), camera_config, train_ids, test_ids,
+    )
+
+    assert result.success, result.error_message
+    assert result.fitted_params["neural_batch_size"] == 8.0
+    assert np.isfinite(result.fitted_params["neural_best_train_ray_loss"])

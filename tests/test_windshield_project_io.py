@@ -94,11 +94,15 @@ def test_windshield_fields_round_trip_through_disk(tmp_path):
     assert WindshieldModelType.BASELINE in restored.windshield_results
 
 
-def test_residual_grid_and_rbf_results_round_trip_as_separate_entries():
+def test_residual_grid_rbf_and_neural_results_round_trip_as_separate_entries():
+    """사용자 스펙 5-E번 - Residual Grid/RBF/Neural 세 결과가 동시에 같은
+    project에 서로 다른 key(residual_ray:grid/rbf/neural)로 저장되고,
+    로드 후에도 셋 다 구분된 채로 남아 있어야 한다."""
     project = _project_with_windshield_data()
     baseline_result = project.windshield_results[WindshieldModelType.BASELINE]
     grid_key = windshield_result_key(WindshieldModelType.RESIDUAL_RAY, "grid")
     rbf_key = windshield_result_key(WindshieldModelType.RESIDUAL_RAY, "rbf")
+    neural_key = windshield_result_key(WindshieldModelType.RESIDUAL_RAY, "neural")
     grid_result = dataclasses.replace(
         baseline_result,
         windshield_model=WindshieldModelType.RESIDUAL_RAY,
@@ -114,16 +118,68 @@ def test_residual_grid_and_rbf_results_round_trip_as_separate_entries():
             "serialized_numeric_value_count": 40.0,
         },
     )
-    project.windshield_results = {grid_key: grid_result, rbf_key: rbf_result}
+    neural_result = dataclasses.replace(
+        baseline_result,
+        windshield_model=WindshieldModelType.RESIDUAL_RAY,
+        fitted_params={"residual_ray_method": 2.0, "runtime_param_count": 4387.0, "neural_batch_size": 128.0},
+        neural_state_dict_b64="ZmFrZS1zdGF0ZS1kaWN0LWJ5dGVz",  # 실제 torch.save 결과가 아니어도 되는 순수 round-trip 테스트
+    )
+    project.windshield_results = {grid_key: grid_result, rbf_key: rbf_result, neural_key: neural_result}
 
     payload = project_to_dict(project)
-    assert set(payload["project"]["windshield_results"]) == {"residual_ray:grid", "residual_ray:rbf"}
+    assert set(payload["project"]["windshield_results"]) == {
+        "residual_ray:grid", "residual_ray:rbf", "residual_ray:neural",
+    }
 
     restored = project_from_dict(payload)
 
-    assert set(restored.windshield_results) == {grid_key, rbf_key}
+    assert set(restored.windshield_results) == {grid_key, rbf_key, neural_key}
     assert restored.windshield_results[grid_key].fitted_params["residual_ray_method"] == 0.0
     assert restored.windshield_results[rbf_key].fitted_params["residual_ray_method"] == 1.0
+    assert restored.windshield_results[neural_key].fitted_params["residual_ray_method"] == 2.0
+    assert restored.windshield_results[neural_key].fitted_params["neural_batch_size"] == 128.0
+    assert restored.windshield_results[neural_key].neural_state_dict_b64 == neural_result.neural_state_dict_b64
+
+
+def test_real_trained_neural_result_state_dict_round_trips_through_project():
+    """사용자 스펙 5-E번(실제 Neural 결과) - 진짜로 학습한 결과를 project에
+    저장/복원한 뒤, base64 문자열뿐 아니라 decode한 state_dict tensor
+    값까지 원본과 정확히 같은지 확인한다."""
+    torch = pytest.importorskip("torch")
+    from calibration.windshield.neural_residual import _decode_state_dict, calibrate_neural_residual
+    from tests._windshield_test_utils import build_synthetic_residual_ray_dataset, default_residual_delta_fn
+
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_residual_ray_dataset(K, D, default_residual_delta_fn(K))
+    camera_config = default_camera_config()
+    config = WindshieldConfig(
+        base_model_name=CameraModelType.BROWN_CONRADY, base_camera_matrix=K, base_distortion=D,
+        windshield_model=WindshieldModelType.RESIDUAL_RAY,
+        residual_ray_hint={"method": "neural", "neural_max_epochs": 40, "neural_patience": 10},
+    )
+    train_ids = [f.image_info.image_id for f in dataset.frames[:-2]]
+    test_ids = [f.image_info.image_id for f in dataset.frames[-2:]]
+    result = calibrate_neural_residual(dataset, config, camera_config, train_ids, test_ids)
+    assert result.success, result.error_message
+
+    neural_key = windshield_result_key(WindshieldModelType.RESIDUAL_RAY, "neural")
+    project = CalibrationProject(
+        project_name="neural-project-io-test",
+        camera_config=camera_config,
+        pattern_config=PatternConfig(type=PatternType.CHARUCO, squares_x=6, squares_y=5, square_size=0.04),
+        windshield_config=config,
+        windshield_dataset=dataset,
+        windshield_results={neural_key: result},
+    )
+    restored = project_from_dict(project_to_dict(project))
+    restored_result = restored.windshield_results[neural_key]
+
+    assert restored_result.neural_state_dict_b64 == result.neural_state_dict_b64
+    original_state = _decode_state_dict(result.neural_state_dict_b64)
+    restored_state = _decode_state_dict(restored_result.neural_state_dict_b64)
+    assert original_state.keys() == restored_state.keys()
+    for key in original_state:
+        torch.testing.assert_close(original_state[key], restored_state[key], rtol=0, atol=0)
 
 
 def test_baseline_test_side_fields_round_trip():

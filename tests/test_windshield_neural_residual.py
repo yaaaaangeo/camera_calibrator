@@ -212,6 +212,27 @@ def test_neural_model_export_yaml_and_reload_matches_original(tmp_path):
     )
 
 
+def test_neural_model_reload_fails_clearly_if_sibling_pt_file_is_missing(tmp_path):
+    """사용자 스펙 5-F번 - sibling .pt 파일이 없으면 조용히 fallback하지
+    않고 명확한 에러를 내야 한다(silent fallback 금지)."""
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_residual_ray_dataset(K, D, default_residual_delta_fn(K))
+    camera_config = default_camera_config()
+    train_ids = [f.image_info.image_id for f in dataset.frames[:-2]]
+    test_ids = [f.image_info.image_id for f in dataset.frames[-2:]]
+    result = calibrate_neural_residual(dataset, _neural_config(K, D), camera_config, train_ids, test_ids)
+    assert result.success, result.error_message
+
+    path = str(tmp_path / "windshield_neural.yml")
+    export_windshield_yaml(result, camera_config, path)
+    pt_path = tmp_path / "windshield_neural_neural.pt"
+    assert pt_path.exists()
+    pt_path.unlink()  # sibling .pt 파일을 일부러 지워서 "빠진" 상황을 재현한다
+
+    with pytest.raises(OSError):
+        windshield_model_from_yaml(path)
+
+
 def test_run_windshield_calibration_dispatches_neural_method(monkeypatch):
     from calibration.windshield.base import WindshieldCalibrationResult
 

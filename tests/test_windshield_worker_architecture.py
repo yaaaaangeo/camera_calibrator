@@ -88,6 +88,43 @@ def test_on_run_windshield_calibration_disables_run_button_and_shows_running_sta
     assert "self.run_button.setEnabled(True)" in source  # thread.finished 콜백 쪽에 있음
 
 
+def test_worker_run_dispatches_neural_when_method_is_neural():
+    """사용자 스펙 5-D번 - method=="neural"이면 run_neural_residual_
+    calibration_with_diagnostics(가 실제로 호출돼야 하고, 그 import는
+    run() 본문 안(lazy, method=="neural" 분기)에만 있어야 한다(모듈
+    top-level에 있으면 PyTorch가 없는 환경에서 워커 자체를 import하지
+    못하게 된다)."""
+    source = _WORKER_PATH.read_text(encoding="utf-8")
+    run_source = _extract_function_source(source, "run")
+    assert 'method == "neural"' in run_source
+    assert _calls(run_source, "run_neural_residual_calibration_with_diagnostics")
+    assert "from calibration.windshield.neural_residual import run_neural_residual_calibration_with_diagnostics" in run_source
+
+    top_level_lines = []
+    for line in source.splitlines():
+        if line.startswith(("class ", "def ")):
+            break
+        top_level_lines.append(line)
+    assert not any("neural_residual" in line for line in top_level_lines), (
+        "neural_residual must only be imported lazily inside run(), not at module top-level"
+    )
+
+
+def test_worker_run_dispatches_grid_rbf_neural_spline_to_distinct_functions():
+    """Grid/RBF/Neural/Spline이 서로 다른 함수로 정확히 분기되는지 - 어느
+    하나가 다른 하나로 잘못 dispatch되지 않는다는 것을 최소한 "그 함수
+    이름이 run() 본문에 전부 등장한다"는 수준에서 확인한다(세부 분기
+    로직의 정확성은 calibrate_neural_residual/calibrate_residual_rbf 등
+    backend 테스트가 이미 검증한다 - 여기서는 worker가 그 4개 함수를 모두
+    실제로 참조하는지만 구조적으로 본다)."""
+    source = _WORKER_PATH.read_text(encoding="utf-8")
+    run_source = _extract_function_source(source, "run")
+    assert _calls(run_source, "run_residual_ray_calibration_with_diagnostics")
+    assert _calls(run_source, "run_residual_rbf_calibration_with_diagnostics")
+    assert _calls(run_source, "run_neural_residual_calibration_with_diagnostics")
+    assert _calls(run_source, "run_spline_calibration_with_diagnostics")
+
+
 def test_workspace_module_never_calls_heavy_calibration_functions_at_module_scope():
     """run_windshield_calibration/run_residual_ray_calibration_with_diagnostics에
     대한 실제 호출(함수 정의가 아니라 '이름(' 형태)이 windshield_worker.py를

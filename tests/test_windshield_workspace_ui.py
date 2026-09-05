@@ -17,7 +17,8 @@ import pytest
 
 pytest.importorskip("PySide6", reason="PySide6가 설치되어 있지 않음")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+QtWidgets = pytest.importorskip("PySide6.QtWidgets", reason="PySide6.QtWidgets is not importable in this environment")
+QApplication = QtWidgets.QApplication
 
 from calibration.windshield.base import WindshieldModelType  # noqa: E402
 from ui.windshield_vector_field_view import VectorFieldChartWidget  # noqa: E402
@@ -151,6 +152,98 @@ def test_residual_ray_diagnostics_panel_visible_only_for_residual_ray_result(qap
     assert workspace.residual_ray_diagnostics_group.isVisibleTo(workspace)
     assert workspace.diag_selected_grid_label.text() == "3 x 4"
     assert workspace.diag_selection_mode_label.text() == "AUTO"
+
+
+def test_residual_ray_neural_settings_visible_only_when_neural_method_selected(qapp):
+    """사용자 스펙 5-C번 - Grid/RBF를 고르면 Neural Settings가 숨겨지고,
+    Neural을 고르면 보여야 한다."""
+    workspace = _make_workspace_with_config(qapp)
+    buttons = {
+        button.property("windshield_model"): button
+        for button in workspace._model_button_group.buttons()
+    }
+    buttons[WindshieldModelType.RESIDUAL_RAY.value].setChecked(True)
+
+    workspace.residual_ray_method_grid_radio.setChecked(True)
+    assert not workspace.residual_neural_settings_group.isVisibleTo(workspace)
+
+    workspace.residual_ray_method_rbf_radio.setChecked(True)
+    assert not workspace.residual_neural_settings_group.isVisibleTo(workspace)
+
+    workspace.residual_ray_method_neural_radio.setChecked(True)
+    assert workspace.residual_neural_settings_group.isVisibleTo(workspace)
+    assert not workspace.residual_grid_settings_group.isVisibleTo(workspace)
+    assert not workspace.residual_rbf_settings_group.isVisibleTo(workspace)
+
+
+def test_neural_method_and_hyperparameter_mapping_to_hint(qapp):
+    """사용자 스펙 5-C번 - method=="neural" 매핑 + 모든 hyperparameter
+    spinbox(max epochs/learning rate/weight decay/lambda mag/lambda
+    smooth/patience/seed/batch size)가 정확히 hint에 반영되는지."""
+    workspace = _make_workspace_with_config(qapp)
+    workspace.residual_ray_method_neural_radio.setChecked(True)
+    workspace.neural_epochs_spin.setValue(250)
+    workspace.neural_lr_spin.setValue(0.002)
+    workspace.neural_weight_decay_spin.setValue(0.0005)
+    workspace.neural_lambda_mag_spin.setValue(0.03)
+    workspace.neural_lambda_smooth_spin.setValue(0.04)
+    workspace.neural_patience_spin.setValue(20)
+    workspace.neural_seed_spin.setValue(7)
+    workspace.neural_batch_size_spin.setValue(32)
+
+    workspace._apply_residual_ray_advanced_settings()
+    hint = workspace._windshield_config.residual_ray_hint
+
+    assert hint["method"] == "neural"
+    assert hint["neural_max_epochs"] == 250.0
+    assert hint["neural_learning_rate"] == pytest.approx(0.002)
+    assert hint["neural_weight_decay"] == pytest.approx(0.0005)
+    assert hint["neural_lambda_mag"] == pytest.approx(0.03)
+    assert hint["neural_lambda_smooth"] == pytest.approx(0.04)
+    assert hint["neural_patience"] == 20.0
+    assert hint["neural_seed"] == 7.0
+    assert hint["neural_batch_size"] == 32.0
+
+
+def test_neural_diagnostics_panel_shows_expected_fields(qapp):
+    """사용자 스펙 5-C번 - 가짜 Neural 결과를 넣었을 때 Method/Architecture/
+    Best Epoch/Train-Val Ray Loss/Seed Stability가 화면에 반영되는지."""
+    from calibration.windshield.base import WindshieldCalibrationResult
+
+    workspace = _make_workspace_with_config(qapp)
+    K, D = workspace._windshield_config.base_camera_matrix, workspace._windshield_config.base_distortion
+
+    neural_result = WindshieldCalibrationResult(
+        windshield_model=WindshieldModelType.RESIDUAL_RAY,
+        base_model_name=workspace._windshield_config.base_model_name,
+        base_camera_matrix=K, base_distortion=D, success=True,
+        fitted_params={
+            "residual_ray_method": 2.0,
+            "neural_num_hidden_layers": 3.0,
+            "neural_hidden_dim_0": 32.0, "neural_hidden_dim_1": 64.0, "neural_hidden_dim_2": 32.0,
+            "neural_param_count": 4387.0,
+            "neural_best_epoch": 83.0,
+            "neural_best_train_ray_loss": 0.0012,
+            "neural_best_val_ray_loss": 0.0015,
+            "neural_best_train_total_loss": 0.002,
+            "neural_best_val_total_loss": 0.0023,
+            "neural_batch_size": 64.0,
+            "diag_seed_stability_mean_deg": 0.013,
+            "diag_seed_stability_p95_deg": 0.031,
+            "diag_selection_mode_is_auto": 0.0,
+        },
+    )
+    workspace._display_result(neural_result)
+
+    assert workspace.residual_ray_diagnostics_group.isVisibleTo(workspace)
+    assert workspace.diag_residual_method_label.text() == "Neural"
+    assert "32" in workspace.diag_neural_architecture_label.text()
+    assert "64" in workspace.diag_neural_architecture_label.text()
+    assert "83" in workspace.diag_neural_training_label.text()
+    assert "64" in workspace.diag_neural_training_label.text()  # batch size
+    assert workspace.diag_neural_total_loss_label.text() != "N/A"
+    assert workspace.diag_neural_seed_stability_label.text() != "N/A"
+    assert workspace.diag_selection_mode_label.text() == "Manual"
 
 
 def test_spline_advanced_group_visible_only_when_selected(qapp):

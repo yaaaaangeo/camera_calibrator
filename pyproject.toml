@@ -27,6 +27,15 @@ dependencies = [
 # `pip install camera-calibrator[ros]`로 함께 설치 가능.
 ros = ["rosbags>=0.9"]
 
+# Neural Residual Windshield 모델(calibration/windshield/neural_residual.py,
+# residual_ray_hint["method"]=="neural")에만 필요한 선택 의존성. 다른 모든
+# 기능(Baseline/Spherical/Residual Grid/Residual RBF/Spline 포함)은 이
+# extra 없이도 완전히 동작한다 - `pip install camera-calibrator[neural]`로
+# 함께 설치 가능. Jetson 등 aarch64/CUDA 환경에서는 이 일반 PyPI wheel
+# 대신 플랫폼에 맞는 NVIDIA PyTorch wheel을 별도로 설치해야 한다(README/
+# requirements-jetson*.txt 참고 - 그 파일들에는 이 extra를 넣지 않는다).
+neural = ["torch>=2.0"]
+
 # 테스트 스위트 실행에만 필요 (requirements-dev.txt와 동일 구성).
 dev = [
     "pytest>=7.4",
