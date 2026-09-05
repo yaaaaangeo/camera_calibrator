@@ -113,14 +113,19 @@ def test_build_projector_spline_returns_spline_model():
     """Phase 4(Spline)는 이번 라운드에서 실제 구현됐다."""
     from calibration.windshield.spline import SplineWindshieldModel
 
+    from calibration.windshield.spline import MIN_SPLINE_GRID_SIZE, SPLINE_DEGREE
+
     cfg = _make_config()
+    n = MIN_SPLINE_GRID_SIZE
     fitted_params = {
         "sphere_center_x": 0.0, "sphere_center_y": 0.0, "sphere_center_z": -9.7,
-        "sphere_radius": 10.0, "spline_rows": 2.0, "spline_cols": 2.0,
+        "sphere_radius": 10.0, "spline_rows": float(n), "spline_cols": float(n),
         "image_width": 1280.0, "image_height": 800.0,
+        "spline_degree": float(SPLINE_DEGREE),
+        "spline_theta_scale_rad": 0.03, "spline_phi_scale_rad": 0.02,
     }
-    for r in range(2):
-        for c in range(2):
+    for r in range(n):
+        for c in range(n):
             fitted_params[f"spline_ds_{r}_{c}"] = 0.0
     result = WindshieldCalibrationResult(
         windshield_model=WindshieldModelType.SPLINE,

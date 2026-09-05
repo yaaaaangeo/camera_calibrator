@@ -210,23 +210,37 @@ def default_residual_delta_fn(camera_matrix, image_width: float = IMG_W, image_h
     return delta_fn
 
 
-def default_spline_bump_fn(amplitude: float = 0.006, center: tuple[float, float] = (0.4, -0.3), sigma: float = 0.35):
-    """사용자 스펙 35번 형태의 smooth Gaussian bump Δs(u,v) GT field(미터
-    단위) - control grid의 bilinear interpolation과는 완전히 다른 함수
-    형태다(사용자 스펙 36번 "Spline interpolation 자체를 그대로 호출하지
-    않는다" - 독립적인 closed-form).
+def default_spline_bump_fn(amplitude: float = 0.006, theta0: float = 0.010, phi0: float = -0.006, sigma_rad: float = 0.012):
+    """STEP 4 물리 모델 보완 라운드 - smooth Gaussian bump Δs(n0) GT field
+    (미터 단위), **3D 방향(n0, base sphere 중심 기준 unit vector)의 각도
+    거리** 함수로 정의한다 - production(calibration/windshield/spline.py)의
+    (p,q) pixel-FOV 정규화 convention과 전혀 무관한 독립적 표현이다(사용자
+    스펙 31/33번 - "Spline interpolation 자체를 그대로 호출하지 않는다").
 
-        Delta_s(u,v) = amplitude * exp(-((un-u0)^2+(vn-v0)^2) / (2*sigma^2))
+        Delta_s(n0) = amplitude * exp(-angle(n0, n0_target)^2 / (2*sigma_rad^2))
 
-    (un,vn)은 [-1,1] normalized 좌표. amplitude=6mm는 기본 max_displacement_m
-    bound(10mm)보다 작아 optimizer bound에 걸리지 않는다.
+    `theta0`/`phi0`/`sigma_rad`는 기본 테스트 sphere(DEFAULT_SPHERE_CENTER/
+    DEFAULT_SPHERE_RADIUS, 카메라와 표준 렌즈 기준)에서 실제 관측되는 각도
+    범위(~±0.02-0.03 rad, 별도 스크립트로 한 번 확인한 값 - production
+    함수를 호출해 구한 게 아니라 상수로 박아둔 값이다)에 맞춰 고른 기본값
+    이다 - 그래야 bump가 실제 코너들이 덮는 각도 범위 안에서 의미 있는
+    변화를 만든다. amplitude=6mm는 기본 max_displacement_m bound(10mm)보다
+    작아 optimizer bound에 걸리지 않는다.
     """
     import math
 
-    u0, v0 = center
+    theta_t, phi_t = theta0, phi0
+    target = np.array([
+        math.cos(phi_t) * math.sin(theta_t),
+        math.sin(phi_t),
+        math.cos(phi_t) * math.cos(theta_t),
+    ])
+    target = target / np.linalg.norm(target)
 
-    def bump_fn(un: float, vn: float) -> float:
-        return amplitude * math.exp(-((un - u0) ** 2 + (vn - v0) ** 2) / (2.0 * sigma ** 2))
+    def bump_fn(n0: np.ndarray) -> float:
+        cos_angle = float(np.clip(np.dot(n0, target), -1.0, 1.0))
+        angle = math.acos(cos_angle)
+        return amplitude * math.exp(-(angle ** 2) / (2.0 * sigma_rad ** 2))
 
     return bump_fn
 
@@ -243,17 +257,25 @@ def build_synthetic_spline_windshield_dataset(
     bump_fn=None,
     model=None,
 ) -> Dataset:
-    """알려진 base sphere + smooth Gaussian bump 형태의 surface deformation을
-    통해 "관측" 코너를 만든다. calibration/windshield/spline.py의 bilinear
-    grid interpolation이나 SplineWindshieldModel을 전혀 호출하지 않는
-    독립적인 forward model이다(사용자 스펙 36번 - self-consistency 회피).
-    저수준 primitive(refraction.py의 intersect_ray_sphere/refract_ray/
-    normalize, BaselineWindshieldModel)만 재사용한다 - 그 primitive들의
-    정오는 tests/test_windshield_refraction.py가 독립적으로 검증한다.
-    """
+    """알려진 base sphere + smooth Gaussian bump(3D 방향 각도 거리 함수)
+    형태의 **진짜 normal-offset surface deformation**을 통해 "관측" 코너를
+    만든다. calibration/windshield/spline.py의 B-spline interpolation이나
+    SplineWindshieldModel, `compute_angular_fov_scale`/(p,q) 매핑을 전혀
+    호출하지 않는 완전히 독립적인 forward model이다(사용자 스펙 31/32/33번 -
+    self-consistency 회피). 저수준 primitive(refraction.py의
+    intersect_ray_sphere/refract_ray/normalize, BaselineWindshieldModel)만
+    재사용한다 - 그 primitive들의 정오는 tests/test_windshield_refraction.py가
+    독립적으로 검증한다.
+
+    핵심: 이전 라운드의 버그(등가성이 성립하지 않는 `sphere(R+ds)` 교차)를
+    GT 생성에서도 제거했다 - 여기서는 **base sphere(반지름 R, 변형 없음)와
+    ray를 먼저 교차**시켜 그 지점의 방향 n0을 얻고, `S = P0 + Delta_s(n0)*n0`
+    로 진짜 normal 방향 offset을 적용한다. Normal은 근처 픽셀들에서 이
+    "진짜" deformed point(S)를 다시 계산해 finite difference로 구한다 -
+    tangential 변화를 올바르게 반영한다."""
     from calibration.types import CameraModelType
     from calibration.windshield.baseline import BaselineWindshieldModel
-    from calibration.windshield.refraction import intersect_ray_sphere, normalize, refract_ray
+    from calibration.windshield.refraction import intersect_ray_sphere, refract_ray
     from scipy.optimize import least_squares
 
     model = model or CameraModelType.BROWN_CONRADY
@@ -262,20 +284,28 @@ def build_synthetic_spline_windshield_dataset(
     center = np.asarray(sphere_center, dtype=np.float64)
     origin = np.zeros(3, dtype=np.float64)
 
-    def local_delta_s(u: float, v: float) -> float:
-        un = 2.0 * u / IMG_W - 1.0
-        vn = 2.0 * v / IMG_H - 1.0
-        return bump_fn(un, vn)
-
-    def surface_point(u: float, v: float):
+    def base_hit_and_normal(u: float, v: float):
         d = np.asarray(baseline.unproject_pixel(u, v), dtype=np.float64)
-        ds = local_delta_s(u, v)
-        hit = intersect_ray_sphere(origin, d, center, sphere_radius + ds)
-        return hit[0] if hit is not None else None
+        hit = intersect_ray_sphere(origin, d, center, sphere_radius)
+        if hit is None:
+            return None
+        p0, _t0 = hit
+        n0 = (p0 - center) / sphere_radius
+        return d, p0, n0
+
+    def deformed_point(u: float, v: float):
+        """S = P0(방향 n0) + Delta_s(n0) * n0 - 진짜 normal-offset 정의
+        그대로(사용자 스펙 9번), sphere(R+ds) intersection이 아니다."""
+        res = base_hit_and_normal(u, v)
+        if res is None:
+            return None
+        _d, p0, n0 = res
+        ds = bump_fn(n0)
+        return p0 + ds * n0
 
     def normal_at(u: float, v: float, p: np.ndarray, step: float = 2.0):
-        p_u1, p_u2 = surface_point(u + step, v), surface_point(u - step, v)
-        p_v1, p_v2 = surface_point(u, v + step), surface_point(u, v - step)
+        p_u1, p_u2 = deformed_point(u + step, v), deformed_point(u - step, v)
+        p_v1, p_v2 = deformed_point(u, v + step), deformed_point(u, v - step)
         if any(x is None for x in (p_u1, p_u2, p_v1, p_v2)):
             return None
         tu = (p_u1 - p_u2) / (2.0 * step)
@@ -290,7 +320,7 @@ def build_synthetic_spline_windshield_dataset(
         return n
 
     def refract_through_deformed(u: float, v: float):
-        p = surface_point(u, v)
+        p = deformed_point(u, v)
         if p is None:
             raise ValueError("no inner hit")
         n1 = normal_at(u, v, p)
@@ -300,12 +330,23 @@ def build_synthetic_spline_windshield_dataset(
         d_glass = refract_ray(d_cam, n1, n_air, n_glass)
         if d_glass is None:
             raise ValueError("TIR at inner surface")
-        ds = local_delta_s(u, v)
-        outer_hit = intersect_ray_sphere(p, d_glass, center, sphere_radius + ds + thickness)
-        if outer_hit is None:
-            raise ValueError("no outer hit")
-        p2, _ = outer_hit
-        n2 = normalize(p2 - center)
+
+        # Outer surface: local-normal thin-shell 근사(사용자 스펙 19/21번과
+        # 같은 철학이지만, production의 3-unknown iterative solve를 재사용
+        # 하지 않는 독립적이고 단순한 구현 - 굴절된 광선을, 예상 outer
+        # point(p + thickness*n1)를 지나고 법선이 n1인 평면과 closed-form
+        # ray-plane intersection으로 교차시킨다. thickness가 곡률반경보다
+        # 훨씬 작으므로 국소 평면 근사가 합리적이다).
+        outer_point_guess = p + thickness * n1
+        denom = float(np.dot(d_glass, n1))
+        if abs(denom) < 1e-9:
+            raise ValueError("grazing ray at outer surface")
+        tau = float(np.dot(outer_point_guess - p, n1)) / denom
+        if tau <= 0.0:
+            raise ValueError("outer surface behind ray")
+        p2 = p + tau * d_glass
+        n2 = n1  # N_outer ≈ N_inner (사용자 스펙 21번 fallback, 독립 재구현)
+
         d_out = refract_ray(d_glass, n2, n_glass, n_air)
         if d_out is None:
             raise ValueError("TIR at outer surface")

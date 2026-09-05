@@ -234,7 +234,7 @@ def test_spline_result_round_trips_through_project():
     camera_config = default_camera_config()
     config = WindshieldConfig(
         base_model_name=CameraModelType.BROWN_CONRADY, base_camera_matrix=K, base_distortion=D,
-        windshield_model=WindshieldModelType.SPLINE, spline_hint={"spline_rows": 2.0, "spline_cols": 2.0},
+        windshield_model=WindshieldModelType.SPLINE, spline_hint={"spline_rows": 4.0, "spline_cols": 4.0},
     )
     train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio=0.3, seed=3)
     result = calibrate_spline(dataset, config, camera_config, train_ids, test_ids)

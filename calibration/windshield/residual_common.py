@@ -318,23 +318,36 @@ def compute_ray_stability_deg(
     모델이 2개 미만이면 비교 대상이 없으므로 (None, None)을 반환한다(억지로
     0을 만들지 않는다) - Stability Score 같은 0~100 인위적 지표로 바꾸지
     말라는 요구사항에 따라, 반환값은 항상 실제 각도(도) 단위다.
-    """
+
+    Grid/RBF는 어떤 픽셀에서도 unproject_pixel()이 실패하지 않지만, Spline은
+    물리적으로 정확한 ray-surface intersection이 자신이 관측한 각도 범위
+    (theta_scale/phi_scale) 밖에서는 정당하게 실패할 수 있다(브루트포스로
+    도메인 밖을 검색하지 않는다는 설계) - 이런 픽셀은 조용히 건너뛰고 양쪽
+    모델이 모두 성공한 픽셀만 비교한다."""
     if len(models) < 2:
         return None, None
 
     sample_pixels = fixed_evaluation_pixels(image_width, image_height, sample_rows, sample_cols)
 
-    corrected_rays_per_model = []
+    rays_per_model: list[list[Optional[np.ndarray]]] = []
     for model in models:
-        rays = np.array([model.unproject_pixel(float(u), float(v)) for u, v in sample_pixels])
-        corrected_rays_per_model.append(rays)
+        rays: list[Optional[np.ndarray]] = []
+        for u, v in sample_pixels:
+            try:
+                ray = np.asarray(model.unproject_pixel(float(u), float(v)), dtype=np.float64)
+            except (ValueError, ArithmeticError):
+                ray = None
+            rays.append(ray)
+        rays_per_model.append(rays)
 
     all_angles: list[float] = []
-    for i in range(len(corrected_rays_per_model)):
-        for j in range(i + 1, len(corrected_rays_per_model)):
-            dots = np.clip(np.sum(corrected_rays_per_model[i] * corrected_rays_per_model[j], axis=1), -1.0, 1.0)
-            angles = np.degrees(np.arccos(dots))
-            all_angles.extend(angles.tolist())
+    for i in range(len(rays_per_model)):
+        for j in range(i + 1, len(rays_per_model)):
+            for ray_i, ray_j in zip(rays_per_model[i], rays_per_model[j]):
+                if ray_i is None or ray_j is None:
+                    continue
+                dot = float(np.clip(np.dot(ray_i, ray_j), -1.0, 1.0))
+                all_angles.append(float(np.degrees(np.arccos(dot))))
 
     if not all_angles:
         return None, None
