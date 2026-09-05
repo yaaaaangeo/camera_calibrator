@@ -1,0 +1,28 @@
+name: Reflection Windshield Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  reflection-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Run reflection evaluation and geometry regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_windshield_reflection_evaluation.py \
+            tests/test_windshield_reflection_ui_architecture.py \
+            tests/test_windshield_project_io.py \
+            tests/test_windshield_projection.py \
+            tests/test_windshield_export.py

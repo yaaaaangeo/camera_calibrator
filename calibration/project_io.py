@@ -90,6 +90,12 @@ from calibration.windshield.base import (
     windshield_result_key_from_storage,
     windshield_result_key_to_storage,
 )
+from calibration.windshield.reflection.types import (
+    ReflectionDatasetResult,
+    ReflectionEvaluationResult,
+    ReflectionRegionMetrics,
+    ReflectionSpatialCell,
+)
 
 PROJECT_FORMAT_VERSION = 2
 PROJECT_EXTENSION = ".ccproj"
@@ -693,6 +699,88 @@ def _windshield_calibration_result_from_dict(d) -> WindshieldCalibrationResult |
     )
 
 
+def _reflection_region_metrics_from_dict(d) -> ReflectionRegionMetrics:
+    d = d or {}
+    return ReflectionRegionMetrics(
+        mean_strength=d.get("mean_strength", 0.0),
+        p95_strength=d.get("p95_strength", 0.0),
+        coverage=d.get("coverage", 0.0),
+    )
+
+
+def _reflection_spatial_cell_from_dict(d) -> ReflectionSpatialCell:
+    return ReflectionSpatialCell(
+        row=d.get("row", 0),
+        col=d.get("col", 0),
+        mean_strength=d.get("mean_strength", 0.0),
+        p95_strength=d.get("p95_strength", 0.0),
+        coverage=d.get("coverage", 0.0),
+    )
+
+
+def _reflection_evaluation_result_from_dict(d) -> ReflectionEvaluationResult:
+    return ReflectionEvaluationResult(
+        mode=d.get("mode", "reference"),
+        metric_version=d.get("metric_version", 1),
+        pair_id=d.get("pair_id", ""),
+        mean_strength=d.get("mean_strength", 0.0),
+        median_strength=d.get("median_strength", 0.0),
+        p95_strength=d.get("p95_strength", 0.0),
+        p99_strength=d.get("p99_strength", 0.0),
+        max_strength=d.get("max_strength", 0.0),
+        positive_mean_strength=d.get("positive_mean_strength", 0.0),
+        positive_p95_strength=d.get("positive_p95_strength", 0.0),
+        coverage=d.get("coverage", 0.0),
+        coverage_threshold=d.get("coverage_threshold", 0.08),
+        saturation_threshold=d.get("saturation_threshold", 250.0),
+        glare_luminance_threshold=d.get("glare_luminance_threshold", 220.0),
+        glare_contrast_threshold=d.get("glare_contrast_threshold", 12.0),
+        severity_score=d.get("severity_score"),
+        saturation_coverage=d.get("saturation_coverage", 0.0),
+        glare_coverage=d.get("glare_coverage"),
+        contrast_retention=d.get("contrast_retention"),
+        edge_retention=d.get("edge_retention"),
+        bottom_roi_mean_strength=d.get("bottom_roi_mean_strength"),
+        bottom_roi_coverage=d.get("bottom_roi_coverage"),
+        regional_metrics={
+            k: _reflection_region_metrics_from_dict(v)
+            for k, v in d.get("regional_metrics", {}).items()
+        },
+        spatial_map=[_reflection_spatial_cell_from_dict(c) for c in d.get("spatial_map", [])],
+        alignment_score=d.get("alignment_score"),
+        alignment_error_px=d.get("alignment_error_px"),
+        alignment_status=d.get("alignment_status", "not_run"),
+        alignment_method=d.get("alignment_method", "none"),
+        photometric_normalized=d.get("photometric_normalized", False),
+        photometric_gain=d.get("photometric_gain"),
+        photometric_bias=d.get("photometric_bias"),
+        heatmap_rows=d.get("heatmap_rows", 0),
+        heatmap_cols=d.get("heatmap_cols", 0),
+        downsampled_reflection_map=d.get("downsampled_reflection_map", []),
+        warning_message=d.get("warning_message"),
+        error_message=d.get("error_message"),
+        success=d.get("success", True),
+    )
+
+
+def _reflection_dataset_result_from_dict(d) -> ReflectionDatasetResult:
+    return ReflectionDatasetResult(
+        mode=d.get("mode", "reference"),
+        metric_version=d.get("metric_version", 1),
+        pair_results=[_reflection_evaluation_result_from_dict(r) for r in d.get("pair_results", [])],
+        mean_strength=d.get("mean_strength", 0.0),
+        median_strength=d.get("median_strength", 0.0),
+        p95_strength=d.get("p95_strength", 0.0),
+        worst_pair_id=d.get("worst_pair_id"),
+        coverage=d.get("coverage", 0.0),
+        severity_score=d.get("severity_score"),
+        by_day_night=d.get("by_day_night", {}),
+        success=d.get("success", True),
+        warning_message=d.get("warning_message"),
+        error_message=d.get("error_message"),
+    )
+
+
 def _raw_array_len(d) -> int | None:
     """migrate_v1_to_v2용 - 아직 dataclass로 복원하지 않은 raw JSON 값에서
     distortion 배열 길이만 알고 싶을 때. _arr()과 같은 언랩 규칙(_json_safe가
@@ -901,6 +989,10 @@ def project_from_dict(payload: dict) -> CalibrationProject:
         windshield_results={
             windshield_result_key_from_storage(k): _windshield_calibration_result_from_dict(v)
             for k, v in d.get("windshield_results", {}).items()
+        },
+        reflection_results={
+            k: _reflection_dataset_result_from_dict(v)
+            for k, v in d.get("reflection_results", {}).items()
         },
         created_at=_dt(d.get("created_at")),
         updated_at=_dt(d.get("updated_at")),

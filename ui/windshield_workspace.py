@@ -70,6 +70,7 @@ from calibration.windshield.base import (
     windshield_result_key_for_result,
     windshield_result_key_label,
 )
+from calibration.windshield.reflection import ReflectionDatasetResult, ReflectionEvaluationConfig, ReflectionImagePair
 from calibration.windshield.residual_ray import DEFAULT_GRID_COLS, DEFAULT_GRID_ROWS, DEFAULT_LAMBDA_MAG, DEFAULT_LAMBDA_SMOOTH
 from calibration.windshield.residual_rbf import DEFAULT_RBF_NUM_CENTERS, DEFAULT_RBF_SMOOTHING
 # UI는 neural_residual.py를 절대 import하지 않는다(STEP 5 안정화 라운드
@@ -99,6 +100,8 @@ from export.opencv import (
     load_camera_matrix_and_distortion_from_opencv_yaml,
 )
 from export.windshield import export_windshield_yaml
+from export.reflection import export_reflection_yaml
+from ui.reflection_worker import ReflectionEvaluationWorker
 from ui.radial_profile_view import RadialProfileChartWidget
 from ui.theme import Theme
 from ui.windshield_vector_field_view import VectorFieldChartWidget
@@ -171,6 +174,11 @@ class WindshieldWorkspace(QWidget):
         self._windshield_dataset: Dataset | None = None
         self._windshield_config: WindshieldConfig | None = None
         self._windshield_results: dict[WindshieldResultKey, WindshieldCalibrationResult] = {}
+        self._reflection_pairs: list[ReflectionImagePair] = []
+        self._reflection_results: dict[str, ReflectionDatasetResult] = {}
+        self._reflection_result: ReflectionDatasetResult | None = None
+        self._reflection_normal_path = ""
+        self._reflection_reference_path = ""
         # 마지막으로 화면에 표시된(=Export 대상) 모델 - export_button과
         # _on_export_windshield_yaml이 특정 모델(예: Baseline)에 고정되지
         # 않고 "방금 실행/표시한 결과"를 export하도록 추적한다.
@@ -207,6 +215,7 @@ class WindshieldWorkspace(QWidget):
         self.tabs.addTab(self._build_dataset_tab(), "② Dataset")
         self.tabs.addTab(self._build_model_tab(), "③ Windshield Model")
         self.tabs.addTab(self._build_comparison_tab(), "④ Comparison")
+        self.tabs.addTab(self._build_reflection_tab(), "⑤ Reflection")
         layout.addWidget(self.tabs, stretch=1)
 
     # ------------------------------------------------------------------
@@ -231,6 +240,8 @@ class WindshieldWorkspace(QWidget):
         self._windshield_config = project.windshield_config
         self._windshield_dataset = project.windshield_dataset
         self._windshield_results = dict(project.windshield_results or {})
+        self._reflection_results = dict(getattr(project, "reflection_results", {}) or {})
+        self._reflection_result = next(iter(self._reflection_results.values()), None)
         if self._windshield_config is not None:
             self._camera_config = project.camera_config
             self._pattern_config = project.pattern_config
@@ -241,11 +252,13 @@ class WindshieldWorkspace(QWidget):
         if baseline_result is not None:
             self._display_result(baseline_result)
         self._refresh_comparison_table()
+        if self._reflection_result is not None:
+            self._display_reflection_result(self._reflection_result)
 
     def export_state(
         self,
-    ) -> tuple[WindshieldConfig | None, Dataset | None, dict[WindshieldResultKey, WindshieldCalibrationResult]]:
-        return self._windshield_config, self._windshield_dataset, self._windshield_results
+    ) -> tuple[WindshieldConfig | None, Dataset | None, dict[WindshieldResultKey, WindshieldCalibrationResult], dict[str, ReflectionDatasetResult]]:
+        return self._windshield_config, self._windshield_dataset, self._windshield_results, self._reflection_results
 
     # ------------------------------------------------------------------
     # ① Base Camera
@@ -1289,6 +1302,168 @@ class WindshieldWorkspace(QWidget):
         layout.addWidget(self.comparison_table)
         layout.addStretch(1)
         return page
+
+    def _build_reflection_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        mode_group = QGroupBox("REFLECTION EVALUATION")
+        mode_layout = QVBoxLayout(mode_group)
+        mode_row = QHBoxLayout()
+        self.reflection_reference_radio = QRadioButton("Reference Pair")
+        self.reflection_reference_radio.setChecked(True)
+        self.reflection_no_reference_radio = QRadioButton("No-Reference")
+        mode_row.addWidget(self.reflection_reference_radio)
+        mode_row.addWidget(self.reflection_no_reference_radio)
+        mode_row.addStretch(1)
+        mode_layout.addLayout(mode_row)
+
+        path_form = QFormLayout()
+        self.reflection_normal_path_label = QLabel("N/A")
+        self.reflection_reference_path_label = QLabel("N/A")
+        normal_btn = QPushButton("Load Normal Image...")
+        normal_btn.clicked.connect(self._on_load_reflection_normal_image)
+        reference_btn = QPushButton("Load Reference Image...")
+        reference_btn.clicked.connect(self._on_load_reflection_reference_image)
+        normal_row = QHBoxLayout()
+        normal_row.addWidget(normal_btn)
+        normal_row.addWidget(self.reflection_normal_path_label, stretch=1)
+        reference_row = QHBoxLayout()
+        reference_row.addWidget(reference_btn)
+        reference_row.addWidget(self.reflection_reference_path_label, stretch=1)
+        path_form.addRow("Normal:", normal_row)
+        path_form.addRow("Reference:", reference_row)
+
+        self.reflection_threshold_spin = QDoubleSpinBox()
+        self.reflection_threshold_spin.setRange(0.001, 1.0)
+        self.reflection_threshold_spin.setDecimals(3)
+        self.reflection_threshold_spin.setSingleStep(0.01)
+        self.reflection_threshold_spin.setValue(0.08)
+        path_form.addRow("Coverage Threshold:", self.reflection_threshold_spin)
+        mode_layout.addLayout(path_form)
+
+        action_row = QHBoxLayout()
+        self.reflection_run_button = QPushButton("Run Evaluation")
+        self.reflection_run_button.clicked.connect(self._on_run_reflection_evaluation)
+        self.reflection_export_button = QPushButton("Export YAML...")
+        self.reflection_export_button.setEnabled(False)
+        self.reflection_export_button.clicked.connect(self._on_export_reflection_yaml)
+        action_row.addWidget(self.reflection_run_button)
+        action_row.addWidget(self.reflection_export_button)
+        action_row.addStretch(1)
+        mode_layout.addLayout(action_row)
+        self.reflection_status_label = QLabel("Raw image-domain photometric evaluation. Geometry calibration is not modified.")
+        mode_layout.addWidget(self.reflection_status_label)
+        layout.addWidget(mode_group)
+
+        self.reflection_metrics_table = _ScrollTable(13, 1)
+        self.reflection_metrics_table.setHorizontalHeaderLabels(["Value"])
+        self.reflection_metrics_table.setVerticalHeaderLabels([
+            "Mode", "Alignment", "Mean", "Median", "P95", "P99", "Coverage",
+            "Bottom Mean", "Bottom Coverage", "Contrast Retention",
+            "Edge Retention", "Saturation", "Glare",
+        ])
+        layout.addWidget(self.reflection_metrics_table)
+
+        self.reflection_spatial_table = _ScrollTable(4, 6)
+        self.reflection_spatial_table.setHorizontalHeaderLabels([f"C{c+1}" for c in range(6)])
+        self.reflection_spatial_table.setVerticalHeaderLabels([f"R{r+1}" for r in range(4)])
+        layout.addWidget(self.reflection_spatial_table)
+        layout.addStretch(1)
+        return page
+
+    def _on_load_reflection_normal_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load Normal Reflection Image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+        if not path:
+            return
+        self._reflection_normal_path = path
+        self.reflection_normal_path_label.setText(path)
+
+    def _on_load_reflection_reference_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load Reflection-Reduced Reference Image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+        if not path:
+            return
+        self._reflection_reference_path = path
+        self.reflection_reference_path_label.setText(path)
+
+    def _on_run_reflection_evaluation(self) -> None:
+        normal_path = getattr(self, "_reflection_normal_path", "")
+        reference_path = getattr(self, "_reflection_reference_path", "")
+        if not normal_path:
+            QMessageBox.warning(self, "Reflection Evaluation", "Normal image is required.")
+            return
+        mode = "no_reference" if self.reflection_no_reference_radio.isChecked() else "reference"
+        if mode == "reference" and not reference_path:
+            QMessageBox.warning(self, "Reflection Evaluation", "Reference mode requires a reflection-reduced reference image.")
+            return
+        cfg = ReflectionEvaluationConfig(mode=mode, coverage_threshold=float(self.reflection_threshold_spin.value()))
+        pair = ReflectionImagePair(normal_image_path=normal_path, reference_image_path=reference_path or None, pair_id="scene_001")
+        worker = ReflectionEvaluationWorker([pair], cfg)
+        thread = run_worker_in_thread(worker, self)
+        self.reflection_run_button.setEnabled(False)
+        self.reflection_status_label.setText("Reflection evaluation running...")
+        worker.result_ready.connect(self._on_reflection_evaluation_finished)
+        worker.error.connect(self._on_reflection_evaluation_error)
+        worker.progress.connect(self.reflection_status_label.setText)
+        self._reflection_thread, self._reflection_worker = thread, worker
+        thread.start()
+
+    def _on_reflection_evaluation_finished(self, result: ReflectionDatasetResult) -> None:
+        self._reflection_result = result
+        self._reflection_results["latest"] = result
+        self._display_reflection_result(result)
+        self.reflection_run_button.setEnabled(True)
+        self.reflection_export_button.setEnabled(result.success)
+
+    def _on_reflection_evaluation_error(self, message: str) -> None:
+        self.reflection_status_label.setText(message)
+        self.reflection_run_button.setEnabled(True)
+        QMessageBox.critical(self, "Reflection Evaluation", message)
+
+    def _display_reflection_result(self, dataset_result: ReflectionDatasetResult) -> None:
+        result = dataset_result.pair_results[0] if dataset_result.pair_results else None
+        if result is None:
+            self.reflection_status_label.setText(dataset_result.error_message or "No reflection result.")
+            return
+        self.reflection_status_label.setText(
+            f"Metric v{result.metric_version} · "
+            + ("No-reference likelihood only." if result.mode == "no_reference" else "Reference difference metrics.")
+        )
+        values = [
+            result.mode,
+            f"{result.alignment_status} ({_fmt(result.alignment_score)})",
+            f"{result.mean_strength * 100.0:.2f}%",
+            f"{result.median_strength * 100.0:.2f}%",
+            f"{result.p95_strength * 100.0:.2f}%",
+            f"{result.p99_strength * 100.0:.2f}%",
+            f"{result.coverage * 100.0:.2f}%",
+            f"{(result.bottom_roi_mean_strength or 0.0) * 100.0:.2f}%",
+            f"{(result.bottom_roi_coverage or 0.0) * 100.0:.2f}%",
+            f"{result.contrast_retention * 100.0:.2f}%" if result.contrast_retention is not None else "N/A",
+            f"{result.edge_retention * 100.0:.2f}%" if result.edge_retention is not None else "N/A",
+            f"{result.saturation_coverage * 100.0:.2f}%",
+            f"{(result.glare_coverage or 0.0) * 100.0:.2f}%",
+        ]
+        for row, value in enumerate(values):
+            self.reflection_metrics_table.setItem(row, 0, QTableWidgetItem(value))
+        _fit_table_to_rows(self.reflection_metrics_table)
+
+        for cell in result.spatial_map:
+            if cell.row < self.reflection_spatial_table.rowCount() and cell.col < self.reflection_spatial_table.columnCount():
+                self.reflection_spatial_table.setItem(cell.row, cell.col, QTableWidgetItem(f"{cell.mean_strength * 100.0:.1f}%"))
+        _fit_table_to_rows(self.reflection_spatial_table)
+
+    def _on_export_reflection_yaml(self) -> None:
+        if self._reflection_result is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Reflection YAML 저장", "reflection_evaluation.yml", "YAML (*.yml *.yaml)")
+        if not path:
+            return
+        try:
+            export_reflection_yaml(self._reflection_result, path)
+            self.reflection_status_label.setText(f"Reflection YAML saved: {path}")
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Reflection Export", str(e))
 
     def _refresh_comparison_table(self) -> None:
         order: list[WindshieldResultKey] = [

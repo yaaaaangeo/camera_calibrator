@@ -1040,6 +1040,7 @@ class CalibrationProject:
     windshield_config: Optional["WindshieldConfig"] = None
     windshield_dataset: Optional[Dataset] = None
     windshield_results: dict["WindshieldResultKey", "WindshieldCalibrationResult"] = field(default_factory=dict)
+    reflection_results: dict[str, "ReflectionDatasetResult"] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     export_paths: dict[ExportFormat, str] = field(default_factory=dict)
