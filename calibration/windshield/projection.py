@@ -16,6 +16,7 @@ import numpy as np
 
 from calibration.windshield.base import WindshieldCalibrationResult, WindshieldModel, WindshieldModelType
 from calibration.windshield.baseline import BaselineWindshieldModel
+from calibration.windshield.residual_ray import ResidualRayWindshieldModel
 from calibration.windshield.spherical import (
     DEFAULT_AIR_REFRACTIVE_INDEX,
     DEFAULT_GLASS_REFRACTIVE_INDEX,
@@ -44,7 +45,22 @@ def build_projector(result: WindshieldCalibrationResult) -> WindshieldModel:
             glass_thickness_m=fp.get("glass_thickness_m", DEFAULT_GLASS_THICKNESS_M),
         )
     if result.windshield_model == WindshieldModelType.RESIDUAL_RAY:
-        raise NotImplementedError("Residual-Ray windshield model is not implemented yet (Phase 3).")
+        fp = result.fitted_params
+        rows, cols = int(fp["grid_rows"]), int(fp["grid_cols"])
+        grid = np.zeros((rows, cols, 3), dtype=np.float64)
+        for r in range(rows):
+            for c in range(cols):
+                grid[r, c, 0] = fp[f"grid_dx_{r}_{c}"]
+                grid[r, c, 1] = fp[f"grid_dy_{r}_{c}"]
+                grid[r, c, 2] = fp[f"grid_dz_{r}_{c}"]
+        return ResidualRayWindshieldModel(
+            result.base_camera_matrix,
+            result.base_distortion,
+            result.base_model_name,
+            grid=grid,
+            image_width=fp["image_width"],
+            image_height=fp["image_height"],
+        )
     if result.windshield_model == WindshieldModelType.SPLINE:
         raise NotImplementedError("Spline windshield model is not implemented yet (Phase 4).")
     raise ValueError(f"알 수 없는 windshield 모델: {result.windshield_model}")

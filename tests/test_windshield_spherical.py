@@ -107,11 +107,11 @@ def test_calibrate_spherical_converges_to_low_angular_residual():
     result = calibrate_spherical(dataset, config, camera_config, train_ids, [])
 
     assert result.success, result.error_message
-    # optimizer_cost는 least_squares의 0.5*sum(residual^2) - 각 residual은
-    # 두 단위벡터 차이(대략 라디안 각도 오차)이므로, 이 값이 작다는 것은
-    # 실제로 광선이 잘 정렬됐다는 뜻이다(픽셀 RMS는 초점거리로 증폭되므로
-    # 여기서는 1차 신호로 안 쓴다).
-    assert result.fitted_params["optimizer_cost"] < 0.01
+    # stage_a_optimizer_cost는 STAGE A(ray-space initial fit)의
+    # least_squares 0.5*sum(residual^2) - 각 residual은 두 단위벡터 차이
+    # (대략 라디안 각도 오차)이므로, 이 값이 작다는 것은 초기 fit부터 이미
+    # 광선이 잘 정렬됐다는 뜻이다.
+    assert result.fitted_params["stage_a_optimizer_cost"] < 0.01
     assert result.ray_angular_error_deg is not None
     assert result.ray_angular_error_deg < 1.0  # degrees
 

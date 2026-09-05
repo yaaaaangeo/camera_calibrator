@@ -85,9 +85,34 @@ def test_build_projector_spherical_returns_spherical_model():
     assert isinstance(model, SphericalWindshieldModel)
 
 
+def test_build_projector_residual_ray_returns_residual_ray_model():
+    """Phase 3-A(Residual Ray Grid)는 이번 라운드에서 실제 구현됐다."""
+    from calibration.windshield.residual_ray import ResidualRayWindshieldModel
+
+    cfg = _make_config()
+    fitted_params = {
+        "grid_rows": 2.0, "grid_cols": 2.0, "image_width": 1280.0, "image_height": 800.0,
+    }
+    for r in range(2):
+        for c in range(2):
+            fitted_params[f"grid_dx_{r}_{c}"] = 0.0
+            fitted_params[f"grid_dy_{r}_{c}"] = 0.0
+            fitted_params[f"grid_dz_{r}_{c}"] = 0.0
+    result = WindshieldCalibrationResult(
+        windshield_model=WindshieldModelType.RESIDUAL_RAY,
+        base_model_name=cfg.base_model_name,
+        base_camera_matrix=cfg.base_camera_matrix,
+        base_distortion=cfg.base_distortion,
+        fitted_params=fitted_params,
+        success=True,
+    )
+    model = build_projector(result)
+    assert isinstance(model, ResidualRayWindshieldModel)
+
+
 @pytest.mark.parametrize(
     "windshield_model",
-    [WindshieldModelType.RESIDUAL_RAY, WindshieldModelType.SPLINE],
+    [WindshieldModelType.SPLINE],
 )
 def test_build_projector_unimplemented_models_raise_not_implemented(windshield_model):
     cfg = _make_config()

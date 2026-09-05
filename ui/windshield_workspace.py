@@ -438,9 +438,14 @@ class WindshieldWorkspace(QWidget):
         model_group = QGroupBox("Windshield Models")
         model_layout = QVBoxLayout(model_group)
         self._model_button_group = QButtonGroup(self)
-        # Spherical(Phase 2)은 STEP 2에서 실제로 구현됐으므로 활성화한다 -
-        # Residual Ray/Spline(Phase 3/4)은 여전히 미구현이라 비활성화 상태로 둔다.
-        _ENABLED_MODELS = (WindshieldModelType.BASELINE, WindshieldModelType.SPHERICAL)
+        # Spherical(Phase 2)은 STEP 2에서, Residual Ray(Phase 3-A)는 이번
+        # 라운드에서 실제로 구현됐으므로 활성화한다 - Spline(Phase 4)만 여전히
+        # 미구현이라 비활성화 상태로 둔다.
+        _ENABLED_MODELS = (
+            WindshieldModelType.BASELINE,
+            WindshieldModelType.SPHERICAL,
+            WindshieldModelType.RESIDUAL_RAY,
+        )
         for model in (
             WindshieldModelType.BASELINE,
             WindshieldModelType.SPHERICAL,

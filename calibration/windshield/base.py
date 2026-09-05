@@ -91,6 +91,10 @@ class WindshieldConfig:
     glass_refractive_index: Optional[float] = None
     glass_thickness_m: Optional[float] = None
     windshield_position_hint: Optional[dict[str, float]] = None
+    # Phase 3 (Residual Ray) 전용 설정 자리 - windshield_position_hint와 같은
+    # 패턴(범용 dict, additive) - grid_rows/grid_cols/lambda_mag/lambda_smooth
+    # 키를 선택적으로 덮어쓸 수 있다(calibration/windshield/residual_ray.py 참고).
+    residual_ray_hint: Optional[dict[str, float]] = None
 
 
 @dataclass

@@ -179,3 +179,100 @@ def build_synthetic_spherical_windshield_dataset(
         )
         frames.append(frame)
     return Dataset(frames=frames)
+
+
+# ---------------------------------------------------------------------------
+# Residual Ray (STEP 3-A) 합성 ground-truth
+# ---------------------------------------------------------------------------
+
+def default_residual_delta_fn(camera_matrix, image_width: float = IMG_W, image_height: float = IMG_H, scale: float = 0.02):
+    """사용자 스펙 25번 형태의 smooth ray-correction GT field.
+
+        dx = a*xn^2 + b*yn
+        dy = c*yn^3 + d*xn*yn
+
+    (xn, yn)은 이미지 중심 기준 정규화 좌표(대략 [-1,1]). scale은 ray-direction
+    단위로의 크기 조절 - 초점거리(~900px) 기준으로 몇 픽셀급 효과가 나도록
+    작게 잡는다. Grid 구현(calibration/windshield/residual_ray.py)과 완전히
+    독립적인 closed-form 함수다 - 이 함수 자체가 grid를 전혀 참조하지 않는다.
+    """
+    cx, cy = float(camera_matrix[0, 2]), float(camera_matrix[1, 2])
+    half_w, half_h = image_width / 2.0, image_height / 2.0
+    a, b, c, d = 0.6, 0.3, 0.5, 0.4
+
+    def delta_fn(u: float, v: float) -> np.ndarray:
+        xn = (u - cx) / half_w
+        yn = (v - cy) / half_h
+        dx = a * xn**2 + b * yn
+        dy = c * yn**3 + d * xn * yn
+        return np.array([scale * dx, scale * dy, 0.0])
+
+    return delta_fn
+
+
+def build_synthetic_residual_ray_dataset(camera_matrix, distortion, delta_fn, model=None) -> Dataset:
+    """delta_fn(u,v)->[dx,dy,dz](ray-direction 단위)으로 정의된 임의의
+    closed-form ray-correction field를 통해 "관측" 코너를 만든다.
+
+    Grid 구현을 재사용하지 않고 이 함수 자체가 독립적으로 root-solve를
+    수행한다(ResidualRayWindshieldModel.project_point()와 같은 계산이지만,
+    grid 보간 대신 delta_fn을 직접 호출) - Grid Recovery 테스트가 "자기
+    자신의 구현으로 정답을 만드는" 것을 피하기 위함이다.
+    """
+    from calibration.types import CameraModelType
+    from calibration.windshield.baseline import BaselineWindshieldModel
+    from calibration.windshield.refraction import normalize
+    from scipy.optimize import least_squares
+
+    model = model or CameraModelType.BROWN_CONRADY
+    baseline = BaselineWindshieldModel(camera_matrix, distortion, model)
+
+    def project_with_delta(x: float, y: float, z: float) -> tuple[float, float]:
+        target_dir = normalize(np.array([x, y, z], dtype=np.float64))
+        initial_uv = np.asarray(baseline.project_point(x, y, z), dtype=np.float64)
+
+        def residual(uv: np.ndarray) -> np.ndarray:
+            d_base = np.asarray(baseline.unproject_pixel(float(uv[0]), float(uv[1])), dtype=np.float64)
+            corrected = normalize(d_base + delta_fn(float(uv[0]), float(uv[1])))
+            return target_dir - corrected
+
+        result = least_squares(residual, x0=initial_uv, method="lm", max_nfev=50)
+        return float(result.x[0]), float(result.x[1])
+
+    obj = _object_grid()
+    frames: list[Frame] = []
+    for i, (rvec, tvec) in enumerate(_POSES):
+        frame_id = f"res_{i:02d}"
+        R, _ = cv2.Rodrigues(rvec)
+        cam_pts = (R @ obj.reshape(-1, 3).T).T + tvec.reshape(1, 3)
+
+        pixels = []
+        ok = True
+        for p in cam_pts:
+            try:
+                u, v = project_with_delta(float(p[0]), float(p[1]), float(p[2]))
+            except Exception:  # noqa: BLE001
+                ok = False
+                break
+            pixels.append([u, v])
+        if not ok:
+            continue
+
+        corners = np.array(pixels, dtype=np.float32).reshape(-1, 1, 2)
+        center = corners.reshape(-1, 2).mean(axis=0)
+        detection = DetectionResult(
+            image_id=frame_id,
+            success=True,
+            corners=corners,
+            object_points=obj.astype(np.float32),
+            num_corners=corners.shape[0],
+            board_area_ratio=0.2,
+            board_center_px=(float(center[0]), float(center[1])),
+        )
+        frame = Frame(
+            image_info=ImageInfo(image_id=frame_id, path=f"synthetic://{frame_id}", width=IMG_W, height=IMG_H),
+            detection=detection,
+            status=FrameStatus.DETECTED,
+        )
+        frames.append(frame)
+    return Dataset(frames=frames)
