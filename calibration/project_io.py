@@ -719,6 +719,7 @@ def _reflection_spatial_cell_from_dict(d) -> ReflectionSpatialCell:
 
 
 def _reflection_evaluation_result_from_dict(d) -> ReflectionEvaluationResult:
+    mode = d.get("mode", "reference")
     mean_strength = d.get("mean_strength", 0.0)
     median_strength = d.get("median_strength", 0.0)
     p95_strength = d.get("p95_strength", 0.0)
@@ -726,17 +727,17 @@ def _reflection_evaluation_result_from_dict(d) -> ReflectionEvaluationResult:
     max_strength = d.get("max_strength", 0.0)
     coverage = d.get("coverage", 0.0)
     return ReflectionEvaluationResult(
-        mode=d.get("mode", "reference"),
+        mode=mode,
         metric_version=d.get("metric_version", 1),
         pair_id=d.get("pair_id", ""),
-        reflection_mean=d.get("reflection_mean", mean_strength if d.get("mode", "reference") == "reference" else None),
-        reflection_median=d.get("reflection_median", median_strength if d.get("mode", "reference") == "reference" else None),
-        reflection_p95=d.get("reflection_p95", p95_strength if d.get("mode", "reference") == "reference" else None),
-        reflection_p99=d.get("reflection_p99", p99_strength if d.get("mode", "reference") == "reference" else None),
-        reflection_max=d.get("reflection_max", max_strength if d.get("mode", "reference") == "reference" else None),
-        reflection_coverage=d.get("reflection_coverage", coverage if d.get("mode", "reference") == "reference" else None),
-        reflection_likelihood=d.get("reflection_likelihood"),
-        no_reference_is_likelihood=d.get("no_reference_is_likelihood", False),
+        reflection_mean=d.get("reflection_mean", mean_strength if mode == "reference" else None),
+        reflection_median=d.get("reflection_median", median_strength if mode == "reference" else None),
+        reflection_p95=d.get("reflection_p95", p95_strength if mode == "reference" else None),
+        reflection_p99=d.get("reflection_p99", p99_strength if mode == "reference" else None),
+        reflection_max=d.get("reflection_max", max_strength if mode == "reference" else None),
+        reflection_coverage=d.get("reflection_coverage", coverage if mode == "reference" else None),
+        reflection_likelihood=d.get("reflection_likelihood", mean_strength if mode == "no_reference" else None),
+        no_reference_is_likelihood=d.get("no_reference_is_likelihood", mode == "no_reference"),
         mean_strength=mean_strength,
         median_strength=median_strength,
         p95_strength=p95_strength,
@@ -749,7 +750,7 @@ def _reflection_evaluation_result_from_dict(d) -> ReflectionEvaluationResult:
         saturation_threshold=d.get("saturation_threshold", 250.0),
         glare_luminance_threshold=d.get("glare_luminance_threshold", 220.0),
         glare_contrast_threshold=d.get("glare_contrast_threshold", 12.0),
-        severity_score=d.get("severity_score"),
+        severity_score=None if mode == "no_reference" else d.get("severity_score"),
         saturation_coverage=d.get("saturation_coverage", 0.0),
         glare_coverage=d.get("glare_coverage"),
         glare_strength=d.get("glare_strength"),
@@ -779,16 +780,22 @@ def _reflection_evaluation_result_from_dict(d) -> ReflectionEvaluationResult:
 
 
 def _reflection_dataset_result_from_dict(d) -> ReflectionDatasetResult:
+    mode = d.get("mode", "reference")
     return ReflectionDatasetResult(
-        mode=d.get("mode", "reference"),
+        mode=mode,
         metric_version=d.get("metric_version", 1),
         pair_results=[_reflection_evaluation_result_from_dict(r) for r in d.get("pair_results", [])],
+        reference_mean_strength=d.get("reference_mean_strength", d.get("mean_strength") if mode == "reference" else None),
+        reference_p95_strength=d.get("reference_p95_strength", d.get("p95_strength") if mode == "reference" else None),
+        reference_coverage=d.get("reference_coverage", d.get("coverage") if mode == "reference" else None),
+        mean_reflection_likelihood=d.get("mean_reflection_likelihood", d.get("mean_strength") if mode == "no_reference" else None),
+        p95_reflection_likelihood=d.get("p95_reflection_likelihood", d.get("p95_strength") if mode == "no_reference" else None),
         mean_strength=d.get("mean_strength", 0.0),
         median_strength=d.get("median_strength", 0.0),
         p95_strength=d.get("p95_strength", 0.0),
         worst_pair_id=d.get("worst_pair_id"),
         coverage=d.get("coverage", 0.0),
-        severity_score=d.get("severity_score"),
+        severity_score=None if mode == "no_reference" else d.get("severity_score"),
         by_day_night=d.get("by_day_night", {}),
         success=d.get("success", True),
         warning_message=d.get("warning_message"),

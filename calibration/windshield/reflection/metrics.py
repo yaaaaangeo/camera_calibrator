@@ -47,7 +47,7 @@ def normalize_reflection_map(
     reference_luma: np.ndarray,
     *,
     photometric_normalize: bool = True,
-) -> tuple[np.ndarray, np.ndarray, float, float]:
+) -> tuple[np.ndarray, np.ndarray, float, float, np.ndarray]:
     if normal_luma.shape != reference_luma.shape:
         raise ValueError("normal/reference images must have the same resolution")
     gain, bias = (1.0, 0.0)
@@ -57,7 +57,7 @@ def normalize_reflection_map(
         aligned_ref = np.clip(gain * aligned_ref + bias, 0.0, 255.0).astype(np.float32)
     absolute = np.abs(normal_luma.astype(np.float32) - aligned_ref) / np.maximum(aligned_ref, 20.0)
     positive = np.maximum(normal_luma.astype(np.float32) - aligned_ref, 0.0) / np.maximum(aligned_ref, 20.0)
-    return absolute, positive, gain, bias
+    return absolute, positive, gain, bias, aligned_ref
 
 
 def local_contrast(luma: np.ndarray, ksize: int = 9) -> np.ndarray:

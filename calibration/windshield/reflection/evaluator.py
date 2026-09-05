@@ -58,6 +58,8 @@ def evaluate_reflection_reference(
     pair_id: str = "",
 ) -> ReflectionEvaluationResult:
     cfg = config or ReflectionEvaluationConfig(mode="reference")
+    alignment_enabled = True if not cfg.allow_unsafe_reference_bypass else cfg.align
+    normalization_enabled = True if not cfg.allow_unsafe_reference_bypass else cfg.photometric_normalize
     if normal_image.shape[:2] != reference_image.shape[:2]:
         return ReflectionEvaluationResult(
             mode="reference",
@@ -74,7 +76,7 @@ def evaluate_reflection_reference(
         normal_luma,
         reference_luma,
         method=cfg.alignment_model,
-        enabled=cfg.align,
+        enabled=alignment_enabled,
     )
     if alignment.status == "invalid":
         return ReflectionEvaluationResult(
@@ -89,17 +91,17 @@ def evaluate_reflection_reference(
             error_message=alignment.warning_message or "alignment quality is invalid",
         )
 
-    reflection_map, positive_map, gain, bias = normalize_reflection_map(
+    reflection_map, positive_map, gain, bias, normalized_reference = normalize_reflection_map(
         normal_luma,
         alignment.aligned_reference,
-        photometric_normalize=cfg.photometric_normalize,
+        photometric_normalize=normalization_enabled,
     )
     return _result_from_map(
         reflection_map,
         positive_map,
         normal_image,
         normal_luma,
-        alignment.aligned_reference,
+        normalized_reference,
         cfg,
         mode="reference",
         pair_id=pair_id,
@@ -107,10 +109,11 @@ def evaluate_reflection_reference(
         alignment_error_px=alignment.error_px,
         alignment_status=alignment.status,
         alignment_method=alignment.method,
+        photometric_normalized=normalization_enabled,
         photometric_gain=gain,
         photometric_bias=bias,
-        contrast_retention_value=contrast_retention(normal_luma, alignment.aligned_reference),
-        edge_retention_value=edge_retention(normal_luma, alignment.aligned_reference),
+        contrast_retention_value=contrast_retention(normal_luma, normalized_reference),
+        edge_retention_value=edge_retention(normal_luma, normalized_reference),
     )
 
 
@@ -195,16 +198,22 @@ def evaluate_reflection_dataset(
         }
         for key, vals in by_day_night.items()
     }
+    is_no_reference = cfg.mode == "no_reference"
     return ReflectionDatasetResult(
         mode=cfg.mode,
         metric_version=REFLECTION_METRIC_VERSION,
         pair_results=results,
+        reference_mean_strength=None if is_no_reference else float(np.mean(means)),
+        reference_p95_strength=None if is_no_reference else float(np.mean([r.p95_strength for r in successful])),
+        reference_coverage=None if is_no_reference else float(np.mean(coverages)),
+        mean_reflection_likelihood=float(np.mean(means)) if is_no_reference else None,
+        p95_reflection_likelihood=float(np.percentile(means, 95.0)) if is_no_reference else None,
         mean_strength=float(np.mean(means)),
         median_strength=float(np.median(means)),
         p95_strength=float(np.percentile(means, 95.0)),
         worst_pair_id=worst.pair_id,
         coverage=float(np.mean(coverages)),
-        severity_score=severity_from_metrics(float(np.mean(means)), float(np.mean([r.p95_strength for r in successful])), float(np.mean(coverages))),
+        severity_score=None if is_no_reference else severity_from_metrics(float(np.mean(means)), float(np.mean([r.p95_strength for r in successful])), float(np.mean(coverages))),
         by_day_night=grouped,
         success=True,
         warning_message="Some pairs were invalid and excluded." if len(successful) != len(results) else None,
@@ -226,6 +235,7 @@ def _result_from_map(
     alignment_status: str = "not_run",
     alignment_method: str = "none",
     no_reference_is_likelihood: bool = False,
+    photometric_normalized: bool = False,
     photometric_gain: float | None = None,
     photometric_bias: float | None = None,
     warning_message: str | None = None,
@@ -266,7 +276,7 @@ def _result_from_map(
         saturation_threshold=config.saturation_threshold,
         glare_luminance_threshold=config.glare_luminance_threshold,
         glare_contrast_threshold=config.glare_contrast_threshold,
-        severity_score=severity_from_metrics(mean_strength, p95_strength, coverage),
+        severity_score=None if mode == "no_reference" else severity_from_metrics(mean_strength, p95_strength, coverage),
         saturation_coverage=saturation_coverage(normal_image, config.saturation_threshold),
         glare_coverage=glare_coverage(normal_luma, config),
         glare_strength=glare_strength(normal_luma, config),
@@ -280,7 +290,7 @@ def _result_from_map(
         alignment_error_px=alignment_error_px,
         alignment_status=alignment_status,
         alignment_method=alignment_method,
-        photometric_normalized=config.photometric_normalize if mode == "reference" else False,
+        photometric_normalized=photometric_normalized if mode == "reference" else False,
         photometric_gain=photometric_gain,
         photometric_bias=photometric_bias,
         heatmap_rows=24,

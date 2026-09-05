@@ -11,3 +11,8 @@ jsonschema>=4.0
 # RBF/Spline) work without it. Install a CPU or CUDA build matching your
 # platform, e.g.: pip install torch --index-url https://download.pytorch.org/whl/cpu
 # torch>=2.0
+#
+# If installing via pyproject.toml instead, use the "neural" extra:
+#   pip install -e ".[neural]"
+# Jetson users: do NOT add torch here or to requirements-jetson*.txt - install
+# the NVIDIA-provided PyTorch wheel matching your JetPack version separately.

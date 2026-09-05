@@ -1,0 +1,44 @@
+name: Reflection Suppression Tests
+
+# STEP 7 - Reflection Suppression 전용 CI. STEP 6 Reflection Evaluation
+# workflow(reflection-tests.yml)와 별도로 둔다 - Evaluation은 PyTorch 없이
+# 항상 실행 가능해야 하고, 이 job에서만 PyTorch를 실제로 설치해 Suppression
+# 테스트가 skip 없이 돌아가는지 확인한다(neural-tests.yml과 동일한 원칙).
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  reflection-suppression-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install project with dev + neural extras (installs real PyTorch)
+        run: pip install -e ".[dev,neural]"
+
+      - name: Verify PyTorch is actually installed (fail fast, not silently skip)
+        run: python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Run Reflection Suppression test suite
+        run: |
+          pytest -q \
+            tests/test_reflection_suppression_torch_lazy_import.py \
+            tests/test_reflection_suppression.py \
+            tests/test_windshield_reflection_ui_architecture.py \
+            tests/test_windshield_reflection_evaluation.py
+
+      - name: Fail if Suppression tests were skipped (PyTorch is installed in this job)
+        run: |
+          set -e
+          pytest -q tests/test_reflection_suppression.py -rs | tee /tmp/suppression_test_output.log
+          if grep -q "^[0-9]* skipped" /tmp/suppression_test_output.log; then
+            echo "Reflection Suppression tests reported a skip in a job where PyTorch is installed - investigate." >&2
+            exit 1
+          fi

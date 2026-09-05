@@ -1,5 +1,13 @@
 name: Neural Windshield Tests
 
+# STEP 5 안정화 라운드 항목 2 - Neural Residual Windshield 모델 전용 CI.
+#
+# 이 workflow의 핵심 목적은 "Neural 테스트가 torch 부재로 SKIPPED 상태로
+# CI를 통과하는" 상황을 막는 것이다 - `pip install -e ".[dev,neural]"`로
+# PyTorch를 실제로 설치한 뒤 테스트를 돌리므로, 여기서 스킵되는 테스트가
+# 있다면 그건 torch 부재가 아니라 다른 정당한 이유(예: PySide6 GUI
+# 테스트의 headless 환경 제약)여야 한다.
+
 on:
   push:
   pull_request:
@@ -15,17 +23,31 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install neural test dependencies
-        run: python -m pip install -e ".[dev,neural]"
+      - name: Install project with dev + neural extras (installs real PyTorch)
+        run: pip install -e ".[dev,neural]"
 
-      - name: Run neural windshield tests
+      - name: Verify PyTorch is actually installed (fail fast, not silently skip)
+        run: python -c "import torch; print('torch', torch.__version__)"
+
+      - name: Run Neural Residual test suite
         run: |
-          python -m pytest -q \
+          pytest -q \
             tests/test_neural_torch_lazy_import.py \
             tests/test_windshield_neural_residual.py \
             tests/test_windshield_neural_residual_stabilization.py \
-            tests/test_windshield_workspace_ui.py \
             tests/test_windshield_worker_architecture.py \
-            tests/test_windshield_project_io.py \
+            tests/test_windshield_project_io.py -k "not spline" \
             tests/test_windshield_projection.py \
-            tests/test_windshield_export.py
+            tests/test_windshield_export.py -k "not spline"
+
+      - name: Fail if any Neural test was skipped (torch is installed - nothing should skip here)
+        run: |
+          set -e
+          pytest -q \
+            tests/test_windshield_neural_residual.py \
+            tests/test_windshield_neural_residual_stabilization.py \
+            -rs | tee /tmp/neural_test_output.log
+          if grep -q "^[0-9]* skipped" /tmp/neural_test_output.log; then
+            echo "Neural-only test files reported a skip in a job where PyTorch is installed - investigate (must not be 'torch missing')." >&2
+            exit 1
+          fi

@@ -27,6 +27,7 @@ class ReflectionEvaluationConfig:
     align: bool = True
     alignment_model: str = "translation"
     photometric_normalize: bool = True
+    allow_unsafe_reference_bypass: bool = False
     automotive_bottom_roi_fraction: float = 0.25
 
 
@@ -118,6 +119,11 @@ class ReflectionDatasetResult:
     mode: str
     metric_version: int = REFLECTION_METRIC_VERSION
     pair_results: list[ReflectionEvaluationResult] = field(default_factory=list)
+    reference_mean_strength: Optional[float] = None
+    reference_p95_strength: Optional[float] = None
+    reference_coverage: Optional[float] = None
+    mean_reflection_likelihood: Optional[float] = None
+    p95_reflection_likelihood: Optional[float] = None
     mean_strength: float = 0.0
     median_strength: float = 0.0
     p95_strength: float = 0.0
