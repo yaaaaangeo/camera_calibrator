@@ -14,10 +14,12 @@ from __future__ import annotations
 import pytest
 
 from calibration.types import CameraModelType
+from calibration.validation import split_train_test
 from calibration.windshield.base import WindshieldConfig, WindshieldModelType
 from calibration.windshield.baseline import calibrate_baseline
 from calibration.windshield.projection import build_projector
 from calibration.windshield.spherical import calibrate_spherical
+from calibration.windshield.spline import calibrate_spline
 from export.windshield import export_windshield_yaml, load_windshield_yaml, windshield_model_from_yaml
 from tests._windshield_test_utils import (
     build_synthetic_spherical_windshield_dataset,
@@ -79,6 +81,43 @@ def test_export_windshield_yaml_round_trip_spherical(tmp_path):
     assert reconstructed.project_point(*test_point) == pytest.approx(
         original_model.project_point(*test_point), abs=1e-6
     )
+
+
+def test_export_windshield_yaml_round_trip_spline(tmp_path):
+    """STEP 4(Spline) - Test N: export -> load -> runtime reconstruction 후
+    project_point/unproject_pixel이 원본과 tolerance 내에서 일치해야 한다.
+    SciPy 내부 상태가 아니라 base sphere + spline grid 값(재구성 가능한
+    public 값)만 저장한다는 것도 이 round-trip이 성공한다는 사실로 검증된다."""
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_spherical_windshield_dataset(K, D)
+    camera_config = default_camera_config()
+    config = WindshieldConfig(
+        base_model_name=CameraModelType.BROWN_CONRADY, base_camera_matrix=K, base_distortion=D,
+        windshield_model=WindshieldModelType.SPLINE, spline_hint={"spline_rows": 2.0, "spline_cols": 2.0},
+    )
+    train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio=0.3, seed=3)
+    result = calibrate_spline(dataset, config, camera_config, train_ids, test_ids)
+    assert result.success, result.error_message
+
+    path = str(tmp_path / "windshield_spline.yml")
+    export_windshield_yaml(result, camera_config, path)
+    data = load_windshield_yaml(path)
+
+    assert data["windshield"]["model"] == WindshieldModelType.SPLINE.value
+    assert data["windshield"]["fitted_params"]["sphere_radius"] == pytest.approx(
+        result.fitted_params["sphere_radius"]
+    )
+
+    reconstructed = windshield_model_from_yaml(path)
+    original_model = build_projector(result)
+    for test_point in [(0.05, 0.02, 3.0), (-0.1, 0.05, 4.0), (0.0, -0.05, 2.5)]:
+        assert reconstructed.project_point(*test_point) == pytest.approx(
+            original_model.project_point(*test_point), abs=1e-4
+        )
+    for u, v in [(640.0, 400.0), (300.0, 200.0), (900.0, 600.0)]:
+        assert reconstructed.unproject_pixel(u, v) == pytest.approx(
+            original_model.unproject_pixel(u, v), abs=1e-6
+        )
 
 
 def test_export_windshield_yaml_rejects_failed_result(tmp_path):

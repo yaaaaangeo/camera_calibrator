@@ -13,9 +13,9 @@ main_window.py의 레거시 상태 머신에 있음)와 달리, 이 Workspace는
 오케스트레이션 로직을 전부 이 클래스 안에 둔다 - 82KB짜리 main_window.py를
 더 키우지 않기 위한 의도적인 선택이다.
 
-지금은 Phase 1(Baseline)만 실제로 계산할 수 있다. Spherical/Residual Ray/
-Spline은 라디오 버튼은 보이되 비활성화("Coming soon")로 표시한다(사용자 스펙
-11/21번 - Neural Network/고급 모델은 이번 라운드에 구현하지 않음).
+Baseline/Spherical/Residual Ray(Grid+RBF)/Spline(Phase 4) 전부 실제로
+계산할 수 있다 - 더 이상 "Coming soon" 비활성 모델은 없다(Neural Residual/
+Reflection은 이 Workspace의 범위 밖이라 아예 라디오 버튼 자체가 없다).
 
 사용자 스펙 5/6번 UI 목업의 6단계(Base Camera/Dataset/Baseline/Windshield
 Model/Validation/Comparison)를 4개 탭으로 압축했다 - Baseline 결과 표시와
@@ -72,6 +72,14 @@ from calibration.windshield.base import (
 )
 from calibration.windshield.residual_ray import DEFAULT_GRID_COLS, DEFAULT_GRID_ROWS, DEFAULT_LAMBDA_MAG, DEFAULT_LAMBDA_SMOOTH
 from calibration.windshield.residual_rbf import DEFAULT_RBF_NUM_CENTERS, DEFAULT_RBF_SMOOTHING
+from calibration.windshield.spline import (
+    DEFAULT_LAMBDA_CURVE as SPLINE_DEFAULT_LAMBDA_CURVE,
+    DEFAULT_LAMBDA_MAG as SPLINE_DEFAULT_LAMBDA_MAG,
+    DEFAULT_LAMBDA_SMOOTH as SPLINE_DEFAULT_LAMBDA_SMOOTH,
+    DEFAULT_MAX_DISPLACEMENT_M,
+    DEFAULT_SPLINE_COLS,
+    DEFAULT_SPLINE_ROWS,
+)
 from export.opencv import (
     detect_model_hint_from_opencv_yaml,
     load_camera_matrix_and_distortion_from_opencv_yaml,
@@ -451,13 +459,13 @@ class WindshieldWorkspace(QWidget):
         model_group = QGroupBox("Windshield Models")
         model_layout = QVBoxLayout(model_group)
         self._model_button_group = QButtonGroup(self)
-        # Spherical(Phase 2)은 STEP 2에서, Residual Ray(Phase 3-A)는 이번
-        # 라운드에서 실제로 구현됐으므로 활성화한다 - Spline(Phase 4)만 여전히
-        # 미구현이라 비활성화 상태로 둔다.
+        # Baseline/Spherical/Residual Ray(Grid+RBF)/Spline(Phase 4) 전부
+        # 실제로 구현됐으므로 활성화한다 - 더 이상 미구현 모델이 없다.
         _ENABLED_MODELS = (
             WindshieldModelType.BASELINE,
             WindshieldModelType.SPHERICAL,
             WindshieldModelType.RESIDUAL_RAY,
+            WindshieldModelType.SPLINE,
         )
         for model in (
             WindshieldModelType.BASELINE,
@@ -474,6 +482,8 @@ class WindshieldWorkspace(QWidget):
                 radio.setToolTip("Coming soon - 아직 구현되지 않았습니다.")
             if model == WindshieldModelType.SPHERICAL:
                 radio.toggled.connect(self._on_spherical_radio_toggled)
+            if model == WindshieldModelType.SPLINE:
+                radio.toggled.connect(self._on_spline_radio_toggled)
             if model == WindshieldModelType.RESIDUAL_RAY:
                 radio.toggled.connect(self._on_residual_ray_radio_toggled)
             self._model_button_group.addButton(radio)
@@ -600,6 +610,66 @@ class WindshieldWorkspace(QWidget):
         self.residual_ray_method_rbf_radio.toggled.connect(self.residual_rbf_settings_group.setVisible)
         layout.addWidget(self.residual_ray_advanced_group)
 
+        self.spline_advanced_group = QGroupBox("Advanced (Spline)")
+        self.spline_advanced_group.setVisible(False)
+        spline_layout = QVBoxLayout(self.spline_advanced_group)
+        spline_form = QFormLayout()
+        spline_form.addRow("Base Surface:", QLabel("Spherical (frozen)"))
+
+        spline_mode_row = QHBoxLayout()
+        self._spline_mode_button_group = QButtonGroup(self)
+        self.spline_mode_auto_radio = QRadioButton("AUTO (권장)")
+        self.spline_mode_auto_radio.setChecked(True)
+        self.spline_mode_manual_radio = QRadioButton("Manual")
+        self._spline_mode_button_group.addButton(self.spline_mode_auto_radio)
+        self._spline_mode_button_group.addButton(self.spline_mode_manual_radio)
+        spline_mode_row.addWidget(self.spline_mode_auto_radio)
+        spline_mode_row.addWidget(self.spline_mode_manual_radio)
+        spline_mode_row.addStretch(1)
+        spline_form.addRow("Control Grid:", spline_mode_row)
+
+        self.spline_rows_spin = QSpinBox()
+        self.spline_rows_spin.setRange(2, 12)
+        self.spline_rows_spin.setValue(DEFAULT_SPLINE_ROWS)
+        self.spline_rows_spin.setEnabled(False)
+        spline_form.addRow("Manual Rows:", self.spline_rows_spin)
+        self.spline_cols_spin = QSpinBox()
+        self.spline_cols_spin.setRange(2, 16)
+        self.spline_cols_spin.setValue(DEFAULT_SPLINE_COLS)
+        self.spline_cols_spin.setEnabled(False)
+        spline_form.addRow("Manual Cols:", self.spline_cols_spin)
+
+        self.spline_lambda_mag_spin = QDoubleSpinBox()
+        self.spline_lambda_mag_spin.setRange(0.0, 10.0)
+        self.spline_lambda_mag_spin.setDecimals(6)
+        self.spline_lambda_mag_spin.setSingleStep(0.001)
+        self.spline_lambda_mag_spin.setValue(SPLINE_DEFAULT_LAMBDA_MAG)
+        spline_form.addRow("Magnitude λ:", self.spline_lambda_mag_spin)
+        self.spline_lambda_smooth_spin = QDoubleSpinBox()
+        self.spline_lambda_smooth_spin.setRange(0.0, 10.0)
+        self.spline_lambda_smooth_spin.setDecimals(6)
+        self.spline_lambda_smooth_spin.setSingleStep(0.01)
+        self.spline_lambda_smooth_spin.setValue(SPLINE_DEFAULT_LAMBDA_SMOOTH)
+        spline_form.addRow("Smoothness λ:", self.spline_lambda_smooth_spin)
+        self.spline_lambda_curve_spin = QDoubleSpinBox()
+        self.spline_lambda_curve_spin.setRange(0.0, 10.0)
+        self.spline_lambda_curve_spin.setDecimals(6)
+        self.spline_lambda_curve_spin.setSingleStep(0.01)
+        self.spline_lambda_curve_spin.setValue(SPLINE_DEFAULT_LAMBDA_CURVE)
+        spline_form.addRow("Curvature λ:", self.spline_lambda_curve_spin)
+
+        self.spline_max_displacement_spin = QDoubleSpinBox()
+        self.spline_max_displacement_spin.setRange(1.0, 50.0)
+        self.spline_max_displacement_spin.setDecimals(2)
+        self.spline_max_displacement_spin.setSuffix(" mm")
+        self.spline_max_displacement_spin.setValue(DEFAULT_MAX_DISPLACEMENT_M * 1000.0)
+        spline_form.addRow("Max deformation:", self.spline_max_displacement_spin)
+        spline_layout.addLayout(spline_form)
+
+        self.spline_mode_manual_radio.toggled.connect(self.spline_rows_spin.setEnabled)
+        self.spline_mode_manual_radio.toggled.connect(self.spline_cols_spin.setEnabled)
+        layout.addWidget(self.spline_advanced_group)
+
         run_row = QHBoxLayout()
         self.run_button = QPushButton("Run")
         self.run_button.clicked.connect(self._on_run_windshield_calibration)
@@ -662,6 +732,29 @@ class WindshieldWorkspace(QWidget):
         diag_form.addRow("Pose Movement (STAGE B):", self.diag_pose_movement_label)
         layout.addWidget(self.residual_ray_diagnostics_group)
 
+        self.spline_diagnostics_group = QGroupBox("SPLINE DIAGNOSTICS")
+        self.spline_diagnostics_group.setVisible(False)
+        spline_diag_form = QFormLayout(self.spline_diagnostics_group)
+        self.diag_spline_sphere_label = QLabel("N/A")
+        spline_diag_form.addRow("Base Sphere:", self.diag_spline_sphere_label)
+        self.diag_spline_grid_label = QLabel("N/A")
+        spline_diag_form.addRow("Spline Grid:", self.diag_spline_grid_label)
+        self.diag_spline_params_label = QLabel("N/A")
+        spline_diag_form.addRow("Surface Params:", self.diag_spline_params_label)
+        self.diag_spline_selection_mode_label = QLabel("N/A")
+        spline_diag_form.addRow("Selection Mode:", self.diag_spline_selection_mode_label)
+        self.diag_spline_deformation_label = QLabel("N/A")
+        spline_diag_form.addRow("Deformation |Δs|:", self.diag_spline_deformation_label)
+        self.diag_spline_holdout_label = QLabel("N/A")
+        spline_diag_form.addRow("Repeated Hold-out:", self.diag_spline_holdout_label)
+        self.diag_spline_ray_stability_label = QLabel("N/A")
+        spline_diag_form.addRow("Ray Stability:", self.diag_spline_ray_stability_label)
+        self.diag_spline_surface_stability_label = QLabel("N/A")
+        spline_diag_form.addRow("Surface Stability:", self.diag_spline_surface_stability_label)
+        self.diag_spline_pose_movement_label = QLabel("N/A")
+        spline_diag_form.addRow("Pose Movement (STAGE B):", self.diag_spline_pose_movement_label)
+        layout.addWidget(self.spline_diagnostics_group)
+
         layout.addStretch(1)
         return page
 
@@ -676,6 +769,34 @@ class WindshieldWorkspace(QWidget):
 
     def _on_residual_ray_radio_toggled(self, checked: bool) -> None:
         self.residual_ray_advanced_group.setVisible(checked)
+
+    def _on_spline_radio_toggled(self, checked: bool) -> None:
+        self.spline_advanced_group.setVisible(checked)
+
+    def _apply_spline_advanced_settings(self) -> None:
+        """Advanced (Spline) 위젯 값을 self._windshield_config.spline_hint에
+        반영한다 - Residual Ray의 helper와 완전히 별도로 둔다(사용자 스펙
+        1번과 동일한 원칙, 서로 다른 모델의 advanced 설정을 섞지 않는다).
+
+        AUTO면 auto_spline=1.0만 쓰고 spline_rows/cols는 넣지 않는다
+        (calibrate_spline이 auto_spline>0이면 select_best_spline_grid_
+        resolution으로 스스로 해상도를 고른다). Manual이면 auto_spline=0.0 +
+        사용자가 고른 rows/cols를 명시적으로 넣는다. λ/max displacement는
+        AUTO/Manual 여부와 무관하게 항상 포함한다(mm -> m 변환)."""
+        assert self._windshield_config is not None
+        hint: dict[str, object] = {
+            "lambda_mag": self.spline_lambda_mag_spin.value(),
+            "lambda_smooth": self.spline_lambda_smooth_spin.value(),
+            "lambda_curve": self.spline_lambda_curve_spin.value(),
+            "max_displacement_m": self.spline_max_displacement_spin.value() / 1000.0,
+        }
+        if self.spline_mode_auto_radio.isChecked():
+            hint["auto_spline"] = 1.0
+        else:
+            hint["auto_spline"] = 0.0
+            hint["spline_rows"] = float(self.spline_rows_spin.value())
+            hint["spline_cols"] = float(self.spline_cols_spin.value())
+        self._windshield_config.spline_hint = hint
 
     def _apply_residual_ray_advanced_settings(self) -> None:
         """Advanced (Residual Ray) 위젯 값을 self._windshield_config.residual_ray_hint에
@@ -751,6 +872,8 @@ class WindshieldWorkspace(QWidget):
             self._apply_spherical_advanced_settings()
         if selected_model == WindshieldModelType.RESIDUAL_RAY:
             self._apply_residual_ray_advanced_settings()
+        if selected_model == WindshieldModelType.SPLINE:
+            self._apply_spline_advanced_settings()
 
         # Residual Ray의 STAGE A/B + Repeated Hold-out은 수 초~수십 초가 걸릴
         # 수 있어 GUI 스레드에서 직접 돌리면 그동안 창 이동/크기 조절/다른 탭
@@ -791,6 +914,7 @@ class WindshieldWorkspace(QWidget):
             self.run_summary_label.setText(f"실패: {result.error_message}")
             self.export_button.setEnabled(False)
             self.residual_ray_diagnostics_group.setVisible(False)
+            self.spline_diagnostics_group.setVisible(False)
             return
 
         note = result.warning_message or ""
@@ -838,6 +962,79 @@ class WindshieldWorkspace(QWidget):
         self.vector_field_chart.set_spatial_error_map(result.spatial_error_map)
 
         self._update_residual_ray_diagnostics(result)
+        self._update_spline_diagnostics(result)
+
+    def _update_spline_diagnostics(self, result: WindshieldCalibrationResult) -> None:
+        """Spline 결과의 fitted_params에 이미 backend(calibration.windshield.
+        spline.calibrate_spline/run_spline_calibration_with_diagnostics)가
+        계산해 둔 값만 그대로 읽어 표시한다 - UI에서 새로 계산하지 않는다
+        (Residual Ray 진단 패널과 동일한 원칙). Baseline/Spherical/Residual
+        Ray 결과에서는 패널을 숨긴다."""
+        if result.windshield_model != WindshieldModelType.SPLINE:
+            self.spline_diagnostics_group.setVisible(False)
+            return
+        self.spline_diagnostics_group.setVisible(True)
+
+        fp = result.fitted_params
+        radius = fp.get("sphere_radius")
+        cx, cy, cz = fp.get("sphere_center_x"), fp.get("sphere_center_y"), fp.get("sphere_center_z")
+        if radius is not None and cx is not None:
+            self.diag_spline_sphere_label.setText(
+                f"Radius {_fmt(radius)}m · Center ({_fmt(cx)}, {_fmt(cy)}, {_fmt(cz)})"
+            )
+        else:
+            self.diag_spline_sphere_label.setText("N/A")
+
+        rows, cols = fp.get("spline_rows"), fp.get("spline_cols")
+        self.diag_spline_grid_label.setText(f"{int(rows)} x {int(cols)}" if rows is not None and cols is not None else "N/A")
+        self.diag_spline_params_label.setText(_fmt(fp.get("runtime_param_count")))
+
+        is_auto = fp.get("diag_selection_mode_is_auto")
+        self.diag_spline_selection_mode_label.setText(
+            "AUTO" if is_auto == 1.0 else "Manual" if is_auto == 0.0 else "N/A"
+        )
+
+        mean_abs, max_abs = fp.get("diag_deformation_mean_abs_m"), fp.get("diag_deformation_max_abs_m")
+        if mean_abs is not None and max_abs is not None:
+            self.diag_spline_deformation_label.setText(f"Mean {mean_abs*1000:.3f}mm · Max {max_abs*1000:.3f}mm")
+        else:
+            self.diag_spline_deformation_label.setText("N/A")
+
+        n_req, n_ok = fp.get("diag_repeated_n_requested"), fp.get("diag_repeated_n_successful")
+        if n_req is not None and n_ok is not None:
+            self.diag_spline_holdout_label.setText(
+                f"{int(n_ok)}/{int(n_req)} successful · "
+                f"Mean Test RMS {_fmt(fp.get('diag_repeated_mean_test_rmse'))} "
+                f"(±{_fmt(fp.get('diag_repeated_std_test_rmse'))}) · "
+                f"Mean P95 {_fmt(fp.get('diag_repeated_mean_test_p95'))} · "
+                f"Mean Edge RMS {_fmt(fp.get('diag_repeated_mean_edge_rms'))}"
+            )
+        else:
+            self.diag_spline_holdout_label.setText("N/A")
+
+        ray_mean, ray_p95 = fp.get("diag_ray_stability_mean_deg"), fp.get("diag_ray_stability_p95_deg")
+        if ray_mean is not None or ray_p95 is not None:
+            self.diag_spline_ray_stability_label.setText(f"Mean {_fmt_deg(ray_mean)} · P95 {_fmt_deg(ray_p95)}")
+        else:
+            self.diag_spline_ray_stability_label.setText("N/A")
+
+        surf_mean, surf_p95 = fp.get("diag_surface_stability_mean_mm"), fp.get("diag_surface_stability_p95_mm")
+        if surf_mean is not None or surf_p95 is not None:
+            self.diag_spline_surface_stability_label.setText(
+                f"Mean {_fmt(surf_mean)}mm · P95 {_fmt(surf_p95)}mm"
+            )
+        else:
+            self.diag_spline_surface_stability_label.setText("N/A")
+
+        pose_r_med, pose_r_p95 = fp.get("diag_pose_delta_r_median_deg"), fp.get("diag_pose_delta_r_p95_deg")
+        pose_t_med, pose_t_p95 = fp.get("diag_pose_delta_t_median_mm"), fp.get("diag_pose_delta_t_p95_mm")
+        if pose_r_med is not None and pose_t_med is not None:
+            self.diag_spline_pose_movement_label.setText(
+                f"ΔR median {_fmt_deg(pose_r_med)} / P95 {_fmt_deg(pose_r_p95)} · "
+                f"Δt median {_fmt(pose_t_med)}mm / P95 {_fmt(pose_t_p95)}mm"
+            )
+        else:
+            self.diag_spline_pose_movement_label.setText("N/A")
 
     def _update_residual_ray_diagnostics(self, result: WindshieldCalibrationResult) -> None:
         """Residual Ray 결과의 fitted_params에 이미 backend(calibration.windshield.

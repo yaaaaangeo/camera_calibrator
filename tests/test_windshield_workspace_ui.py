@@ -30,10 +30,9 @@ def qapp():
     yield app
 
 
-def test_baseline_spherical_residual_ray_enabled_spline_disabled(qapp):
-    """Baseline(STEP 1)/Spherical(STEP 2)/Residual Ray(STEP 3-A)는 모두 실제로
-    구현됐으므로 라디오가 활성화돼 있어야 하고, Spline(Phase 4)만 여전히
-    "Coming soon"으로 비활성 상태여야 한다."""
+def test_all_windshield_models_are_enabled():
+    """Baseline/Spherical/Residual Ray(Grid+RBF)/Spline(Phase 4) 전부 실제로
+    구현됐으므로 더 이상 비활성화된("Coming soon") 모델이 없어야 한다."""
     workspace = WindshieldWorkspace()
     buttons = {
         button.property("windshield_model"): button
@@ -43,7 +42,7 @@ def test_baseline_spherical_residual_ray_enabled_spline_disabled(qapp):
     assert buttons[WindshieldModelType.BASELINE.value].isChecked()
     assert buttons[WindshieldModelType.SPHERICAL.value].isEnabled()
     assert buttons[WindshieldModelType.RESIDUAL_RAY.value].isEnabled()
-    assert not buttons[WindshieldModelType.SPLINE.value].isEnabled()
+    assert buttons[WindshieldModelType.SPLINE.value].isEnabled()
 
 
 def test_back_requested_signal_fires(qapp):
@@ -152,6 +151,80 @@ def test_residual_ray_diagnostics_panel_visible_only_for_residual_ray_result(qap
     assert workspace.residual_ray_diagnostics_group.isVisibleTo(workspace)
     assert workspace.diag_selected_grid_label.text() == "3 x 4"
     assert workspace.diag_selection_mode_label.text() == "AUTO"
+
+
+def test_spline_advanced_group_visible_only_when_selected(qapp):
+    workspace = _make_workspace_with_config(qapp)
+    buttons = {
+        button.property("windshield_model"): button
+        for button in workspace._model_button_group.buttons()
+    }
+    buttons[WindshieldModelType.SPLINE.value].setChecked(True)
+    assert workspace.spline_advanced_group.isVisibleTo(workspace)
+    buttons[WindshieldModelType.BASELINE.value].setChecked(True)
+    assert not workspace.spline_advanced_group.isVisibleTo(workspace)
+
+
+def test_spline_auto_mode_sets_auto_spline_hint(qapp):
+    workspace = _make_workspace_with_config(qapp)
+    workspace.spline_mode_auto_radio.setChecked(True)
+    workspace._apply_spline_advanced_settings()
+    hint = workspace._windshield_config.spline_hint
+    assert hint["auto_spline"] == 1.0
+    assert "spline_rows" not in hint
+    assert "spline_cols" not in hint
+    assert "lambda_mag" in hint and "lambda_smooth" in hint and "lambda_curve" in hint
+    assert "max_displacement_m" in hint
+
+
+def test_spline_manual_mode_sets_rows_cols_hint(qapp):
+    workspace = _make_workspace_with_config(qapp)
+    workspace.spline_mode_manual_radio.setChecked(True)
+    workspace.spline_rows_spin.setValue(4)
+    workspace.spline_cols_spin.setValue(6)
+    workspace._apply_spline_advanced_settings()
+    hint = workspace._windshield_config.spline_hint
+    assert hint["auto_spline"] == 0.0
+    assert hint["spline_rows"] == 4.0
+    assert hint["spline_cols"] == 6.0
+
+
+def test_spline_max_displacement_spinbox_converts_mm_to_meters(qapp):
+    workspace = _make_workspace_with_config(qapp)
+    workspace.spline_max_displacement_spin.setValue(15.0)  # mm
+    workspace._apply_spline_advanced_settings()
+    hint = workspace._windshield_config.spline_hint
+    assert hint["max_displacement_m"] == pytest.approx(0.015)
+
+
+def test_spline_diagnostics_panel_visible_only_for_spline_result(qapp):
+    from calibration.windshield.base import WindshieldCalibrationResult
+
+    workspace = _make_workspace_with_config(qapp)
+    K, D = workspace._windshield_config.base_camera_matrix, workspace._windshield_config.base_distortion
+
+    baseline_result = WindshieldCalibrationResult(
+        windshield_model=WindshieldModelType.BASELINE,
+        base_model_name=workspace._windshield_config.base_model_name,
+        base_camera_matrix=K, base_distortion=D, success=True,
+    )
+    workspace._display_result(baseline_result)
+    assert not workspace.spline_diagnostics_group.isVisibleTo(workspace)
+
+    spline_result = WindshieldCalibrationResult(
+        windshield_model=WindshieldModelType.SPLINE,
+        base_model_name=workspace._windshield_config.base_model_name,
+        base_camera_matrix=K, base_distortion=D, success=True,
+        fitted_params={
+            "sphere_radius": 5.0, "sphere_center_x": 0.0, "sphere_center_y": 0.0, "sphere_center_z": -4.9,
+            "spline_rows": 3.0, "spline_cols": 4.0, "diag_selection_mode_is_auto": 1.0,
+            "runtime_param_count": 12.0,
+        },
+    )
+    workspace._display_result(spline_result)
+    assert workspace.spline_diagnostics_group.isVisibleTo(workspace)
+    assert workspace.diag_spline_grid_label.text() == "3 x 4"
+    assert workspace.diag_spline_selection_mode_label.text() == "AUTO"
 
 
 def test_vector_field_widget_renders_populated_map_without_crashing(qapp):

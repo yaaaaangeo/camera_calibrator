@@ -210,6 +210,164 @@ def default_residual_delta_fn(camera_matrix, image_width: float = IMG_W, image_h
     return delta_fn
 
 
+def default_spline_bump_fn(amplitude: float = 0.006, center: tuple[float, float] = (0.4, -0.3), sigma: float = 0.35):
+    """사용자 스펙 35번 형태의 smooth Gaussian bump Δs(u,v) GT field(미터
+    단위) - control grid의 bilinear interpolation과는 완전히 다른 함수
+    형태다(사용자 스펙 36번 "Spline interpolation 자체를 그대로 호출하지
+    않는다" - 독립적인 closed-form).
+
+        Delta_s(u,v) = amplitude * exp(-((un-u0)^2+(vn-v0)^2) / (2*sigma^2))
+
+    (un,vn)은 [-1,1] normalized 좌표. amplitude=6mm는 기본 max_displacement_m
+    bound(10mm)보다 작아 optimizer bound에 걸리지 않는다.
+    """
+    import math
+
+    u0, v0 = center
+
+    def bump_fn(un: float, vn: float) -> float:
+        return amplitude * math.exp(-((un - u0) ** 2 + (vn - v0) ** 2) / (2.0 * sigma ** 2))
+
+    return bump_fn
+
+
+def build_synthetic_spline_windshield_dataset(
+    camera_matrix,
+    distortion,
+    *,
+    sphere_center: np.ndarray = DEFAULT_SPHERE_CENTER,
+    sphere_radius: float = DEFAULT_SPHERE_RADIUS,
+    n_air: float = DEFAULT_AIR_INDEX,
+    n_glass: float = DEFAULT_GLASS_INDEX,
+    thickness: float = DEFAULT_GLASS_THICKNESS_M,
+    bump_fn=None,
+    model=None,
+) -> Dataset:
+    """알려진 base sphere + smooth Gaussian bump 형태의 surface deformation을
+    통해 "관측" 코너를 만든다. calibration/windshield/spline.py의 bilinear
+    grid interpolation이나 SplineWindshieldModel을 전혀 호출하지 않는
+    독립적인 forward model이다(사용자 스펙 36번 - self-consistency 회피).
+    저수준 primitive(refraction.py의 intersect_ray_sphere/refract_ray/
+    normalize, BaselineWindshieldModel)만 재사용한다 - 그 primitive들의
+    정오는 tests/test_windshield_refraction.py가 독립적으로 검증한다.
+    """
+    from calibration.types import CameraModelType
+    from calibration.windshield.baseline import BaselineWindshieldModel
+    from calibration.windshield.refraction import intersect_ray_sphere, normalize, refract_ray
+    from scipy.optimize import least_squares
+
+    model = model or CameraModelType.BROWN_CONRADY
+    baseline = BaselineWindshieldModel(camera_matrix, distortion, model)
+    bump_fn = bump_fn or default_spline_bump_fn()
+    center = np.asarray(sphere_center, dtype=np.float64)
+    origin = np.zeros(3, dtype=np.float64)
+
+    def local_delta_s(u: float, v: float) -> float:
+        un = 2.0 * u / IMG_W - 1.0
+        vn = 2.0 * v / IMG_H - 1.0
+        return bump_fn(un, vn)
+
+    def surface_point(u: float, v: float):
+        d = np.asarray(baseline.unproject_pixel(u, v), dtype=np.float64)
+        ds = local_delta_s(u, v)
+        hit = intersect_ray_sphere(origin, d, center, sphere_radius + ds)
+        return hit[0] if hit is not None else None
+
+    def normal_at(u: float, v: float, p: np.ndarray, step: float = 2.0):
+        p_u1, p_u2 = surface_point(u + step, v), surface_point(u - step, v)
+        p_v1, p_v2 = surface_point(u, v + step), surface_point(u, v - step)
+        if any(x is None for x in (p_u1, p_u2, p_v1, p_v2)):
+            return None
+        tu = (p_u1 - p_u2) / (2.0 * step)
+        tv = (p_v1 - p_v2) / (2.0 * step)
+        n = np.cross(tu, tv)
+        norm = np.linalg.norm(n)
+        if norm < 1e-15:
+            return None
+        n = n / norm
+        if np.dot(n, p - center) < 0.0:
+            n = -n
+        return n
+
+    def refract_through_deformed(u: float, v: float):
+        p = surface_point(u, v)
+        if p is None:
+            raise ValueError("no inner hit")
+        n1 = normal_at(u, v, p)
+        if n1 is None:
+            raise ValueError("degenerate normal")
+        d_cam = np.asarray(baseline.unproject_pixel(u, v), dtype=np.float64)
+        d_glass = refract_ray(d_cam, n1, n_air, n_glass)
+        if d_glass is None:
+            raise ValueError("TIR at inner surface")
+        ds = local_delta_s(u, v)
+        outer_hit = intersect_ray_sphere(p, d_glass, center, sphere_radius + ds + thickness)
+        if outer_hit is None:
+            raise ValueError("no outer hit")
+        p2, _ = outer_hit
+        n2 = normalize(p2 - center)
+        d_out = refract_ray(d_glass, n2, n_glass, n_air)
+        if d_out is None:
+            raise ValueError("TIR at outer surface")
+        return p2, d_out
+
+    def project_with_bump(x: float, y: float, z: float):
+        target = np.array([x, y, z], dtype=np.float64)
+        initial_uv = np.asarray(baseline.project_point(x, y, z), dtype=np.float64)
+
+        def residual(uv):
+            try:
+                point, direction = refract_through_deformed(float(uv[0]), float(uv[1]))
+            except ValueError:
+                return np.full(3, 5.0)
+            to_target = target - point
+            norm = np.linalg.norm(to_target)
+            if norm < 1e-9:
+                return np.zeros(3)
+            return to_target / norm - direction
+
+        result = least_squares(residual, x0=initial_uv, method="lm", max_nfev=50)
+        return float(result.x[0]), float(result.x[1])
+
+    obj = _object_grid()
+    frames: list[Frame] = []
+    for i, (rvec, tvec) in enumerate(_POSES):
+        frame_id = f"spl_{i:02d}"
+        R, _ = cv2.Rodrigues(rvec)
+        cam_pts = (R @ obj.reshape(-1, 3).T).T + tvec.reshape(1, 3)
+
+        pixels = []
+        ok = True
+        for p in cam_pts:
+            try:
+                u, v = project_with_bump(float(p[0]), float(p[1]), float(p[2]))
+            except Exception:  # noqa: BLE001
+                ok = False
+                break
+            pixels.append([u, v])
+        if not ok:
+            continue
+
+        corners = np.array(pixels, dtype=np.float32).reshape(-1, 1, 2)
+        center_px = corners.reshape(-1, 2).mean(axis=0)
+        detection = DetectionResult(
+            image_id=frame_id,
+            success=True,
+            corners=corners,
+            object_points=obj.astype(np.float32),
+            num_corners=corners.shape[0],
+            board_area_ratio=0.2,
+            board_center_px=(float(center_px[0]), float(center_px[1])),
+        )
+        frame = Frame(
+            image_info=ImageInfo(image_id=frame_id, path=f"synthetic://{frame_id}", width=IMG_W, height=IMG_H),
+            detection=detection,
+            status=FrameStatus.DETECTED,
+        )
+        frames.append(frame)
+    return Dataset(frames=frames)
+
+
 def build_synthetic_residual_ray_dataset(camera_matrix, distortion, delta_fn, model=None) -> Dataset:
     """delta_fn(u,v)->[dx,dy,dz](ray-direction 단위)으로 정의된 임의의
     closed-form ray-correction field를 통해 "관측" 코너를 만든다.

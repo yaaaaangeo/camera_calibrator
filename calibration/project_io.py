@@ -646,6 +646,11 @@ def _windshield_config_from_dict(d) -> WindshieldConfig | None:
         glass_refractive_index=d.get("glass_refractive_index"),
         glass_thickness_m=d.get("glass_thickness_m"),
         windshield_position_hint=d.get("windshield_position_hint"),
+        # STEP 3-A 때 필드는 추가됐지만 여기 복원 코드가 빠져 있던 기존 버그 -
+        # residual_ray_hint(method/AUTO/manual 설정)가 프로젝트 저장 후
+        # 재로드 시 사라지는 문제였다. spline_hint도 같은 패턴이라 함께 추가.
+        residual_ray_hint=d.get("residual_ray_hint"),
+        spline_hint=d.get("spline_hint"),
     )
 
 

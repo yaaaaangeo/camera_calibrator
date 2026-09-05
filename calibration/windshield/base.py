@@ -45,9 +45,9 @@ class WindshieldModelType(str, Enum):
     않는다 - Windshield는 카메라 모델이 아니라 카메라 뒤에 있는 별도 계층이다.
     """
     BASELINE = "baseline"          # Phase 1 - 보정 없음(항등), 순수 측정 용도
-    SPHERICAL = "spherical"        # Phase 2 - 미구현 (Snell 굴절 + 구면 근사)
-    RESIDUAL_RAY = "residual_ray"  # Phase 3 - 미구현 (Residual Grid/RBF)
-    SPLINE = "spline"              # Phase 4 - 미구현 (Advanced, Spline surface)
+    SPHERICAL = "spherical"        # Phase 2 - Snell 굴절 + 구면 근사
+    RESIDUAL_RAY = "residual_ray"  # Phase 3 - Residual Grid(3-A)/RBF(3-B), residual_ray_hint["method"]로 구분
+    SPLINE = "spline"              # Phase 4 - Base Sphere + Spline local surface deformation
 
 
 WindshieldResultKey: TypeAlias = str | WindshieldModelType | tuple[WindshieldModelType, str]
@@ -148,6 +148,11 @@ class WindshieldConfig:
     # 패턴(범용 dict, additive) - grid_rows/grid_cols/lambda_mag/lambda_smooth
     # 키를 선택적으로 덮어쓸 수 있다(calibration/windshield/residual_ray.py 참고).
     residual_ray_hint: Optional[dict[str, object]] = None
+    # Phase 4 (Spline) 전용 설정 자리 - 동일한 패턴(범용 dict, additive).
+    # spline_rows/spline_cols/lambda_mag/lambda_smooth/lambda_curve/
+    # max_displacement_m/auto_spline 키를 선택적으로 덮어쓸 수 있다
+    # (calibration/windshield/spline.py 참고).
+    spline_hint: Optional[dict[str, object]] = None
 
 
 @dataclass

@@ -32,6 +32,7 @@ from calibration.types import CameraConfig, Dataset
 from calibration.windshield.base import WindshieldCalibrationResult, WindshieldConfig, WindshieldModelType
 from calibration.windshield.residual_ray import run_residual_ray_calibration_with_diagnostics
 from calibration.windshield.residual_rbf import run_residual_rbf_calibration_with_diagnostics
+from calibration.windshield.spline import run_spline_calibration_with_diagnostics
 from calibration.windshield.validation import run_windshield_calibration, split_windshield_train_test
 
 
@@ -73,6 +74,16 @@ class WindshieldCalibrationWorker(QObject):
                     result = run_residual_ray_calibration_with_diagnostics(
                         self._dataset, self._config, self._camera_config, train_ids, test_ids,
                     )
+            elif self._config.windshield_model == WindshieldModelType.SPLINE:
+                # Spline도 Repeated Hold-out/Ray/Surface Stability 진단이 필요한
+                # "advanced" 모델이라 Residual Ray와 동일하게 전용 오케스트레이터를
+                # 거친다(run_windshield_calibration의 얇은 dispatch가 아니라).
+                train_ids, test_ids = split_windshield_train_test(
+                    self._dataset, self._camera_config, self._config.test_ratio, self._config.split_seed,
+                )
+                result = run_spline_calibration_with_diagnostics(
+                    self._dataset, self._config, self._camera_config, train_ids, test_ids,
+                )
             else:
                 result = run_windshield_calibration(self._dataset, self._config, self._camera_config)
             self.result_ready.emit(result)

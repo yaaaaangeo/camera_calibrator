@@ -8,7 +8,6 @@ calibration.windshield.base의 타입/dispatch 스캐폴딩 검증.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from calibration.types import CameraModelType
 from calibration.windshield.base import (
@@ -110,18 +109,26 @@ def test_build_projector_residual_ray_returns_residual_ray_model():
     assert isinstance(model, ResidualRayWindshieldModel)
 
 
-@pytest.mark.parametrize(
-    "windshield_model",
-    [WindshieldModelType.SPLINE],
-)
-def test_build_projector_unimplemented_models_raise_not_implemented(windshield_model):
+def test_build_projector_spline_returns_spline_model():
+    """Phase 4(Spline)는 이번 라운드에서 실제 구현됐다."""
+    from calibration.windshield.spline import SplineWindshieldModel
+
     cfg = _make_config()
+    fitted_params = {
+        "sphere_center_x": 0.0, "sphere_center_y": 0.0, "sphere_center_z": -9.7,
+        "sphere_radius": 10.0, "spline_rows": 2.0, "spline_cols": 2.0,
+        "image_width": 1280.0, "image_height": 800.0,
+    }
+    for r in range(2):
+        for c in range(2):
+            fitted_params[f"spline_ds_{r}_{c}"] = 0.0
     result = WindshieldCalibrationResult(
-        windshield_model=windshield_model,
+        windshield_model=WindshieldModelType.SPLINE,
         base_model_name=cfg.base_model_name,
         base_camera_matrix=cfg.base_camera_matrix,
         base_distortion=cfg.base_distortion,
+        fitted_params=fitted_params,
         success=True,
     )
-    with pytest.raises(NotImplementedError):
-        build_projector(result)
+    model = build_projector(result)
+    assert isinstance(model, SplineWindshieldModel)

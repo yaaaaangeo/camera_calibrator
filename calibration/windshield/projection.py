@@ -24,6 +24,7 @@ from calibration.windshield.spherical import (
     DEFAULT_GLASS_THICKNESS_M,
     SphericalWindshieldModel,
 )
+from calibration.windshield.spline import build_spline_model_from_fitted_params
 
 
 def build_projector(result: WindshieldCalibrationResult) -> WindshieldModel:
@@ -70,5 +71,7 @@ def build_projector(result: WindshieldCalibrationResult) -> WindshieldModel:
             image_height=fp["image_height"],
         )
     if result.windshield_model == WindshieldModelType.SPLINE:
-        raise NotImplementedError("Spline windshield model is not implemented yet (Phase 4).")
+        return build_spline_model_from_fitted_params(
+            result.base_camera_matrix, result.base_distortion, result.base_model_name, result.fitted_params,
+        )
     raise ValueError(f"알 수 없는 windshield 모델: {result.windshield_model}")
