@@ -353,3 +353,125 @@ def test_suppression_before_after_can_use_shared_dispatcher():
     assert before.mode == "point_source"
     assert after.mode == "point_source"
     assert (after.mean_strength_ratio or 0.0) < (before.mean_strength_ratio or 0.0)
+
+
+# ===========================================================================
+# STEP 8 semantic fix 2 - General Suppression -> Likelihood Before/After
+# ===========================================================================
+
+from calibration.windshield.ghost.evaluator import evaluate_ghost_general_likelihood
+from calibration.windshield.ghost.suppression import build_suppression_evaluation
+
+
+def _fake_suppression_result(*, over_suppression_score=0.05) -> object:
+    from calibration.windshield.ghost.types import GhostSuppressionResult
+
+    return GhostSuppressionResult(success=True, over_suppression_score=over_suppression_score)
+
+
+def test_point_source_suppression_populates_strength_reduction_not_likelihood():
+    """build_suppression_evaluation()의 mode 분기 로직 자체를 검증한다 -
+    suppress_ghost()의 실제 수치(완전히 제거되면 after.mean_strength_ratio
+    가 None이 될 수 있음)와 무관하게, before/after 둘 다 값이 있을 때
+    strength_reduction이 채워지고 likelihood_reduction은 절대 채워지지
+    않아야 한다."""
+    from calibration.windshield.ghost.types import GhostEvaluationResult
+
+    before = GhostEvaluationResult(success=True, mode="point_source", detection_count=2, mean_strength_ratio=0.15)
+    after = GhostEvaluationResult(success=True, mode="point_source", detection_count=1, mean_strength_ratio=0.05)
+    supp = _fake_suppression_result()
+
+    evaln = build_suppression_evaluation(before, after, supp)
+    assert evaln.strength_reduction == pytest.approx(0.10)
+    assert evaln.detection_reduction == 1
+    assert evaln.likelihood_reduction is None
+
+
+def test_edge_target_suppression_populates_strength_reduction_not_likelihood():
+    from calibration.windshield.ghost.types import GhostEvaluationResult
+
+    before = GhostEvaluationResult(success=True, mode="edge_target", detection_count=2, mean_strength_ratio=0.20, edge_offset_median_px=6.0)
+    after = GhostEvaluationResult(success=True, mode="edge_target", detection_count=1, mean_strength_ratio=0.08, edge_offset_median_px=6.0)
+    supp = _fake_suppression_result()
+
+    evaln = build_suppression_evaluation(before, after, supp)
+    assert evaln.strength_reduction == pytest.approx(0.12)
+    assert evaln.likelihood_reduction is None
+
+
+def test_general_likelihood_suppression_populates_likelihood_reduction_not_strength():
+    img_before = np.zeros((64, 64, 3), dtype=np.uint8)
+    img_before[:, 20:] = 200
+    img_before[:, 26:] += 30  # 뚜렷한 double-edge 반복 -> likelihood 높음
+
+    img_after = np.zeros((64, 64, 3), dtype=np.uint8)
+    img_after[:, 20:] = 200  # double-edge 제거됨 -> likelihood 낮음
+
+    before = evaluate_ghost_general_likelihood(img_before)
+    after = evaluate_ghost_general_likelihood(img_after)
+    supp = _fake_suppression_result()
+
+    evaln = build_suppression_evaluation(before, after, supp)
+    assert evaln.likelihood_reduction is not None
+    assert evaln.likelihood_reduction == pytest.approx(before.ghost_likelihood - after.ghost_likelihood)
+    assert evaln.likelihood_reduction > 0.0  # synthetic fixture가 실제로 likelihood를 낮추도록 구성됨
+    # General mode에서는 strength/detection reduction 의미를 절대 혼용하지 않는다.
+    assert evaln.strength_reduction is None
+    assert evaln.detection_reduction is None
+
+
+def test_suppression_evaluation_before_after_share_same_mode():
+    """Before/After는 항상 같은 evaluation mode여야 한다 - dispatcher가
+    양쪽에 동일한 config를 쓰므로 자연히 보장되지만, 결과 타입 레벨에서도
+    확인한다."""
+    img = np.zeros((64, 64, 3), dtype=np.uint8)
+    before = evaluate_ghost_general_likelihood(img)
+    after = evaluate_ghost_general_likelihood(img)
+    assert before.mode == after.mode == "general_likelihood"
+
+
+# ===========================================================================
+# STEP 8 semantic/safety fix 3 - GhostField Fit은 Point Source만 허용
+# ===========================================================================
+
+from calibration.windshield.ghost.evaluator import evaluate_ghost_dataset
+
+
+def test_fit_ghost_field_from_dataset_allows_point_source():
+    observed = _ghosted_observed_uint8()
+    frame = evaluate_ghost_point_source(observed, _point_source_config(bright_source_threshold=20.0), pair_id="f1")
+    dataset_result = evaluate_ghost_dataset([frame], mode="point_source")
+    field = fit_ghost_field_from_dataset(dataset_result, image_width=320, image_height=240, rows=1, cols=1)
+    assert field is not None
+
+
+def test_fit_ghost_field_from_dataset_rejects_edge_target():
+    n = 100
+    profile = np.zeros(n)
+    profile[40:] = 200.0
+    profile[46:] += 30.0
+    from calibration.windshield.ghost.evaluator import evaluate_ghost_edge_target
+
+    frame = evaluate_ghost_edge_target([profile], pair_id="f1")
+    dataset_result = evaluate_ghost_dataset([frame], mode="edge_target")
+    with pytest.raises(ValueError):
+        fit_ghost_field_from_dataset(dataset_result, image_width=320, image_height=240, rows=1, cols=1)
+
+
+def test_fit_ghost_field_from_dataset_rejects_general_likelihood():
+    img = np.zeros((64, 64, 3), dtype=np.uint8)
+    frame = evaluate_ghost_general_likelihood(img, pair_id="f1")
+    dataset_result = evaluate_ghost_dataset([frame], mode="general_likelihood")
+    with pytest.raises(ValueError):
+        fit_ghost_field_from_dataset(dataset_result, image_width=64, image_height=64, rows=1, cols=1)
+
+
+def test_fit_ghost_field_from_dataset_resolution_cross_check():
+    """Worker의 mixed-resolution gate를 통과한 dataset이라도, fit에
+    넘겨지는 image_width/height가 dataset이 실제 평가된 해상도와 다르면
+    거부한다(사용자 스펙 4-F번)."""
+    observed = _ghosted_observed_uint8()
+    frame = evaluate_ghost_point_source(observed, _point_source_config(bright_source_threshold=20.0), pair_id="f1")
+    dataset_result = evaluate_ghost_dataset([frame], mode="point_source", image_width=320, image_height=240)
+    with pytest.raises(ValueError):
+        fit_ghost_field_from_dataset(dataset_result, image_width=999, image_height=999, rows=1, cols=1)

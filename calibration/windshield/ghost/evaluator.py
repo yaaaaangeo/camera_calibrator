@@ -16,8 +16,10 @@ K, D(그리고 base windshield model)는 여기서 절대 재보정하지 않는
 from __future__ import annotations
 
 import math
-from typing import Optional
+import os
+from typing import Callable, Optional
 
+import cv2
 import numpy as np
 
 from calibration.types import CameraModelType
@@ -272,24 +274,42 @@ def evaluate_ghost_general_likelihood(
     )
 
 
-def evaluate_ghost_dataset(per_frame: list[GhostEvaluationResult], *, mode: str) -> GhostDatasetResult:
+def evaluate_ghost_dataset(
+    per_frame: list[GhostEvaluationResult],
+    *,
+    mode: str,
+    image_width: Optional[int] = None,
+    image_height: Optional[int] = None,
+    num_input_frames: Optional[int] = None,
+) -> GhostDatasetResult:
     """여러 프레임의 `GhostEvaluationResult`를 dataset 단위로 집계한다.
 
     Edge-target 모드는 point-source의 `median_distance_px`가 아니라 전용
     `edge_offset_median_px`를 "distance-like" 집계 소스로 쓴다(사용자
-    스펙 - Point/Edge 필드를 절대 섞지 않는다)."""
+    스펙 - Point/Edge 필드를 절대 섞지 않는다).
+
+    General(No-Reference) Likelihood 모드는 dataset-level primary summary가
+    `mean_strength`/`p95_strength`(2차 edge의 상대 강도)가 아니라
+    `mean_ghost_likelihood`/`median_ghost_likelihood`/`p95_ghost_likelihood`
+    (double-edge 패턴이 나타난 profile 비율)여야 한다(STEP 8 semantic fix
+    1번, "Ghost Likelihood != Ghost Strength") - 이 두 값을 절대 같은
+    필드에 넣지 않는다."""
     successful = [r for r in per_frame if r.success]
+    is_general = mode == "general_likelihood"
 
     def _distance_like(r: GhostEvaluationResult) -> Optional[float]:
         return r.edge_offset_median_px if mode == "edge_target" else r.median_distance_px
 
     distances = [d for r in successful if (d := _distance_like(r)) is not None]
     strengths = [r.mean_strength_ratio for r in successful if r.mean_strength_ratio is not None]
+    likelihoods = [r.ghost_likelihood for r in successful if r.ghost_likelihood is not None]
 
     worst_frame_id = None
     worst_val = -1.0
     for r in successful:
-        val = _distance_like(r)
+        # General 모드는 "가장 심한 프레임"을 likelihood 기준으로 고른다 -
+        # distance/strength는 이 모드에서 정의되지 않는다.
+        val = (r.ghost_likelihood if is_general else _distance_like(r))
         val = val if val is not None else -1.0
         if val > worst_val:
             worst_val = val
@@ -305,11 +325,25 @@ def evaluate_ghost_dataset(per_frame: list[GhostEvaluationResult], *, mode: str)
         mode=mode,
         metric_version=GHOST_METRIC_VERSION,
         per_frame=per_frame,
+        # mean_distance_px/mean_strength는 그대로 유지한다(하위 호환 -
+        # 사용자 스펙 1-B번). General mode에서도 "검출된 secondary edge가
+        # 얼마나 강한지"(Strength)는 여전히 의미가 있는 별개의 통계이고,
+        # Likelihood("double-edge 패턴이 나타난 비율")를 대체하지 않는다
+        # (사용자 스펙 1-A번, "Likelihood=0.70, Strength=0.12는 충분히
+        # 가능하다"). General 모드 per-frame 결과는 애초에 distance를
+        # 채우지 않으므로 mean_distance_px는 자연히 None으로 남는다.
         mean_distance_px=_mean_or_none(distances),
         p95_distance_px=_percentile_or_none(distances, 95),
         mean_strength=_mean_or_none(strengths),
         p95_strength=_percentile_or_none(strengths, 95),
+        mean_ghost_likelihood=_mean_or_none(likelihoods) if is_general else None,
+        median_ghost_likelihood=_median_or_none(likelihoods) if is_general else None,
+        p95_ghost_likelihood=_percentile_or_none(likelihoods, 95) if is_general else None,
         worst_frame_id=worst_frame_id,
+        image_width=image_width,
+        image_height=image_height,
+        num_input_frames=num_input_frames if num_input_frames is not None else len(per_frame),
+        num_valid_frames=len(per_frame),
         success=bool(successful),
         warning_message=warning,
     )
@@ -350,3 +384,71 @@ def evaluate_ghost_image(
     if mode == "general_likelihood":
         return evaluate_ghost_general_likelihood(image_bgr, cfg, pair_id=pair_id)
     raise ValueError(f"Unknown ghost evaluation mode: {mode!r}")
+
+
+def evaluate_ghost_dataset_from_paths(
+    image_paths: list[str],
+    config: Optional[GhostEvaluationConfig] = None,
+    *,
+    frame_ids: Optional[list[str]] = None,
+    camera_matrix: Optional[np.ndarray] = None,
+    distortion: Optional[np.ndarray] = None,
+    camera_model: Optional[CameraModelType] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> GhostDatasetResult:
+    """이미지 경로 리스트를 읽어(`cv2.imread`) `evaluate_ghost_image()`로
+    평가하고 `evaluate_ghost_dataset()`으로 집계하는 Qt-independent 순수
+    함수 - `ui/ghost_evaluation_worker.py::GhostEvaluationWorker.run()`이
+    이 함수 하나를 호출하기만 하므로, pytest에서 PySide6 없이도 dataset
+    파이프라인(파일 로딩 + resolution gate + 평가 + 집계) 전체를 직접
+    검증할 수 있다.
+
+    STEP 8 semantic/safety fix 4번 - Multi-frame Resolution Consistency
+    Gate: Ghost displacement는 pixel 좌표계로 측정되므로 서로 다른 해상도
+    프레임을 하나의 dataset으로 섞으면 안 된다(같은 물리적 변위도 해상도에
+    따라 다른 px 값으로 보인다). 첫 유효 프레임의 해상도를 기준으로 삼고,
+    이후 프레임 중 하나라도 다르면 조용히 건너뛰거나 resize/crop하지 않고
+    `ValueError`로 dataset 전체를 실패시킨다(어떤 파일이 문제인지 메시지에
+    명시).
+    """
+    cfg = config or GhostEvaluationConfig()
+    ids = frame_ids or [str(i) for i in range(len(image_paths))]
+    n = len(image_paths)
+
+    per_frame: list[GhostEvaluationResult] = []
+    expected_shape: Optional[tuple[int, int]] = None
+    expected_path: Optional[str] = None
+
+    for i, (path, frame_id) in enumerate(zip(image_paths, ids)):
+        if progress_callback is not None:
+            progress_callback(f"Evaluating ghost {i + 1}/{n}...")
+        image = cv2.imread(path, cv2.IMREAD_COLOR)
+        if image is None:
+            continue
+
+        shape = image.shape[:2]  # (height, width)
+        if expected_shape is None:
+            expected_shape = shape
+            expected_path = path
+        elif shape != expected_shape:
+            eh, ew = expected_shape
+            fh, fw = shape
+            raise ValueError(
+                "Ghost dataset contains mixed image resolutions.\n\n"
+                f"Expected: {ew}x{eh} (from {os.path.basename(expected_path)})\n"
+                f"Found:    {fw}x{fh}\n"
+                f"File:     {os.path.basename(path)}\n\n"
+                "Ghost displacement is measured in pixel coordinates, so "
+                "mixed-resolution frames cannot be combined safely. No automatic "
+                "resize/crop was applied - fix the dataset and retry."
+            )
+
+        res = evaluate_ghost_image(
+            image, cfg, camera_matrix=camera_matrix, distortion=distortion, camera_model=camera_model, pair_id=frame_id,
+        )
+        per_frame.append(res)
+
+    image_height, image_width = expected_shape if expected_shape is not None else (None, None)
+    return evaluate_ghost_dataset(
+        per_frame, mode=cfg.mode, image_width=image_width, image_height=image_height, num_input_frames=n,
+    )

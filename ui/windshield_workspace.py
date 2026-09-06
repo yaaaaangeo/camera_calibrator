@@ -1683,12 +1683,23 @@ class WindshieldWorkspace(QWidget):
         self.ghost_suppression_model_path_label = QLabel("N/A")
         load_model_btn = QPushButton("Load Ghost Model...")
         load_model_btn.clicked.connect(self._on_load_ghost_suppression_model)
-        fit_btn = QPushButton("Fit From Last Evaluation")
-        fit_btn.clicked.connect(self._on_fit_ghost_model_from_evaluation)
+        # GhostField fit은 Point Source Evaluation 결과에서만 허용된다
+        # (STEP 8 semantic/safety fix 3번) - Edge Target은 1D scalar
+        # offset만 갖고 2D dx/dy field를 만들 수 없고, General Likelihood는
+        # displacement 자체를 측정하지 않는 heuristic이다. 이미 저장된
+        # GhostField를 "Load"해서 Suppression에 쓰는 것은 mode와 무관하게
+        # 항상 허용한다(3-D번).
+        self.ghost_fit_button = QPushButton("Fit From Last Evaluation")
+        self.ghost_fit_button.clicked.connect(self._on_fit_ghost_model_from_evaluation)
+        self.ghost_fit_button.setEnabled(False)
+        self.ghost_fit_button.setToolTip(
+            "GhostField fitting requires 2D main/ghost point displacement.\n"
+            "Available only for Point Source mode."
+        )
         save_btn = QPushButton("Save Model...")
         save_btn.clicked.connect(self._on_save_ghost_model)
         model_row.addWidget(load_model_btn)
-        model_row.addWidget(fit_btn)
+        model_row.addWidget(self.ghost_fit_button)
         model_row.addWidget(save_btn)
         model_row.addWidget(self.ghost_suppression_model_path_label, stretch=1)
         form.addRow("Model:", model_row)
@@ -2156,9 +2167,29 @@ class WindshieldWorkspace(QWidget):
         self.ghost_likelihood_label.setVisible(is_general)
         self.ghost_metrics_table.setVisible(not is_general)
         self.ghost_edge_metrics_table.setVisible(is_edge and not is_general)
+
+        # GhostField fit은 Point Source 결과에서만 허용한다(STEP 8
+        # semantic/safety fix 3-C번) - 버튼 자체를 비활성화해 실수로라도
+        # Edge/General 결과에서 fit을 시도하지 못하게 한다.
+        is_point_source = frame.mode == "point_source"
+        self.ghost_fit_button.setEnabled(is_point_source)
+        self.ghost_fit_button.setToolTip(
+            "Fit a GhostField from the current dataset evaluation."
+            if is_point_source else
+            "GhostField fitting requires 2D main/ghost point displacement.\n"
+            "Available only for Point Source mode."
+        )
         if is_general:
+            # Dataset aggregate는 반드시 mean_ghost_likelihood/median_ghost_likelihood/
+            # p95_ghost_likelihood를 쓴다 - mean_strength(2차 edge의 상대
+            # 강도)는 Likelihood(double-edge 패턴이 나타난 비율)와 다른
+            # 값이므로 여기 대신 쓰지 않는다(STEP 8 semantic fix 1번).
             self.ghost_likelihood_label.setText(
-                f"Ghost Likelihood: {frame.ghost_likelihood:.3f}  (mean over dataset: {_fmt(dataset_result.mean_strength)})\n"
+                "Ghost Likelihood\n"
+                f"Current Frame   {_fmt(frame.ghost_likelihood)}\n"
+                f"Dataset Mean    {_fmt(dataset_result.mean_ghost_likelihood)}\n"
+                f"Dataset Median  {_fmt(dataset_result.median_ghost_likelihood)}\n"
+                f"Dataset P95     {_fmt(dataset_result.p95_ghost_likelihood)}\n\n"
                 "No-reference heuristic - NOT Ground Truth."
             )
 
@@ -2252,6 +2283,15 @@ class WindshieldWorkspace(QWidget):
         취급되어 결과가 기존 constant fit과 동일하다."""
         if self._ghost_result is None or not self._ghost_result.per_frame:
             QMessageBox.warning(self, "Ghost Suppression", "먼저 Evaluation 탭에서 Ghost Evaluation을 실행하세요.")
+            return
+        if self._ghost_result.mode != "point_source":
+            # 버튼이 비활성화되어 있어야 정상이지만(3-C번), 방어적으로 한 번
+            # 더 확인한다 - backend guard(fit_ghost_field_from_dataset의
+            # ValueError)에만 기대지 않는다.
+            QMessageBox.warning(
+                self, "Ghost Suppression",
+                "GhostField는 Point Source Evaluation 결과에서만 fit할 수 있습니다.",
+            )
             return
         source_path = self._ghost_image_path or (
             self._ghost_dataset_image_paths(self._ghost_dataset_dir)[0] if self._ghost_dataset_dir else ""
@@ -2357,10 +2397,27 @@ class WindshieldWorkspace(QWidget):
             self._set_suppression_preview_image(self.ghost_suppression_output_image_label, supp.suppressed_image)
 
         before, after = evaln.before, evaln.after
-        self.ghost_suppression_metrics_table.setItem(0, 0, QTableWidgetItem(_fmt(before.mean_strength_ratio)))
-        self.ghost_suppression_metrics_table.setItem(0, 1, QTableWidgetItem(_fmt(after.mean_strength_ratio)))
-        self.ghost_suppression_metrics_table.setItem(1, 0, QTableWidgetItem(str(before.detection_count)))
-        self.ghost_suppression_metrics_table.setItem(1, 1, QTableWidgetItem(str(after.detection_count)))
+        # Mode별 primary metric을 절대 섞지 않는다(STEP 8 semantic fix
+        # 2번) - General(No-Reference) Likelihood는 Strength Reduction/
+        # Detection Reduction이 아니라 Likelihood Before/After/Reduction을
+        # primary로 보여준다. General mode의 detection_count는 heuristic
+        # profile 개수일 뿐 실제 ghost object 개수가 아니므로(사용자 스펙
+        # 2-F번) 그 행 대신 Likelihood Reduction을 보여준다.
+        is_general = before.mode == "general_likelihood"
+        if is_general:
+            self.ghost_suppression_metrics_table.setVerticalHeaderItem(0, QTableWidgetItem("Ghost Likelihood"))
+            self.ghost_suppression_metrics_table.setVerticalHeaderItem(1, QTableWidgetItem("Likelihood Reduction"))
+            self.ghost_suppression_metrics_table.setItem(0, 0, QTableWidgetItem(_fmt(before.ghost_likelihood)))
+            self.ghost_suppression_metrics_table.setItem(0, 1, QTableWidgetItem(_fmt(after.ghost_likelihood)))
+            self.ghost_suppression_metrics_table.setItem(1, 0, QTableWidgetItem("N/A"))
+            self.ghost_suppression_metrics_table.setItem(1, 1, QTableWidgetItem(_fmt(evaln.likelihood_reduction)))
+        else:
+            self.ghost_suppression_metrics_table.setVerticalHeaderItem(0, QTableWidgetItem("Ghost Strength Mean"))
+            self.ghost_suppression_metrics_table.setVerticalHeaderItem(1, QTableWidgetItem("Detection Count"))
+            self.ghost_suppression_metrics_table.setItem(0, 0, QTableWidgetItem(_fmt(before.mean_strength_ratio)))
+            self.ghost_suppression_metrics_table.setItem(0, 1, QTableWidgetItem(_fmt(after.mean_strength_ratio)))
+            self.ghost_suppression_metrics_table.setItem(1, 0, QTableWidgetItem(str(before.detection_count)))
+            self.ghost_suppression_metrics_table.setItem(1, 1, QTableWidgetItem(str(after.detection_count)))
         self.ghost_suppression_metrics_table.setItem(2, 0, QTableWidgetItem("N/A"))
         self.ghost_suppression_metrics_table.setItem(2, 1, QTableWidgetItem(f"{supp.mean_correction:.4f}"))
         self.ghost_suppression_metrics_table.setItem(3, 0, QTableWidgetItem("N/A"))

@@ -15,15 +15,17 @@ from calibration.windshield.ghost.config import GHOST_METRIC_VERSION, GHOST_MODE
 from calibration.windshield.ghost.edge_detector import extract_edge_profiles
 from calibration.windshield.ghost.evaluator import (
     evaluate_ghost_dataset,
+    evaluate_ghost_dataset_from_paths,
     evaluate_ghost_edge_target,
     evaluate_ghost_general_likelihood,
     evaluate_ghost_image,
     evaluate_ghost_point_source,
 )
-from calibration.windshield.ghost.point_detector import estimate_dominant_ghost_vector
+from calibration.windshield.ghost.point_detector import estimate_dominant_energy_ratio, estimate_dominant_ghost_vector
 from calibration.windshield.ghost.spatial_model import build_robust_spatial_map_from_detections, fill_empty_spatial_cells
 from calibration.windshield.ghost.suppression import (
     build_dense_fields,
+    build_suppression_evaluation,
     compute_reconstruction_metrics,
     fit_ghost_field_constant,
     fit_ghost_field_from_dataset,
@@ -59,12 +61,15 @@ __all__ = [
     "evaluate_ghost_general_likelihood",
     "evaluate_ghost_image",
     "evaluate_ghost_dataset",
+    "evaluate_ghost_dataset_from_paths",
     "extract_edge_profiles",
     "estimate_dominant_ghost_vector",
+    "estimate_dominant_energy_ratio",
     "build_robust_spatial_map_from_detections",
     "fill_empty_spatial_cells",
     "suppress_ghost",
     "build_dense_fields",
+    "build_suppression_evaluation",
     "fit_ghost_field_constant",
     "fit_ghost_field_from_spatial_map",
     "fit_ghost_field_from_dataset",

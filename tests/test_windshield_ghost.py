@@ -454,7 +454,7 @@ def test_single_led_fallback_matches_local_nearest_neighbor():
 def test_estimate_dominant_ghost_vector_returns_none_below_min_candidates():
     from calibration.windshield.ghost.point_detector import _CandidatePair
 
-    few = [_CandidatePair(main_idx=0, ghost_idx=1, dx=4.0, dy=-2.0, distance=4.47)]
+    few = [_CandidatePair(main_idx=0, ghost_idx=1, dx=4.0, dy=-2.0, distance=4.47, energy_ratio=0.15)]
     assert estimate_dominant_ghost_vector(few, min_consensus_candidates=3) is None
 
 
@@ -462,7 +462,7 @@ def test_estimate_dominant_ghost_vector_recovers_true_vector_from_noisy_candidat
     from calibration.windshield.ghost.point_detector import _CandidatePair
 
     candidates = [
-        _CandidatePair(main_idx=i, ghost_idx=i + 100, dx=dx, dy=dy, distance=float(np.hypot(dx, dy)))
+        _CandidatePair(main_idx=i, ghost_idx=i + 100, dx=dx, dy=dy, distance=float(np.hypot(dx, dy)), energy_ratio=0.15)
         for i, (dx, dy) in enumerate([(4.0, -2.0), (4.1, -1.9), (3.9, -2.1), (4.0, -2.0), (30.0, 30.0)])
     ]
     dominant = estimate_dominant_ghost_vector(candidates, consensus_radius_px=3.0, min_consensus_candidates=3)
@@ -781,3 +781,262 @@ def test_old_v1_style_ghost_project_payload_still_loads_without_crashing():
     restored_field = _ghost_field_from_dict(v1_field)
     assert restored_field.diagnostics is None
     assert restored_field.model_version == 1
+
+
+# ===========================================================================
+# STEP 8 semantic fix 1 - Dataset Ghost Likelihood aggregation
+# ===========================================================================
+
+def _general_likelihood_frame(pair_id: str, *, likelihood: float, strength: float) -> GhostEvaluationResult:
+    from calibration.windshield.ghost.types import GhostEvaluationResult
+
+    return GhostEvaluationResult(
+        success=True,
+        mode="general_likelihood",
+        pair_id=pair_id,
+        detection_count=3,
+        candidate_count=10,
+        mean_strength_ratio=strength,
+        ghost_likelihood=likelihood,
+        is_likelihood=True,
+    )
+
+
+def test_dataset_ghost_likelihood_aggregation_mean_median_p95():
+    frames = [
+        _general_likelihood_frame("f1", likelihood=0.1, strength=0.5),
+        _general_likelihood_frame("f2", likelihood=0.3, strength=0.5),
+        _general_likelihood_frame("f3", likelihood=0.8, strength=0.5),
+    ]
+    dataset_result = evaluate_ghost_dataset(frames, mode="general_likelihood")
+
+    assert dataset_result.mean_ghost_likelihood == pytest.approx(0.4, abs=1e-9)
+    assert dataset_result.median_ghost_likelihood == pytest.approx(0.3, abs=1e-9)
+    assert dataset_result.p95_ghost_likelihood == pytest.approx(np.percentile([0.1, 0.3, 0.8], 95), abs=1e-9)
+
+
+def test_dataset_ghost_likelihood_is_never_confused_with_strength():
+    """Ghost Likelihood(double-edge 패턴이 나타난 profile 비율)와 Ghost
+    Strength(검출된 secondary edge의 상대 강도)는 서로 다른 값이다(사용자
+    스펙 1-A번) - 우연히 같은 숫자가 아니라 애초에 다른 필드/다른 계산
+    경로에서 나와야 한다."""
+    frames = [
+        _general_likelihood_frame("f1", likelihood=0.70, strength=0.12),
+        _general_likelihood_frame("f2", likelihood=0.65, strength=0.11),
+    ]
+    dataset_result = evaluate_ghost_dataset(frames, mode="general_likelihood")
+
+    assert dataset_result.mean_ghost_likelihood != pytest.approx(dataset_result.mean_strength)
+    assert dataset_result.mean_ghost_likelihood == pytest.approx(0.675, abs=1e-9)
+    assert dataset_result.mean_strength == pytest.approx(0.115, abs=1e-9)
+
+
+def test_point_source_and_edge_target_datasets_never_populate_likelihood_aggregate():
+    clean = _two_dot_image()
+    sample = make_constant_offset_ghost_sample(clean, dx=4.0, dy=-2.0, alpha=0.15)
+    observed = np.clip(sample.observed, 0, 255).astype(np.uint8)
+    frame = evaluate_ghost_point_source(observed, _point_source_config(), pair_id="f1")
+    dataset_result = evaluate_ghost_dataset([frame], mode="point_source")
+    assert dataset_result.mean_ghost_likelihood is None
+    assert dataset_result.median_ghost_likelihood is None
+    assert dataset_result.p95_ghost_likelihood is None
+
+
+def test_real_general_likelihood_evaluation_end_to_end_dataset_aggregate():
+    """실제 이미지 파이프라인(evaluate_ghost_general_likelihood)에서 나온
+    per-frame 결과로도 dataset aggregate가 올바르게 계산되는지 확인한다."""
+    img_low = np.zeros((64, 64, 3), dtype=np.uint8)  # no edges at all -> likelihood ~= 0
+    img_high = np.zeros((64, 64, 3), dtype=np.uint8)
+    img_high[:, 20:] = 200
+    img_high[:, 26:] += 30  # 반복된 double-edge -> likelihood 높음
+
+    frame_low = evaluate_ghost_general_likelihood(img_low, pair_id="low")
+    frame_high = evaluate_ghost_general_likelihood(img_high, pair_id="high")
+    dataset_result = evaluate_ghost_dataset([frame_low, frame_high], mode="general_likelihood")
+
+    assert dataset_result.mean_ghost_likelihood is not None
+    assert frame_high.ghost_likelihood > frame_low.ghost_likelihood
+    assert dataset_result.mean_ghost_likelihood == pytest.approx(
+        (frame_low.ghost_likelihood + frame_high.ghost_likelihood) / 2.0, abs=1e-9,
+    )
+
+
+# ===========================================================================
+# STEP 8 semantic/safety fix 4 - Multi-frame Resolution Consistency Gate
+# ===========================================================================
+
+from calibration.windshield.ghost.evaluator import evaluate_ghost_dataset_from_paths
+
+
+def _write_dot_image(path: str, *, width: int, height: int, dx: float = 4.0, dy: float = -2.0, alpha: float = 0.2) -> None:
+    clean = np.zeros((height, width, 3), dtype=np.float32)
+    cv2.circle(clean, (width // 3, height // 2), 1, (255, 255, 255), -1)
+    cv2.circle(clean, (2 * width // 3, height // 2), 1, (255, 255, 255), -1)
+    sample = make_constant_offset_ghost_sample(clean, dx=dx, dy=dy, alpha=alpha)
+    observed = np.clip(sample.observed, 0, 255).astype(np.uint8)
+    cv2.imwrite(path, observed)
+
+
+def test_same_resolution_multi_frame_dataset_passes(tmp_path):
+    paths = []
+    for i in range(5):
+        p = tmp_path / f"frame_{i}.png"
+        _write_dot_image(str(p), width=320, height=240)
+        paths.append(str(p))
+
+    result = evaluate_ghost_dataset_from_paths(paths, _point_source_config(bright_source_threshold=20.0))
+    assert result.success
+    assert result.num_input_frames == 5
+    assert result.num_valid_frames == 5
+    assert result.image_width == 320
+    assert result.image_height == 240
+
+
+def test_mixed_resolution_dataset_is_rejected_with_descriptive_error(tmp_path):
+    p1 = tmp_path / "a.png"
+    p2 = tmp_path / "b.png"
+    p3 = tmp_path / "c.png"
+    _write_dot_image(str(p1), width=320, height=240)
+    _write_dot_image(str(p2), width=320, height=240)
+    _write_dot_image(str(p3), width=640, height=480)
+
+    with pytest.raises(ValueError) as excinfo:
+        evaluate_ghost_dataset_from_paths([str(p1), str(p2), str(p3)], _point_source_config(bright_source_threshold=20.0))
+
+    message = str(excinfo.value).lower()
+    assert "mixed" in message
+    assert "resolution" in message
+    assert "c.png" in str(excinfo.value)  # 어떤 파일이 문제인지 명시
+
+
+def test_mixed_resolution_does_not_silently_skip_or_resize(tmp_path):
+    """Mixed-resolution frame을 조용히 건너뛰거나 resize하지 않고 dataset
+    전체를 실패시켜야 한다(사용자 스펙 4-D번) - 예외 자체가 이를 보장한다
+    (부분 결과를 반환하지 않음)."""
+    p1 = tmp_path / "a.png"
+    p2 = tmp_path / "b.png"
+    _write_dot_image(str(p1), width=320, height=240)
+    _write_dot_image(str(p2), width=160, height=120)
+
+    with pytest.raises(ValueError):
+        evaluate_ghost_dataset_from_paths([str(p1), str(p2)], _point_source_config(bright_source_threshold=20.0))
+
+
+def test_resolution_gate_progress_callback_still_fires_before_failure(tmp_path):
+    p1 = tmp_path / "a.png"
+    p2 = tmp_path / "b.png"
+    _write_dot_image(str(p1), width=320, height=240)
+    _write_dot_image(str(p2), width=640, height=480)
+
+    messages = []
+    with pytest.raises(ValueError):
+        evaluate_ghost_dataset_from_paths(
+            [str(p1), str(p2)], _point_source_config(bright_source_threshold=20.0),
+            progress_callback=messages.append,
+        )
+    assert len(messages) >= 1
+
+
+# ===========================================================================
+# STEP 8 semantic/safety fix 5 - Pair Score energy-ratio consistency
+# ===========================================================================
+
+from calibration.windshield.ghost.point_detector import (
+    _CandidatePair,
+    _generate_candidate_pairs,
+    estimate_dominant_energy_ratio,
+)
+
+
+def test_bright_main_neighbour_trap_energy_consistency_prefers_real_ghost():
+    """사용자 스펙 5-G번, "Bright Main Neighbour Trap" - 이웃 Main이
+    ghost<main energy gate만 놓고 보면 candidate가 될 수 있지만, 실제
+    ghost와 energy ratio가 크게 다르면(dominant ratio~=0.15 vs
+    후보~=0.78) 걸러져야 한다. 이 시나리오는 vector_error만으로도 이미
+    구분되지만(진짜 ghost가 훨씬 dominant vector에 가까움), energy 항이
+    추가되어도 여전히 진짜 ghost가 선택되어야 한다(회귀 방지)."""
+    blobs = [
+        BrightBlob(x=10, y=10, energy=255, area_px=10),   # Main A
+        BrightBlob(x=14, y=8, energy=40, area_px=10),     # Ghost A (real, ratio ~0.157)
+        BrightBlob(x=12, y=10, energy=200, area_px=10),   # Main B - darker neighbour, ghost<main gate 통과
+        BrightBlob(x=16, y=8, energy=32, area_px=10),     # Ghost B (real, ratio ~0.16)
+        BrightBlob(x=60, y=60, energy=180, area_px=10),   # Main C - independent, far away
+        BrightBlob(x=64, y=58, energy=28, area_px=10),    # Ghost C (real, ratio ~0.156)
+    ]
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=60.0)
+    detected = {(round(d.main_x), round(d.main_y)): d for d in detections if d.detected}
+    assert (10, 10) in detected
+    main_a = detected[(10, 10)]
+    # Main A는 이웃 Main B(200,dist~2.83)가 아니라 자신의 진짜 Ghost A(dist~4.47)를 선택해야 한다.
+    assert main_a.ghost_x == pytest.approx(14.0)
+    assert main_a.ghost_y == pytest.approx(8.0)
+    assert main_a.strength_ratio < 0.3  # Main B(ratio 0.78)를 골랐다면 훨씬 컸을 것
+
+
+def test_unequal_main_brightness_yields_stable_dominant_energy_ratio():
+    """사용자 스펙 5-G번, Unequal Main Brightness - Main 밝기가 달라도
+    (255/210/180) 전부 ratio~=0.15라면 dominant energy ratio가
+    안정적으로 ~=0.15로 추정되어야 한다.
+
+    Main 위치를 불규칙한 간격(0, 47, 139)으로 둔다 - 균등 간격(0,50,100)을
+    쓰면 "Main0->Main1->Main2"/"Ghost0->Ghost1->Ghost2" 사슬이 우연히 진짜
+    ghost displacement와 무관한 자기들끼리의 공통 벡터 cluster를 만들어
+    (예: 둘 다 (50,0)) displacement consensus 자체를 왜곡시킨다 - 이는
+    테스트 fixture의 인위적 결함이지 알고리즘 버그가 아니므로, 불규칙
+    간격으로 그런 우연한 정렬을 피한다."""
+    blobs = [
+        BrightBlob(x=0, y=0, energy=255, area_px=10), BrightBlob(x=4, y=-2, energy=38, area_px=10),
+        BrightBlob(x=47, y=3, energy=210, area_px=10), BrightBlob(x=51, y=1, energy=31, area_px=10),
+        BrightBlob(x=139, y=-5, energy=180, area_px=10), BrightBlob(x=143, y=-7, energy=27, area_px=10),
+    ]
+    candidates = _generate_candidate_pairs(blobs, max_search_radius_px=60.0)
+    dominant = estimate_dominant_ghost_vector(candidates, min_consensus_candidates=3)
+    assert dominant is not None
+    dominant_ratio = estimate_dominant_energy_ratio(candidates, dominant)
+    assert dominant_ratio is not None
+    assert dominant_ratio == pytest.approx(0.15, abs=0.02)
+
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=60.0)
+    detected = [d for d in detections if d.detected]
+    assert len(detected) == 3
+    for det in detected:
+        assert det.pair_energy_residual is not None
+        assert det.pair_energy_residual < 0.05
+
+
+def test_energy_ratio_outlier_does_not_dominate_robust_median():
+    """사용자 스펙 5-G번, Energy outlier - 하나의 pair만 ratio가 크게
+    달라도(0.60) robust median(dominant vector inlier들의 median)이 크게
+    움직이면 안 된다."""
+    candidates = [
+        _CandidatePair(main_idx=i, ghost_idx=i + 100, dx=4.0, dy=-2.0, distance=4.47, energy_ratio=ratio)
+        for i, ratio in enumerate([0.15, 0.16, 0.14, 0.15, 0.60])
+    ]
+    dominant = estimate_dominant_ghost_vector(candidates, consensus_radius_px=3.0, min_consensus_candidates=3)
+    assert dominant is not None
+    ratio = estimate_dominant_energy_ratio(candidates, dominant, consensus_radius_px=3.0)
+    assert ratio is not None
+    assert ratio == pytest.approx(0.15, abs=0.02)  # median of [.15,.16,.14,.15,.60] with radius-based inliers
+
+
+def test_single_led_fallback_ignores_energy_ratio_term():
+    """Consensus가 없으면(candidate 부족) energy-ratio 항도 사용하지
+    않는다(사용자 스펙 5-E번) - 순수 거리 기반 fallback이 그대로 동작해야
+    한다(기존 동작 유지, 회귀 없음)."""
+    blobs = [
+        BrightBlob(x=100.0, y=100.0, energy=1000.0, area_px=10),
+        BrightBlob(x=104.0, y=98.0, energy=150.0, area_px=10),
+    ]
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=60.0, min_consensus_candidates=3)
+    detected = [d for d in detections if d.detected]
+    assert len(detected) == 1
+    assert detected[0].offset_x_px == pytest.approx(4.0)
+    assert detected[0].offset_y_px == pytest.approx(-2.0)
+    assert detected[0].pair_energy_residual is None  # fallback이므로 energy 항 자체가 정의되지 않음
+
+
+def test_estimate_dominant_energy_ratio_returns_none_without_dominant_vector():
+    candidates = [
+        _CandidatePair(main_idx=0, ghost_idx=1, dx=4.0, dy=-2.0, distance=4.47, energy_ratio=0.15),
+    ]
+    assert estimate_dominant_energy_ratio(candidates, None) is None

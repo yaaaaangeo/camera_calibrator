@@ -10,23 +10,24 @@ STEP 8A - Ghost Evaluation을 위한 QThread worker.
 
 STEP 8 stabilization 2/3번 - Point-source/Edge-target/General-likelihood
 세 모드 모두 공용 dispatcher(`evaluate_ghost_image`)를 통해 실행한다(중복
-if/else 제거, 사용자 스펙 8번). 이미지 파일 로딩 + 1D edge profile 추출 +
-평가까지 전부 이 worker(QThread) 안에서 수행한다 - Qt main thread에는
-파일 선택/설정 읽기/결과 표시만 남긴다(사용자 스펙 2-E번). 여러 프레임을
-처리할 때는 "Evaluating ghost i/N" 형태로 progress를 보고한다(사용자 스펙
-3-B번).
+if/else 제거, 사용자 스펙 8번).
+
+이 worker 자체는 아주 얇다 - 파일 로딩 + resolution consistency gate(STEP
+8 semantic/safety fix 4번, 서로 다른 해상도 프레임을 섞지 않는다) + 평가 +
+집계 전체를 `evaluate_ghost_dataset_from_paths()`(Qt 비의존 순수 함수)에
+위임한다. Qt main thread에는 파일 선택/설정 읽기/결과 표시만 남긴다(사용자
+스펙 2-E번).
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-import cv2
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from calibration.types import CameraModelType
-from calibration.windshield.ghost.evaluator import evaluate_ghost_dataset, evaluate_ghost_image
+from calibration.windshield.ghost.evaluator import evaluate_ghost_dataset_from_paths
 from calibration.windshield.ghost.types import GhostEvaluationConfig
 
 
@@ -56,22 +57,14 @@ class GhostEvaluationWorker(QObject):
 
     def run(self) -> None:
         try:
-            n = len(self._image_paths)
-            per_frame = []
-            for i, (path, frame_id) in enumerate(zip(self._image_paths, self._frame_ids)):
-                self.progress.emit(f"Evaluating ghost {i + 1}/{n}...")
-                image = cv2.imread(path, cv2.IMREAD_COLOR)
-                if image is None:
-                    continue
-                res = evaluate_ghost_image(
-                    image, self._config,
-                    camera_matrix=self._camera_matrix, distortion=self._distortion, camera_model=self._camera_model,
-                    pair_id=frame_id,
-                )
-                per_frame.append(res)
-            dataset_result = evaluate_ghost_dataset(per_frame, mode=self._config.mode)
+            dataset_result = evaluate_ghost_dataset_from_paths(
+                self._image_paths, self._config,
+                frame_ids=self._frame_ids,
+                camera_matrix=self._camera_matrix, distortion=self._distortion, camera_model=self._camera_model,
+                progress_callback=self.progress.emit,
+            )
             self.result_ready.emit(dataset_result)
-        except Exception as e:  # noqa: BLE001 - shown directly in the UI
+        except Exception as e:  # noqa: BLE001 - shown directly in the UI (includes mixed-resolution gate messages)
             self.error.emit(f"Ghost evaluation failed: {e}")
         finally:
             self.finished.emit()

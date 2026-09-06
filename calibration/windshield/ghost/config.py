@@ -39,6 +39,18 @@ DEFAULT_PAIRING_CONSENSUS_RADIUS_PX = 3.0   # 이 반경 안의 displacement vec
 DEFAULT_MIN_CONSENSUS_CANDIDATES = 3        # 이보다 candidate pair가 적으면 global consensus를 신뢰하지 않고
                                              # local nearest-neighbor(+ghost<main energy 제약) fallback을 쓴다
 
+# Pair score의 energy-ratio consistency 항(STEP 8 semantic/safety fix
+# 5번) - "촘촘한 LED에서 약간 어두운 이웃 Main"이 순수 displacement
+# consensus만으로는 걸러지지 않는 경우를 막기 위해, ghost/main energy
+# ratio가 dataset 전체의 dominant ratio와 얼마나 다른지도 점수에 반영한다.
+# 우선순위는 항상 displacement > energy > 단순 거리이며, 세 항 모두
+# 서로 다른 단위(px, px, ratio)라 그대로 더하면 안 되므로 각 항을
+# 정규화(consensus_radius_px, max_search_radius_px 기준)한 뒤 더한다.
+# 초기 default일 뿐 실데이터로 재조정 필요.
+PAIR_SCORE_WEIGHT_VECTOR = 1.0
+PAIR_SCORE_WEIGHT_DISTANCE = 0.15
+PAIR_SCORE_WEIGHT_ENERGY = 0.5
+
 # ---------------------------------------------------------------------------
 # Edge-target detection
 # ---------------------------------------------------------------------------

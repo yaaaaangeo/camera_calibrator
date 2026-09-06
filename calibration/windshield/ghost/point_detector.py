@@ -39,6 +39,9 @@ from calibration.windshield.ghost.config import (
     DEFAULT_MIN_CONSENSUS_CANDIDATES,
     DEFAULT_MIN_PEAK_DISTANCE_PX,
     DEFAULT_PAIRING_CONSENSUS_RADIUS_PX,
+    PAIR_SCORE_WEIGHT_DISTANCE,
+    PAIR_SCORE_WEIGHT_ENERGY,
+    PAIR_SCORE_WEIGHT_VECTOR,
 )
 from calibration.windshield.ghost.types import GhostPointDetection
 
@@ -155,6 +158,7 @@ class _CandidatePair:
     dx: float
     dy: float
     distance: float
+    energy_ratio: float
 
 
 def _generate_candidate_pairs(blobs: list[BrightBlob], max_search_radius_px: float) -> list[_CandidatePair]:
@@ -170,7 +174,10 @@ def _generate_candidate_pairs(blobs: list[BrightBlob], max_search_radius_px: flo
             dy = ghost.y - main.y
             dist = math.hypot(dx, dy)
             if dist <= max_search_radius_px:
-                candidates.append(_CandidatePair(main_idx=i, ghost_idx=j, dx=dx, dy=dy, distance=dist))
+                energy_ratio = ghost.energy / max(main.energy, _ENERGY_EPS)
+                candidates.append(
+                    _CandidatePair(main_idx=i, ghost_idx=j, dx=dx, dy=dy, distance=dist, energy_ratio=energy_ratio)
+                )
     return candidates
 
 
@@ -215,6 +222,27 @@ def estimate_dominant_ghost_vector(
     return float(refined[0]), float(refined[1]), int(inliers.shape[0])
 
 
+def estimate_dominant_energy_ratio(
+    candidates: list[_CandidatePair],
+    dominant_vector: Optional[tuple[float, float, int]],
+    *,
+    consensus_radius_px: float = DEFAULT_PAIRING_CONSENSUS_RADIUS_PX,
+) -> Optional[float]:
+    """Displacement consensus에 쓰인 것과 **같은 inlier 집합**에서 robust
+    median energy ratio를 구한다(사용자 스펙 5-B번, "Dominant displacement
+    cluster의 inlier pair들로 median energy ratio를 구한다") - 별도의
+    독립적인 clustering을 하지 않는다. `dominant_vector`가 없으면(=
+    displacement consensus 자체가 없으면) 에너지 비율도 신뢰할 수 없으므로
+    `None`을 반환한다(사용자 스펙 5-E번, "consensus가 있을 때만 사용")."""
+    if dominant_vector is None:
+        return None
+    ddx, ddy, _support = dominant_vector
+    inliers = [c for c in candidates if math.hypot(c.dx - ddx, c.dy - ddy) <= consensus_radius_px]
+    if not inliers:
+        return None
+    return float(np.median([c.energy_ratio for c in inliers]))
+
+
 def pair_main_and_ghost_blobs(
     blobs: list[BrightBlob],
     *,
@@ -227,16 +255,27 @@ def pair_main_and_ghost_blobs(
 
     STEP 8 stabilization 1번 - 순수 거리 기반 nearest-neighbor 대신, 먼저
     전체 candidate에서 dominant ghost displacement vector를 추정하고
-    (`estimate_dominant_ghost_vector`), 각 Main에 대해
+    (`estimate_dominant_ghost_vector`), 각 Main에 대해 정규화된 3-항
+    score(사용자 스펙 5-C번)가 가장 작은 후보를 Ghost로 선택한다:
 
-        score = vector_error(candidate, dominant) + 0.1 * distance
+        vector_term   = vector_error / consensus_radius_px
+        distance_term = distance / max_search_radius_px
+        energy_term   = |candidate.energy_ratio - dominant_energy_ratio|
+        score = W_VECTOR*vector_term + W_DISTANCE*distance_term + W_ENERGY*energy_term
 
-    가 가장 작은 후보를 Ghost로 선택한다 - 촘촘한 LED array에서 이웃
-    Main이 실제 Ghost보다 더 가깝더라도(순수 거리로는 이웃 Main이 이기는
-    경우) displacement vector가 dominant와 맞지 않으면 걸러진다. Dominant
-    vector를 신뢰할 수 없으면(candidate 부족) 기존 순수 거리 기반
-    nearest-neighbor로 fallback한다(사용자 스펙 1-E번, 1-LED 케이스가
-    여기 해당).
+    세 항은 단위가 달라(px, px, ratio) 그대로 더치지 않고 각각
+    `consensus_radius_px`/`max_search_radius_px` 기준으로 정규화한 뒤
+    더한다. 우선순위는 displacement > energy > 단순 거리이며(사용자 스펙
+    5-D번), 기본 weight(`PAIR_SCORE_WEIGHT_VECTOR=1.0` >
+    `PAIR_SCORE_WEIGHT_ENERGY=0.5` > `PAIR_SCORE_WEIGHT_DISTANCE=0.15`)가
+    이를 반영한다. 촘촘한 LED array에서 이웃 Main이 실제 Ghost보다
+    거리상으로는 더 가깝거나 energy gate(ghost<main)를 우연히 만족하더라도,
+    displacement/energy-ratio가 dominant와 맞지 않으면 걸러진다.
+
+    Energy-ratio 항은 displacement consensus가 있을 때만 사용한다(사용자
+    스펙 5-E번) - dominant vector를 신뢰할 수 없으면(candidate 부족)
+    energy-ratio도 신뢰할 근거가 없으므로, score는 순수 거리로 fallback한다
+    (사용자 스펙 1-E번, 1-LED 케이스가 여기 해당).
 
     반경 안에 후보가 없으면 그 Main은 ghost 없음(`detected=False`)으로
     남는다. 이미 다른 Main의 Ghost로 소비된 blob은 재사용하지 않는다
@@ -245,6 +284,9 @@ def pair_main_and_ghost_blobs(
     candidates = _generate_candidate_pairs(blobs, max_search_radius_px)
     dominant = estimate_dominant_ghost_vector(
         candidates, consensus_radius_px=consensus_radius_px, min_consensus_candidates=min_consensus_candidates,
+    )
+    dominant_energy_ratio = estimate_dominant_energy_ratio(
+        candidates, dominant, consensus_radius_px=consensus_radius_px,
     )
 
     # Main별 candidate lookup - O(n^2) 재계산을 피한다.
@@ -265,20 +307,35 @@ def pair_main_and_ghost_blobs(
         best_j = -1
         best_score = None
         best_residual: Optional[float] = None
+        best_energy_residual: Optional[float] = None
         for c in candidates_by_main.get(i, []):
             if consumed[c.ghost_idx]:
                 continue
             if dominant is not None:
                 ddx, ddy, _support = dominant
                 vector_error = math.hypot(c.dx - ddx, c.dy - ddy)
-                score = vector_error + 0.1 * c.distance
+                vector_term = vector_error / max(consensus_radius_px, _ENERGY_EPS)
+                distance_term = c.distance / max(max_search_radius_px, _ENERGY_EPS)
+                if dominant_energy_ratio is not None:
+                    energy_residual = abs(c.energy_ratio - dominant_energy_ratio)
+                    energy_term = energy_residual
+                else:
+                    energy_residual = None
+                    energy_term = 0.0
+                score = (
+                    PAIR_SCORE_WEIGHT_VECTOR * vector_term
+                    + PAIR_SCORE_WEIGHT_DISTANCE * distance_term
+                    + PAIR_SCORE_WEIGHT_ENERGY * energy_term
+                )
             else:
                 vector_error = None
+                energy_residual = None
                 score = c.distance
             if best_score is None or score < best_score:
                 best_score = score
                 best_j = c.ghost_idx
                 best_residual = vector_error
+                best_energy_residual = energy_residual
 
         if best_j < 0:
             detections.append(GhostPointDetection(main_x=main.x, main_y=main.y, detected=False))
@@ -302,6 +359,8 @@ def pair_main_and_ghost_blobs(
                 strength_ratio=strength_ratio,
                 detected=True,
                 pair_residual_px=best_residual,
+                pair_energy_ratio=strength_ratio,
+                pair_energy_residual=best_energy_residual,
             )
         )
 

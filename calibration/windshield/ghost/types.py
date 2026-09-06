@@ -75,6 +75,13 @@ class GhostPointDetection:
     # 얼마나 떨어져 있는지(px). consensus를 아예 쓰지 못한 fallback pairing
     # (candidate가 너무 적을 때)에서는 None으로 남는다.
     pair_residual_px: Optional[float] = None
+    # Energy-ratio consistency(STEP 8 semantic/safety fix 5번) - 이 pair의
+    # ghost.energy/main.energy와 dataset 전체의 dominant energy ratio가
+    # 얼마나 떨어져 있는지. Displacement consensus와 마찬가지로 global
+    # consensus가 없으면(fallback pairing) None으로 남는다. 진단 전용이며
+    # score 계산 자체는 point_detector.py 안에서 끝난다.
+    pair_energy_ratio: Optional[float] = None
+    pair_energy_residual: Optional[float] = None
 
 
 @dataclass
@@ -159,7 +166,23 @@ class GhostDatasetResult:
     p95_distance_px: Optional[float] = None
     mean_strength: Optional[float] = None
     p95_strength: Optional[float] = None
+    # General(No-Reference) Likelihood mode 전용 dataset aggregate(STEP 8
+    # semantic fix 1번) - `mean_strength`/`p95_strength`(secondary/primary
+    # edge 강도 비율)와 의미가 다르다: Likelihood는 "double-edge 패턴이
+    # 나타난 profile/region의 비율"이고, Strength는 "검출된 secondary
+    # edge가 얼마나 강한지"다. Point Source/Edge Target 모드에서는 항상
+    # None으로 남는다 - mean_strength를 Likelihood 대신 표시하지 않는다.
+    mean_ghost_likelihood: Optional[float] = None
+    median_ghost_likelihood: Optional[float] = None
+    p95_ghost_likelihood: Optional[float] = None
     worst_frame_id: Optional[str] = None
+    # Multi-frame resolution consistency gate 진단(STEP 8 semantic/safety
+    # fix 4-E번) - 필수는 아니지만 어떤 해상도 기준으로 dataset이 평가됐고
+    # 몇 프레임이 실제로 쓰였는지 남긴다.
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+    num_input_frames: int = 0
+    num_valid_frames: int = 0
     success: bool = True
     warning_message: Optional[str] = None
     error_message: Optional[str] = None
@@ -239,8 +262,16 @@ class GhostSuppressionEvaluation:
     before: GhostEvaluationResult
     after: GhostEvaluationResult
 
+    # Point Source/Edge Target 전용(STEP 8 semantic fix 2번) - General
+    # Likelihood 모드에서는 항상 None으로 남는다.
     strength_reduction: Optional[float] = None
     detection_reduction: Optional[float] = None
+
+    # General(No-Reference) Likelihood 모드 전용 primary metric - Point
+    # Source/Edge Target에서는 항상 None으로 남는다. `before`/`after`에
+    # 이미 `ghost_likelihood`가 있으므로 별도로 before/after 값 자체를
+    # 중복 저장하지 않고 차이만 저장한다.
+    likelihood_reduction: Optional[float] = None
 
     over_suppression_score: Optional[float] = None
 

@@ -117,12 +117,24 @@ def test_evaluation_worker_uses_shared_dispatcher_not_manual_branching():
 
 
 def test_evaluation_worker_reads_images_inside_worker_not_ui_thread():
-    """이미지 파일 로딩(cv2.imread)이 Worker.run() 안에서 일어나야 한다
-    (사용자 스펙 2-E번, Qt main thread에는 파일 선택/설정 읽기만 남긴다)."""
-    source = _EVAL_WORKER.read_text(encoding="utf-8")
-    assert "def run(self)" in source
-    run_body = source.split("def run(self)")[1]
-    assert "cv2.imread" in run_body
+    """이미지 파일 로딩(cv2.imread)이 Qt main thread가 아니라 Worker.run()
+    이 호출하는 파이프라인 안에서 일어나야 한다(사용자 스펙 2-E번, Qt main
+    thread에는 파일 선택/설정 읽기만 남긴다). Worker.run()은 파일 경로
+    리스트를 그대로 `evaluate_ghost_dataset_from_paths()`(Qt 비의존 순수
+    함수)에 위임하고, 그 함수가 실제 `cv2.imread`를 수행한다."""
+    worker_source = _EVAL_WORKER.read_text(encoding="utf-8")
+    assert "def run(self)" in worker_source
+    run_body = worker_source.split("def run(self)")[1]
+    assert "evaluate_ghost_dataset_from_paths(" in run_body
+
+    evaluator_source = (_ROOT / "calibration" / "windshield" / "ghost" / "evaluator.py").read_text(encoding="utf-8")
+    pipeline_body = evaluator_source.split("def evaluate_ghost_dataset_from_paths(")[1]
+    assert "cv2.imread" in pipeline_body
+
+    # UI 핸들러(_on_run_ghost_evaluation)는 이미지를 직접 읽지 않고 경로만 넘긴다.
+    workspace_source = _WORKSPACE.read_text(encoding="utf-8")
+    handler_body = workspace_source.split("def _on_run_ghost_evaluation(self)")[1].split("\n    def ")[0]
+    assert "cv2.imread" not in handler_body
 
 
 # ===========================================================================
@@ -278,3 +290,78 @@ def test_ghost_ci_workflow_is_separate_from_other_workflows():
             continue
         source = path.read_text(encoding="utf-8")
         assert "test_windshield_ghost" not in source
+
+
+# ===========================================================================
+# STEP 8 semantic/safety fix 1 - General Likelihood dataset UI
+# ===========================================================================
+
+def test_general_likelihood_ui_shows_dataset_mean_median_p95_not_mean_strength():
+    """General mode label이 `dataset_result.mean_strength`가 아니라
+    `mean_ghost_likelihood`/`median_ghost_likelihood`/`p95_ghost_likelihood`
+    를 써야 한다(사용자 스펙 1번, "Likelihood != Strength")."""
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    likelihood_section = source.split("if is_general:")[1].split("\n\n        values = [")[0]
+    assert "dataset_result.mean_ghost_likelihood" in likelihood_section
+    assert "dataset_result.median_ghost_likelihood" in likelihood_section
+    assert "dataset_result.p95_ghost_likelihood" in likelihood_section
+    assert "dataset_result.mean_strength" not in likelihood_section
+
+
+def test_forbidden_likelihood_naming_never_used():
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    for forbidden in ("Ghost Accuracy", "Ghost Probability", "Ghost Confidence", "Ghost Ground Truth Score"):
+        assert forbidden not in source
+
+
+# ===========================================================================
+# STEP 8 semantic fix 2 - General Suppression UI shows Likelihood, not Strength
+# ===========================================================================
+
+def test_suppression_ui_shows_likelihood_reduction_for_general_mode():
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "Likelihood Reduction" in source
+    assert "evaln.likelihood_reduction" in source
+    assert "before.ghost_likelihood" in source
+    assert "after.ghost_likelihood" in source
+
+
+def test_suppression_worker_delegates_mode_split_to_pure_function():
+    """Mode별 strength_reduction/likelihood_reduction 분기 로직은
+    `build_suppression_evaluation()`(Qt 비의존)에 있고, worker는 그 함수를
+    호출하기만 해야 한다 - PySide6 없이 로직을 직접 테스트할 수 있게
+    한다."""
+    source = _SUPPRESSION_WORKER.read_text(encoding="utf-8")
+    assert "build_suppression_evaluation(" in source
+
+
+# ===========================================================================
+# STEP 8 semantic/safety fix 3 - GhostField Fit guard (UI)
+# ===========================================================================
+
+def test_ghost_fit_button_is_disabled_by_default_and_gated_by_mode():
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "self.ghost_fit_button" in source
+    assert "self.ghost_fit_button.setEnabled(False)" in source
+    assert "self.ghost_fit_button.setEnabled(is_point_source)" in source
+
+
+def test_ghost_fit_button_has_explanatory_tooltip():
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "setToolTip" in source
+    assert "2D main/ghost point displacement" in source
+
+
+def test_fit_handler_defensively_rejects_non_point_source_mode():
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    handler_body = source.split("def _on_fit_ghost_model_from_evaluation(self)")[1].split("\n    def ")[0]
+    assert 'self._ghost_result.mode != "point_source"' in handler_body
+
+
+# ===========================================================================
+# STEP 8 semantic/safety fix 4 - Resolution gate UI wiring
+# ===========================================================================
+
+def test_evaluation_worker_calls_pure_dataset_from_paths_pipeline():
+    source = _EVAL_WORKER.read_text(encoding="utf-8")
+    assert "evaluate_ghost_dataset_from_paths" in source

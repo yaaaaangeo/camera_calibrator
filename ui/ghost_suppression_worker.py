@@ -15,6 +15,15 @@ STEP 8 stabilization 8번 - Before/After 평가를 `evaluate_ghost_point_source`
 (`evaluate_ghost_image`)를 쓴다 - Point Source/Edge Target/General
 Likelihood 어떤 모드로 Evaluation을 돌렸든 Suppression Before/After도
 같은 mode-aware evaluator로 비교한다.
+
+STEP 8 semantic fix 2번 - Suppression summary는 mode에 따라 의미가 다른
+필드를 채운다: Point Source/Edge Target은 `strength_reduction`(+
+`detection_reduction`)을 primary metric으로 쓰고, General(No-Reference)
+Likelihood는 `likelihood_reduction`(= before.ghost_likelihood -
+after.ghost_likelihood)을 쓴다. 두 그룹을 절대 같은 필드에 섞지 않는다 -
+이 mode 분기 로직 자체는 `suppression.py::build_suppression_evaluation()`
+(Qt 비의존 순수 함수)에 있고, 이 worker는 그 함수를 호출하기만 한다 -
+PySide6 없이도 pytest로 mode별 분기를 직접 검증할 수 있다.
 """
 
 from __future__ import annotations
@@ -23,8 +32,8 @@ import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from calibration.windshield.ghost.evaluator import evaluate_ghost_image
-from calibration.windshield.ghost.suppression import load_ghost_model, suppress_ghost
-from calibration.windshield.ghost.types import GhostEvaluationConfig, GhostField, GhostSuppressionEvaluation
+from calibration.windshield.ghost.suppression import build_suppression_evaluation, load_ghost_model, suppress_ghost
+from calibration.windshield.ghost.types import GhostEvaluationConfig, GhostField
 
 
 class GhostSuppressionWorker(QObject):
@@ -77,26 +86,7 @@ class GhostSuppressionWorker(QObject):
             else:
                 after = before
 
-            strength_reduction = None
-            detection_reduction = None
-            if before.mean_strength_ratio is not None and after.mean_strength_ratio is not None:
-                strength_reduction = before.mean_strength_ratio - after.mean_strength_ratio
-            if before.detection_count is not None and after.detection_count is not None:
-                detection_reduction = before.detection_count - after.detection_count
-
-            result = GhostSuppressionEvaluation(
-                before=before,
-                after=after,
-                strength_reduction=strength_reduction,
-                detection_reduction=detection_reduction,
-                # Detail Retention/Over-Suppression(STEP 8 stabilization 7번)
-                # - Ghost Strength Reduction만으로는 성공이 아니므로 항상
-                # 함께 채운다.
-                over_suppression_score=supp.over_suppression_score,
-                success=supp.success,
-                warning_message=supp.warning_message,
-                error_message=supp.error_message,
-            )
+            result = build_suppression_evaluation(before, after, supp)
             self.result_ready.emit((supp, result))
         except FileNotFoundError as e:
             self.error.emit(f"Ghost model file not found: {e}")

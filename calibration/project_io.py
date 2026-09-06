@@ -831,6 +831,8 @@ def _ghost_point_detection_from_dict(d) -> GhostPointDetection:
         strength_ratio=d.get("strength_ratio"),
         detected=d.get("detected", False),
         pair_residual_px=d.get("pair_residual_px"),
+        pair_energy_ratio=d.get("pair_energy_ratio"),
+        pair_energy_residual=d.get("pair_energy_residual"),
     )
 
 
@@ -901,7 +903,14 @@ def _ghost_dataset_result_from_dict(d) -> GhostDatasetResult:
         p95_distance_px=d.get("p95_distance_px"),
         mean_strength=d.get("mean_strength"),
         p95_strength=d.get("p95_strength"),
+        mean_ghost_likelihood=d.get("mean_ghost_likelihood"),
+        median_ghost_likelihood=d.get("median_ghost_likelihood"),
+        p95_ghost_likelihood=d.get("p95_ghost_likelihood"),
         worst_frame_id=d.get("worst_frame_id"),
+        image_width=d.get("image_width"),
+        image_height=d.get("image_height"),
+        num_input_frames=d.get("num_input_frames", 0),
+        num_valid_frames=d.get("num_valid_frames", 0),
         success=d.get("success", True),
         warning_message=d.get("warning_message"),
         error_message=d.get("error_message"),

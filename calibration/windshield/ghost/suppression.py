@@ -38,10 +38,12 @@ from calibration.windshield.ghost.spatial_model import build_robust_spatial_map_
 from calibration.windshield.ghost.synthetic import warp_shift_field
 from calibration.windshield.ghost.types import (
     GhostDatasetResult,
+    GhostEvaluationResult,
     GhostField,
     GhostFieldDiagnostics,
     GhostReconstructionMetrics,
     GhostSpatialCell,
+    GhostSuppressionEvaluation,
     GhostSuppressionResult,
 )
 
@@ -279,7 +281,33 @@ def fit_ghost_field_from_dataset(
 
     빈 cell은 `fill_empty_spatial_cells()`(인접 valid cell -> 안 되면
     그대로)로 채운다. `GhostFieldDiagnostics`에 dataset 크기/coverage
-    정보를 함께 기록한다."""
+    정보를 함께 기록한다.
+
+    STEP 8 semantic/safety fix 3번 - GhostField fit은 Point Source 데이터
+    셋만 허용한다. Edge Target은 1D edge-normal scalar offset만 갖고 있어
+    2D dx(u,v)/dy(u,v) field를 만들 수 없고, General Likelihood는 애초에
+    displacement 자체를 측정하지 않는 heuristic이다(Ground Truth도 아님).
+    잘못된 mode로 조용히 0으로 채워진 field를 만드는 대신 명시적으로
+    거부한다."""
+    if dataset_result.mode != "point_source":
+        raise ValueError(
+            "GhostField fitting currently supports point_source datasets only "
+            f"(got mode={dataset_result.mode!r}). Edge Target only measures a 1D "
+            "edge-normal offset (no 2D displacement field), and General Likelihood "
+            "is a no-reference heuristic, not a displacement measurement."
+        )
+
+    # STEP 8 semantic/safety fix 4-F번 - Worker의 mixed-resolution gate만
+    # 믿지 않고 여기서도 가볍게 재확인한다(중복 전체 스캔은 하지 않는다 -
+    # dataset_result.image_width/height는 이미 그 gate를 통과한 단일 값).
+    if dataset_result.image_width is not None and dataset_result.image_height is not None:
+        if abs(dataset_result.image_width - image_width) > 1e-6 or abs(dataset_result.image_height - image_height) > 1e-6:
+            raise ValueError(
+                "GhostField fit image size mismatch: dataset was evaluated at "
+                f"{dataset_result.image_width}x{dataset_result.image_height}, but fit was "
+                f"requested for {image_width}x{image_height}."
+            )
+
     all_detections = [det for frame in dataset_result.per_frame for det in frame.detections]
 
     cells = build_robust_spatial_map_from_detections(
@@ -366,4 +394,46 @@ def load_ghost_model(path: str) -> GhostField:
         image_height=float(data["image_height"]),
         model_version=int(data.get("ghost_model_version", GHOST_MODEL_VERSION)),
         diagnostics=diagnostics,
+    )
+
+
+def build_suppression_evaluation(
+    before: GhostEvaluationResult, after: GhostEvaluationResult, supp: GhostSuppressionResult,
+) -> GhostSuppressionEvaluation:
+    """Before/After 평가 결과와 `suppress_ghost()` 결과를 하나의
+    `GhostSuppressionEvaluation`으로 합친다(STEP 8 semantic fix 2번).
+    `ui/ghost_suppression_worker.py`가 이 함수 하나만 호출하도록 해서,
+    mode별 metric 분리 로직을 Qt 없이도 pytest로 직접 검증할 수 있게 한다.
+
+    General(No-Reference) Likelihood 모드는 primary metric이
+    `likelihood_reduction`(before.ghost_likelihood - after.ghost_likelihood)
+    이고, Point Source/Edge Target은 `strength_reduction`/
+    `detection_reduction`이다 - 두 그룹을 절대 같은 필드에 섞지 않는다:
+    General 모드에서는 strength_reduction/detection_reduction이 항상
+    `None`으로, Point/Edge에서는 likelihood_reduction이 항상 `None`으로
+    남는다. General 모드의 detection_count는 heuristic profile 개수일
+    뿐(실제 ghost object 개수가 아님) primary metric으로 쓰지 않는다."""
+    strength_reduction = None
+    detection_reduction = None
+    likelihood_reduction = None
+
+    if before.mode == "general_likelihood":
+        if before.ghost_likelihood is not None and after.ghost_likelihood is not None:
+            likelihood_reduction = before.ghost_likelihood - after.ghost_likelihood
+    else:
+        if before.mean_strength_ratio is not None and after.mean_strength_ratio is not None:
+            strength_reduction = before.mean_strength_ratio - after.mean_strength_ratio
+        if before.detection_count is not None and after.detection_count is not None:
+            detection_reduction = before.detection_count - after.detection_count
+
+    return GhostSuppressionEvaluation(
+        before=before,
+        after=after,
+        strength_reduction=strength_reduction,
+        detection_reduction=detection_reduction,
+        likelihood_reduction=likelihood_reduction,
+        over_suppression_score=supp.over_suppression_score,
+        success=supp.success,
+        warning_message=supp.warning_message,
+        error_message=supp.error_message,
     )
