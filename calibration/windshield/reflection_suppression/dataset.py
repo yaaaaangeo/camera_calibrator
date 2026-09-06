@@ -19,10 +19,12 @@ train/test에 흩뿌리는 것을 방지).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
+import yaml
 
 from calibration.windshield.reflection.alignment import align_reference_to_normal
 from calibration.windshield.reflection.metrics import normalize_reflection_map, to_luminance
@@ -115,3 +117,40 @@ def scene_level_split(
         else:
             train.append(pair)
     return train, val, test
+
+
+def load_manifest(path: str) -> tuple[list[SuppressionPair], set[str], set[str]]:
+    """실제 paired dataset을 위한 공식 학습 entrypoint(안정화 라운드 항목
+    3)가 읽는 YAML manifest. 스키마:
+
+        pairs:
+          - pair_id: p001
+            scene_id: scene01
+            normal: path/to/normal.png       # manifest 파일 기준 상대경로 허용
+            reference: path/to/reference.png
+        validation_scenes: [scene07]
+        test_scenes: [scene08, scene09]
+
+    상대경로는 manifest 파일이 있는 디렉터리를 기준으로 해석한다."""
+    manifest_path = Path(path)
+    with open(manifest_path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    manifest_dir = manifest_path.parent
+
+    def _resolve(p: str) -> str:
+        candidate = Path(p)
+        return str(candidate if candidate.is_absolute() else manifest_dir / candidate)
+
+    pairs = []
+    for entry in data.get("pairs", []) or []:
+        pairs.append(SuppressionPair(
+            normal_image_path=_resolve(entry["normal"]),
+            reference_image_path=_resolve(entry["reference"]),
+            pair_id=str(entry.get("pair_id", "")),
+            scene_id=str(entry.get("scene_id", "")),
+        ))
+
+    val_scene_ids = {str(s) for s in (data.get("validation_scenes") or [])}
+    test_scene_ids = {str(s) for s in (data.get("test_scenes") or [])}
+    return pairs, val_scene_ids, test_scene_ids

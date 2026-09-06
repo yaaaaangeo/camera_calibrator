@@ -33,13 +33,29 @@ class ReflectionSuppressionResult:
     alpha_map: Optional[np.ndarray] = None              # float32, HxW, [0,1]
 
     suppression_strength: float = 0.0
+
+    # Alpha는 "reflection contribution/mask strength"이지 신경망의 epistemic
+    # confidence가 아니다(안정화 라운드 항목 7) - mean 하나만으로는 화면
+    # 일부에만 있는 강한 반사를 놓칠 수 있어 robust statistic을 함께
+    # 기록한다(항목 8).
     mean_alpha: float = 0.0
+    alpha_p95: float = 0.0
     max_alpha: float = 0.0
+    alpha_coverage: float = 0.0  # alpha > alpha_presence_threshold인 픽셀 비율
+
     mean_correction: float = 0.0
     max_correction: float = 0.0
+
+    # No-reference 상황에서도 계산 가능한 lightweight 진단(항목 9) - reject
+    # 기준이 아니라 warning 트리거용 heuristic이다(ground truth가 아니다).
+    edge_retention_estimate: Optional[float] = None
+
+    # Deprecated(하위 호환용 별칭, mean_alpha와 동일한 값) - "confidence"라는
+    # 이름이 신경망의 예측 확신도로 오해될 수 있어 새 코드에서는 쓰지 않는다.
+    # UI/새 guard 로직은 이 필드를 참조하지 않는다.
     confidence: Optional[float] = None
 
-    skipped_due_to_low_confidence: bool = False
+    skipped_due_to_low_reflection: bool = False
     fell_back_to_original: bool = False
 
     warning_message: Optional[str] = None
@@ -54,9 +70,21 @@ class ReflectionSuppressionEvaluation:
     before: ReflectionEvaluationResult
     after: ReflectionEvaluationResult
 
+    # Reference Mode 전용(안정화 라운드 항목 2) - Reference가 없으면(No-Reference
+    # 모드) 이 셋은 항상 None으로 남는다. STEP 6의 "No-reference는 heuristic
+    # likelihood일 뿐 ground-truth reflection measurement가 아니다"라는 원칙을
+    # 여기서도 깨뜨리지 않기 위함이다 - No-Reference 결과의 mean_strength/
+    # p95_strength/coverage를 이 필드들로 잘못 재활용하지 않는다.
     reflection_mean_reduction: Optional[float] = None
     reflection_p95_reduction: Optional[float] = None
     coverage_reduction: Optional[float] = None
+
+    # No-Reference Mode 전용 - Reference Mode에서는 항상 None으로 남는다.
+    # 이름 자체가 "heuristic likelihood"임을 분명히 한다(실제 reflection
+    # 양이라고 주장하지 않는다).
+    reflection_likelihood_before: Optional[float] = None
+    reflection_likelihood_after: Optional[float] = None
+    reflection_likelihood_reduction: Optional[float] = None
 
     edge_retention_after: Optional[float] = None
     contrast_retention_after: Optional[float] = None
@@ -91,3 +119,9 @@ class SuppressionModelMetadata:
     dataset_num_real_pairs: int = 0
     dataset_num_synthetic_pairs: int = 0
     dataset_num_identity_pairs: int = 0
+    # 안정화 라운드 항목 3/12 - 실제 paired dataset 학습 entrypoint
+    # (training.train_suppression_from_dataset)가 채우는 split별 표본 수.
+    # Synthetic-only CLI 경로에서는 0으로 남는다.
+    train_sample_count: int = 0
+    validation_sample_count: int = 0
+    test_sample_count: int = 0

@@ -96,6 +96,14 @@ from calibration.windshield.reflection.types import (
     ReflectionRegionMetrics,
     ReflectionSpatialCell,
 )
+from calibration.windshield.ghost.types import (
+    GhostDatasetResult,
+    GhostEvaluationResult,
+    GhostField,
+    GhostPointDetection,
+    GhostRegionMetrics,
+    GhostSpatialCell,
+)
 
 PROJECT_FORMAT_VERSION = 2
 PROJECT_EXTENSION = ".ccproj"
@@ -803,6 +811,105 @@ def _reflection_dataset_result_from_dict(d) -> ReflectionDatasetResult:
     )
 
 
+# ---------------------------------------------------------------------------
+# Ghost / Double Image (STEP 8) - Reflection과 완전히 별도의 재구성 함수다.
+# `ghost_results`/`ghost_models`는 windshield_results/reflection_results와
+# 절대 섞이지 않는다.
+# ---------------------------------------------------------------------------
+
+def _ghost_point_detection_from_dict(d) -> GhostPointDetection:
+    return GhostPointDetection(
+        main_x=d.get("main_x", 0.0),
+        main_y=d.get("main_y", 0.0),
+        ghost_x=d.get("ghost_x"),
+        ghost_y=d.get("ghost_y"),
+        offset_x_px=d.get("offset_x_px"),
+        offset_y_px=d.get("offset_y_px"),
+        distance_px=d.get("distance_px"),
+        angular_separation_deg=d.get("angular_separation_deg"),
+        strength_ratio=d.get("strength_ratio"),
+        detected=d.get("detected", False),
+    )
+
+
+def _ghost_region_metrics_from_dict(d) -> GhostRegionMetrics:
+    d = d or {}
+    return GhostRegionMetrics(
+        mean_distance_px=d.get("mean_distance_px", 0.0),
+        mean_strength_ratio=d.get("mean_strength_ratio", 0.0),
+        detection_rate=d.get("detection_rate", 0.0),
+    )
+
+
+def _ghost_spatial_cell_from_dict(d) -> GhostSpatialCell:
+    return GhostSpatialCell(
+        row=d.get("row", 0),
+        col=d.get("col", 0),
+        mean_offset_x_px=d.get("mean_offset_x_px"),
+        mean_offset_y_px=d.get("mean_offset_y_px"),
+        mean_distance_px=d.get("mean_distance_px"),
+        mean_strength_ratio=d.get("mean_strength_ratio"),
+        sample_count=d.get("sample_count", 0),
+    )
+
+
+def _ghost_evaluation_result_from_dict(d) -> GhostEvaluationResult:
+    return GhostEvaluationResult(
+        success=d.get("success", True),
+        mode=d.get("mode", "point_source"),
+        metric_version=d.get("metric_version", 1),
+        pair_id=d.get("pair_id", ""),
+        detection_count=d.get("detection_count", 0),
+        candidate_count=d.get("candidate_count", 0),
+        detection_rate=d.get("detection_rate"),
+        mean_offset_x_px=d.get("mean_offset_x_px"),
+        mean_offset_y_px=d.get("mean_offset_y_px"),
+        median_distance_px=d.get("median_distance_px"),
+        p95_distance_px=d.get("p95_distance_px"),
+        mean_angular_separation_deg=d.get("mean_angular_separation_deg"),
+        p95_angular_separation_deg=d.get("p95_angular_separation_deg"),
+        mean_strength_ratio=d.get("mean_strength_ratio"),
+        p95_strength_ratio=d.get("p95_strength_ratio"),
+        ghost_likelihood=d.get("ghost_likelihood"),
+        is_likelihood=d.get("is_likelihood", False),
+        regional_metrics={
+            k: _ghost_region_metrics_from_dict(v)
+            for k, v in d.get("regional_metrics", {}).items()
+        },
+        spatial_map=[_ghost_spatial_cell_from_dict(c) for c in d.get("spatial_map", [])],
+        detections=[_ghost_point_detection_from_dict(p) for p in d.get("detections", [])],
+        warning_message=d.get("warning_message"),
+        error_message=d.get("error_message"),
+    )
+
+
+def _ghost_dataset_result_from_dict(d) -> GhostDatasetResult:
+    return GhostDatasetResult(
+        mode=d.get("mode", "point_source"),
+        metric_version=d.get("metric_version", 1),
+        per_frame=[_ghost_evaluation_result_from_dict(r) for r in d.get("per_frame", [])],
+        mean_distance_px=d.get("mean_distance_px"),
+        p95_distance_px=d.get("p95_distance_px"),
+        mean_strength=d.get("mean_strength"),
+        p95_strength=d.get("p95_strength"),
+        worst_frame_id=d.get("worst_frame_id"),
+        success=d.get("success", True),
+        warning_message=d.get("warning_message"),
+        error_message=d.get("error_message"),
+    )
+
+
+def _ghost_field_from_dict(d) -> GhostField:
+    return GhostField(
+        offset_x=_arr(d.get("offset_x"), np.float32),
+        offset_y=_arr(d.get("offset_y"), np.float32),
+        strength=_arr(d.get("strength"), np.float32),
+        image_width=d.get("image_width", 0.0),
+        image_height=d.get("image_height", 0.0),
+        model_version=d.get("model_version", 1),
+    )
+
+
 def _raw_array_len(d) -> int | None:
     """migrate_v1_to_v2용 - 아직 dataclass로 복원하지 않은 raw JSON 값에서
     distortion 배열 길이만 알고 싶을 때. _arr()과 같은 언랩 규칙(_json_safe가
@@ -1015,6 +1122,14 @@ def project_from_dict(payload: dict) -> CalibrationProject:
         reflection_results={
             k: _reflection_dataset_result_from_dict(v)
             for k, v in d.get("reflection_results", {}).items()
+        },
+        ghost_results={
+            k: _ghost_dataset_result_from_dict(v)
+            for k, v in d.get("ghost_results", {}).items()
+        },
+        ghost_models={
+            k: _ghost_field_from_dict(v)
+            for k, v in d.get("ghost_models", {}).items()
         },
         created_at=_dt(d.get("created_at")),
         updated_at=_dt(d.get("updated_at")),

@@ -58,12 +58,28 @@ def evaluate_suppression(
 
     after = evaluate_reflection(suppression_result.suppressed_image, reference_image, cfg, pair_id="after")
 
-    def _pick(result, ref_field: str, no_ref_field: str) -> Optional[float]:
-        return getattr(result, ref_field) if result.mode == "reference" else getattr(result, no_ref_field)
+    # 안정화 라운드 항목 2(CRITICAL) - STEP 6의 원칙("No-reference는 heuristic
+    # likelihood일 뿐 ground-truth reflection measurement가 아니다")을 여기서
+    # 다시 깨뜨리지 않는다. Reference Mode의 실제 reflection 측정값
+    # (reflection_mean/p95/coverage)과 No-Reference Mode의 heuristic
+    # likelihood(mean_strength, no-reference에서는 reflection_likelihood와
+    # 같은 값)를 같은 "Reduction" 필드에 섞어 넣지 않는다 - 모드별로 완전히
+    # 분리된 필드 집합을 채운다.
+    reflection_mean_reduction = None
+    reflection_p95_reduction = None
+    coverage_reduction = None
+    reflection_likelihood_before = None
+    reflection_likelihood_after = None
+    reflection_likelihood_reduction = None
 
-    reflection_mean_reduction = _reduction(_pick(before, "reflection_mean", "mean_strength"), _pick(after, "reflection_mean", "mean_strength"))
-    reflection_p95_reduction = _reduction(_pick(before, "reflection_p95", "p95_strength"), _pick(after, "reflection_p95", "p95_strength"))
-    coverage_reduction = _reduction(_pick(before, "reflection_coverage", "coverage"), _pick(after, "reflection_coverage", "coverage"))
+    if before.mode == "reference" and after.mode == "reference":
+        reflection_mean_reduction = _reduction(before.reflection_mean, after.reflection_mean)
+        reflection_p95_reduction = _reduction(before.reflection_p95, after.reflection_p95)
+        coverage_reduction = _reduction(before.reflection_coverage, after.reflection_coverage)
+    else:
+        reflection_likelihood_before = before.reflection_likelihood
+        reflection_likelihood_after = after.reflection_likelihood
+        reflection_likelihood_reduction = _reduction(before.reflection_likelihood, after.reflection_likelihood)
 
     over_suppression_score = None
     if clean_roi_mask is not None:
@@ -80,6 +96,9 @@ def evaluate_suppression(
         reflection_mean_reduction=reflection_mean_reduction,
         reflection_p95_reduction=reflection_p95_reduction,
         coverage_reduction=coverage_reduction,
+        reflection_likelihood_before=reflection_likelihood_before,
+        reflection_likelihood_after=reflection_likelihood_after,
+        reflection_likelihood_reduction=reflection_likelihood_reduction,
         edge_retention_after=after.edge_retention,
         contrast_retention_after=after.contrast_retention,
         over_suppression_score=over_suppression_score,

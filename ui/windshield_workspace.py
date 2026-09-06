@@ -27,6 +27,8 @@ Windshield Model 선택은 사실 "같은 계산의 두 측면"이라 별도 탭
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -71,6 +73,14 @@ from calibration.windshield.base import (
     windshield_result_key_label,
 )
 from calibration.windshield.reflection import ReflectionDatasetResult, ReflectionEvaluationConfig, ReflectionImagePair
+from calibration.windshield.ghost import (
+    GhostDatasetResult,
+    GhostEvaluationConfig,
+    fit_ghost_field_constant,
+    fit_ghost_field_from_spatial_map,
+    save_ghost_model,
+)
+from calibration.windshield.ghost.config import DEFAULT_SPATIAL_COLS, DEFAULT_SPATIAL_ROWS
 from calibration.windshield.residual_ray import DEFAULT_GRID_COLS, DEFAULT_GRID_ROWS, DEFAULT_LAMBDA_MAG, DEFAULT_LAMBDA_SMOOTH
 from calibration.windshield.residual_rbf import DEFAULT_RBF_NUM_CENTERS, DEFAULT_RBF_SMOOTHING
 # UI는 neural_residual.py를 절대 import하지 않는다(STEP 5 안정화 라운드
@@ -102,6 +112,8 @@ from export.opencv import (
 from export.windshield import export_windshield_yaml
 from export.reflection import export_reflection_yaml
 from ui.reflection_worker import ReflectionEvaluationWorker
+from ui.ghost_evaluation_worker import GhostEvaluationWorker
+from ui.ghost_suppression_worker import GhostSuppressionWorker
 from ui.radial_profile_view import RadialProfileChartWidget
 from ui.theme import Theme
 from ui.windshield_vector_field_view import VectorFieldChartWidget
@@ -179,6 +191,14 @@ class WindshieldWorkspace(QWidget):
         self._reflection_result: ReflectionDatasetResult | None = None
         self._reflection_normal_path = ""
         self._reflection_reference_path = ""
+        # Ghost / Double Image(STEP 8) - Reflection과 완전히 별도 상태다
+        # (사용자 스펙 1번, "Ghost는 기존 Reflection 기능 안에 넣지 않는다").
+        self._ghost_results: dict[str, GhostDatasetResult] = {}
+        self._ghost_result: GhostDatasetResult | None = None
+        self._ghost_image_path = ""
+        self._ghost_suppression_model_path = ""
+        self._ghost_suppression_input_path = ""
+        self._ghost_suppression_result = None
         # 마지막으로 화면에 표시된(=Export 대상) 모델 - export_button과
         # _on_export_windshield_yaml이 특정 모델(예: Baseline)에 고정되지
         # 않고 "방금 실행/표시한 결과"를 export하도록 추적한다.
@@ -203,8 +223,8 @@ class WindshieldWorkspace(QWidget):
         title.setStyleSheet("font-size: 18px; font-weight: 700;")
         layout.addWidget(title)
         subtitle = QLabel(
-            "앞유리 굴절로 생기는 기하학적(geometric) 픽셀 변위만 측정/보정합니다. "
-            "Reflection(글레어/고스트)은 다루지 않습니다."
+            "앞유리 굴절로 생기는 기하학적(geometric) 픽셀 변위는 Windshield Model 탭에서, "
+            "Reflection(글레어)과 Ghost(이중상)는 각각 별도의 Photometric 탭에서 다룹니다."
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(f"color: {Theme.TEXT_SECONDARY};")
@@ -216,6 +236,7 @@ class WindshieldWorkspace(QWidget):
         self.tabs.addTab(self._build_model_tab(), "③ Windshield Model")
         self.tabs.addTab(self._build_comparison_tab(), "④ Comparison")
         self.tabs.addTab(self._build_reflection_tab(), "⑤ Reflection")
+        self.tabs.addTab(self._build_ghost_tab(), "⑥ Ghost")
         layout.addWidget(self.tabs, stretch=1)
 
     # ------------------------------------------------------------------
@@ -242,6 +263,8 @@ class WindshieldWorkspace(QWidget):
         self._windshield_results = dict(project.windshield_results or {})
         self._reflection_results = dict(getattr(project, "reflection_results", {}) or {})
         self._reflection_result = next(iter(self._reflection_results.values()), None)
+        self._ghost_results = dict(getattr(project, "ghost_results", {}) or {})
+        self._ghost_result = next(iter(self._ghost_results.values()), None)
         if self._windshield_config is not None:
             self._camera_config = project.camera_config
             self._pattern_config = project.pattern_config
@@ -254,11 +277,19 @@ class WindshieldWorkspace(QWidget):
         self._refresh_comparison_table()
         if self._reflection_result is not None:
             self._display_reflection_result(self._reflection_result)
+        if self._ghost_result is not None:
+            self._display_ghost_result(self._ghost_result)
 
     def export_state(
         self,
-    ) -> tuple[WindshieldConfig | None, Dataset | None, dict[WindshieldResultKey, WindshieldCalibrationResult], dict[str, ReflectionDatasetResult]]:
-        return self._windshield_config, self._windshield_dataset, self._windshield_results, self._reflection_results
+    ) -> tuple[
+        WindshieldConfig | None,
+        Dataset | None,
+        dict[WindshieldResultKey, WindshieldCalibrationResult],
+        dict[str, ReflectionDatasetResult],
+        dict[str, GhostDatasetResult],
+    ]:
+        return self._windshield_config, self._windshield_dataset, self._windshield_results, self._reflection_results, self._ghost_results
 
     # ------------------------------------------------------------------
     # ① Base Camera
@@ -1413,6 +1444,18 @@ class WindshieldWorkspace(QWidget):
         input_row.addWidget(self.suppression_input_path_label, stretch=1)
         form.addRow("Input:", input_row)
 
+        # Reference는 선택 사항이다(사용자 스펙 53번, No-Reference Runtime) -
+        # 있으면 STEP 6 evaluator로 Before/After를 Reference Mode로, 없으면
+        # No-Reference Mode(Reflection Likelihood)로 평가한다.
+        reference_row = QHBoxLayout()
+        self._suppression_reference_path = ""
+        self.suppression_reference_path_label = QLabel("N/A (No-Reference mode)")
+        load_reference_btn = QPushButton("Load Reference (optional)...")
+        load_reference_btn.clicked.connect(self._on_load_suppression_reference_image)
+        reference_row.addWidget(load_reference_btn)
+        reference_row.addWidget(self.suppression_reference_path_label, stretch=1)
+        form.addRow("Reference:", reference_row)
+
         mode_row = QHBoxLayout()
         self._suppression_mode_button_group = QButtonGroup(self)
         self.suppression_mode_conservative_radio = QRadioButton("Conservative")
@@ -1476,6 +1519,172 @@ class WindshieldWorkspace(QWidget):
         layout.addStretch(1)
         return page
 
+    # ------------------------------------------------------------------
+    # STEP 8 - Ghost / Double Image. Reflection과 완전히 독립된 탭이다
+    # (사용자 스펙 "Ghost는 기존 Reflection 기능 안에 넣지 않는다") - worker/
+    # 상태/결과 타입 모두 별도이고, Displacement(vector field)와
+    # Strength(heatmap)도 하나의 표에 억지로 합치지 않는다.
+    # ------------------------------------------------------------------
+
+    def _build_ghost_tab(self) -> QWidget:
+        outer = QTabWidget()
+        outer.addTab(self._build_ghost_evaluation_subtab(), "Evaluation")
+        outer.addTab(self._build_ghost_suppression_subtab(), "Suppression")
+        return outer
+
+    def _build_ghost_evaluation_subtab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        group = QGroupBox("GHOST / DOUBLE IMAGE EVALUATION")
+        group_layout = QVBoxLayout(group)
+
+        mode_row = QHBoxLayout()
+        self._ghost_mode_button_group = QButtonGroup(self)
+        self.ghost_point_source_radio = QRadioButton("Point Source")
+        self.ghost_point_source_radio.setChecked(True)
+        self.ghost_edge_target_radio = QRadioButton("Edge Target")
+        self.ghost_general_likelihood_radio = QRadioButton("General Image (Likelihood)")
+        for radio in (
+            self.ghost_point_source_radio,
+            self.ghost_edge_target_radio,
+            self.ghost_general_likelihood_radio,
+        ):
+            self._ghost_mode_button_group.addButton(radio)
+            mode_row.addWidget(radio)
+        mode_row.addStretch(1)
+        group_layout.addLayout(mode_row)
+
+        image_row = QHBoxLayout()
+        self.ghost_image_path_label = QLabel("N/A")
+        load_image_btn = QPushButton("Load Image...")
+        load_image_btn.clicked.connect(self._on_load_ghost_image)
+        image_row.addWidget(load_image_btn)
+        image_row.addWidget(self.ghost_image_path_label, stretch=1)
+        group_layout.addLayout(image_row)
+
+        action_row = QHBoxLayout()
+        self.ghost_run_button = QPushButton("Run Evaluation")
+        self.ghost_run_button.clicked.connect(self._on_run_ghost_evaluation)
+        action_row.addWidget(self.ghost_run_button)
+        action_row.addStretch(1)
+        group_layout.addLayout(action_row)
+
+        self.ghost_status_label = QLabel(
+            "Ghost = same exterior scene shifted/warped by internal windshield multi-reflection. "
+            "Not related to Reflection(interior scene overlay)."
+        )
+        self.ghost_status_label.setWordWrap(True)
+        group_layout.addWidget(self.ghost_status_label)
+        layout.addWidget(group)
+
+        self.ghost_metrics_table = _ScrollTable(9, 1)
+        self.ghost_metrics_table.setHorizontalHeaderLabels(["Value"])
+        self.ghost_metrics_table.setVerticalHeaderLabels([
+            "Mode", "Detection Count", "Detection Rate",
+            "Ghost Offset X [px]", "Ghost Offset Y [px]",
+            "Ghost Distance (Median) [px]", "Ghost Distance (P95) [px]",
+            "Ghost Strength Mean", "Ghost Strength P95",
+        ])
+        layout.addWidget(self.ghost_metrics_table)
+
+        # Displacement(vector field)와 Strength(heatmap)를 절대 하나의 표로
+        # 합치지 않는다(사용자 스펙 "Displacement와 Strength를 한 map에
+        # 억지로 합치지 않는다") - 완전히 분리된 두 개의 표로 보여준다.
+        viz_group = QGroupBox("SPATIAL GHOST MAP (never merged: displacement vector field vs strength heatmap)")
+        viz_layout = QVBoxLayout(viz_group)
+        viz_layout.addWidget(QLabel("Displacement Vector Field (mean dx, dy per cell):"))
+        self.ghost_vector_field_table = _ScrollTable(DEFAULT_SPATIAL_ROWS, DEFAULT_SPATIAL_COLS)
+        self.ghost_vector_field_table.setHorizontalHeaderLabels([f"C{c+1}" for c in range(DEFAULT_SPATIAL_COLS)])
+        self.ghost_vector_field_table.setVerticalHeaderLabels([f"R{r+1}" for r in range(DEFAULT_SPATIAL_ROWS)])
+        viz_layout.addWidget(self.ghost_vector_field_table)
+        viz_layout.addWidget(QLabel("Strength Heatmap (mean strength ratio per cell):"))
+        self.ghost_strength_heatmap_table = _ScrollTable(DEFAULT_SPATIAL_ROWS, DEFAULT_SPATIAL_COLS)
+        self.ghost_strength_heatmap_table.setHorizontalHeaderLabels([f"C{c+1}" for c in range(DEFAULT_SPATIAL_COLS)])
+        self.ghost_strength_heatmap_table.setVerticalHeaderLabels([f"R{r+1}" for r in range(DEFAULT_SPATIAL_ROWS)])
+        viz_layout.addWidget(self.ghost_strength_heatmap_table)
+        layout.addWidget(viz_group)
+        layout.addStretch(1)
+        return page
+
+    def _build_ghost_suppression_subtab(self) -> QWidget:
+        """STEP 8B - Ghost Suppression. Reflection Suppression 모델을 절대
+        재사용하지 않는다(사용자 스펙 "Ghost 제거를 위해 Reflection
+        Suppression 모델을 사용하지 않는다") - deterministic iterative
+        reconstruction 결과만 불러와 inference/Before-After 평가를 한다."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        group = QGroupBox("GHOST SUPPRESSION")
+        form = QFormLayout(group)
+
+        model_row = QHBoxLayout()
+        self.ghost_suppression_model_path_label = QLabel("N/A")
+        load_model_btn = QPushButton("Load Ghost Model...")
+        load_model_btn.clicked.connect(self._on_load_ghost_suppression_model)
+        fit_btn = QPushButton("Fit From Last Evaluation")
+        fit_btn.clicked.connect(self._on_fit_ghost_model_from_evaluation)
+        save_btn = QPushButton("Save Model...")
+        save_btn.clicked.connect(self._on_save_ghost_model)
+        model_row.addWidget(load_model_btn)
+        model_row.addWidget(fit_btn)
+        model_row.addWidget(save_btn)
+        model_row.addWidget(self.ghost_suppression_model_path_label, stretch=1)
+        form.addRow("Model:", model_row)
+
+        input_row = QHBoxLayout()
+        self.ghost_suppression_input_path_label = QLabel("N/A")
+        load_input_btn = QPushButton("Load Image...")
+        load_input_btn.clicked.connect(self._on_load_ghost_suppression_input_image)
+        input_row.addWidget(load_input_btn)
+        input_row.addWidget(self.ghost_suppression_input_path_label, stretch=1)
+        form.addRow("Input:", input_row)
+        layout.addWidget(group)
+
+        action_row = QHBoxLayout()
+        self.ghost_suppression_run_button = QPushButton("Run Suppression")
+        self.ghost_suppression_run_button.clicked.connect(self._on_run_ghost_suppression)
+        action_row.addWidget(self.ghost_suppression_run_button)
+        action_row.addStretch(1)
+        layout.addLayout(action_row)
+
+        self.ghost_suppression_status_label = QLabel(
+            "Deterministic iterative reconstruction: T_(k+1) = clip(I - alpha*W(T_k), 0, 1). "
+            "Not a large CNN, not trained end-to-end."
+        )
+        self.ghost_suppression_status_label.setWordWrap(True)
+        layout.addWidget(self.ghost_suppression_status_label)
+
+        viz_group = QGroupBox("VISUALIZATION")
+        viz_grid = QHBoxLayout(viz_group)
+        self.ghost_suppression_original_image_label = QLabel("Original")
+        self.ghost_suppression_predicted_image_label = QLabel("Predicted Ghost")
+        self.ghost_suppression_correction_image_label = QLabel("Correction Map")
+        self.ghost_suppression_output_image_label = QLabel("Suppressed")
+        for lbl in (
+            self.ghost_suppression_original_image_label,
+            self.ghost_suppression_predicted_image_label,
+            self.ghost_suppression_correction_image_label,
+            self.ghost_suppression_output_image_label,
+        ):
+            lbl.setMinimumSize(160, 120)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet("border: 1px solid gray;")
+            viz_grid.addWidget(lbl)
+        layout.addWidget(viz_group)
+
+        # STEP 8A evaluator를 그대로 재사용한 Before/After 비교(사용자 스펙
+        # "Must reuse the exact same STEP 8A evaluator for Before/After
+        # comparison").
+        self.ghost_suppression_metrics_table = _ScrollTable(4, 2)
+        self.ghost_suppression_metrics_table.setHorizontalHeaderLabels(["Before", "After"])
+        self.ghost_suppression_metrics_table.setVerticalHeaderLabels([
+            "Ghost Strength Mean", "Detection Count", "Mean Correction", "Max Correction",
+        ])
+        layout.addWidget(self.ghost_suppression_metrics_table)
+        layout.addStretch(1)
+        return page
+
     def _suppression_strength_value(self) -> float:
         from calibration.windshield.reflection_suppression.config import (
             SUPPRESSION_STRENGTH_CONSERVATIVE,
@@ -1502,6 +1711,13 @@ class WindshieldWorkspace(QWidget):
             return
         self._suppression_input_path = path
         self.suppression_input_path_label.setText(path)
+
+    def _on_load_suppression_reference_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load Reflection-Reduced Reference Image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+        if not path:
+            return
+        self._suppression_reference_path = path
+        self.suppression_reference_path_label.setText(path)
 
     def _on_run_reflection_suppression(self) -> None:
         import cv2
@@ -1541,13 +1757,17 @@ class WindshieldWorkspace(QWidget):
         self._suppression_result = result
         if not result.success:
             self.suppression_status_label.setText(result.error_message or "Suppression failed; original image returned.")
-        elif result.skipped_due_to_low_confidence:
-            self.suppression_status_label.setText(result.warning_message or "Suppression skipped (low confidence).")
+        elif result.skipped_due_to_low_reflection:
+            self.suppression_status_label.setText(result.warning_message or "Suppression skipped (low reflection presence).")
         else:
-            self.suppression_status_label.setText(
-                f"Mean alpha {result.mean_alpha:.3f} · Mean correction {result.mean_correction:.4f} "
+            status = (
+                f"Mean alpha {result.mean_alpha:.3f} (P95 {result.alpha_p95:.3f}, coverage "
+                f"{result.alpha_coverage*100.0:.1f}%) · Mean correction {result.mean_correction:.4f} "
                 f"· Strength {result.suppression_strength:.2f}"
             )
+            if result.warning_message:
+                status += f" · {result.warning_message}"
+            self.suppression_status_label.setText(status)
 
         self._set_suppression_preview_image(self.suppression_original_image_label, original_image)
         if result.reflection_layer is not None:
@@ -1559,6 +1779,68 @@ class WindshieldWorkspace(QWidget):
             self._set_suppression_preview_image(self.suppression_alpha_image_label, alpha_vis, is_gray=True)
         if result.suppressed_image is not None:
             self._set_suppression_preview_image(self.suppression_output_image_label, result.suppressed_image)
+
+        self._display_suppression_evaluation(result, original_image)
+
+    def _display_suppression_evaluation(self, result, original_image) -> None:
+        """STEP 6 evaluator를 suppression 전/후에 그대로 적용한다(사용자
+        스펙 41번). Reference가 없으면 No-Reference Mode로 평가하고, 그
+        결과를 절대 "실제 Reflection 측정값"처럼 표시하지 않는다(안정화
+        라운드 항목 2) - Reference Mode에서만 Reflection Mean/P95/Coverage
+        Reduction을, No-Reference Mode에서는 오직 Reflection Likelihood
+        (heuristic, not ground truth)만 표시한다."""
+        if not result.success or result.suppressed_image is None:
+            for row in range(self.suppression_metrics_table.rowCount()):
+                self.suppression_metrics_table.setItem(row, 0, QTableWidgetItem("N/A"))
+                self.suppression_metrics_table.setItem(row, 1, QTableWidgetItem("N/A"))
+            return
+
+        import cv2
+
+        from calibration.windshield.reflection.types import ReflectionEvaluationConfig
+        from calibration.windshield.reflection_suppression.evaluation import evaluate_suppression
+
+        reference_image = None
+        if self._suppression_reference_path:
+            reference_image = cv2.imread(self._suppression_reference_path, cv2.IMREAD_COLOR)
+        cfg = ReflectionEvaluationConfig(mode="reference" if reference_image is not None else "no_reference")
+        evaln = evaluate_suppression(original_image, result, reference_image=reference_image, config=cfg)
+
+        is_reference = evaln.before.mode == "reference"
+        first_row_label = "Reflection Mean" if is_reference else "Reflection Likelihood"
+        self.suppression_metrics_table.setVerticalHeaderItem(0, QTableWidgetItem(first_row_label))
+
+        def _pct(v):
+            return f"{v*100.0:.1f}%" if v is not None else "N/A"
+
+        if is_reference:
+            before_vals = [evaln.before.reflection_mean, evaln.before.reflection_p95, evaln.before.reflection_coverage]
+            after_vals = [evaln.after.reflection_mean, evaln.after.reflection_p95, evaln.after.reflection_coverage]
+        else:
+            before_vals = [evaln.reflection_likelihood_before, None, None]
+            after_vals = [evaln.reflection_likelihood_after, None, None]
+
+        for row, (b, a) in enumerate(zip(before_vals, after_vals)):
+            self.suppression_metrics_table.setItem(row, 0, QTableWidgetItem(_pct(b)))
+            self.suppression_metrics_table.setItem(row, 1, QTableWidgetItem(_pct(a)))
+
+        self.suppression_metrics_table.setItem(3, 0, QTableWidgetItem("N/A"))
+        self.suppression_metrics_table.setItem(
+            3, 1, QTableWidgetItem(_pct(evaln.edge_retention_after) if evaln.edge_retention_after is not None else "N/A")
+        )
+        self.suppression_metrics_table.setItem(4, 0, QTableWidgetItem("N/A"))
+        self.suppression_metrics_table.setItem(
+            4, 1, QTableWidgetItem(_pct(evaln.contrast_retention_after) if evaln.contrast_retention_after is not None else "N/A")
+        )
+        self.suppression_metrics_table.setItem(5, 0, QTableWidgetItem("N/A"))
+        self.suppression_metrics_table.setItem(
+            5, 1, QTableWidgetItem(f"{evaln.over_suppression_score:.4f}" if evaln.over_suppression_score is not None else "N/A")
+        )
+
+        if not is_reference:
+            note = " (no-reference heuristic, not ground truth)"
+            if note not in self.suppression_status_label.text():
+                self.suppression_status_label.setText(self.suppression_status_label.text() + note)
 
     def _set_suppression_preview_image(self, label: QLabel, image, is_gray: bool = False) -> None:
         import cv2
@@ -1714,3 +1996,245 @@ class WindshieldWorkspace(QWidget):
                 4, col, QTableWidgetItem(f"{improvement:.0f}%" if improvement is not None else "-")
             )
         _fit_table_to_rows(self.comparison_table)
+
+    # ------------------------------------------------------------------
+    # STEP 8A - Ghost Evaluation handlers
+    # ------------------------------------------------------------------
+
+    def _on_load_ghost_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load Ghost Evaluation Image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+        if not path:
+            return
+        self._ghost_image_path = path
+        self.ghost_image_path_label.setText(path)
+
+    def _ghost_mode(self) -> str:
+        if self.ghost_edge_target_radio.isChecked():
+            return "edge_target"
+        if self.ghost_general_likelihood_radio.isChecked():
+            return "general_likelihood"
+        return "point_source"
+
+    def _on_run_ghost_evaluation(self) -> None:
+        import cv2
+
+        if not self._ghost_image_path:
+            QMessageBox.warning(self, "Ghost Evaluation", "Image가 필요합니다.")
+            return
+        image = cv2.imread(self._ghost_image_path, cv2.IMREAD_COLOR)
+        if image is None:
+            QMessageBox.warning(self, "Ghost Evaluation", "이미지를 읽을 수 없습니다.")
+            return
+
+        mode = self._ghost_mode()
+        if mode == "edge_target":
+            QMessageBox.warning(
+                self, "Ghost Evaluation",
+                "Edge Target 모드는 1D intensity profile 입력이 필요합니다 - "
+                "evaluate_ghost_edge_target()을 스크립트/API로 직접 호출하세요.",
+            )
+            return
+        cfg = GhostEvaluationConfig(mode=mode)
+        worker = GhostEvaluationWorker([image], cfg, frame_ids=[Path(self._ghost_image_path).stem])
+        thread = run_worker_in_thread(worker, self)
+        self.ghost_run_button.setEnabled(False)
+        self.ghost_status_label.setText("Ghost evaluation running...")
+        worker.result_ready.connect(self._on_ghost_evaluation_finished)
+        worker.error.connect(self._on_ghost_evaluation_error)
+        worker.progress.connect(self.ghost_status_label.setText)
+        self._ghost_thread, self._ghost_worker = thread, worker
+        thread.finished.connect(lambda: self.ghost_run_button.setEnabled(True))
+        thread.start()
+
+    def _on_ghost_evaluation_error(self, message: str) -> None:
+        self.ghost_status_label.setText(message)
+        QMessageBox.critical(self, "Ghost Evaluation", message)
+
+    def _on_ghost_evaluation_finished(self, result: GhostDatasetResult) -> None:
+        self._ghost_result = result
+        self._ghost_results["latest"] = result
+        self._display_ghost_result(result)
+
+    def _display_ghost_result(self, dataset_result: GhostDatasetResult) -> None:
+        frame = dataset_result.per_frame[0] if dataset_result.per_frame else None
+        if frame is None:
+            self.ghost_status_label.setText(dataset_result.error_message or dataset_result.warning_message or "No ghost result.")
+            return
+
+        status = f"Metric v{frame.metric_version}"
+        if frame.is_likelihood:
+            status += " | Ghost Likelihood: no-reference heuristic, not ground truth."
+        else:
+            status += " | Point-source/edge ghost evaluation (K,D read-only, never re-optimized)."
+        if frame.warning_message:
+            status += f" | {frame.warning_message}"
+        self.ghost_status_label.setText(status)
+
+        values = [
+            frame.mode,
+            str(frame.detection_count),
+            f"{frame.detection_rate * 100.0:.1f}%" if frame.detection_rate is not None else "N/A",
+            _fmt(frame.mean_offset_x_px),
+            _fmt(frame.mean_offset_y_px),
+            _fmt(frame.median_distance_px),
+            _fmt(frame.p95_distance_px),
+            _fmt(frame.mean_strength_ratio),
+            _fmt(frame.p95_strength_ratio),
+        ]
+        for row, v in enumerate(values):
+            self.ghost_metrics_table.setItem(row, 0, QTableWidgetItem(str(v)))
+        _fit_table_to_rows(self.ghost_metrics_table)
+
+        rows = self.ghost_vector_field_table.rowCount()
+        cols = self.ghost_vector_field_table.columnCount()
+        for r in range(rows):
+            for c in range(cols):
+                self.ghost_vector_field_table.setItem(r, c, QTableWidgetItem("N/A"))
+                self.ghost_strength_heatmap_table.setItem(r, c, QTableWidgetItem("N/A"))
+        for cell in frame.spatial_map:
+            if cell.sample_count <= 0 or cell.row >= rows or cell.col >= cols:
+                continue
+            dx = f"{cell.mean_offset_x_px:.1f}" if cell.mean_offset_x_px is not None else "?"
+            dy = f"{cell.mean_offset_y_px:.1f}" if cell.mean_offset_y_px is not None else "?"
+            self.ghost_vector_field_table.setItem(cell.row, cell.col, QTableWidgetItem(f"({dx},{dy})"))
+            strength_text = f"{cell.mean_strength_ratio:.3f}" if cell.mean_strength_ratio is not None else "N/A"
+            self.ghost_strength_heatmap_table.setItem(cell.row, cell.col, QTableWidgetItem(strength_text))
+
+    # ------------------------------------------------------------------
+    # STEP 8B - Ghost Suppression handlers
+    # ------------------------------------------------------------------
+
+    def _on_load_ghost_suppression_model(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load Ghost Model", "", "Ghost Model (*.yml *.yaml)")
+        if not path:
+            return
+        self._ghost_suppression_model_path = path
+        self._ghost_suppression_field = None
+        self.ghost_suppression_model_path_label.setText(path)
+
+    def _on_fit_ghost_model_from_evaluation(self) -> None:
+        """마지막 8A 평가 결과에서 `GhostField`를 직접 fit한다(사용자 스펙
+        "이미 계산된 spatial map을 재사용하는 결정론적 fit") - 별도 학습
+        스텝 없이 즉시 Suppression에 쓸 수 있다."""
+        if self._ghost_result is None or not self._ghost_result.per_frame:
+            QMessageBox.warning(self, "Ghost Suppression", "먼저 Evaluation 탭에서 Ghost Evaluation을 실행하세요.")
+            return
+        frame = self._ghost_result.per_frame[0]
+        if not self._ghost_image_path:
+            QMessageBox.warning(self, "Ghost Suppression", "Evaluation에 쓰인 이미지 크기를 알 수 없습니다.")
+            return
+        import cv2
+
+        image = cv2.imread(self._ghost_image_path, cv2.IMREAD_COLOR)
+        if image is None:
+            QMessageBox.warning(self, "Ghost Suppression", "이미지를 읽을 수 없습니다.")
+            return
+        h, w = image.shape[:2]
+        if frame.spatial_map:
+            field = fit_ghost_field_from_spatial_map(
+                frame.spatial_map,
+                image_width=w,
+                image_height=h,
+                rows=DEFAULT_SPATIAL_ROWS,
+                cols=DEFAULT_SPATIAL_COLS,
+                default_offset_x=frame.mean_offset_x_px or 0.0,
+                default_offset_y=frame.mean_offset_y_px or 0.0,
+                default_strength=frame.mean_strength_ratio or 0.0,
+            )
+        else:
+            field = fit_ghost_field_constant(
+                image_width=w, image_height=h,
+                mean_offset_x_px=frame.mean_offset_x_px or 0.0,
+                mean_offset_y_px=frame.mean_offset_y_px or 0.0,
+                mean_strength_ratio=frame.mean_strength_ratio or 0.0,
+            )
+        self._ghost_suppression_field = field
+        self._ghost_suppression_model_path = ""
+        self.ghost_suppression_model_path_label.setText("(fitted from last evaluation, not saved)")
+
+    def _on_save_ghost_model(self) -> None:
+        field = getattr(self, "_ghost_suppression_field", None)
+        if field is None:
+            QMessageBox.warning(self, "Ghost Suppression", "먼저 'Fit From Last Evaluation'으로 model을 만드세요.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save Ghost Model", "ghost_model.yml", "Ghost Model (*.yml *.yaml)")
+        if not path:
+            return
+        save_ghost_model(field, path)
+        self._ghost_suppression_model_path = path
+        self.ghost_suppression_model_path_label.setText(path)
+
+    def _on_load_ghost_suppression_input_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load Ghost Suppression Input Image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+        if not path:
+            return
+        self._ghost_suppression_input_path = path
+        self.ghost_suppression_input_path_label.setText(path)
+
+    def _on_run_ghost_suppression(self) -> None:
+        import cv2
+
+        ghost_field = getattr(self, "_ghost_suppression_field", None)
+        if ghost_field is None and not self._ghost_suppression_model_path:
+            QMessageBox.warning(self, "Ghost Suppression", "Model을 불러오거나 마지막 Evaluation에서 fit하세요.")
+            return
+        if not self._ghost_suppression_input_path:
+            QMessageBox.warning(self, "Ghost Suppression", "Input image가 필요합니다.")
+            return
+        image = cv2.imread(self._ghost_suppression_input_path, cv2.IMREAD_COLOR)
+        if image is None:
+            QMessageBox.warning(self, "Ghost Suppression", "이미지를 읽을 수 없습니다.")
+            return
+
+        eval_cfg = GhostEvaluationConfig(mode="point_source")
+        worker = GhostSuppressionWorker(
+            self._ghost_suppression_model_path or None,
+            image,
+            eval_cfg,
+            ghost_field=ghost_field,
+        )
+        thread = run_worker_in_thread(worker, self)
+        self.ghost_suppression_run_button.setEnabled(False)
+        self.ghost_suppression_status_label.setText("Running ghost suppression...")
+        worker.result_ready.connect(lambda result: self._on_ghost_suppression_finished(result, image))
+        worker.error.connect(self._on_ghost_suppression_error)
+        worker.progress.connect(self.ghost_suppression_status_label.setText)
+        self._ghost_suppression_thread, self._ghost_suppression_worker = thread, worker
+        thread.finished.connect(lambda: self.ghost_suppression_run_button.setEnabled(True))
+        thread.start()
+
+    def _on_ghost_suppression_error(self, message: str) -> None:
+        self.ghost_suppression_status_label.setText(message)
+        QMessageBox.critical(self, "Ghost Suppression", message)
+
+    def _on_ghost_suppression_finished(self, result_tuple, original_image) -> None:
+        supp, evaln = result_tuple
+        self._ghost_suppression_result = supp
+        if not supp.success:
+            self.ghost_suppression_status_label.setText(supp.warning_message or supp.error_message or "Suppression failed; original image returned.")
+        else:
+            self.ghost_suppression_status_label.setText(
+                f"Iterations {supp.iterations} | Mean correction {supp.mean_correction:.4f} | Max correction {supp.max_correction:.4f}"
+            )
+
+        self._set_suppression_preview_image(self.ghost_suppression_original_image_label, original_image)
+        if supp.predicted_ghost_image is not None:
+            import numpy as np
+            pred_u8 = np.clip(supp.predicted_ghost_image, 0, 255).astype(np.uint8)
+            self._set_suppression_preview_image(self.ghost_suppression_predicted_image_label, pred_u8)
+        if supp.correction_map is not None:
+            import numpy as np
+            corr_gray = np.clip(np.mean(supp.correction_map, axis=-1) if supp.correction_map.ndim == 3 else supp.correction_map, 0, 255).astype(np.uint8)
+            self._set_suppression_preview_image(self.ghost_suppression_correction_image_label, corr_gray, is_gray=True)
+        if supp.suppressed_image is not None:
+            self._set_suppression_preview_image(self.ghost_suppression_output_image_label, supp.suppressed_image)
+
+        before, after = evaln.before, evaln.after
+        self.ghost_suppression_metrics_table.setItem(0, 0, QTableWidgetItem(_fmt(before.mean_strength_ratio)))
+        self.ghost_suppression_metrics_table.setItem(0, 1, QTableWidgetItem(_fmt(after.mean_strength_ratio)))
+        self.ghost_suppression_metrics_table.setItem(1, 0, QTableWidgetItem(str(before.detection_count)))
+        self.ghost_suppression_metrics_table.setItem(1, 1, QTableWidgetItem(str(after.detection_count)))
+        self.ghost_suppression_metrics_table.setItem(2, 0, QTableWidgetItem("N/A"))
+        self.ghost_suppression_metrics_table.setItem(2, 1, QTableWidgetItem(f"{supp.mean_correction:.4f}"))
+        self.ghost_suppression_metrics_table.setItem(3, 0, QTableWidgetItem("N/A"))
+        self.ghost_suppression_metrics_table.setItem(3, 1, QTableWidgetItem(f"{supp.max_correction:.4f}"))

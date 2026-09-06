@@ -32,10 +32,14 @@ import yaml
 
 from calibration.windshield.reflection_suppression.config import (
     DEFAULT_ACTIVATION,
+    DEFAULT_ALPHA_PRESENCE_THRESHOLD,
     DEFAULT_DECODER_CHANNELS,
+    DEFAULT_EDGE_RETENTION_SAFETY_THRESHOLD,
     DEFAULT_ENCODER_CHANNELS,
     DEFAULT_MAX_CORRECTION,
-    DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_MIN_ALPHA_COVERAGE,
+    DEFAULT_MIN_ALPHA_P95,
+    DEFAULT_MIN_MEAN_ALPHA,
     DEFAULT_SUPPRESSION_STRENGTH,
 )
 from calibration.windshield.reflection_suppression.model import _require_torch, build_model
@@ -46,7 +50,21 @@ from calibration.windshield.reflection_suppression.types import ReflectionSuppre
 class SuppressionRuntimeConfig:
     strength: float = DEFAULT_SUPPRESSION_STRENGTH
     max_correction: float = DEFAULT_MAX_CORRECTION
-    min_confidence: Optional[float] = DEFAULT_MIN_CONFIDENCE
+
+    # Low Reflection Guard(안정화 라운드 항목 8) - mean/P95/coverage 중
+    # **전부**가 각자의 threshold보다 낮을 때만 suppression을 skip한다(하나
+    # 라도 반사 존재를 시사하면 skip하지 않는다 - "화면의 3%에만 강한
+    # 반사가 있는" 경우 global mean만으로 skip하면 그걸 놓친다). 개별
+    # threshold를 None으로 두면 그 기준은 판단에서 제외된다.
+    min_mean_alpha: Optional[float] = DEFAULT_MIN_MEAN_ALPHA
+    min_alpha_p95: Optional[float] = DEFAULT_MIN_ALPHA_P95
+    min_alpha_coverage: Optional[float] = DEFAULT_MIN_ALPHA_COVERAGE
+    alpha_presence_threshold: float = DEFAULT_ALPHA_PRESENCE_THRESHOLD
+
+    # No-reference edge preservation 진단(안정화 라운드 항목 9) - 미달 시
+    # reject가 아니라 warning만 기록한다(ground truth가 아닌 heuristic).
+    # None이면 계산하지 않는다.
+    edge_retention_safety_threshold: Optional[float] = DEFAULT_EDGE_RETENTION_SAFETY_THRESHOLD
 
 
 class ReflectionSuppressionModel:
@@ -103,6 +121,34 @@ def _decode_state_dict(state_dict_b64: str) -> dict:
     return torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
 
 
+def _edge_energy(image_bgr: np.ndarray) -> float:
+    """Reference 없이도 계산 가능한 gradient 에너지(Sobel) - No-reference
+    edge preservation 진단 전용(사용자 스펙 9번). Ground truth가 아니라
+    runtime safety heuristic이다."""
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    return float(np.mean(np.sqrt(gx * gx + gy * gy)))
+
+
+def _should_skip_due_to_low_reflection(
+    mean_alpha: float, alpha_p95: float, alpha_coverage: float, cfg: SuppressionRuntimeConfig,
+) -> bool:
+    """mean/P95/coverage 중 활성화된(threshold가 None이 아닌) 기준이 **전부**
+    "반사 없음"을 가리킬 때만 skip한다 - 안정화 라운드 항목 8("global mean만
+    낮다고 잘못 skip하지 않는다")."""
+    checks = []
+    if cfg.min_mean_alpha is not None:
+        checks.append(mean_alpha < cfg.min_mean_alpha)
+    if cfg.min_alpha_p95 is not None:
+        checks.append(alpha_p95 < cfg.min_alpha_p95)
+    if cfg.min_alpha_coverage is not None:
+        checks.append(alpha_coverage < cfg.min_alpha_coverage)
+    if not checks:
+        return False
+    return all(checks)
+
+
 def suppress_reflection(
     image_bgr: np.ndarray,
     model: ReflectionSuppressionModel,
@@ -134,10 +180,11 @@ def suppress_reflection(
         alpha = np.clip(alpha, 0.0, 1.0).astype(np.float64)
         reflection = np.clip(reflection, 0.0, 1.0).astype(np.float64)
         mean_alpha = float(np.mean(alpha))
+        alpha_p95 = float(np.percentile(alpha, 95.0))
         max_alpha = float(np.max(alpha))
-        confidence = mean_alpha
+        alpha_coverage = float(np.mean(alpha > cfg.alpha_presence_threshold))
 
-        if cfg.min_confidence is not None and mean_alpha < cfg.min_confidence:
+        if _should_skip_due_to_low_reflection(mean_alpha, alpha_p95, alpha_coverage, cfg):
             return ReflectionSuppressionResult(
                 success=True,
                 suppressed_image=image_bgr.copy(),
@@ -145,14 +192,16 @@ def suppress_reflection(
                 alpha_map=alpha.astype(np.float32),
                 suppression_strength=cfg.strength,
                 mean_alpha=mean_alpha,
+                alpha_p95=alpha_p95,
                 max_alpha=max_alpha,
+                alpha_coverage=alpha_coverage,
                 mean_correction=0.0,
                 max_correction=0.0,
-                confidence=confidence,
-                skipped_due_to_low_confidence=True,
+                confidence=mean_alpha,  # deprecated alias
+                skipped_due_to_low_reflection=True,
                 warning_message=(
-                    "Mean reflection confidence is below min_confidence - suppression skipped, "
-                    "original image returned unchanged."
+                    "Mean/P95/coverage of predicted alpha are all below their thresholds - "
+                    "suppression skipped, original image returned unchanged."
                 ),
             )
 
@@ -164,6 +213,19 @@ def suppress_reflection(
         suppressed_float = np.clip(img_float - correction, 0.0, 1.0)
         suppressed_image = np.clip(suppressed_float * 255.0, 0, 255).astype(np.uint8)
 
+        edge_retention_estimate = None
+        warning_message = None
+        if cfg.edge_retention_safety_threshold is not None:
+            input_edge_energy = _edge_energy(image_bgr)
+            output_edge_energy = _edge_energy(suppressed_image)
+            edge_retention_estimate = output_edge_energy / (input_edge_energy + 1e-6)
+            if edge_retention_estimate < cfg.edge_retention_safety_threshold:
+                warning_message = (
+                    f"No-reference edge retention estimate ({edge_retention_estimate:.2f}) is below the "
+                    f"safety threshold ({cfg.edge_retention_safety_threshold:.2f}) - suppression may be "
+                    "removing scene detail (heuristic, not ground truth; output is still returned)."
+                )
+
         return ReflectionSuppressionResult(
             success=True,
             suppressed_image=suppressed_image,
@@ -171,10 +233,14 @@ def suppress_reflection(
             alpha_map=alpha.astype(np.float32),
             suppression_strength=cfg.strength,
             mean_alpha=mean_alpha,
+            alpha_p95=alpha_p95,
             max_alpha=max_alpha,
+            alpha_coverage=alpha_coverage,
             mean_correction=mean_correction,
             max_correction=max_correction_actual,
-            confidence=confidence,
+            edge_retention_estimate=edge_retention_estimate,
+            confidence=mean_alpha,  # deprecated alias
+            warning_message=warning_message,
         )
     except Exception as e:  # noqa: BLE001 - 사용자 스펙 38번, 항상 안전하게 fallback
         return ReflectionSuppressionResult(

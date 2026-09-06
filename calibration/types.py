@@ -1041,6 +1041,12 @@ class CalibrationProject:
     windshield_dataset: Optional[Dataset] = None
     windshield_results: dict["WindshieldResultKey", "WindshieldCalibrationResult"] = field(default_factory=dict)
     reflection_results: dict[str, "ReflectionDatasetResult"] = field(default_factory=dict)
+    # Ghost / Double Image(STEP 8) - Reflection과 완전히 별도 필드다(사용자
+    # 스펙 "ghost_results, ghost_models는 windshield_results/
+    # reflection_results와 섞이지 않는다"). 같은 forward-reference 패턴을
+    # 그대로 따른다(circular import 방지).
+    ghost_results: dict[str, "GhostDatasetResult"] = field(default_factory=dict)
+    ghost_models: dict[str, "GhostField"] = field(default_factory=dict)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     export_paths: dict[ExportFormat, str] = field(default_factory=dict)

@@ -1548,7 +1548,7 @@ class MainWindow(QMainWindow):
         if not path.endswith(PROJECT_EXTENSION):
             path += PROJECT_EXTENSION
 
-        windshield_config, windshield_dataset, windshield_results, reflection_results = self.windshield_workspace.export_state()
+        windshield_config, windshield_dataset, windshield_results, reflection_results, ghost_results = self.windshield_workspace.export_state()
         project = CalibrationProject(
             project_name=self.camera_config.sensor_name or Path(path).stem,
             camera_config=self.camera_config,
@@ -1568,6 +1568,7 @@ class MainWindow(QMainWindow):
             windshield_dataset=windshield_dataset,
             windshield_results=windshield_results,
             reflection_results=reflection_results,
+            ghost_results=ghost_results,
         )
         try:
             saved_path = save_project(project, path)
