@@ -276,6 +276,54 @@ def test_general_likelihood_mode_never_populates_point_source_only_fields():
 
 
 # ---------------------------------------------------------------------------
+# Phase B-5 - column-profile expansion (row-profile만으로는 세로 방향
+# double-edge를 놓친다).
+# ---------------------------------------------------------------------------
+
+def test_general_likelihood_row_only_pattern_reports_row_but_not_column_detection():
+    """가로 스캔(row-profile)으로만 잡히는 패턴(수직선 형태의 double-edge,
+    모든 row에서 x축을 따라 밝기가 계단식으로 변함) - column 방향으로는
+    각 열이 y축 방향으로 상수이므로 검출되면 안 된다."""
+    img = np.zeros((64, 64, 3), dtype=np.uint8)
+    img[:, 20:] = 200
+    img[:, 26:] += 30
+    result = evaluate_ghost_general_likelihood(img)
+    assert result.likelihood_row_detection_rate is not None
+    assert result.likelihood_column_detection_rate is not None
+    assert result.likelihood_row_detection_rate > 0.0
+    assert result.likelihood_column_detection_rate == pytest.approx(0.0)
+
+
+def test_general_likelihood_column_only_pattern_is_recovered_by_column_profile():
+    """Phase B-5 핵심 회귀 - row-profile만 쓰던 이전 구현이라면 이 패턴(모든
+    column에서 y축을 따라 밝기가 계단식으로 변하고, 각 row는 x축 방향으로
+    상수라 row-profile로는 전혀 검출되지 않음)에서 ghost_likelihood가
+    0이었을 것이다. Column-profile을 추가한 뒤에는 검출되어야 한다."""
+    img = np.zeros((64, 64, 3), dtype=np.uint8)
+    img[20:, :] = 200
+    img[26:, :] += 30
+    result = evaluate_ghost_general_likelihood(img)
+    assert result.success
+    assert result.likelihood_row_detection_rate == pytest.approx(0.0)
+    assert result.likelihood_column_detection_rate is not None
+    assert result.likelihood_column_detection_rate > 0.0
+    # 핵심 assertion: row-profile만 썼다면 0이었을 전체 ghost_likelihood가
+    # column-profile 덕분에 0보다 커야 한다.
+    assert result.ghost_likelihood > 0.0
+    assert result.is_likelihood is True
+    assert result.warning_message is not None
+
+
+def test_general_likelihood_row_and_column_rates_never_appear_in_other_modes():
+    """Point Source/Edge Target 모드에서는 이 두 필드가 절대 채워지면 안
+    된다(사용자 스펙 - General Likelihood 전용 필드가 다른 모드로 새면
+    안 된다)."""
+    result = evaluate_ghost_point_source([BrightBlob(x=10, y=10, energy=100, area_px=5)])
+    assert result.likelihood_row_detection_rate is None
+    assert result.likelihood_column_detection_rate is None
+
+
+# ---------------------------------------------------------------------------
 # Edge-target evaluation wrapper
 # ---------------------------------------------------------------------------
 
@@ -938,6 +986,88 @@ def test_resolution_gate_progress_callback_still_fires_before_failure(tmp_path):
 
 
 # ===========================================================================
+# Phase A-5 - num_valid_frames must count only *successfully evaluated*
+# frames, not merely "attempted" frames.
+# ===========================================================================
+
+def test_num_valid_frames_excludes_failed_evaluations():
+    from calibration.windshield.ghost.types import GhostEvaluationResult
+
+    good = GhostEvaluationResult(success=True, mode="point_source", detection_count=1)
+    bad = GhostEvaluationResult(success=False, mode="point_source", error_message="boom")
+    dataset_result = evaluate_ghost_dataset([good, good, bad], mode="point_source", num_input_frames=3)
+
+    assert dataset_result.num_input_frames == 3
+    assert dataset_result.num_valid_frames == 2
+    assert dataset_result.num_failed_frames == 1
+
+
+def test_dataset_from_paths_counts_unreadable_image_as_failed_not_silently_dropped(tmp_path):
+    """읽을 수 없는 이미지는 조용히 건너뛰지 않고, 실패한 frame으로
+    기록되어야 한다(Phase A-5) - 그래야 num_input_frames == len(per_frame)
+    불변식이 유지되고, 실패 원인도 결과에 남는다."""
+    good_path = tmp_path / "good.png"
+    _write_dot_image(str(good_path), width=320, height=240)
+    bad_path = tmp_path / "not_an_image.png"
+    bad_path.write_bytes(b"not a real image file")
+
+    result = evaluate_ghost_dataset_from_paths(
+        [str(good_path), str(bad_path)], _point_source_config(bright_source_threshold=20.0),
+    )
+    assert result.num_input_frames == 2
+    assert len(result.per_frame) == 2  # 실패한 이미지도 per_frame 항목으로 남는다
+    assert result.num_valid_frames == 1
+    assert result.num_failed_frames == 1
+    failed = [f for f in result.per_frame if not f.success]
+    assert len(failed) == 1
+    assert failed[0].error_message is not None
+
+
+def test_all_frames_failed_dataset_reports_zero_valid():
+    from calibration.windshield.ghost.types import GhostEvaluationResult
+
+    bad = GhostEvaluationResult(success=False, mode="point_source", error_message="boom")
+    dataset_result = evaluate_ghost_dataset([bad, bad], mode="point_source")
+    assert dataset_result.num_valid_frames == 0
+    assert dataset_result.num_failed_frames == 2
+    assert dataset_result.success is False
+
+
+# ===========================================================================
+# Phase A-6 - frame_ids/image_paths length mismatch must not silently
+# truncate the dataset.
+# ===========================================================================
+
+def test_frame_ids_length_mismatch_raises_instead_of_silent_truncation(tmp_path):
+    paths = []
+    for i in range(4):
+        p = tmp_path / f"frame_{i}.png"
+        _write_dot_image(str(p), width=320, height=240)
+        paths.append(str(p))
+
+    with pytest.raises(ValueError, match="frame_ids"):
+        evaluate_ghost_dataset_from_paths(
+            paths, _point_source_config(bright_source_threshold=20.0),
+            frame_ids=["a", "b"],  # 4개 중 2개만 - 길이 불일치
+        )
+
+
+def test_frame_ids_matching_length_is_accepted(tmp_path):
+    paths = []
+    for i in range(3):
+        p = tmp_path / f"frame_{i}.png"
+        _write_dot_image(str(p), width=320, height=240)
+        paths.append(str(p))
+
+    result = evaluate_ghost_dataset_from_paths(
+        paths, _point_source_config(bright_source_threshold=20.0),
+        frame_ids=["a", "b", "c"],
+    )
+    assert result.success
+    assert [f.pair_id for f in result.per_frame] == ["a", "b", "c"]
+
+
+# ===========================================================================
 # STEP 8 semantic/safety fix 5 - Pair Score energy-ratio consistency
 # ===========================================================================
 
@@ -1040,3 +1170,232 @@ def test_estimate_dominant_energy_ratio_returns_none_without_dominant_vector():
         _CandidatePair(main_idx=0, ghost_idx=1, dx=4.0, dy=-2.0, distance=4.47, energy_ratio=0.15),
     ]
     assert estimate_dominant_energy_ratio(candidates, None) is None
+
+
+# ===========================================================================
+# Phase B-3 - Regular LED-grid Ghost regression (실제 calibration target이
+# 규칙적인 패턴일 가능성이 높으므로 반드시 검증해야 한다).
+# ===========================================================================
+
+def _regular_led_grid_blobs(
+    *, rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15, main_energy=1000.0,
+    skip_positions=(), energy_variation=None, extra_outlier_ratio_at=None,
+):
+    """rows x cols 격자로 배치된 Main LED + 각자의 Ghost(dx,dy,ratio 공통)를
+    만든다. `skip_positions`에 있는 (r,c)는 Main 자체를 빼서 "missing LED"를
+    흉내낸다. `energy_variation`은 (r,c)->energy 배율 dict로 밝기를
+    다르게 만든다. `extra_outlier_ratio_at`는 (r,c)의 ghost energy ratio만
+    다르게(outlier) 만든다."""
+    blobs = []
+    for r in range(rows):
+        for c in range(cols):
+            if (r, c) in skip_positions:
+                continue
+            mx, my = c * spacing, r * spacing
+            energy = main_energy * (energy_variation.get((r, c), 1.0) if energy_variation else 1.0)
+            blobs.append(BrightBlob(x=mx, y=my, energy=energy, area_px=10))
+            local_ratio = ratio
+            if extra_outlier_ratio_at is not None and (r, c) == extra_outlier_ratio_at:
+                local_ratio = extra_outlier_ratio_at[2] if len(extra_outlier_ratio_at) > 2 else 0.7
+            blobs.append(BrightBlob(x=mx + dx, y=my + dy, energy=energy * local_ratio, area_px=10))
+    return blobs
+
+
+def test_regular_5x4_led_grid_recovers_dominant_offset_and_ratio():
+    blobs = _regular_led_grid_blobs(rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15)
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=15.0)
+    detected = [d for d in detections if d.detected]
+
+    assert len(detected) == 20  # 4x5 격자 전부 자기 자신의 ghost와 짝지어져야 한다
+    for det in detected:
+        assert det.offset_x_px == pytest.approx(5.0, abs=0.2)
+        assert det.offset_y_px == pytest.approx(-3.0, abs=0.2)
+        assert det.strength_ratio == pytest.approx(0.15, abs=0.02)
+        # 규칙적인 격자에서도 main-main mispair가 없어야 한다: 짝지어진
+        # ghost는 항상 main으로부터 정확히 (5,-3) 근처여야지, 이웃 Main
+        # (거리 30px)일 수 없다.
+        assert det.distance_px < 10.0
+
+
+def test_regular_led_grid_with_unequal_brightness():
+    """격자 안에서 Main 밝기가 위치마다 달라도(예: 좌상단이 더 밝고
+    우하단이 더 어두운 vignette 패턴) dominant offset/ratio는 흔들리면
+    안 된다."""
+    variation = {(r, c): 1.0 - 0.15 * (r + c) / 8.0 for r in range(4) for c in range(5)}
+    blobs = _regular_led_grid_blobs(
+        rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15, energy_variation=variation,
+    )
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=15.0)
+    detected = [d for d in detections if d.detected]
+    assert len(detected) == 20
+    for det in detected:
+        assert det.offset_x_px == pytest.approx(5.0, abs=0.2)
+        assert det.offset_y_px == pytest.approx(-3.0, abs=0.2)
+
+
+def test_regular_led_grid_with_missing_leds():
+    """일부 LED가 검출 실패/빠짐(missing)이어도 나머지는 정상적으로
+    pairing되어야 한다."""
+    missing = {(0, 0), (1, 3), (3, 4), (2, 2)}
+    blobs = _regular_led_grid_blobs(rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15, skip_positions=missing)
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=15.0)
+    detected = [d for d in detections if d.detected]
+    assert len(detected) == 20 - len(missing)
+    for det in detected:
+        assert det.offset_x_px == pytest.approx(5.0, abs=0.2)
+        assert det.offset_y_px == pytest.approx(-3.0, abs=0.2)
+
+
+def test_regular_led_grid_with_one_energy_outlier():
+    """한 위치의 ghost energy ratio만 크게 벗어나도(outlier) 그 위치의
+    pairing 자체는 displacement가 여전히 정확하므로 정상적으로
+    이루어져야 하고, dominant ratio(다른 19개 기준)는 흔들리면 안 된다."""
+    outlier_pos = (2, 3)
+    blobs = _regular_led_grid_blobs(
+        rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15,
+        extra_outlier_ratio_at=(outlier_pos[0], outlier_pos[1], 0.7),
+    )
+    candidates = _generate_candidate_pairs(blobs, max_search_radius_px=15.0)
+    dominant = estimate_dominant_ghost_vector(candidates, min_consensus_candidates=3)
+    assert dominant is not None
+    dominant_ratio = estimate_dominant_energy_ratio(candidates, dominant)
+    assert dominant_ratio == pytest.approx(0.15, abs=0.02)  # outlier 하나가 median을 흔들면 안 된다
+
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=15.0)
+    detected = [d for d in detections if d.detected]
+    assert len(detected) == 20
+    for det in detected:
+        # Outlier 위치라도 displacement 자체는 정확하다 - energy만 다르다.
+        assert det.offset_x_px == pytest.approx(5.0, abs=0.2)
+        assert det.offset_y_px == pytest.approx(-3.0, abs=0.2)
+
+
+def test_regular_led_grid_with_one_unrelated_bright_neighbor():
+    """격자와 무관한 밝은 점 하나가 격자 사이에 끼어 있어도(예: 다른
+    반사광원) 격자 pairing 자체가 깨지면 안 된다."""
+    blobs = _regular_led_grid_blobs(rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15)
+    # 격자 칸 사이(15,15 오프셋)에 무관한 밝은 점 하나 추가 - 어떤 Main과도
+    # (5,-3) 벡터로 맞지 않는다.
+    blobs.append(BrightBlob(x=15.0, y=15.0, energy=900.0, area_px=10))
+
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=15.0)
+    detected = [d for d in detections if d.detected]
+    assert len(detected) == 20  # 무관한 점은 어느 Main과도 짝지어지지 않아야 한다
+    for det in detected:
+        assert det.offset_x_px == pytest.approx(5.0, abs=0.2)
+        assert det.offset_y_px == pytest.approx(-3.0, abs=0.2)
+
+
+# ===========================================================================
+# Phase B-4 - Ghost 2-pass Spatial Pairing.
+# ===========================================================================
+
+from calibration.windshield.ghost.point_detector import pair_main_and_ghost_blobs_two_pass
+
+
+def test_two_pass_pairing_recovers_local_offset_that_global_vector_gets_wrong():
+    """PASS 1(단일 global dominant vector)은 이미지 전체에서 가장 support가
+    큰 하나의 displacement만 대표로 쓰므로, 소수 지역에서 실제 ghost
+    displacement가 다르면(windshield 곡률 등) 그 지역의 애매한 pairing을
+    틀리게 고를 수 있다. PASS 2(coarse spatial field 기반 재-pairing)는
+    이 경우를 복구해야 한다."""
+    image_width, image_height = 500.0, 200.0
+
+    # 왼쪽: 4x5 규칙적 LED grid, true ghost vector A=(+5,-3) - global
+    # consensus를 지배하는 다수 지역(20개 main, x<200이라 오른쪽과 같은
+    # coarse cell에 절대 섞이지 않는다).
+    blobs = _regular_led_grid_blobs(rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15)
+
+    # 오른쪽: 같은 coarse cell(3x3 grid의 (row=1,col=1)) 안에 놓인 4개의
+    # Main - true ghost vector B=(+9,-7)로, A와는 displacement가 뚜렷이
+    # 다른(consensus_radius=3.0보다 먼) 별도의 local cluster.
+    m1, m2, m3, m4 = (300.0, 100.0), (330.0, 100.0), (300.0, 130.0), (330.0, 130.0)
+    dx_b, dy_b, ratio = 9.0, -7.0, 0.15
+    for mx, my in (m1, m2, m3):
+        blobs.append(BrightBlob(x=mx, y=my, energy=1000.0, area_px=10))
+        blobs.append(BrightBlob(x=mx + dx_b, y=my + dy_b, energy=1000.0 * ratio, area_px=10))
+
+    # M4는 "애매한" main이다 - 진짜 local ghost(B)뿐 아니라, 우연히 global
+    # dominant vector A와 정확히 일치하는 위치에 놓인 밝은 점(distractor,
+    # 예: 다른 반사/광원)도 함께 있다. PASS 1은 global vector(A)로 점수를
+    # 매기므로 이 distractor를 진짜 ghost로 착각해야 한다(이 assertion
+    # 자체가 "2-pass 없이는 실제로 문제가 있다"를 먼저 증명한다).
+    mx4, my4 = m4
+    blobs.append(BrightBlob(x=mx4, y=my4, energy=1000.0, area_px=10))
+    blobs.append(BrightBlob(x=mx4 + dx_b, y=my4 + dy_b, energy=1000.0 * ratio, area_px=10))  # true local ghost(B)
+    blobs.append(BrightBlob(x=mx4 + 5.0, y=my4 - 3.0, energy=1000.0 * ratio, area_px=10))  # distractor at global A
+
+    pass1 = pair_main_and_ghost_blobs(blobs, max_search_radius_px=15.0)
+    pass1_detected = [d for d in pass1 if d.detected]
+    assert len(pass1_detected) == 24  # 20(왼쪽) + 4(오른쪽)
+
+    pass1_m4 = next(d for d in pass1_detected if d.main_x == mx4 and d.main_y == my4)
+    assert pass1_m4.offset_x_px == pytest.approx(5.0, abs=0.5)
+    assert pass1_m4.offset_y_px == pytest.approx(-3.0, abs=0.5)
+
+    two_pass = pair_main_and_ghost_blobs_two_pass(
+        blobs, image_width=image_width, image_height=image_height, max_search_radius_px=15.0,
+    )
+    two_pass_detected = [d for d in two_pass if d.detected]
+    assert len(two_pass_detected) == 24  # PASS 2는 detected 여부 자체를 바꾸지 않는다
+
+    two_pass_m4 = next(d for d in two_pass_detected if d.main_x == mx4 and d.main_y == my4)
+    # PASS 2는 M4가 속한 coarse cell의 나머지 3개 clean main이 전부 진짜
+    # local vector B로 pairing된 것을 보고, M4도 B로 재-pairing해야 한다.
+    assert two_pass_m4.offset_x_px == pytest.approx(dx_b, abs=0.5)
+    assert two_pass_m4.offset_y_px == pytest.approx(dy_b, abs=0.5)
+
+    # 2-pass가 나머지(애매하지 않은) main들의 정확한 pairing을 망가뜨리지
+    # 않았는지도 함께 확인한다(사용자 스펙: "PASS 2는 안전해야 한다").
+    for det in two_pass_detected:
+        if det.main_x == mx4 and det.main_y == my4:
+            continue
+        if det.main_x < 200.0:  # 왼쪽 LED grid
+            assert det.offset_x_px == pytest.approx(5.0, abs=0.3)
+            assert det.offset_y_px == pytest.approx(-3.0, abs=0.3)
+        else:  # 오른쪽 clean main들
+            assert det.offset_x_px == pytest.approx(dx_b, abs=0.3)
+            assert det.offset_y_px == pytest.approx(dy_b, abs=0.3)
+
+
+def test_two_pass_pairing_falls_back_to_pass_one_with_too_few_detections():
+    """Candidate가 너무 적어 PASS 1 자체가 이미 global consensus 없이
+    (순수 거리 기반) pairing된 경우, coarse spatial field를 만들 근거가
+    없으므로 PASS 2는 PASS 1 결과를 그대로 반환해야 한다(fallback,
+    사용자 스펙 B-4번)."""
+    blobs = [
+        BrightBlob(x=100.0, y=100.0, energy=1000.0, area_px=10),
+        BrightBlob(x=104.0, y=98.0, energy=150.0, area_px=10),
+    ]
+    pass1 = pair_main_and_ghost_blobs(blobs, max_search_radius_px=60.0, min_consensus_candidates=3)
+    two_pass = pair_main_and_ghost_blobs_two_pass(
+        blobs, image_width=320.0, image_height=240.0, max_search_radius_px=60.0, min_consensus_candidates=3,
+    )
+    assert len(two_pass) == len(pass1)
+    for a, b in zip(pass1, two_pass):
+        assert a.detected == b.detected
+        assert a.offset_x_px == b.offset_x_px
+        assert a.offset_y_px == b.offset_y_px
+
+
+def test_two_pass_pairing_handles_empty_blobs_without_crashing():
+    two_pass = pair_main_and_ghost_blobs_two_pass(
+        [], image_width=320.0, image_height=240.0,
+    )
+    assert two_pass == []
+
+
+def test_two_pass_pairing_on_regular_grid_matches_single_pass_result():
+    """단일하고 고른(spatial variation이 없는) 격자에서는 PASS 2가 PASS 1과
+    동일한 결과를 내야 한다(회귀 없음 - local vector가 global vector와
+    사실상 같아지므로)."""
+    blobs = _regular_led_grid_blobs(rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15)
+    pass1 = pair_main_and_ghost_blobs(blobs, max_search_radius_px=15.0)
+    two_pass = pair_main_and_ghost_blobs_two_pass(
+        blobs, image_width=200.0, image_height=200.0, max_search_radius_px=15.0,
+    )
+    assert len(two_pass) == len(pass1) == 20
+    for det in two_pass:
+        assert det.detected
+        assert det.offset_x_px == pytest.approx(5.0, abs=0.2)
+        assert det.offset_y_px == pytest.approx(-3.0, abs=0.2)

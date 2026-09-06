@@ -309,6 +309,22 @@ def fit_ghost_field_from_dataset(
             )
 
     all_detections = [det for frame in dataset_result.per_frame for det in frame.detections]
+    detected_detections_check = [d for d in all_detections if d.detected]
+    if not detected_detections_check:
+        # Phase A-4 안정화 - "Ghost가 없다"와 "Ghost offset이 0이다"는 완전히
+        # 다른 의미다. 유효 detection이 0개인 상태로 계속 진행하면 모든
+        # cell이 채울 근거 없이 dx=dy=strength=0인 GhostField가 되어(다음
+        # `cells`/`fill_empty_spatial_cells` 단계에서 자연히 그렇게 됨),
+        # suppress_ghost()가 "이 위치는 ghost가 없다고 측정됨"과 구분할 수
+        # 없는 채로 아무 보정도 하지 않게 된다 - 이는 "측정 안 됨"을
+        # "측정했더니 0이었음"으로 조용히 둔갑시키는 것이라 명시적으로
+        # 거부한다.
+        raise ValueError(
+            "Cannot fit GhostField: no valid ghost detections in the dataset "
+            f"({len(dataset_result.per_frame)} frame(s) evaluated, 0 detected). "
+            "A GhostField with dx=dy=strength=0 would silently claim 'no ghost "
+            "here' when the real situation is 'never observed a ghost to measure'."
+        )
 
     cells = build_robust_spatial_map_from_detections(
         all_detections, image_width=image_width, image_height=image_height, rows=rows, cols=cols, mad_k=mad_k,

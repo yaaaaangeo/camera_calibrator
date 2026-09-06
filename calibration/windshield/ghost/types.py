@@ -148,6 +148,13 @@ class GhostEvaluationResult:
     # 항상 None/False로 남는다.
     ghost_likelihood: Optional[float] = None
     is_likelihood: bool = False
+    # Phase B-5 안정화 - row-profile(가로 스캔)만으로는 세로 방향으로만
+    # 나타나는 double-edge 패턴을 놓친다. `ghost_likelihood`는 row+column
+    # 양쪽을 합친 값이고, 아래 두 필드는 방향별 breakdown 진단용이다(둘 다
+    # heuristic - Ground Truth 아님, General Likelihood 이외 모드에서는
+    # 항상 None).
+    likelihood_row_detection_rate: Optional[float] = None
+    likelihood_column_detection_rate: Optional[float] = None
 
     regional_metrics: dict[str, GhostRegionMetrics] = field(default_factory=dict)
     spatial_map: list[GhostSpatialCell] = field(default_factory=list)
@@ -181,8 +188,15 @@ class GhostDatasetResult:
     # 몇 프레임이 실제로 쓰였는지 남긴다.
     image_width: Optional[int] = None
     image_height: Optional[int] = None
+    # Phase A-5 안정화 - `num_valid_frames`는 "입력 이미지 개수"가 아니라
+    # "실제 evaluation에 성공한(success=True) frame 개수"여야 한다(예:
+    # Input=20, Successful=15, Failed=5 라면 num_input_frames=20,
+    # num_valid_frames=15, num_failed_frames=5). 이전에는
+    # `len(per_frame)`을 그대로 넣어서, evaluation 자체가 실패한(success=
+    # False) frame까지 "유효"로 잘못 세고 있었다.
     num_input_frames: int = 0
     num_valid_frames: int = 0
+    num_failed_frames: int = 0
     success: bool = True
     warning_message: Optional[str] = None
     error_message: Optional[str] = None

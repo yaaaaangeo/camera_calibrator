@@ -109,6 +109,158 @@ def test_reference_alignment_reduces_false_reflection_from_small_shift():
     assert aligned.mean_strength < no_align.mean_strength * 0.5
 
 
+def _blurred_noise_bgr(h: int, w: int, seed: int = 0, sigma: float = 6.0) -> np.ndarray:
+    """ECC가 안정적으로 recover할 수 있는, 주기성 없는 non-periodic
+    texture(순수 gradient는 aperture problem 때문에 ECC가 shift를 아예
+    못 잡아낼 수 있어 이 테스트 목적에 부적합하다 - blur된 random noise를
+    쓴다)."""
+    rng = np.random.default_rng(seed)
+    raw = (rng.random((h, w)) * 255).astype(np.float32)
+    blurred = cv2.GaussianBlur(raw, (0, 0), sigmaX=sigma)
+    return cv2.cvtColor(blurred.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+
+def test_valid_warp_mask_excludes_border_reflect_artifacts():
+    """Phase B-1 안정화 - alignment warp가 만드는 BORDER_REFLECT 인공
+    영역이 Reflection metric에 섞이면 안 된다. 실제로 겹치는 영역만 보면
+    같은 이미지끼리의 비교이므로 reflection이 거의 0이어야 하고, valid
+    영역의 크기는 정확히 "이미지 폭 - shift 크기"와 일치해야 한다."""
+    h, w = 200, 300
+    normal = _blurred_noise_bgr(h, w)
+    shift_px = 20
+    warp = np.float32([[1, 0, shift_px], [0, 1, 0]])
+    reference = cv2.warpAffine(normal, warp, (w, h), borderMode=cv2.BORDER_REFLECT)
+
+    result = evaluate_reflection_reference(
+        normal, reference,
+        ReflectionEvaluationConfig(align=True, alignment_model="translation", photometric_normalize=True),
+    )
+    assert result.success
+    assert result.alignment_status == "good"
+    assert result.alignment_translation_x_px == pytest.approx(shift_px, abs=0.5)
+    # Border를 제대로 제외했다면, 실제로 겹치는 영역은 같은 이미지끼리의
+    # 비교이므로 reflection이 거의 0에 가까워야 한다.
+    assert result.reflection_mean is not None
+    assert result.reflection_mean < 0.02
+    assert result.reflection_max is not None
+    assert result.reflection_max < 0.1
+
+
+def test_valid_warp_mask_matches_exact_expected_border_width():
+    """`align_reference_to_normal()`의 valid_mask 자체를 직접 검증한다 -
+    shift_px만큼 border가 생겼다면 valid 비율은 정확히
+    (w-shift_px)/w이어야 한다(사용자 스펙 B-1, 근사가 아니라 정확한 값)."""
+    from calibration.windshield.reflection.alignment import align_reference_to_normal
+
+    h, w = 200, 300
+    normal_bgr = _blurred_noise_bgr(h, w)
+    normal_luma = cv2.cvtColor(normal_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    shift_px = 20
+    warp = np.float32([[1, 0, shift_px], [0, 1, 0]])
+    reference_luma = cv2.warpAffine(normal_luma, warp, (w, h), borderMode=cv2.BORDER_REFLECT)
+
+    result = align_reference_to_normal(normal_luma, reference_luma, method="translation")
+    assert result.status == "good"
+    assert result.valid_mask is not None
+    expected_valid_fraction = (w - shift_px) / w
+    assert float(result.valid_mask.mean()) == pytest.approx(expected_valid_fraction, abs=0.01)
+    # Border는 항상 전체 행에 걸쳐 있어야 한다(순수 x-translation이므로).
+    col_valid = result.valid_mask.all(axis=0)
+    assert int(col_valid.sum()) == w - shift_px
+
+
+def test_valid_warp_mask_is_none_when_alignment_disabled():
+    """정렬을 아예 하지 않으면(align=False) border 개념 자체가 없다 -
+    valid_mask 제약 없이 전체 이미지가 그대로 평가되어야 한다(기존 동작
+    유지)."""
+    normal = _base_image()
+    result = evaluate_reflection_reference(
+        normal, normal,
+        ReflectionEvaluationConfig(align=False, photometric_normalize=False, allow_unsafe_reference_bypass=True),
+    )
+    assert result.success
+    assert result.reflection_mean == pytest.approx(0.0, abs=1e-6)
+
+
+def test_alignment_method_typo_is_rejected_not_silently_treated_as_affine():
+    """Phase B-2 안정화 - 지원하지 않는 alignment method(오타 포함)가
+    조용히 Affine으로 처리되면 안 된다."""
+    from calibration.windshield.reflection.alignment import align_reference_to_normal
+
+    normal = _base_image()
+    with pytest.raises(ValueError, match="unsupported reflection alignment method"):
+        align_reference_to_normal(
+            cv2.cvtColor(normal, cv2.COLOR_BGR2GRAY).astype(np.float32),
+            cv2.cvtColor(normal, cv2.COLOR_BGR2GRAY).astype(np.float32),
+            method="Affine",  # 대문자 오타 - 예전에는 조용히 AFFINE으로 처리됐다
+        )
+    with pytest.raises(ValueError, match="unsupported reflection alignment method"):
+        align_reference_to_normal(
+            cv2.cvtColor(normal, cv2.COLOR_BGR2GRAY).astype(np.float32),
+            cv2.cvtColor(normal, cv2.COLOR_BGR2GRAY).astype(np.float32),
+            method="afifne",  # 오타
+        )
+
+
+def test_alignment_translation_and_affine_are_still_accepted():
+    from calibration.windshield.reflection.alignment import align_reference_to_normal
+
+    normal = _base_image()
+    luma = cv2.cvtColor(normal, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    for method in ("translation", "affine"):
+        result = align_reference_to_normal(luma, luma, method=method)
+        assert result.method == method
+        assert result.status in {"good", "warning", "invalid"}
+
+
+def test_affine_alignment_reports_readable_diagnostics():
+    """Phase B-2 - Affine 사용 시 translation/rotation/scale/shear 진단이
+    채워져야 한다."""
+    h, w = 160, 220
+    gradient = np.tile(np.linspace(0, 255, w, dtype=np.float32), (h, 1))
+    gradient = cv2.GaussianBlur(gradient, (0, 0), sigmaX=3.0)
+    normal = cv2.cvtColor(gradient.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+    warp = np.float32([[1, 0, 5], [0, 1, 3]])
+    reference = cv2.warpAffine(normal, warp, (w, h), borderMode=cv2.BORDER_REFLECT)
+
+    result = evaluate_reflection_reference(
+        normal, reference,
+        ReflectionEvaluationConfig(align=True, alignment_model="affine", photometric_normalize=True),
+    )
+    assert result.success
+    assert result.alignment_method == "affine"
+    assert result.alignment_translation_x_px is not None
+    assert result.alignment_translation_y_px is not None
+    assert result.alignment_rotation_deg is not None
+    assert result.alignment_scale is not None
+    assert result.alignment_shear_deg is not None
+
+
+def test_unusually_large_transform_is_downgraded_to_warning_even_with_high_score():
+    """Phase B-2 - score가 높아도 transform 자체가 이미지 대각선 대비
+    비정상적으로 크면 자동으로 'good'이 되면 안 된다(다른 scene을 잘못
+    짝지었을 가능성)."""
+    from calibration.windshield.reflection.alignment import (
+        DEFAULT_MAX_REASONABLE_TRANSLATION_DIAGONAL_RATIO,
+        align_reference_to_normal,
+    )
+
+    h, w = 100, 100
+    rng = np.random.default_rng(1)
+    raw = (rng.random((h, w)) * 255).astype(np.float32)
+    clean = cv2.GaussianBlur(raw, (0, 0), sigmaX=5.0)
+    diagonal = float(np.hypot(h, w))
+    huge_shift = int(diagonal * DEFAULT_MAX_REASONABLE_TRANSLATION_DIAGONAL_RATIO) + 10
+    warp = np.float32([[1, 0, huge_shift], [0, 1, 0]])
+    shifted = cv2.warpAffine(clean, warp, (w, h), borderMode=cv2.BORDER_REFLECT)
+
+    result = align_reference_to_normal(clean, shifted, method="translation")
+    if result.score is not None and result.score >= 0.90:
+        assert result.status == "warning"
+        assert result.warning_message is not None
+
+
 def test_production_reference_path_forces_alignment_and_normalization():
     normal = _base_image()
     warp = np.float32([[1, 0, 3], [0, 1, -2]])
@@ -322,6 +474,52 @@ def test_multi_pair_dataset_aggregates_and_keeps_day_night_groups(tmp_path):
     assert result.reference_mean_strength == pytest.approx(result.mean_strength)
     assert result.mean_reflection_likelihood is None
     assert set(result.by_day_night) == {"day", "night"}
+
+
+def test_dataset_isolates_one_broken_pair_and_keeps_evaluating_the_rest(tmp_path):
+    """Phase A-7 안정화 - Pair 03이 INVALID(존재하지 않는 파일)여도 그 뒤에
+    오는 Pair 04가 평가되지 않고 dataset 전체가 예외로 죽으면 안 된다.
+    GOOD pair만 aggregate에 쓰이고, invalid pair 개수도 명시적으로
+    보고되어야 한다."""
+    reference = _base_image()
+    mild = _overlay_rect(reference, value=15)
+    ref_path = tmp_path / "ref.png"
+    mild_path = tmp_path / "mild.png"
+    cv2.imwrite(str(ref_path), reference)
+    cv2.imwrite(str(mild_path), mild)
+
+    result = evaluate_reflection_dataset([
+        ReflectionImagePair(str(mild_path), str(ref_path), "pair_01"),
+        ReflectionImagePair(str(mild_path), str(ref_path), "pair_02"),
+        ReflectionImagePair(str(tmp_path / "does_not_exist.png"), str(ref_path), "pair_03"),
+        ReflectionImagePair(str(mild_path), str(ref_path), "pair_04"),
+    ])
+
+    assert result.success
+    assert len(result.pair_results) == 4  # 실패한 pair도 결과 목록에는 남는다(원인 추적용)
+    assert result.num_valid_pairs == 3
+    assert result.num_invalid_pairs == 1
+    pair_03 = next(r for r in result.pair_results if r.pair_id == "pair_03")
+    assert pair_03.success is False
+    assert pair_03.error_message is not None
+    # Pair 04는 Pair 03의 실패와 무관하게 정상적으로 평가되어야 한다.
+    pair_04 = next(r for r in result.pair_results if r.pair_id == "pair_04")
+    assert pair_04.success is True
+    assert result.warning_message is not None and "1" in result.warning_message
+
+
+def test_dataset_with_all_pairs_invalid_reports_failure_not_exception(tmp_path):
+    """Phase A-7 안정화 - 모든 pair가 invalid면 dataset 자체는 실패해야
+    하지만, 예외를 던지는 대신 `success=False`인 결과를 정상적으로
+    반환해야 한다."""
+    result = evaluate_reflection_dataset([
+        ReflectionImagePair(str(tmp_path / "missing_1.png"), pair_id="bad_1"),
+        ReflectionImagePair(str(tmp_path / "missing_2.png"), pair_id="bad_2"),
+    ])
+    assert result.success is False
+    assert result.num_valid_pairs == 0
+    assert result.num_invalid_pairs == 2
+    assert result.error_message is not None
 
 
 def test_no_reference_dataset_aggregate_uses_likelihood_not_severity(tmp_path):

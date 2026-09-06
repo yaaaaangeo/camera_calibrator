@@ -1,43 +1,15 @@
 #!/usr/bin/env bash
-# Runs every tests/test_*.py file (each has its own standalone runner, no
-# pytest required) and reports an aggregate pass/fail. Exits non-zero if
-# any file failed, so this is CI-friendly as-is (see .github/workflows/ci.yml).
-set -uo pipefail
+# Runs the full pytest suite (tests/test_*.py) via the real pytest runner.
+#
+# Phase A-2 안정화 - 이전 버전은 `python3 "$f"`로 각 테스트 파일을
+# standalone script처럼 실행했지만, 이 저장소의 테스트 파일은 전부 pytest
+# 함수/fixture(assert, pytest.approx, pytest.raises, tmp_path 등) 기반이고
+# `if __name__ == "__main__":` 블록이 하나도 없다 - 즉 `python3 file.py`는
+# 모듈을 import만 하고 실제 테스트 함수를 단 하나도 호출하지 않은 채 항상
+# exit code 0으로 끝났다("0 passed, 0 failed"를 조용히 성공으로 보고).
+# pytest가 파일을 직접 수집/실행하도록 고친다.
+set -euo pipefail
 
 cd "$(dirname "$0")"
 
-total_pass=0
-total_fail=0
-failed_files=()
-
-for f in tests/test_*.py; do
-    echo "=== $f ==="
-    output="$(python3 "$f" 2>&1)"
-    status=$?
-    echo "$output" | tail -3
-    echo
-
-    if [ $status -ne 0 ]; then
-        failed_files+=("$f")
-    fi
-
-    counts="$(echo "$output" | grep -Eo '[0-9]+ passed, [0-9]+ failed' | tail -1)"
-    if [ -n "$counts" ]; then
-        p="$(echo "$counts" | grep -Eo '^[0-9]+')"
-        fcount="$(echo "$counts" | grep -Eo '[0-9]+ failed' | grep -Eo '^[0-9]+')"
-        total_pass=$((total_pass + p))
-        total_fail=$((total_fail + fcount))
-    fi
-done
-
-echo "============================================================"
-echo "TOTAL: $total_pass passed, $total_fail failed, across $(ls tests/test_*.py | wc -l | tr -d ' ') files"
-echo "============================================================"
-
-if [ ${#failed_files[@]} -gt 0 ]; then
-    echo "Files with failures or errors:"
-    printf '  %s\n' "${failed_files[@]}"
-    exit 1
-fi
-
-exit 0
+python -m pytest -q

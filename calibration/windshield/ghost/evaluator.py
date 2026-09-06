@@ -229,21 +229,44 @@ def evaluate_ghost_general_likelihood(
     """Point-source ground truth가 없는 일반 도로 영상에서 heuristic하게
     ghost 가능성을 추정한다(사용자 스펙 24-26번). 결과는 절대 "Ground
     Truth"라고 부르지 않고 `ghost_likelihood`/`is_likelihood=True`로만
-    노출한다."""
+    노출한다.
+
+    Phase B-5 안정화 - row-profile(가로 스캔)만으로는 double-edge 패턴이
+    세로 방향으로만 나타나는 경우(예: 세로 줄무늬 형태의 ghost)를 놓친다.
+    동일한 `detect_edge_ghost` 검출기를 column-profile(세로 스캔)에도
+    대칭적으로 적용해 두 방향을 모두 본다 - `ghost_likelihood`는 두 방향의
+    profile을 합쳐 계산하고(둘 다 여전히 같은 heuristic profile 기반),
+    `likelihood_row_detection_rate`/`likelihood_column_detection_rate`에
+    방향별 breakdown을 별도로 남긴다(진단용, 여전히 heuristic - Ground
+    Truth 아님)."""
     cfg = config or GhostEvaluationConfig(mode="general_likelihood")
     try:
         lum = image_bgr.astype(np.float32)
         if lum.ndim == 3:
             lum = lum.mean(axis=2)
-        # 수평 방향 double-edge 탐색: 각 행을 1D profile로 보고 edge 검출기를 재사용한다.
+        min_gradient = (
+            DEFAULT_LIKELIHOOD_MIN_GRADIENT if cfg.likelihood_min_gradient is None else cfg.likelihood_min_gradient
+        )
+        # 수평 방향 double-edge 탐색: 각 행(row)을 1D profile로 보고 edge
+        # 검출기를 재사용한다.
         row_results = [
             detect_edge_ghost(
                 lum[row, :],
-                min_gradient=DEFAULT_LIKELIHOOD_MIN_GRADIENT if cfg.likelihood_min_gradient is None else cfg.likelihood_min_gradient,
+                min_gradient=min_gradient,
                 max_search_radius_px=cfg.likelihood_max_search_radius_px,
                 min_secondary_ratio=0.05,
             )
             for row in range(0, lum.shape[0], max(1, lum.shape[0] // 64))
+        ]
+        # 수직 방향 double-edge 탐색: 각 열(column)을 1D profile로 본다.
+        col_results = [
+            detect_edge_ghost(
+                lum[:, col],
+                min_gradient=min_gradient,
+                max_search_radius_px=cfg.likelihood_max_search_radius_px,
+                min_secondary_ratio=0.05,
+            )
+            for col in range(0, lum.shape[1], max(1, lum.shape[1] // 64))
         ]
     except Exception as exc:  # pragma: no cover - defensive
         return GhostEvaluationResult(
@@ -254,8 +277,13 @@ def evaluate_ghost_general_likelihood(
             error_message=f"general likelihood 평가 중 예외 발생: {exc}",
         )
 
-    detected = [r for r in row_results if r.detected]
-    likelihood = (len(detected) / len(row_results)) if row_results else 0.0
+    row_detected = [r for r in row_results if r.detected]
+    col_detected = [r for r in col_results if r.detected]
+    all_results = row_results + col_results
+    detected = row_detected + col_detected
+    likelihood = (len(detected) / len(all_results)) if all_results else 0.0
+    row_rate = (len(row_detected) / len(row_results)) if row_results else None
+    col_rate = (len(col_detected) / len(col_results)) if col_results else None
     strengths = [r.strength_ratio for r in detected if r.strength_ratio is not None]
 
     return GhostEvaluationResult(
@@ -264,12 +292,14 @@ def evaluate_ghost_general_likelihood(
         metric_version=GHOST_METRIC_VERSION,
         pair_id=pair_id,
         detection_count=len(detected),
-        candidate_count=len(row_results),
-        detection_rate=float(likelihood) if row_results else None,
+        candidate_count=len(all_results),
+        detection_rate=float(likelihood) if all_results else None,
         mean_strength_ratio=_mean_or_none(strengths),
         p95_strength_ratio=_percentile_or_none(strengths, 95),
         ghost_likelihood=float(likelihood),
         is_likelihood=True,
+        likelihood_row_detection_rate=row_rate,
+        likelihood_column_detection_rate=col_rate,
         warning_message=_GENERAL_LIKELIHOOD_WARNING,
     )
 
@@ -343,7 +373,10 @@ def evaluate_ghost_dataset(
         image_width=image_width,
         image_height=image_height,
         num_input_frames=num_input_frames if num_input_frames is not None else len(per_frame),
-        num_valid_frames=len(per_frame),
+        # num_valid_frames = "evaluation에 성공한(success=True) frame 수"다
+        # (Phase A-5) - `len(per_frame)`(=시도한 frame 수)이 아니다.
+        num_valid_frames=len(successful),
+        num_failed_frames=len(per_frame) - len(successful),
         success=bool(successful),
         warning_message=warning,
     )
@@ -412,8 +445,17 @@ def evaluate_ghost_dataset_from_paths(
     명시).
     """
     cfg = config or GhostEvaluationConfig()
-    ids = frame_ids or [str(i) for i in range(len(image_paths))]
     n = len(image_paths)
+
+    # Phase A-6 안정화 - frame_ids 개수가 image_paths와 다르면 zip()이
+    # 짧은 쪽 길이에서 조용히 잘라버린다(예: 20장 중 18개 id만 있으면 마지막
+    # 2장이 아무 경고 없이 누락됨). 명시적으로 거부한다.
+    if frame_ids is not None and len(frame_ids) != len(image_paths):
+        raise ValueError(
+            f"frame_ids length ({len(frame_ids)}) does not match image_paths length "
+            f"({len(image_paths)}) - refusing to silently truncate the dataset."
+        )
+    ids = frame_ids or [str(i) for i in range(len(image_paths))]
 
     per_frame: list[GhostEvaluationResult] = []
     expected_shape: Optional[tuple[int, int]] = None
@@ -424,6 +466,15 @@ def evaluate_ghost_dataset_from_paths(
             progress_callback(f"Evaluating ghost {i + 1}/{n}...")
         image = cv2.imread(path, cv2.IMREAD_COLOR)
         if image is None:
+            # Phase A-5 안정화 - 읽지 못한 이미지를 그냥 건너뛰지 않는다
+            # (num_input_frames == len(per_frame) 불변식이 깨지고, 실패
+            # 원인도 사라진다) - 실패한 frame으로 명시적으로 기록한다.
+            per_frame.append(
+                GhostEvaluationResult(
+                    success=False, mode=cfg.mode, pair_id=frame_id,
+                    error_message=f"이미지를 읽을 수 없습니다: {path}",
+                )
+            )
             continue
 
         shape = image.shape[:2]  # (height, width)

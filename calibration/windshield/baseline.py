@@ -218,6 +218,17 @@ class BaselineWindshieldModel(WindshieldModel):
         u, v = projected[0]
         return float(u), float(v)
 
+    def project_points_batch(self, points_xyz: np.ndarray) -> np.ndarray:
+        """`project_point()`를 포인트 수만큼 반복 호출하는 것과 수학적으로
+        완전히 동일한 결과를 한 번의 벡터화된 `project_points_for_model()`
+        호출로 낸다(Baseline은 rvec=tvec=0 고정이라 `cv2.projectPoints`류
+        호출 자체가 원래 다중 포인트를 한 번에 받을 수 있음 - Phase C-1
+        Runtime Projector의 "Batch(Exact)" 티어 전용, 별도 API - 기존
+        `project_point()`의 동작/시그니처는 바꾸지 않는다)."""
+        pts = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 1, 3)
+        projected = project_points_for_model(pts, self._zero, self._zero, self._K, self._D, self._model)
+        return np.asarray(projected, dtype=np.float64).reshape(-1, 2)
+
     def unproject_pixel(self, u: float, v: float) -> tuple[float, float, float]:
         pt = np.array([[[u, v]]], dtype=np.float64)
         if self._model == CameraModelType.FISHEYE:

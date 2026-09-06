@@ -13,6 +13,7 @@ import copy
 
 import pytest
 
+from calibration.holdout_evidence import evaluate_holdout_evidence
 from calibration.types import CameraModelType, FrameStatus
 from calibration.validation import (
     _subset_dataset,
@@ -141,6 +142,70 @@ def test_train_rms_reproducible_independently_of_test_evaluation(synthetic_datas
         "validate_holdout 내부에서 쓰인 train fit이 순수 train-only 결과와 달라짐 - "
         "test 정보가 학습에 섞여 들어갔을 가능성이 있음"
     )
+
+
+def test_holdout_test_evaluation_does_not_mutate_test_frame_reprojection_error(
+    synthetic_dataset, camera_config, pattern_config,
+):
+    """Phase A-8 안정화 - hold-out **test** 평가(_test_reprojection_errors,
+    고정된 intrinsic으로 test 프레임의 pose만 재추정)는 원본 test Frame의
+    reprojection_error를 직접 덮어쓰면 안 된다. Pinhole/Brown/Rational/
+    Fisheye를 순차적으로 hold-out 검증하면 같은 test Frame 객체가 매번
+    mutate되어 "마지막에 평가된 모델의 test 값"만 남는 문제가 있었다 -
+    이제는 test 평가 쪽에서는 절대 건드리지 않고, 필요한 값은
+    ValidationResult.per_frame_error에만 담아야 한다.
+
+    (참고: train 쪽 calibrate_*() 함수 자체가 갖고 있는 별도의
+    frame.reprojection_error 기록 동작은 이 테스트의 범위가 아니다 - 그
+    함수들은 이 validation 경로 밖에서도 단독으로 쓰이는 범용 함수라 이번
+    라운드에서는 손대지 않았다.)"""
+    dataset = copy.deepcopy(synthetic_dataset)
+    train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio=0.25, seed=11)
+    assert test_ids
+
+    test_frames_before = {fid: next(f for f in dataset.frames if f.image_info.image_id == fid).reprojection_error for fid in test_ids}
+
+    validation_result = validate_holdout(
+        dataset, camera_config, pattern_config, CameraModelType.PINHOLE, train_ids, test_ids
+    )
+    assert validation_result.success
+
+    for fid in test_ids:
+        frame = next(f for f in dataset.frames if f.image_info.image_id == fid)
+        assert frame.reprojection_error == test_frames_before[fid], (
+            "hold-out test 평가가 test Frame.reprojection_error를 mutate했다 - "
+            "여러 모델을 순차 검증하면 마지막 모델의 test 값만 남는 버그가 재발한다."
+        )
+
+    # 대신 ValidationResult.per_frame_error에 model-specific하게 보관되어야 한다.
+    assert validation_result.per_frame_error, "per_frame_error가 비어 있음 - hold-out 결과가 어디에도 저장되지 않음"
+    assert set(validation_result.per_frame_error) <= set(test_ids)
+
+
+def test_sequential_holdout_validation_across_models_keeps_independent_test_errors(
+    synthetic_dataset, camera_config, pattern_config,
+):
+    """Pinhole -> Fisheye 순서로 같은 Dataset을 hold-out 검증해도, 각
+    ValidationResult.per_frame_error(test 프레임 기준)는 서로 다른 모델의
+    값을 독립적으로 유지해야 한다."""
+    dataset = copy.deepcopy(synthetic_dataset)
+    train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio=0.3, seed=5)
+    assert test_ids
+
+    pinhole_validation = validate_holdout(
+        dataset, camera_config, pattern_config, CameraModelType.PINHOLE, train_ids, test_ids
+    )
+    fisheye_validation = validate_holdout(
+        dataset, camera_config, pattern_config, CameraModelType.FISHEYE, train_ids, test_ids
+    )
+    assert pinhole_validation.success and fisheye_validation.success
+    assert pinhole_validation.per_frame_error
+    assert fisheye_validation.per_frame_error
+    # 각 ValidationResult는 자신의 모델 값만 독립적으로 갖고 있어야 한다 -
+    # 같은 dict 객체를 공유하거나 서로 덮어쓰면 안 된다.
+    assert pinhole_validation.per_frame_error is not fisheye_validation.per_frame_error
+    assert set(pinhole_validation.per_frame_error) <= set(test_ids)
+    assert set(fisheye_validation.per_frame_error) <= set(test_ids)
 
 
 def test_leak_safe_outlier_pruning_only_removes_train_frames(
@@ -275,3 +340,109 @@ def test_corner_level_leak_safe_reproduces_pure_train_fit(synthetic_dataset, cam
     independent_fit = calibrate_pinhole(_subset_dataset(dataset, train_ids), camera_config)
     assert independent_fit.success
     assert train_result.rms_error == pytest.approx(independent_fit.rms_error, rel=1e-9, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Phase B-6 - Hold-out Evidence Gate.
+#
+# synthetic_dataset은 16장뿐이라 test_ratio=0.25면 test 프레임이 3~4장뿐이다
+# (calibration/holdout_evidence.py의 MIN_EVIDENCE_TEST_FRAMES=5보다 적음) -
+# 이 자연스러운 소규모 데이터셋 자체가 "insufficient evidence" 케이스를
+# 실제로 재현하는 좋은 fixture가 된다(인위적으로 조작할 필요 없음).
+# ---------------------------------------------------------------------------
+
+def test_validate_holdout_populates_evidence_gate(synthetic_dataset, camera_config, pattern_config):
+    dataset = copy.deepcopy(synthetic_dataset)
+    train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio=0.25, seed=42)
+    assert test_ids
+
+    result = validate_holdout(
+        dataset, camera_config, pattern_config, CameraModelType.PINHOLE, train_ids, test_ids
+    )
+    assert result.success
+    assert result.evidence_gate is not None
+    assert result.evidence_gate.status in ("sufficient", "insufficient_evidence")
+    assert result.evidence_gate.test_frame_count == len(test_ids)
+    assert result.evidence_gate.test_corner_count > 0
+
+
+def test_evidence_gate_never_overrides_or_hides_test_rms(synthetic_dataset, camera_config, pattern_config):
+    """Evidence Gate는 test_rms 숫자 자체를 바꾸거나 success를 False로
+    만들면 안 된다 - "낮은 RMS를 틀렸다고 판정"하는 게 아니라 근거 부족을
+    별도로 보고할 뿐이다(사용자 스펙 B-6번 핵심 원칙)."""
+    dataset = copy.deepcopy(synthetic_dataset)
+    train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio=0.25, seed=42)
+
+    result = validate_holdout(
+        dataset, camera_config, pattern_config, CameraModelType.PINHOLE, train_ids, test_ids
+    )
+    assert result.success is True
+    assert result.test_rms is not None
+    # evidence_gate가 채워졌더라도 test_rms/success는 그대로여야 한다.
+    assert result.evidence_gate is not None
+
+
+def test_small_synthetic_test_set_is_flagged_as_insufficient_evidence(synthetic_dataset, camera_config):
+    """16장짜리 synthetic_dataset을 0.25 비율로 나누면 test 프레임이
+    MIN_EVIDENCE_TEST_FRAMES(5)보다 적다 - 이런 소규모 test set은 RMS가
+    아무리 낮아도 "insufficient evidence"로 명시적으로 구분되어야 한다."""
+    dataset = copy.deepcopy(synthetic_dataset)
+    _, test_ids = split_train_test(dataset, camera_config, test_ratio=0.25, seed=42)
+    assert 0 < len(test_ids) < 5, "이 테스트는 test set이 작다는 전제가 깨지면 무의미함"
+
+    test_dataset = _subset_dataset(dataset, test_ids)
+    gate = evaluate_holdout_evidence(test_dataset, camera_config)
+
+    assert gate.status == "insufficient_evidence"
+    assert gate.reasons  # 근거 부족 사유가 최소 하나 이상 기록되어야 한다
+    assert any("프레임" in r for r in gate.reasons)
+
+
+def test_evidence_gate_reports_sufficient_when_thresholds_are_relaxed(synthetic_dataset, camera_config):
+    """같은 test set이라도 threshold를 충분히 낮추면 "sufficient"로 판정돼야
+    한다 - gate 로직 자체가 항상 insufficient만 내는 고정 함수가 아님을
+    확인한다(사용자 스펙 - "낮은 RMS를 INVALID로 바꾸는 것"이 아니라 근거를
+    평가하는 것이므로, 근거가 실제로 충분하면 sufficient가 나와야 함)."""
+    dataset = copy.deepcopy(synthetic_dataset)
+    _, test_ids = split_train_test(dataset, camera_config, test_ratio=0.25, seed=42)
+    test_dataset = _subset_dataset(dataset, test_ids)
+
+    gate = evaluate_holdout_evidence(
+        test_dataset, camera_config,
+        min_test_frames=1, min_test_corners=1, min_coverage_pct=0.0, min_pose_diversity=0.0,
+    )
+    assert gate.status == "sufficient"
+    assert gate.reasons == []
+
+
+def test_evidence_gate_is_none_when_no_test_frames(synthetic_dataset, camera_config, pattern_config):
+    """Test 프레임이 아예 없어 hold-out 평가 자체를 못 하는 경로
+    (`_evaluate_on_test`의 조기 반환)에서는 evidence_gate도 "아직 평가되지
+    않음"을 뜻하는 None으로 남아야 한다 - 억지로 "insufficient_evidence"를
+    지어내지 않는다."""
+    dataset = copy.deepcopy(synthetic_dataset)
+    all_ids = [f.image_info.image_id for f in dataset.enabled_frames if f.detection and f.detection.success]
+
+    result = validate_holdout(
+        dataset, camera_config, pattern_config, CameraModelType.PINHOLE, all_ids, [],
+    )
+    assert result.success
+    assert result.test_frame_ids == []
+    assert result.evidence_gate is None
+
+
+def test_evidence_gate_does_not_mutate_input_dataset(synthetic_dataset, camera_config):
+    """Phase A-8 원칙 재확인 - evaluate_holdout_evidence()는
+    analyze_dataset_quality()와 달리 dataset.coverage_grid/diversity에 직접
+    쓰지 않아야 한다(호출자가 그 결과를 이미 다른 용도로 쓰고 있을 수
+    있으므로 부수효과를 만들지 않는다)."""
+    dataset = copy.deepcopy(synthetic_dataset)
+    _, test_ids = split_train_test(dataset, camera_config, test_ratio=0.25, seed=42)
+    test_dataset = _subset_dataset(dataset, test_ids)
+    assert test_dataset.coverage_grid == []
+    assert test_dataset.diversity is None
+
+    evaluate_holdout_evidence(test_dataset, camera_config)
+
+    assert test_dataset.coverage_grid == []
+    assert test_dataset.diversity is None

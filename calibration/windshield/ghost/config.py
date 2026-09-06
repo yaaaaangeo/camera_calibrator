@@ -51,6 +51,19 @@ PAIR_SCORE_WEIGHT_VECTOR = 1.0
 PAIR_SCORE_WEIGHT_DISTANCE = 0.15
 PAIR_SCORE_WEIGHT_ENERGY = 0.5
 
+# 2-pass spatial pairing(Phase B-4 안정화) - PASS 1은 위 global consensus
+# vector 하나로 이미지 전체를 커버하지만, windshield 곡률/장착 각도에 따라
+# 실제 ghost displacement가 위치마다(예: 좌측 상단 vs 우측 하단) 달라질 수
+# 있다. PASS 2는 PASS 1 결과로 만든 성긴 coarse grid를 이용해 main별 local
+# dx(u,v)/dy(u,v)를 예측하고, 그 local vector로 재-pairing한다. 새 딥러닝
+# 모델을 쓰지 않고 기존 robust median/MAD 집계(spatial_model.py)를 그대로
+# 재사용한다. 초기 default일 뿐 실데이터로 재조정 필요.
+DEFAULT_TWO_PASS_GRID_ROWS = 3
+DEFAULT_TWO_PASS_GRID_COLS = 3
+# 이보다 샘플(=PASS 1 detection)이 적은 cell은 local vector를 신뢰하지
+# 않고 PASS 1의 global dominant vector로 fallback한다.
+DEFAULT_TWO_PASS_MIN_CELL_SAMPLES = 3
+
 # ---------------------------------------------------------------------------
 # Edge-target detection
 # ---------------------------------------------------------------------------

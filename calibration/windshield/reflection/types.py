@@ -103,6 +103,14 @@ class ReflectionEvaluationResult:
     alignment_error_px: Optional[float] = None
     alignment_status: str = "not_run"
     alignment_method: str = "none"
+    # Phase B-2 안정화 - Affine alignment 사용 시 사람이 읽을 수 있는
+    # 진단(사용자 스펙). Translation 모드에서는 rotation_deg=0/scale=1/
+    # shear_deg=0으로 고정된다.
+    alignment_translation_x_px: Optional[float] = None
+    alignment_translation_y_px: Optional[float] = None
+    alignment_rotation_deg: Optional[float] = None
+    alignment_scale: Optional[float] = None
+    alignment_shear_deg: Optional[float] = None
     photometric_normalized: bool = False
     photometric_gain: Optional[float] = None
     photometric_bias: Optional[float] = None
@@ -131,6 +139,12 @@ class ReflectionDatasetResult:
     coverage: float = 0.0
     severity_score: Optional[float] = None
     by_day_night: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Phase A-7 안정화 - 개별 pair 성공/실패 개수를 명시적으로 남긴다(예:
+    # "Valid 18 / Invalid 2") - `pair_results`를 순회해서 매번 세지 않아도
+    # UI/로그에서 바로 쓸 수 있다. Ghost의 num_valid_frames/num_failed_frames
+    # 와 동일한 패턴.
+    num_valid_pairs: int = 0
+    num_invalid_pairs: int = 0
     success: bool = True
     warning_message: Optional[str] = None
     error_message: Optional[str] = None

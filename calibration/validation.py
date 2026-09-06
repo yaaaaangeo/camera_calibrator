@@ -49,6 +49,7 @@ from calibration.models.pinhole import calibrate_pinhole
 from calibration.models.brown_conrady import calibrate_brown_conrady
 from calibration.models.extended_pinhole import calibrate_extended_pinhole
 from calibration.models.fisheye import calibrate_fisheye
+from calibration.holdout_evidence import evaluate_holdout_evidence
 from calibration.residual_stats import compute_residual_stats
 from calibration.straightness import compute_straightness_residual, compute_straightness_breakdown
 
@@ -203,7 +204,11 @@ def _test_reprojection_errors(
         rms = float(np.sqrt(np.mean(per_point ** 2)))
         errors[frame_id] = rms
         point_errors.extend(per_point.tolist())
-        frame.reprojection_error = rms  # test 프레임에도 기록해 UI/coverage 등에서 재사용 가능
+        # Phase A-8 안정화 - 원본 Frame을 mutate하지 않는다. `errors` dict가
+        # 이미 이 함수의 반환값으로 나가고, 호출자(_evaluate_on_test)가
+        # ValidationResult.per_frame_error에 그대로 담는다 - Pinhole/Brown/
+        # Rational/Fisheye를 순차 hold-out 검증해도 각 모델의 값이 서로
+        # 덮어쓰이지 않고 독립적으로 보존된다.
 
     return errors, failed, point_errors
 
@@ -344,6 +349,12 @@ def _evaluate_on_test(
         train_result.camera_matrix, train_result.distortion, model,
     )
 
+    # Phase B-6 안정화 - test_rms 숫자 자체는 이미 위에서 확정됐다. 이
+    # 숫자를 뒷받침할 근거(test 프레임 수/코너 수/coverage/pose 다양성)가
+    # 충분한지는 완전히 별개의 판단이라 별도 gate로 분리해서 담는다 -
+    # test_rms 값 자체를 바꾸거나 success를 False로 만들지 않는다.
+    evidence_gate = evaluate_holdout_evidence(test_dataset, camera_config)
+
     return ValidationResult(
         train_frame_ids=train_ids,
         test_frame_ids=test_ids,
@@ -356,6 +367,8 @@ def _evaluate_on_test(
         test_residual_stats=test_residual_stats,
         success=True,
         failed_test_frame_ids=failed_ids,
+        per_frame_error=per_frame_error,
+        evidence_gate=evidence_gate,
     )
 
 

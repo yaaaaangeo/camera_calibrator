@@ -1,5 +1,16 @@
 numpy>=1.24
-opencv-python>=4.8
+# ChArUco 패턴 검출(cv2.aruco), calibrateCameraRO, cv2.fisheye를 쓰므로 contrib
+# build가 필수다 - 일반 opencv-python에는 cv2.aruco가 없어서, 그 wheel로
+# 설치하면 ChArUco 데이터셋 로딩이 AttributeError로 즉시 실패한다(Phase A-3
+# 안정화 - 예전에는 이 줄이 실수로 opencv-python이었다). GUI는 PySide6가
+# 전담하고 이 프로젝트 어디서도 cv2 자체 highgui(cv2.imshow 등)를 쓰지
+# 않으므로 headless wheel을 쓴다 - OpenCV가 번들하는 Qt5 plugin이 PySide6의
+# Qt6 platform plugin과 충돌할 여지를 없앤다(Jetson에서 이미 쓰던 정책과
+# 동일). opencv-python/opencv-python-headless/opencv-contrib-python(비-headless)
+# 을 같은 환경에 동시에 설치하지 마라 - 전부 `cv2`라는 같은 모듈 이름을
+# 놓고 경쟁해서 마지막에 설치된 것이 이긴다(원인 파악이 매우 어려운 silent
+# breakage).
+opencv-contrib-python-headless>=4.9
 scipy>=1.11
 matplotlib>=3.8
 PyYAML>=6.0

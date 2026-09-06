@@ -685,6 +685,37 @@ class StraightnessBreakdown:
     num_lines: int = 0
 
 
+@dataclass
+class HoldoutEvidenceGate:
+    """Phase B-6 안정화 - Hold-out Evidence Gate.
+
+    Hold-out RMS(test_rms) 숫자 자체는 그대로 두고, 그 숫자를 뒷받침할
+    근거(test 프레임 수/코너 수/공간 coverage/자세 다양성)가 충분한지를
+    별도로 판단한다. "낮은 RMS를 틀렸다고 바꾸는" 것이 아니라, 근거가
+    부족하면 `status="insufficient_evidence"`로 명시적으로 구분해
+    "VALID(낮은 RMS + 충분한 근거)"와 "우연히 낮게 나온 숫자"를 UI/보고서가
+    서로 다르게 취급할 수 있게 한다. 계산은 `calibration/holdout_evidence.py`
+    에 있다(순환 import를 피하기 위해 dataclass만 여기 둔다 - ResidualStats/
+    residual_stats.py와 동일한 패턴).
+    """
+    status: str = "not_evaluated"  # "sufficient" | "insufficient_evidence" | "not_evaluated"
+    test_frame_count: int = 0
+    test_corner_count: int = 0
+    test_coverage_pct: float = 0.0
+    test_pose_diversity: float = 0.0
+    reasons: list[str] = field(default_factory=list)
+
+    @property
+    def validity(self):
+        """Phase D-3 - 공통 `ResultValidity`로 읽는 read-only 뷰. `status`
+        문자열 자체(직렬화 대상)는 바뀌지 않는다 - 지연 import로 순환
+        의존을 피한다(calibration.result_validity는 calibration.types를
+        참조하지 않으므로 실제로는 순환이 아니지만, 이 파일 최상단에
+        서브모듈을 추가로 import하지 않는 기존 스타일을 유지한다)."""
+        from calibration.result_validity import validity_from_legacy_status
+        return validity_from_legacy_status(self.status)
+
+
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -712,6 +743,19 @@ class ValidationResult:
     success: bool = True
     error_message: Optional[str] = None
     failed_test_frame_ids: list[str] = field(default_factory=list)
+    # Phase A-8 안정화 - 이 모델의 hold-out test 평가에서 나온 frame별 RMS
+    # (frame_id -> rms_px). 이전에는 원본 Dataset의 Frame.reprojection_error를
+    # 직접 덮어썼는데, Pinhole/Brown-Conrady/Rational/Fisheye를 순차적으로
+    # hold-out 검증하면 같은 Frame 객체가 매번 다시 mutate되어 마지막에
+    # 평가된 모델의 값만 남았다(어느 모델의 값인지 알 수 없는 채로). 이제는
+    # model별로 이미 분리되어 있는 이 ValidationResult 안에만 값을 보관한다 -
+    # 원본 Dataset은 건드리지 않는다.
+    per_frame_error: dict[str, float] = field(default_factory=dict)
+    # Phase B-6 안정화 - Hold-out RMS 값 자체와는 독립적으로, 그 값을
+    # 신뢰할 근거가 충분한지 별도로 기록한다. None이면 아직 평가되지
+    # 않은 경우(예: test 프레임이 아예 없어 애초에 hold-out 자체를
+    # 수행하지 못한 경우)다.
+    evidence_gate: Optional[HoldoutEvidenceGate] = None
 
 
 @dataclass

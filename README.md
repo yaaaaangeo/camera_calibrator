@@ -10,6 +10,10 @@ Grid에는 **Advanced Calibration(Object-Releasing)** — 카메라 파라미터
 타겟 형상 자체도 함께 보정하는 `cv2.calibrateCameraRO` 기반 고급 모드 — 도
 별도로 제공한다 (4번 섹션 참고).
 
+`windshield` 브랜치에는 이 위에 얹는 **Windshield Refraction Calibration**
+계층(Camera Intrinsic은 고정한 채 windshield 굴절만 별도로 모델링 + 반사/
+유령상 photometric 평가)도 있다 - 12번 섹션 참고.
+
 ## 1. 요구 사항
 
 - **Python 3.10 이상** (3.11 권장)
@@ -113,6 +117,19 @@ python -m pip install -e . --no-deps
 
 python scripts/jetson_jp512_preflight.py
 python -m app.main
+```
+
+이 수동 절차를 자동화한 `scripts/install_jetson_jp512.sh`도 있다(aarch64/
+Ubuntu 20.04/`python3.10` 존재 여부를 먼저 확인하고, 위 단계를 그대로
+수행한다). JetPack 6 설치 스크립트(`install_jetson.sh`)와 달리
+**`--system-site-packages`를 쓰지 않는다** - ROS1 Noetic의 apt 패키지
+(`rospy`/`sensor_msgs`/`cv_bridge`)는 Ubuntu 20.04 기본 Python 3.8용으로
+빌드되어 있어 이 프로젝트가 요구하는 Python 3.10 venv와 ABI가 맞지 않는다
+(특히 `cv_bridge`는 컴파일된 확장이라 3.8용 바이너리를 3.10 인터프리터가
+아예 로드할 수 없다):
+
+```bash
+./scripts/install_jetson_jp512.sh
 ```
 
 JetPack 5.1.2 profile은 GUI를 PySide6로 띄우기 때문에 OpenCV는
@@ -578,6 +595,15 @@ pytest -m "not slow"   # 느린 통합 테스트 빼고 빠르게만 (~7초, 스
 pytest tests/test_straightness.py -v   # 특정 파일만
 ```
 
+같은 명령을 매번 타이핑하지 않도록 `./run_tests.sh`(전체 `pytest -q`)와
+`./run_tests_fast.sh`(`pytest -q -m "not slow"`) 래퍼 스크립트도 있다.
+과거 버전의 `run_tests.sh`는 각 테스트 파일을 `python3 file.py`로 개별
+실행했는데, 이 저장소의 테스트 파일들은 전부 pytest 함수/fixture 기반이라
+`if __name__ == "__main__":` 블록이 없다 - 즉 그 방식은 매번 "0 passed"를
+조용히 성공으로 보고할 뿐 테스트를 단 하나도 실행하지 않고 있었다(Phase
+A-2에서 발견/수정). 지금은 두 스크립트 모두 실제 pytest 실행기를 그대로
+호출한다.
+
 **두 단계로 나뉜다:**
 - **빠른 티어** (마커 없음, `not slow`로 걸러짐): 단위 테스트 대부분 +
   `test_smoke_pipeline.py` - 3D->2D 직접 사영으로 이미지 렌더링/검출 없이,
@@ -694,3 +720,239 @@ Rational과 Fisheye가 통계적으로 구분하기 어려워질 수 있다 (근
 - **Dataset 탭 UI**: 검출 실패 이유 표시, "상태" 컬럼 폭/줄바꿈 개선,
   Coverage 탭 막대그래프 정렬, Square/Marker size mm 입력, Complexity 행 제거,
   모델 선택 콤보 위치 및 실패 모델 상태 표시 개선.
+
+## 12. Windshield Refraction Calibration (`windshield` 브랜치)
+
+Camera Intrinsic(위 1~11번 섹션) 위에 얹는 **별도 계층**이다. 실제 차량은
+카메라 앞에 windshield(자동차 유리)가 있고, 그 유리가 굴절을 일으켜 순수
+K/D 모델만으로는 설명 안 되는 잔차가 남는다 - 이 계층은 그 잔차를
+모델링한다.
+
+### 12.1 아키텍처 (절대 원칙)
+
+```
+Camera Intrinsic Calibration (1~11번 섹션)
+        │  (fx, fy, cx, cy, distortion, base camera model)
+        ▼
+   Fixed Base K, D  ──────────────────────────────────────
+        │                                                  │  (재최적화 절대 금지)
+        ▼                                                  │
+Windshield Geometry Correction                             │
+  (Baseline/Spherical/Residual Grid/Residual RBF/           │
+   Spline/Neural Residual 중 하나)                          │
+        │                                                  │
+        ▼                                                  │
+  Corrected Projection (project_point / unproject_pixel) ◄──┘
+
+── 완전히 독립된 두 번째 축(Geometry 점수에 절대 반영되지 않음) ──
+Photometric Evaluation
+  Reflection (Reference-mode 실측 vs No-Reference heuristic)
+  Ghost / Double Image (Point-source 실측 vs General heuristic)
+  → Glare / Saturation은 Reflection의 하위 지표
+```
+
+**두 가지 절대 원칙**(코드 전체에 강제됨, 테스트로 회귀 방지):
+
+1. **Camera Intrinsic vs Windshield 분리**: Windshield 관련 어떤 함수도
+   `fx/fy/cx/cy`/distortion/base camera model을 재추정하지 않는다.
+   `WindshieldConfig.base_camera_matrix`/`base_distortion`은 항상 이미
+   확정된 `CalibrationResult`의 스냅샷(`.copy()`)이다.
+2. **Geometry vs Photometric 분리**: Reflection/Ghost 점수(강도, 검출률,
+   likelihood)는 Windshield Geometry 모델의 "승자" 선택에 절대 영향을 주지
+   않는다. Geometry는 Hold-out RMS/P95/P99/Regional/Edge/Stability로만
+   비교하고, Photometric은 별도 축으로만 보고한다.
+
+### 12.2 Windshield Geometry 모델
+
+| 모델 | 설명 |
+|---|---|
+| **Baseline** | 보정 없음(항등) - Base K,D 그대로 투영/역투영. Windshield 효과가 실제로 얼마나 되는지 측정하는 기준선. |
+| **Spherical** | Windshield를 단일 구(sphere)로 근사하고 Snell 굴절 법칙(공기→유리→공기, 굴절률/유리 두께 고정 파라미터)을 광선 단위로 실제 계산한다. |
+| **Residual Ray (Grid)** | Base Ray(Baseline/Spherical 없이 순수 카메라 광선)에 이미지 위 성긴 grid에 저장된 3D 방향 보정을 bilinear interpolation으로 더한다 - closed-form 물리 모델이 아니라 관측 데이터 기반 보정. |
+| **Residual Ray (RBF)** | 위와 같은 아이디어지만 grid 대신 `scipy.interpolate.RBFInterpolator`(thin plate spline)로 성긴 center 집합을 보간한다 - 불규칙한 코너 분포에서 Grid보다 유연할 수 있다. |
+| **Spline** | Base Sphere(고정) 위에 bicubic B-spline으로 국소 표면 변형(surface deformation)을 추가하고, 그 변형된 표면에서 실제 Snell 굴절을 계산한다 - Spherical보다 표현력이 높지만 코너마다 광선-표면 교차를 두 번(안쪽+바깥쪽 표면) 풀어야 해서 계산이 훨씬 무겁다. |
+| **Residual Ray (Neural)** | Grid/RBF와 같은 계열이지만 보정을 작은 MLP(PyTorch)가 학습한다 - CPU inference만으로 동작(GPU 불필요). 선택적 의존성(12.8번 참고). |
+
+Grid/RBF/Neural은 전부 `WindshieldModelType.RESIDUAL_RAY` 하나의 enum
+아래 variant(`residual_ray_hint["method"]`로 구분)다 - UI의 Comparison
+표에는 "Residual Grid"/"Residual RBF"로 구분해서 보여준다.
+
+모든 모델은 공통 런타임 API를 구현한다(`calibration/windshield/base.py`):
+`project_point(x, y, z) -> (u, v)`, `unproject_pixel(u, v) -> (dx, dy, dz)`.
+어떤 계산된 결과(`WindshieldCalibrationResult`)로도 항상
+`build_projector(result)` 하나로 실행 가능한 모델 인스턴스를 얻는다
+(`calibration/windshield/projection.py`) - 모델 종류를 몰라도 되는 단일
+진입점.
+
+### 12.3 Photometric Evaluation - Reflection
+
+Windshield에 비치는 반사(하늘/차내 조명/대시보드 등)를 평가한다. **두
+모드는 신뢰 수준이 완전히 다르다**:
+
+- **Reference Mode** (실측): 같은 장면을 반사가 없는(또는 적은) 기준
+  이미지와 비교해서 실제 반사 강도(gain/bias 보정 후 차이)를 측정한다.
+  Mean/Median/P95/P99/Max/Coverage, 영역별(Center/Top/Bottom/Left/Right/
+  Corners) 지표, 자동차 특화 하단 ROI 지표까지 낸다.
+- **No-Reference Mode** (heuristic): 기준 이미지가 없을 때 이미지 자체의
+  통계만으로 반사 가능성을 추정한다. 결과는 **`reflection_likelihood`에만
+  채워지고 `is_likelihood=True`가 항상 함께 붙는다 - 절대 Ground Truth가
+  아니다.**
+
+Reflection과는 별개로 **Glare**(과도한 밝기+낮은 대비 영역)와
+**Saturation**(픽셀값 clipping 비율)도 독립된 지표로 낸다 - 셋을 하나로
+합치지 않는다.
+
+**Reflection Alignment**(Reference mode 전용, Phase B-1/B-2 안정화):
+Reference 이미지를 Normal 이미지에 맞추는 정렬(translation 또는 affine)이
+`cv2.findTransformECC`(`cv2.MOTION_TRANSLATION`/`cv2.MOTION_AFFINE`) 기반으로
+이뤄지고, `method` 값이 지원 목록(`"translation"`,
+`"affine"`) 밖이면 조용히 fallback하지 않고 명시적으로 실패한다. 정렬로
+생긴 인공적인 border(예: `cv2.BORDER_REFLECT`로 채워진 영역)는 **Valid
+Warp Mask**로 계산돼 모든 Reflection 지표 계산에서 제외된다 - border
+아티팩트가 반사 강도로 오인되지 않는다. Affine을 쓰면 translation/
+rotation/scale/shear 진단값이 함께 기록되고, 비정상적으로 큰 변환은
+`warning` 상태로 표시된다(정렬 실패 가능성).
+
+### 12.4 Photometric Evaluation - Ghost / Double Image
+
+Windshield의 이중 표면(안쪽/바깥쪽) 반사가 만드는 유령상(ghost, 원본보다
+어둡고 살짝 어긋난 복제 이미지)을 평가한다.
+
+- **Point-source Ghost Evaluation**: 밝은 광원(LED, 헤드라이트 등)의 Main
+  피크와 Ghost 피크를 짝지어 displacement(dx, dy)와 강도 비율을 직접
+  측정한다. 촘촘한 LED array에서 이웃 Main끼리 잘못 짝지어지는 문제를
+  막기 위해 **2-pass spatial pairing**을 쓴다: PASS 1이 전체 이미지의
+  dominant displacement vector로 대략적인 pairing을 하고, PASS 2가 그
+  결과로 만든 성긴 spatial field에서 위치별 local vector를 다시 추정해
+  재-pairing한다(windshield 곡률 등으로 위치마다 실제 ghost displacement가
+  달라지는 경우 대응) - PASS 2가 실패하거나 근거가 부족하면 항상 PASS 1로
+  안전하게 fallback한다.
+- **General (No-Reference) Likelihood**: Point-source 타겟 없이 일반
+  도로 영상에서 이미지의 row/column profile을 스캔해 double-edge 패턴
+  비율을 heuristic하게 추정한다. **`ghost_likelihood`/`is_likelihood=True`
+  로만 노출되고 절대 Ground Truth가 아니다** - `ghost_likelihood`와 실측
+  강도 지표(`mean_strength`)를 같은 필드에 절대 섞지 않는다.
+- **GhostField**: Dataset 전체의 point-source detection을 robust
+  median/MAD로 집계해 만드는 성긴 2D displacement/strength field. 유효
+  detection이 0개면 "ghost 없음"과 "ghost=0으로 측정됨"을 구분하기 위해
+  명시적으로 fitting을 거부한다(조용히 0으로 채우지 않음).
+- **Ghost Suppression**: `I = T + α·W_delta(T)`의 결정론적 역변환으로
+  ghost를 제거한다(`suppress_ghost(image, ghost_field)`) - PyTorch 불필요.
+  Strength 감소만으로는 성공이 아니므로 edge retention/clean-region
+  변화까지 함께 본다(over-suppression score).
+
+### 12.5 Validation Metrics 용어집
+
+| 용어 | 의미 |
+|---|---|
+| Train RMS | 학습에 쓰인 프레임에서의 재투영 오차 RMS. |
+| Hold-out(Test) RMS | 학습에 전혀 쓰이지 않은 프레임에서, intrinsic/geometry 파라미터를 고정한 채 pose만 재추정해 계산한 RMS - 진짜 generalization 지표. |
+| Median / P90 / P95 / P99 / Max | 코너 포인트 단위 오차 분포의 요약 통계. RMS 하나로는 안 보이는 꼬리(worst-case) 거동을 드러낸다. |
+| Regional / Edge Error | 이미지의 중앙/가장자리/코너 영역별 오차 - 가장자리에서만 오차가 크면 왜곡 보정이 그쪽에서 덜 됐다는 뜻. |
+| Radial Profile | 이미지 중심으로부터의 거리(반지름)별 오차 분포. |
+| Stability (Repeated Hold-out) | 서로 다른 train/test 분할(seed)로 여러 번 반복한 hold-out 결과의 흩어짐(std) - 낮을수록 특정 분할에 우연히 의존하지 않는 안정적인 모델. |
+| **Hold-out Evidence Gate** (Phase B-6, 신규) | Hold-out RMS가 낮다는 사실 하나만으로 "검증됨"이라 말할 수 없다 - test 프레임 수/코너 수/공간 coverage/자세(pose) 다양성이 충분한지 별도로 판정해 `sufficient`/`insufficient_evidence`/`not_evaluated`로 명시한다(`calibration/holdout_evidence.py`). RMS 숫자 자체를 바꾸거나 무효화하지 않는다 - "낮은 RMS + 근거 부족"과 "낮은 RMS + 근거 충분"을 구분해서 보고할 뿐이다. |
+
+### 12.6 Runtime 성능 - Exact vs Batch(Exact) vs LUT(근사)
+
+`build_projector(result)`가 만드는 point-by-point 모델은 Calibration/
+Evaluation에는 충분히 빠르지만, Camera-LiDAR 프로젝션처럼 프레임당
+수만~수백만 포인트를 처리해야 하는 런타임에는 느릴 수 있다(특히
+Spherical/Spline/Neural은 포인트마다 root-solve/surface-intersection이
+필요). `calibration/windshield/runtime_projector.py`가 이를 위한 **별도
+API**(`build_runtime_projector()` - 기존 `build_projector()`는 그대로
+유지)를 추가한다:
+
+- **Batch(Exact)**: `project_points_exact_batch()`/
+  `unproject_pixels_exact_batch()` - 계산 자체는 point-by-point와 100%
+  동일(근사 아님), 호출자가 (N,3)/(N,2) 배열 하나로 넘길 수 있는 껍데기다.
+  Baseline은 실제로 벡터화된 `cv2.projectPoints` 경로를 타 진짜 빨라지고,
+  나머지는 반복 호출 오버헤드만 줄인다.
+- **LUT(근사)**: `RuntimeWindshieldProjector` - 이미지 전체를 성긴 grid로
+  미리 샘플링해 둔 뒤 bilinear 보간(`unproject_pixels`)/k-최근접
+  역거리가중평균(`project_points`)으로 조회한다. **정확도 tradeoff가
+  있다**: `unproject_pixels`는 격자 해상도만큼의 보간 오차만 생기지만,
+  `project_points`는 "포인트의 방향만" 쓰는 근사라 windshield에 아주
+  가까운 포인트(수십 cm 이내)일수록 오차가 커질 수 있다(parallax) - LiDAR
+  포인트처럼 windshield-camera 간격보다 훨씬 먼 포인트에서는 근사 오차가
+  작을 것으로 기대되지만, **실측 없이 이 가정을 신뢰하지 않는다.**
+  `validate_runtime_projector_vs_exact()`가 median/P95/P99/Max 픽셀 오차
+  (project)와 각도 오차(unproject)를 실제로 측정해 알려준다.
+
+성능 실측은 `scripts/benchmark_windshield_runtime.py`로 직접 확인한다
+(1/100/1,000/10,000 포인트 스케일 x Scalar/Batch(Exact)/LUT 세 티어,
+CPU-first, Jetson에서도 실행 가능):
+
+```bash
+python scripts/benchmark_windshield_runtime.py
+```
+
+**이 스크립트가 출력하는 숫자는 그 스크립트를 실행한 기기의 실측치일
+뿐이다** - Jetson 성능을 알고 싶으면 실제 Jetson에서 이 스크립트를 직접
+돌려야 한다. 이 저장소의 CI는 Jetson 하드웨어를 갖고 있지 않으므로 Jetson
+숫자를 대신 만들어내지 않는다.
+
+### 12.7 Real Vehicle Day/Night/Session Validation Framework
+
+`calibration/vehicle_validation.py`가 실제 차량에서 촬영한 여러
+세션(차량 x 시간대 x windshield 상태)을 비교하기 위한 메타데이터/집계/
+비교 프레임워크를 제공한다 - Day/Night 비교, Geometry(Hold-out) 지표와
+Photometric(Reflection/Ghost) 지표를 절대 하나로 섞지 않는 두 개의 독립된
+요약(`SessionGeometrySummary`/`SessionPhotometricSummary`)으로 관리한다.
+
+> ⚠️ **NOT YET VALIDATED ON REAL VEHICLE.** 이 저장소에는 실제 차량 캡처
+> 데이터셋이 전혀 없다. 위 프레임워크는 그런 데이터가 생기면 곧바로 쓸 수
+> 있는 틀만 제공할 뿐, 어떤 실차 검증 결과도 만들어내지 않는다. 모든
+> 세션 메타데이터는 `data_provenance`("real_vehicle"/"synthetic"/
+> "unknown")를 명시해야 하고, `real_vehicle_validation_disclaimer()`는
+> real_vehicle 세션이 하나도 없으면 이 사실을 항상 그대로 보고한다.
+
+### 12.8 Neural Residual (선택적 의존성)
+
+Residual Ray의 Neural variant만 PyTorch가 필요하다 - 다른 모든 기능
+(Baseline/Spherical/Residual Grid/Residual RBF/Spline, Reflection/Ghost
+평가/Suppression 포함)은 PyTorch 없이 완전히 동작한다.
+
+```bash
+# Desktop
+pip install -e ".[neural]"        # torch>=2.0 (일반 PyPI wheel)
+```
+
+**Jetson에서는 일반 PyPI `torch` wheel을 설치하지 않는다** - JetPack
+버전에 맞는 NVIDIA 제공 PyTorch wheel을 따로 설치해야 한다(architecture가
+aarch64 + CUDA라 PyPI의 표준 wheel과 호환되지 않음). `requirements-jetson*.txt`
+에는 의도적으로 `torch`를 넣지 않았다.
+
+Reflection Suppression도 별도의 학습된 PyTorch 모델(`calibration/windshield/
+reflection_suppression/`)을 쓴다 - Ghost Suppression(12.4번, 결정론적,
+PyTorch 불필요)과는 완전히 다른 접근이다.
+
+### 12.9 Windshield 테스트
+
+Camera Intrinsic과 같은 `pytest`로 함께 돌아간다 - Windshield 전용
+테스트만 고르려면:
+
+```bash
+pytest -q -k windshield
+pytest -q tests/test_windshield_ghost.py tests/test_windshield_ghost_suppression.py
+pytest -q tests/test_windshield_reflection_evaluation.py
+pytest -q tests/test_windshield_runtime_projector.py
+```
+
+기능별 GitHub Actions 워크플로우(`.github/workflows/ghost-tests.yml`,
+`reflection-tests.yml`, `reflection-suppression-tests.yml`,
+`neural-tests.yml`)가 각각 독립적으로 돌고, `.github/workflows/ci.yml`
+(Python 3.10/3.11 매트릭스)이 `pytest -q -m "not slow"`로 이 저장소
+전체(Windshield 포함)의 핵심 회귀를 한 번 더 빠르게 확인한다 - torch를
+요구하지 않으므로 Neural 전용 회귀는 여전히 `neural-tests.yml`이
+담당한다.
+
+### 12.10 Current Validation Status
+
+| 대상 | 상태 |
+|---|---|
+| Synthetic unit/integration tests (CI) | ✅ 검증됨 - 이 저장소의 pytest 스위트가 매 커밋마다 확인 |
+| Desktop (Windows/macOS/Linux) 수동 실행 | ⚠️ 부분적 - 이 세션(Windows 샌드박스)에서는 PySide6 자체를 import할 수 없어 UI를 직접 띄워보지 못했다(DLL 로드 실패, 코드/데이터 레이어만 검증) |
+| Jetson JetPack 6.2.1 | ⚠️ 부분적 - 설치 스크립트/preflight만 있고 실제 Jetson 기기에서 실행한 적은 없다 |
+| Jetson JetPack 5.1.2 | ⚠️ 부분적 - 설치 스크립트/preflight만 있고 실제 Jetson 기기에서 실행한 적은 없다 |
+| **실제 차량(Real Vehicle)** | ❌ **NOT YET VALIDATED** - 실차 캡처 데이터셋 자체가 이 저장소에 없다(12.7번 참고) |

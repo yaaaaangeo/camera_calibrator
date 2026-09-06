@@ -11,11 +11,18 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "yaaaaangeo" }]
 
-# requirements.txt와 동일한 하한선을 그대로 반영 (opencv-python과 동시 설치
-# 금지 등 상세 이유는 requirements.txt 주석 참고 - 여기서는 pip install 시
-# 그대로 재사용되도록 dependencies에도 옮겨둔다).
+# requirements.txt와 동일한 패키지/하한선을 반영한다(Phase A-3 안정화 -
+# 이전에는 이 파일과 requirements.txt가 서로 다른 OpenCV package
+# (opencv-contrib-python vs opencv-python)를 선언해서 `pip install -e .`와
+# `pip install -r requirements.txt`가 실제로 다른 dependency graph를
+# 만들었다). cv2.aruco/ChArUco/calibrateCameraRO/cv2.fisheye를 쓰므로
+# contrib build가 필수이고, GUI는 PySide6가 전담하며 이 프로젝트 어디서도
+# cv2 자체의 highgui(cv2.imshow 등)를 쓰지 않으므로 headless wheel로
+# 통일한다 - Jetson에서 이미 쓰던 것과 같은 정책이다(OpenCV가 번들하는
+# Qt5 plugin이 PySide6의 Qt6 platform plugin과 충돌할 여지를 원천 차단).
+# 상세 이유는 requirements.txt 주석 참고.
 dependencies = [
-    "opencv-contrib-python>=4.9",
+    "opencv-contrib-python-headless>=4.9",
     "numpy>=1.24",
     "scipy>=1.10",
     "PyYAML>=6.0",

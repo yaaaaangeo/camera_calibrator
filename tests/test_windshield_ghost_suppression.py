@@ -475,3 +475,39 @@ def test_fit_ghost_field_from_dataset_resolution_cross_check():
     dataset_result = evaluate_ghost_dataset([frame], mode="point_source", image_width=320, image_height=240)
     with pytest.raises(ValueError):
         fit_ghost_field_from_dataset(dataset_result, image_width=999, image_height=999, rows=1, cols=1)
+
+
+# ===========================================================================
+# Phase A-4 - Ghost zero-detection fit must not silently produce a
+# meaningless dx=dy=strength=0 GhostField ("no ghost" != "ghost offset 0").
+# ===========================================================================
+
+def test_fit_ghost_field_from_dataset_rejects_zero_detections():
+    clean = _two_dot_image()
+    frame = evaluate_ghost_point_source(clean.astype(np.uint8), _point_source_config())
+    assert frame.detection_count == 0  # 후보는 있지만(candidate_count>0) ghost는 하나도 검출 안 됨
+    dataset_result = evaluate_ghost_dataset([frame], mode="point_source")
+
+    with pytest.raises(ValueError, match="no valid ghost detections"):
+        fit_ghost_field_from_dataset(dataset_result, image_width=320, image_height=240, rows=1, cols=1)
+
+
+def test_fit_ghost_field_from_dataset_rejects_dataset_with_no_frames_at_all():
+    dataset_result = evaluate_ghost_dataset([], mode="point_source")
+    with pytest.raises(ValueError, match="no valid ghost detections"):
+        fit_ghost_field_from_dataset(dataset_result, image_width=320, image_height=240, rows=1, cols=1)
+
+
+def test_fit_ghost_field_from_dataset_succeeds_with_partial_detections():
+    """일부 frame/cell에만 detection이 있는 경우(전체가 0인 것과 다름)는
+    여전히 정상적으로 fit되어야 한다 - 이 가드가 과도하게 넓게 걸리면 안
+    된다."""
+    observed = _ghosted_observed_uint8()
+    clean = _two_dot_image()
+    frame_with_ghost = evaluate_ghost_point_source(observed, _point_source_config(bright_source_threshold=20.0), pair_id="has_ghost")
+    frame_without_ghost = evaluate_ghost_point_source(clean.astype(np.uint8), _point_source_config(), pair_id="no_ghost")
+    dataset_result = evaluate_ghost_dataset([frame_with_ghost, frame_without_ghost], mode="point_source")
+
+    field = fit_ghost_field_from_dataset(dataset_result, image_width=320, image_height=240, rows=1, cols=1)
+    assert field is not None
+    assert field.offset_x[0, 0] == pytest.approx(4.0, abs=0.5)

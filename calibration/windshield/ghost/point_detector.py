@@ -39,11 +39,15 @@ from calibration.windshield.ghost.config import (
     DEFAULT_MIN_CONSENSUS_CANDIDATES,
     DEFAULT_MIN_PEAK_DISTANCE_PX,
     DEFAULT_PAIRING_CONSENSUS_RADIUS_PX,
+    DEFAULT_TWO_PASS_GRID_COLS,
+    DEFAULT_TWO_PASS_GRID_ROWS,
+    DEFAULT_TWO_PASS_MIN_CELL_SAMPLES,
     PAIR_SCORE_WEIGHT_DISTANCE,
     PAIR_SCORE_WEIGHT_ENERGY,
     PAIR_SCORE_WEIGHT_VECTOR,
 )
-from calibration.windshield.ghost.types import GhostPointDetection
+from calibration.windshield.ghost.spatial_model import build_robust_spatial_map_from_detections
+from calibration.windshield.ghost.types import GhostPointDetection, GhostSpatialCell
 
 _ENERGY_EPS = 1e-6
 
@@ -243,6 +247,56 @@ def estimate_dominant_energy_ratio(
     return float(np.median([c.energy_ratio for c in inliers]))
 
 
+def _pick_best_ghost_for_main(
+    candidates_for_main: list[_CandidatePair],
+    consumed: list[bool],
+    *,
+    dominant_vector: Optional[tuple[float, float]],
+    dominant_energy_ratio: Optional[float],
+    consensus_radius_px: float,
+    max_search_radius_px: float,
+) -> tuple[int, Optional[float], Optional[float]]:
+    """`pair_main_and_ghost_blobs()`/2-pass 버전이 공유하는 단일 main에
+    대한 best-ghost 선택 로직(사용자 스펙 5-C/5-D/5-E번 3-항 score). PASS
+    1(단일 global vector)과 PASS 2(main별 local vector)의 유일한 차이는
+    호출자가 넘기는 `dominant_vector`/`dominant_energy_ratio`뿐이다 - 점수
+    산식 자체는 완전히 동일하게 유지해야 두 pass의 결과가 일관적으로
+    비교 가능하다."""
+    best_j = -1
+    best_score: Optional[float] = None
+    best_residual: Optional[float] = None
+    best_energy_residual: Optional[float] = None
+    for c in candidates_for_main:
+        if consumed[c.ghost_idx]:
+            continue
+        if dominant_vector is not None:
+            ddx, ddy = dominant_vector
+            vector_error = math.hypot(c.dx - ddx, c.dy - ddy)
+            vector_term = vector_error / max(consensus_radius_px, _ENERGY_EPS)
+            distance_term = c.distance / max(max_search_radius_px, _ENERGY_EPS)
+            if dominant_energy_ratio is not None:
+                energy_residual = abs(c.energy_ratio - dominant_energy_ratio)
+                energy_term = energy_residual
+            else:
+                energy_residual = None
+                energy_term = 0.0
+            score = (
+                PAIR_SCORE_WEIGHT_VECTOR * vector_term
+                + PAIR_SCORE_WEIGHT_DISTANCE * distance_term
+                + PAIR_SCORE_WEIGHT_ENERGY * energy_term
+            )
+        else:
+            vector_error = None
+            energy_residual = None
+            score = c.distance
+        if best_score is None or score < best_score:
+            best_score = score
+            best_j = c.ghost_idx
+            best_residual = vector_error
+            best_energy_residual = energy_residual
+    return best_j, best_residual, best_energy_residual
+
+
 def pair_main_and_ghost_blobs(
     blobs: list[BrightBlob],
     *,
@@ -298,44 +352,22 @@ def pair_main_and_ghost_blobs(
     consumed = [False] * len(blobs)
     detections: list[GhostPointDetection] = []
 
+    dominant_vector_only = None if dominant is None else (dominant[0], dominant[1])
+
     for i in order:
         if consumed[i]:
             continue
         consumed[i] = True
         main = blobs[i]
 
-        best_j = -1
-        best_score = None
-        best_residual: Optional[float] = None
-        best_energy_residual: Optional[float] = None
-        for c in candidates_by_main.get(i, []):
-            if consumed[c.ghost_idx]:
-                continue
-            if dominant is not None:
-                ddx, ddy, _support = dominant
-                vector_error = math.hypot(c.dx - ddx, c.dy - ddy)
-                vector_term = vector_error / max(consensus_radius_px, _ENERGY_EPS)
-                distance_term = c.distance / max(max_search_radius_px, _ENERGY_EPS)
-                if dominant_energy_ratio is not None:
-                    energy_residual = abs(c.energy_ratio - dominant_energy_ratio)
-                    energy_term = energy_residual
-                else:
-                    energy_residual = None
-                    energy_term = 0.0
-                score = (
-                    PAIR_SCORE_WEIGHT_VECTOR * vector_term
-                    + PAIR_SCORE_WEIGHT_DISTANCE * distance_term
-                    + PAIR_SCORE_WEIGHT_ENERGY * energy_term
-                )
-            else:
-                vector_error = None
-                energy_residual = None
-                score = c.distance
-            if best_score is None or score < best_score:
-                best_score = score
-                best_j = c.ghost_idx
-                best_residual = vector_error
-                best_energy_residual = energy_residual
+        best_j, best_residual, best_energy_residual = _pick_best_ghost_for_main(
+            candidates_by_main.get(i, []),
+            consumed,
+            dominant_vector=dominant_vector_only,
+            dominant_energy_ratio=dominant_energy_ratio,
+            consensus_radius_px=consensus_radius_px,
+            max_search_radius_px=max_search_radius_px,
+        )
 
         if best_j < 0:
             detections.append(GhostPointDetection(main_x=main.x, main_y=main.y, detected=False))
@@ -365,3 +397,164 @@ def pair_main_and_ghost_blobs(
         )
 
     return detections
+
+
+def _cell_indices_for_point(x: float, y: float, *, image_width: float, image_height: float, rows: int, cols: int) -> tuple[int, int]:
+    """`spatial_model.py`의 grid bucketing과 동일한 규칙(사용자 spec과의
+    일관성을 위해 두 곳에서 같은 공식을 씀)으로 (row,col)을 계산한다."""
+    col = int(x / max(image_width, 1e-9) * cols)
+    row = int(y / max(image_height, 1e-9) * rows)
+    col = min(max(col, 0), cols - 1)
+    row = min(max(row, 0), rows - 1)
+    return row, col
+
+
+def pair_main_and_ghost_blobs_two_pass(
+    blobs: list[BrightBlob],
+    *,
+    image_width: float,
+    image_height: float,
+    max_search_radius_px: float = DEFAULT_MAX_SEARCH_RADIUS_PX,
+    consensus_radius_px: float = DEFAULT_PAIRING_CONSENSUS_RADIUS_PX,
+    min_consensus_candidates: int = DEFAULT_MIN_CONSENSUS_CANDIDATES,
+    coarse_grid_rows: int = DEFAULT_TWO_PASS_GRID_ROWS,
+    coarse_grid_cols: int = DEFAULT_TWO_PASS_GRID_COLS,
+    min_cell_samples_for_local: int = DEFAULT_TWO_PASS_MIN_CELL_SAMPLES,
+) -> list[GhostPointDetection]:
+    """Phase B-4 - 2-pass spatial pairing(사용자 스펙 B-4번).
+
+    PASS 1: 기존 `pair_main_and_ghost_blobs()`(단일 global dominant
+    vector)을 그대로 실행해 coarse 결과를 얻는다 - 이 결과 자체가 이미
+    "detected=True인 pairing"으로 유효하다.
+
+    PASS 2: PASS 1의 detection들을 `coarse_grid_rows x coarse_grid_cols`
+    grid로 버켓팅(`build_robust_spatial_map_from_detections` 재사용 -
+    median/MAD 기반, 새 통계 로직을 만들지 않음)해 "성긴 GhostField"를
+    만들고, 각 Main 위치가 속한 cell의 median offset/energy-ratio를 그
+    Main 전용 local dominant vector로 써서 **다시** pairing한다(점수 산식
+    자체는 PASS 1과 동일한 `_pick_best_ghost_for_main` 공유 - 유일한 차이는
+    "global 하나짜리 vector"냐 "main별 local vector"냐 뿐이다). 이렇게 하면
+    windshield 곡률 등으로 위치마다 실제 ghost displacement가 달라지는
+    경우에도(PASS 1의 단일 global vector로는 못 잡음) 지역적으로 더 정확한
+    pairing이 가능하다.
+
+    Local vector 신뢰 기준(사용자 스펙: "PASS 2는 PASS 1보다 세밀하게, 단
+    항상 안전하게"): 어떤 cell의 PASS 1 detection 수가
+    `min_cell_samples_for_local` 미만이면 그 cell의 local vector를 믿지
+    않고 PASS 1의 global dominant vector로 fallback한다(빈 cell을 억지로
+    extrapolate하지 않음 - `fill_empty_spatial_cells()`와 같은 보수적
+    원칙).
+
+    안전장치(사용자 스펙 "PASS 2 실패 시 PASS 1로 안전하게 fallback"):
+    PASS 1 자체에 global consensus가 없거나(=candidate 부족, 이미
+    거리 기반 fallback으로 pairing됨), coarse map을 만들 수 없거나, PASS 2
+    계산 중 예외가 발생하면 PASS 1 결과를 그대로 반환한다 - 절대 예외를
+    호출자에게 전파하지 않는다.
+    """
+    pass1_detections = pair_main_and_ghost_blobs(
+        blobs,
+        max_search_radius_px=max_search_radius_px,
+        consensus_radius_px=consensus_radius_px,
+        min_consensus_candidates=min_consensus_candidates,
+    )
+    detected_pass1 = [d for d in pass1_detections if d.detected]
+    if len(detected_pass1) < min_consensus_candidates:
+        # PASS 1 자체가 이미 global consensus 없이(순수 거리 기반) 짝지어진
+        # 상태다 - 이런 소량의 detection으로 coarse spatial field를 만드는
+        # 것은 근거가 없으므로 PASS 1을 그대로 최종 결과로 쓴다.
+        return pass1_detections
+
+    try:
+        candidates = _generate_candidate_pairs(blobs, max_search_radius_px)
+        global_dominant = estimate_dominant_ghost_vector(
+            candidates, consensus_radius_px=consensus_radius_px, min_consensus_candidates=min_consensus_candidates,
+        )
+        if global_dominant is None:
+            return pass1_detections
+        global_dominant_vector = (global_dominant[0], global_dominant[1])
+        global_dominant_energy_ratio = estimate_dominant_energy_ratio(
+            candidates, global_dominant, consensus_radius_px=consensus_radius_px,
+        )
+
+        coarse_cells = build_robust_spatial_map_from_detections(
+            detected_pass1,
+            image_width=image_width,
+            image_height=image_height,
+            rows=coarse_grid_rows,
+            cols=coarse_grid_cols,
+        )
+        cells_by_rc: dict[tuple[int, int], GhostSpatialCell] = {(c.row, c.col): c for c in coarse_cells}
+
+        def _local_vector_and_ratio(main: BrightBlob) -> tuple[tuple[float, float], Optional[float]]:
+            row, col = _cell_indices_for_point(
+                main.x, main.y, image_width=image_width, image_height=image_height,
+                rows=coarse_grid_rows, cols=coarse_grid_cols,
+            )
+            cell = cells_by_rc.get((row, col))
+            if (
+                cell is not None
+                and cell.sample_count >= min_cell_samples_for_local
+                and cell.mean_offset_x_px is not None
+                and cell.mean_offset_y_px is not None
+            ):
+                ratio = cell.mean_strength_ratio if cell.mean_strength_ratio is not None else global_dominant_energy_ratio
+                return (cell.mean_offset_x_px, cell.mean_offset_y_px), ratio
+            return global_dominant_vector, global_dominant_energy_ratio
+
+        candidates_by_main: dict[int, list[_CandidatePair]] = {}
+        for c in candidates:
+            candidates_by_main.setdefault(c.main_idx, []).append(c)
+
+        order = sorted(range(len(blobs)), key=lambda i: blobs[i].energy, reverse=True)
+        consumed = [False] * len(blobs)
+        detections: list[GhostPointDetection] = []
+
+        for i in order:
+            if consumed[i]:
+                continue
+            consumed[i] = True
+            main = blobs[i]
+            local_vector, local_energy_ratio = _local_vector_and_ratio(main)
+
+            best_j, best_residual, best_energy_residual = _pick_best_ghost_for_main(
+                candidates_by_main.get(i, []),
+                consumed,
+                dominant_vector=local_vector,
+                dominant_energy_ratio=local_energy_ratio,
+                consensus_radius_px=consensus_radius_px,
+                max_search_radius_px=max_search_radius_px,
+            )
+
+            if best_j < 0:
+                detections.append(GhostPointDetection(main_x=main.x, main_y=main.y, detected=False))
+                continue
+
+            consumed[best_j] = True
+            ghost = blobs[best_j]
+            offset_x = ghost.x - main.x
+            offset_y = ghost.y - main.y
+            distance = float(np.hypot(offset_x, offset_y))
+            strength_ratio = float(ghost.energy / (main.energy + _ENERGY_EPS))
+            detections.append(
+                GhostPointDetection(
+                    main_x=main.x,
+                    main_y=main.y,
+                    ghost_x=ghost.x,
+                    ghost_y=ghost.y,
+                    offset_x_px=offset_x,
+                    offset_y_px=offset_y,
+                    distance_px=distance,
+                    strength_ratio=strength_ratio,
+                    detected=True,
+                    pair_residual_px=best_residual,
+                    pair_energy_ratio=strength_ratio,
+                    pair_energy_residual=best_energy_residual,
+                )
+            )
+
+        return detections
+    except Exception:
+        # PASS 2는 어디까지나 PASS 1의 개선 시도일 뿐이다 - 어떤 이유로든
+        # 실패하면 이미 유효한 PASS 1 결과로 안전하게 fallback한다(사용자
+        # 스펙 B-4번, "must safely fall back to PASS 1 on failure").
+        return pass1_detections
