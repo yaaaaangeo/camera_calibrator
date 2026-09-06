@@ -27,7 +27,9 @@ from calibration.windshield.ghost.config import (
     DEFAULT_LIKELIHOOD_MIN_GRADIENT,
     DEFAULT_MAX_SEARCH_RADIUS_PX,
     DEFAULT_MIN_BLOB_AREA_PX,
+    DEFAULT_MIN_CONSENSUS_CANDIDATES,
     DEFAULT_MIN_PEAK_DISTANCE_PX,
+    DEFAULT_PAIRING_CONSENSUS_RADIUS_PX,
     DEFAULT_SPATIAL_COLS,
     DEFAULT_SPATIAL_ROWS,
     GHOST_METRIC_VERSION,
@@ -46,11 +48,14 @@ class GhostEvaluationConfig:
     edge_min_gradient: float = DEFAULT_EDGE_MIN_GRADIENT
     edge_max_search_radius_px: float = DEFAULT_EDGE_MAX_SEARCH_RADIUS_PX
     edge_min_secondary_ratio: float = DEFAULT_EDGE_MIN_SECONDARY_RATIO
-    edge_axis: str = "vertical"  # 대상 edge가 수직선이면 "vertical"(오프셋은 x축), 수평선이면 "horizontal"
+    edge_axis: str = "vertical"  # "vertical" | "horizontal" | "auto" - 대상 edge가 수직선이면
+                                  # "vertical"(오프셋은 x축), 수평선이면 "horizontal", 방향을 모르면 "auto"
     likelihood_min_gradient: float = DEFAULT_LIKELIHOOD_MIN_GRADIENT
     likelihood_max_search_radius_px: float = DEFAULT_LIKELIHOOD_MAX_SEARCH_RADIUS_PX
     spatial_rows: int = DEFAULT_SPATIAL_ROWS
     spatial_cols: int = DEFAULT_SPATIAL_COLS
+    pairing_consensus_radius_px: float = DEFAULT_PAIRING_CONSENSUS_RADIUS_PX
+    min_consensus_candidates: int = DEFAULT_MIN_CONSENSUS_CANDIDATES
 
 
 @dataclass
@@ -65,6 +70,11 @@ class GhostPointDetection:
     angular_separation_deg: Optional[float] = None
     strength_ratio: Optional[float] = None
     detected: bool = False
+    # Global displacement consensus pairing(STEP 8 stabilization 1-C번) -
+    # 이 pair의 (dx,dy)가 dataset 전체의 dominant ghost displacement vector와
+    # 얼마나 떨어져 있는지(px). consensus를 아예 쓰지 못한 fallback pairing
+    # (candidate가 너무 적을 때)에서는 None으로 남는다.
+    pair_residual_px: Optional[float] = None
 
 
 @dataclass
@@ -83,6 +93,18 @@ class GhostSpatialCell:
     mean_distance_px: Optional[float] = None
     mean_strength_ratio: Optional[float] = None
     sample_count: int = 0
+    # Multi-frame robust aggregation(STEP 8 stabilization 3-D번) - median 기반
+    # 통계이므로 이름은 "mean_*"이지만 실제로는 robust median이다(기존
+    # 필드명/의미를 유지하기 위해 이름은 바꾸지 않았다). MAD와 outlier로
+    # 제외된 개수를 함께 기록해 fit stability를 진단할 수 있게 한다.
+    mad_offset_x_px: Optional[float] = None
+    mad_offset_y_px: Optional[float] = None
+    mad_strength: Optional[float] = None
+    outlier_rejected_count: int = 0
+    # 이 cell에 직접 관측값이 없어 인접 cell 보간 또는 global median으로
+    # 채워진 경우 True(STEP 8 stabilization 3-F번) - 실제 관측인지 fallback
+    # 채움인지 UI/진단에서 구분할 수 있게 한다.
+    is_filled: bool = False
 
 
 @dataclass
@@ -106,6 +128,13 @@ class GhostEvaluationResult:
 
     mean_strength_ratio: Optional[float] = None
     p95_strength_ratio: Optional[float] = None
+
+    # Edge-target mode 전용(STEP 8 stabilization 2-F번) - Point Source의
+    # dx/dy(2D 벡터)와 Edge의 scalar offset(1D, edge normal 방향)을 절대
+    # 같은 필드로 재사용하지 않는다. Point Source/General 모드에서는 항상
+    # None으로 남는다.
+    edge_offset_median_px: Optional[float] = None
+    edge_offset_p95_px: Optional[float] = None
 
     # General(No-Reference) mode 전용(사용자 스펙 24-26번) - heuristic
     # likelihood일 뿐 ground truth가 아니다. Point-source/edge 모드에서는
@@ -137,6 +166,24 @@ class GhostDatasetResult:
 
 
 @dataclass
+class GhostFieldDiagnostics:
+    """Dataset 전체에서 `GhostField`를 fit한 과정에 대한 진단 정보(STEP 8
+    stabilization 3-H번). `GhostField` 자체를 과도하게 키우지 않기 위해
+    별도 타입으로 분리했다."""
+    num_frames: int = 0
+    num_detections: int = 0
+    grid_rows: int = 0
+    grid_cols: int = 0
+    samples_per_cell: list[int] = field(default_factory=list)  # row-major 순서, len == rows*cols
+    global_median_dx: Optional[float] = None
+    global_median_dy: Optional[float] = None
+    global_median_strength: Optional[float] = None
+    # fit stability = 채워진(비어있지 않은) cell 비율(0~1) - 낮을수록 dataset
+    # coverage가 부족해 빈 cell을 fallback으로 채운 비중이 크다는 뜻이다.
+    fit_stability: Optional[float] = None
+
+
+@dataclass
 class GhostField:
     """Grid basis의 spatially varying displacement/strength field(사용자
     스펙 40번). `offset_x`/`offset_y`/`strength` 모두 (rows, cols) 크기의
@@ -148,6 +195,17 @@ class GhostField:
     image_width: float
     image_height: float
     model_version: int = GHOST_MODEL_VERSION
+    diagnostics: Optional[GhostFieldDiagnostics] = None
+
+
+@dataclass
+class GhostReconstructionMetrics:
+    """Synthetic GT(clean 원본을 알고 있는 경우)에서만 계산 가능한
+    reconstruction 품질 지표(STEP 8 stabilization 7-D번) - real footage
+    평가에는 쓰이지 않는다."""
+    mae: float
+    rmse: float
+    psnr_db: Optional[float] = None
 
 
 @dataclass
@@ -161,6 +219,13 @@ class GhostSuppressionResult:
     iterations: int = 0
     mean_correction: float = 0.0
     max_correction: float = 0.0
+
+    # Detail Retention / Over-Suppression(STEP 8 stabilization 7번) - Ghost
+    # 제거만으로는 성공이 아니다: main edge가 유지되고 clean 영역에
+    # 불필요한 변화가 없어야 한다.
+    clean_region_change: Optional[float] = None
+    edge_retention: Optional[float] = None
+    over_suppression_score: Optional[float] = None
 
     fell_back_to_original: bool = False
     warning_message: Optional[str] = None

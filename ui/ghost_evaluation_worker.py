@@ -6,25 +6,27 @@ STEP 8A - Ghost Evaluation을 위한 QThread worker.
 
 `ui/reflection_worker.py`(Reflection Evaluation)와 완전히 독립된 worker다
 - Ghost는 Reflection과 다른 image formation model을 갖는 별도 기능이므로
-(사용자 스펙 1번), worker 레벨에서도 절대 섞지 않는다. Point-source/edge/
-general-likelihood 평가는 모두 순수 NumPy/OpenCV라 가볍지만, 여러 프레임을
-한 번에 돌리는 dataset 평가는 Qt main thread를 막을 수 있으므로 QThread
-안에서 실행한다.
+(사용자 스펙 1번), worker 레벨에서도 절대 섞지 않는다.
+
+STEP 8 stabilization 2/3번 - Point-source/Edge-target/General-likelihood
+세 모드 모두 공용 dispatcher(`evaluate_ghost_image`)를 통해 실행한다(중복
+if/else 제거, 사용자 스펙 8번). 이미지 파일 로딩 + 1D edge profile 추출 +
+평가까지 전부 이 worker(QThread) 안에서 수행한다 - Qt main thread에는
+파일 선택/설정 읽기/결과 표시만 남긴다(사용자 스펙 2-E번). 여러 프레임을
+처리할 때는 "Evaluating ghost i/N" 형태로 progress를 보고한다(사용자 스펙
+3-B번).
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
+import cv2
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from calibration.types import CameraModelType
-from calibration.windshield.ghost.evaluator import (
-    evaluate_ghost_dataset,
-    evaluate_ghost_general_likelihood,
-    evaluate_ghost_point_source,
-)
+from calibration.windshield.ghost.evaluator import evaluate_ghost_dataset, evaluate_ghost_image
 from calibration.windshield.ghost.types import GhostEvaluationConfig
 
 
@@ -36,7 +38,7 @@ class GhostEvaluationWorker(QObject):
 
     def __init__(
         self,
-        images_bgr: list[np.ndarray],
+        image_paths: list[str],
         config: GhostEvaluationConfig,
         *,
         camera_matrix: Optional[np.ndarray] = None,
@@ -45,29 +47,27 @@ class GhostEvaluationWorker(QObject):
         frame_ids: Optional[list[str]] = None,
     ):
         super().__init__()
-        self._images = images_bgr
+        self._image_paths = image_paths
         self._config = config
         self._camera_matrix = camera_matrix
         self._distortion = distortion
         self._camera_model = camera_model
-        self._frame_ids = frame_ids or [str(i) for i in range(len(images_bgr))]
+        self._frame_ids = frame_ids or [str(i) for i in range(len(image_paths))]
 
     def run(self) -> None:
         try:
-            self.progress.emit(f"Evaluating ghost ({len(self._images)} frame(s))...")
+            n = len(self._image_paths)
             per_frame = []
-            for image, frame_id in zip(self._images, self._frame_ids):
-                if self._config.mode == "general_likelihood":
-                    res = evaluate_ghost_general_likelihood(image, self._config, pair_id=frame_id)
-                else:
-                    res = evaluate_ghost_point_source(
-                        image,
-                        self._config,
-                        camera_matrix=self._camera_matrix,
-                        distortion=self._distortion,
-                        camera_model=self._camera_model,
-                        pair_id=frame_id,
-                    )
+            for i, (path, frame_id) in enumerate(zip(self._image_paths, self._frame_ids)):
+                self.progress.emit(f"Evaluating ghost {i + 1}/{n}...")
+                image = cv2.imread(path, cv2.IMREAD_COLOR)
+                if image is None:
+                    continue
+                res = evaluate_ghost_image(
+                    image, self._config,
+                    camera_matrix=self._camera_matrix, distortion=self._distortion, camera_model=self._camera_model,
+                    pair_id=frame_id,
+                )
                 per_frame.append(res)
             dataset_result = evaluate_ghost_dataset(per_frame, mode=self._config.mode)
             self.result_ready.emit(dataset_result)

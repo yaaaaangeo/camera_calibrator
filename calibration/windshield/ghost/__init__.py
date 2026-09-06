@@ -12,15 +12,21 @@ Ghost는 "같은 exterior scene의 shifted/warped duplicate"이고, Reflection�
 from __future__ import annotations
 
 from calibration.windshield.ghost.config import GHOST_METRIC_VERSION, GHOST_MODEL_VERSION
+from calibration.windshield.ghost.edge_detector import extract_edge_profiles
 from calibration.windshield.ghost.evaluator import (
     evaluate_ghost_dataset,
     evaluate_ghost_edge_target,
     evaluate_ghost_general_likelihood,
+    evaluate_ghost_image,
     evaluate_ghost_point_source,
 )
+from calibration.windshield.ghost.point_detector import estimate_dominant_ghost_vector
+from calibration.windshield.ghost.spatial_model import build_robust_spatial_map_from_detections, fill_empty_spatial_cells
 from calibration.windshield.ghost.suppression import (
     build_dense_fields,
+    compute_reconstruction_metrics,
     fit_ghost_field_constant,
+    fit_ghost_field_from_dataset,
     fit_ghost_field_from_spatial_map,
     load_ghost_model,
     save_ghost_model,
@@ -31,11 +37,18 @@ from calibration.windshield.ghost.types import (
     GhostEvaluationConfig,
     GhostEvaluationResult,
     GhostField,
+    GhostFieldDiagnostics,
     GhostPointDetection,
+    GhostReconstructionMetrics,
     GhostRegionMetrics,
     GhostSpatialCell,
     GhostSuppressionEvaluation,
     GhostSuppressionResult,
+)
+from calibration.windshield.ghost.visualization import (
+    render_ghost_point_overlay,
+    render_strength_heatmap_image,
+    render_vector_field_image,
 )
 
 __all__ = [
@@ -44,11 +57,18 @@ __all__ = [
     "evaluate_ghost_point_source",
     "evaluate_ghost_edge_target",
     "evaluate_ghost_general_likelihood",
+    "evaluate_ghost_image",
     "evaluate_ghost_dataset",
+    "extract_edge_profiles",
+    "estimate_dominant_ghost_vector",
+    "build_robust_spatial_map_from_detections",
+    "fill_empty_spatial_cells",
     "suppress_ghost",
     "build_dense_fields",
     "fit_ghost_field_constant",
     "fit_ghost_field_from_spatial_map",
+    "fit_ghost_field_from_dataset",
+    "compute_reconstruction_metrics",
     "save_ghost_model",
     "load_ghost_model",
     "GhostEvaluationConfig",
@@ -58,6 +78,11 @@ __all__ = [
     "GhostEvaluationResult",
     "GhostDatasetResult",
     "GhostField",
+    "GhostFieldDiagnostics",
+    "GhostReconstructionMetrics",
     "GhostSuppressionResult",
     "GhostSuppressionEvaluation",
+    "render_ghost_point_overlay",
+    "render_vector_field_image",
+    "render_strength_heatmap_image",
 ]

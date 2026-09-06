@@ -27,12 +27,23 @@ import numpy as np
 import yaml
 
 from calibration.windshield.ghost.config import (
+    DEFAULT_MAD_OUTLIER_K,
     DEFAULT_MAX_CORRECTION,
+    DEFAULT_OVER_SUPPRESSION_CLEAN_WEIGHT,
+    DEFAULT_OVER_SUPPRESSION_EDGE_WEIGHT,
     DEFAULT_SUPPRESSION_ITERATIONS,
     GHOST_MODEL_VERSION,
 )
+from calibration.windshield.ghost.spatial_model import build_robust_spatial_map_from_detections, fill_empty_spatial_cells
 from calibration.windshield.ghost.synthetic import warp_shift_field
-from calibration.windshield.ghost.types import GhostField, GhostSpatialCell, GhostSuppressionResult
+from calibration.windshield.ghost.types import (
+    GhostDatasetResult,
+    GhostField,
+    GhostFieldDiagnostics,
+    GhostReconstructionMetrics,
+    GhostSpatialCell,
+    GhostSuppressionResult,
+)
 
 
 def _resize_grid_to_dense(grid: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -53,6 +64,67 @@ def build_dense_fields(ghost_field: GhostField) -> tuple[np.ndarray, np.ndarray,
     dy_dense = _resize_grid_to_dense(ghost_field.offset_y, w, h)
     alpha_dense = _resize_grid_to_dense(ghost_field.strength, w, h)
     return dx_dense, dy_dense, alpha_dense
+
+
+def _edge_magnitude(image: np.ndarray) -> np.ndarray:
+    """Reflection Suppression의 `_edge_energy`와 완전히 독립된 Ghost 전용
+    구현이다(Ghost가 Reflection 코드를 재사용하지 않는다는 원칙을 detail
+    retention metric에도 그대로 적용) - Sobel gradient magnitude."""
+    gray = cv2.cvtColor(image.astype(np.float32), cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    return np.sqrt(gx * gx + gy * gy)
+
+
+def _compute_detail_retention_metrics(
+    original: np.ndarray, suppressed: np.ndarray, correction_map: np.ndarray, high: float,
+) -> tuple[float, float, float]:
+    """Ghost Strength Reduction만으로는 성공이 아니다(STEP 8 stabilization
+    7번, "Ghost만 지우면 완료가 아니다") - main edge 유지 + clean 영역
+    불필요 변화까지 함께 봐야 한다.
+
+    - edge_retention = mean(|grad(suppressed)|) / (mean(|grad(original)|)+eps)
+      1에 가까울수록 구조가 잘 유지된 것이다.
+    - clean_region_change = correction이 median 이하로 작았던("거의 손대지
+      않았어야 할") 절반 영역에서의 평균 correction 크기 - 넓게 퍼진 불필요한
+      변화를 감지하기 위한 진단이다.
+    - over_suppression_score = clean_region_change(0-1 정규화) +
+      max(0, 1-edge_retention) - 0에 가까울수록 이상적이다.
+    """
+    eps = 1e-6
+    edge_before = float(np.mean(_edge_magnitude(original)))
+    edge_after = float(np.mean(_edge_magnitude(suppressed)))
+    edge_retention = edge_after / (edge_before + eps)
+
+    correction_gray = np.mean(correction_map, axis=-1) if correction_map.ndim == 3 else correction_map
+    if correction_gray.size:
+        median_correction = float(np.median(correction_gray))
+        clean_mask = correction_gray <= median_correction
+        clean_region_change = float(np.mean(correction_gray[clean_mask])) if np.any(clean_mask) else 0.0
+    else:
+        clean_region_change = 0.0
+
+    over_suppression_score = (
+        DEFAULT_OVER_SUPPRESSION_CLEAN_WEIGHT * (clean_region_change / max(high, eps))
+        + DEFAULT_OVER_SUPPRESSION_EDGE_WEIGHT * max(0.0, 1.0 - edge_retention)
+    )
+    return clean_region_change, edge_retention, over_suppression_score
+
+
+def compute_reconstruction_metrics(clean: np.ndarray, reconstructed: np.ndarray) -> GhostReconstructionMetrics:
+    """Synthetic GT(clean 원본을 알고 있는 경우)에서만 쓰는 reconstruction
+    품질 지표(STEP 8 stabilization 7-D번) - real footage 평가에는 GT가
+    없으므로 쓰이지 않는다. `skimage` 등 새 dependency 없이 MAE/RMSE/PSNR만
+    계산한다(SSIM은 이번 라운드에서 추가하지 않는다)."""
+    a = clean.astype(np.float64)
+    b = reconstructed.astype(np.float64)
+    diff = a - b
+    mae = float(np.mean(np.abs(diff)))
+    mse = float(np.mean(diff * diff))
+    rmse = float(np.sqrt(mse))
+    max_val = 255.0 if clean.dtype == np.uint8 else float(np.max(a)) or 1.0
+    psnr_db = None if mse <= 1e-12 else float(20.0 * np.log10(max_val) - 10.0 * np.log10(mse))
+    return GhostReconstructionMetrics(mae=mae, rmse=rmse, psnr_db=psnr_db)
 
 
 def suppress_ghost(
@@ -117,6 +189,10 @@ def suppress_ghost(
         suppressed = t_k.astype(out_dtype)
         predicted_ghost = (np.clip(alpha3 * warp_shift_field(t_k, dx_dense, dy_dense), 0.0, high)).astype(np.float32)
 
+        clean_region_change, edge_retention, over_suppression_score = _compute_detail_retention_metrics(
+            i_img, t_k, correction_map, high,
+        )
+
         return GhostSuppressionResult(
             success=True,
             suppressed_image=suppressed,
@@ -125,6 +201,9 @@ def suppress_ghost(
             iterations=n_iter,
             mean_correction=float(np.mean(correction_map)),
             max_correction=float(np.max(correction_map)) if correction_map.size else 0.0,
+            clean_region_change=clean_region_change,
+            edge_retention=edge_retention,
+            over_suppression_score=over_suppression_score,
         )
     except Exception as exc:  # pragma: no cover - defensive safety guard
         return GhostSuppressionResult(
@@ -181,11 +260,79 @@ def fit_ghost_field_from_spatial_map(
     return GhostField(offset_x=offset_x, offset_y=offset_y, strength=strength, image_width=image_width, image_height=image_height)
 
 
+def fit_ghost_field_from_dataset(
+    dataset_result: GhostDatasetResult,
+    *,
+    image_width: float,
+    image_height: float,
+    rows: int,
+    cols: int,
+    mad_k: float = DEFAULT_MAD_OUTLIER_K,
+) -> GhostField:
+    """Dataset 전체(모든 frame의 모든 detection)에서 `GhostField`를
+    fit한다(STEP 8 stabilization 3-G번, "반드시 `per_frame[0]`을 사용하지
+    않는다"). 각 frame이 이미 계산해 둔 spatial map을 재사용하는 대신,
+    frame 경계를 없애고 raw detection을 전부 풀링한 뒤 cell별로 다시
+    robust median/MAD aggregation(`build_robust_spatial_map_from_detections`)
+    을 적용한다 - 이렇게 해야 outlier가 섞인 소수의 frame이 최종 field를
+    왜곡하지 않는다.
+
+    빈 cell은 `fill_empty_spatial_cells()`(인접 valid cell -> 안 되면
+    그대로)로 채운다. `GhostFieldDiagnostics`에 dataset 크기/coverage
+    정보를 함께 기록한다."""
+    all_detections = [det for frame in dataset_result.per_frame for det in frame.detections]
+
+    cells = build_robust_spatial_map_from_detections(
+        all_detections, image_width=image_width, image_height=image_height, rows=rows, cols=cols, mad_k=mad_k,
+    )
+    cells = fill_empty_spatial_cells(cells)
+
+    offset_x = np.zeros((rows, cols), dtype=np.float32)
+    offset_y = np.zeros((rows, cols), dtype=np.float32)
+    strength = np.zeros((rows, cols), dtype=np.float32)
+    samples_per_cell = [0] * (rows * cols)
+    filled_cell_count = 0
+    for cell in cells:
+        offset_x[cell.row, cell.col] = cell.mean_offset_x_px or 0.0
+        offset_y[cell.row, cell.col] = cell.mean_offset_y_px or 0.0
+        strength[cell.row, cell.col] = cell.mean_strength_ratio or 0.0
+        samples_per_cell[cell.row * cols + cell.col] = cell.sample_count
+        if cell.sample_count > 0:
+            filled_cell_count += 1
+
+    detected_detections = [d for d in all_detections if d.detected]
+    global_dx = float(np.median([d.offset_x_px for d in detected_detections])) if detected_detections else None
+    global_dy = float(np.median([d.offset_y_px for d in detected_detections])) if detected_detections else None
+    global_strength = (
+        float(np.median([d.strength_ratio for d in detected_detections if d.strength_ratio is not None]))
+        if any(d.strength_ratio is not None for d in detected_detections) else None
+    )
+
+    diagnostics = GhostFieldDiagnostics(
+        num_frames=len(dataset_result.per_frame),
+        num_detections=len(detected_detections),
+        grid_rows=rows,
+        grid_cols=cols,
+        samples_per_cell=samples_per_cell,
+        global_median_dx=global_dx,
+        global_median_dy=global_dy,
+        global_median_strength=global_strength,
+        fit_stability=(filled_cell_count / (rows * cols)) if rows * cols > 0 else None,
+    )
+
+    return GhostField(
+        offset_x=offset_x, offset_y=offset_y, strength=strength,
+        image_width=image_width, image_height=image_height,
+        diagnostics=diagnostics,
+    )
+
+
 def save_ghost_model(ghost_field: GhostField, path: str, *, metadata: Optional[dict] = None) -> str:
     """`ghost_model.yml` 하나로 GhostField 전체를 저장한다(사용자 스펙 42
     번) - PyTorch tensor가 없으므로 sibling 바이너리 파일이 필요 없다."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    diag = ghost_field.diagnostics
     data = {
         "ghost_model_version": ghost_field.model_version,
         "image_width": float(ghost_field.image_width),
@@ -195,6 +342,7 @@ def save_ghost_model(ghost_field: GhostField, path: str, *, metadata: Optional[d
         "offset_x": ghost_field.offset_x.astype(float).tolist(),
         "offset_y": ghost_field.offset_y.astype(float).tolist(),
         "strength": ghost_field.strength.astype(float).tolist(),
+        "diagnostics": None if diag is None else dataclasses.asdict(diag),
         "metadata": metadata or {},
     }
     with open(p, "w", encoding="utf-8") as f:
@@ -208,6 +356,8 @@ def load_ghost_model(path: str) -> GhostField:
     p = Path(path)
     with open(p, encoding="utf-8") as f:
         data = yaml.safe_load(f)
+    diag_raw = data.get("diagnostics")
+    diagnostics = GhostFieldDiagnostics(**diag_raw) if diag_raw else None
     return GhostField(
         offset_x=np.array(data["offset_x"], dtype=np.float32),
         offset_y=np.array(data["offset_y"], dtype=np.float32),
@@ -215,4 +365,5 @@ def load_ghost_model(path: str) -> GhostField:
         image_width=float(data["image_width"]),
         image_height=float(data["image_height"]),
         model_version=int(data.get("ghost_model_version", GHOST_MODEL_VERSION)),
+        diagnostics=diagnostics,
     )

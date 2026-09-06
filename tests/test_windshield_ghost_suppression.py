@@ -201,3 +201,155 @@ def test_before_after_suppression_uses_same_evaluator_and_shows_improvement():
     assert before.detection_count >= after.detection_count
     if before.mean_strength_ratio is not None and after.mean_strength_ratio is not None:
         assert after.mean_strength_ratio < before.mean_strength_ratio
+
+
+# ===========================================================================
+# STEP 8 stabilization 7 - Detail Retention / Over-Suppression Metrics
+# ===========================================================================
+
+from calibration.windshield.ghost.suppression import compute_reconstruction_metrics
+
+
+def test_suppress_ghost_populates_detail_retention_metrics():
+    observed = _ghosted_observed_uint8()
+    field = fit_ghost_field_constant(image_width=320, image_height=240, mean_offset_x_px=4.0, mean_offset_y_px=-2.0, mean_strength_ratio=0.15)
+    result = suppress_ghost(observed, field)
+    assert result.success
+    assert result.edge_retention is not None
+    assert result.clean_region_change is not None
+    assert result.over_suppression_score is not None
+    # Main edge가 어느 정도 유지되어야 한다(과도한 스무딩으로 완전히
+    # 사라지면 안 됨) - 완벽한 1.0을 요구하지 않는다.
+    assert result.edge_retention > 0.5
+
+
+def test_suppress_ghost_over_suppression_score_is_bounded_and_finite():
+    observed = _ghosted_observed_uint8(alpha=0.15)
+    field = fit_ghost_field_constant(image_width=320, image_height=240, mean_offset_x_px=4.0, mean_offset_y_px=-2.0, mean_strength_ratio=0.15)
+    result = suppress_ghost(observed, field)
+    assert np.isfinite(result.over_suppression_score)
+    assert result.over_suppression_score >= 0.0
+
+
+def test_suppress_ghost_zero_iterations_has_perfect_edge_retention_and_zero_change():
+    """iterations=0이면 이미지가 전혀 바뀌지 않으므로 edge_retention은
+    정확히 1.0, clean_region_change/over_suppression_score는 0에 가까워야
+    한다."""
+    observed = _ghosted_observed_uint8()
+    field = fit_ghost_field_constant(image_width=320, image_height=240, mean_offset_x_px=4.0, mean_offset_y_px=-2.0, mean_strength_ratio=0.15)
+    result = suppress_ghost(observed, field, iterations=0)
+    assert result.edge_retention == pytest.approx(1.0, abs=1e-4)
+    assert result.clean_region_change == pytest.approx(0.0, abs=1e-6)
+    assert result.over_suppression_score == pytest.approx(0.0, abs=1e-4)
+
+
+def test_compute_reconstruction_metrics_zero_for_identical_images():
+    clean = _ghosted_observed_uint8()
+    metrics = compute_reconstruction_metrics(clean, clean)
+    assert metrics.mae == pytest.approx(0.0)
+    assert metrics.rmse == pytest.approx(0.0)
+    assert metrics.psnr_db is None  # mse==0이면 PSNR은 정의되지 않음(무한대) - None으로 남긴다
+
+
+def test_compute_reconstruction_metrics_nonzero_for_different_images():
+    clean = np.zeros((32, 32, 3), dtype=np.uint8)
+    other = np.full((32, 32, 3), 10, dtype=np.uint8)
+    metrics = compute_reconstruction_metrics(clean, other)
+    assert metrics.mae == pytest.approx(10.0)
+    assert metrics.rmse == pytest.approx(10.0)
+    assert metrics.psnr_db is not None and metrics.psnr_db > 0
+
+
+def test_suppression_success_requires_ghost_down_and_edge_retained_simultaneously():
+    """사용자 스펙 7-E번 - Ghost Strength만 내려가는 것으로는 부족하다:
+    같은 suppress_ghost() 호출 하나의 결과 안에서 Ghost 감소와 edge 유지가
+    동시에 확인되어야 한다."""
+    observed = _ghosted_observed_uint8()
+    field = fit_ghost_field_constant(image_width=320, image_height=240, mean_offset_x_px=4.0, mean_offset_y_px=-2.0, mean_strength_ratio=0.15)
+    cfg = _point_source_config()
+
+    before = evaluate_ghost_point_source(observed, cfg)
+    result = suppress_ghost(observed, field)
+    after = evaluate_ghost_point_source(result.suppressed_image, cfg)
+
+    ghost_reduced = (after.mean_strength_ratio or 0.0) < (before.mean_strength_ratio or 0.0)
+    edge_retained = result.edge_retention > 0.5
+    assert ghost_reduced and edge_retained
+
+
+# ===========================================================================
+# STEP 8 stabilization 3 - Dataset-level GhostField fit + diagnostics round-trip
+# ===========================================================================
+
+from calibration.windshield.ghost.evaluator import evaluate_ghost_dataset
+from calibration.windshield.ghost.suppression import fit_ghost_field_from_dataset
+from calibration.windshield.ghost.types import GhostFieldDiagnostics
+
+
+def test_dataset_ghost_field_yaml_round_trips_with_diagnostics():
+    rng = np.random.default_rng(3)
+    per_frame = []
+    cfg = _point_source_config(bright_source_threshold=20.0, spatial_rows=1, spatial_cols=1)
+    for i in range(10):
+        observed = _ghosted_observed_uint8(
+            dx=4.0 + rng.normal(0, 0.1), dy=-2.0 + rng.normal(0, 0.1), alpha=0.15 + rng.normal(0, 0.005),
+        )
+        per_frame.append(evaluate_ghost_point_source(observed, cfg, pair_id=f"f{i}"))
+    dataset_result = evaluate_ghost_dataset(per_frame, mode="point_source")
+
+    field = fit_ghost_field_from_dataset(dataset_result, image_width=320, image_height=240, rows=1, cols=1)
+    assert field.diagnostics is not None
+    assert field.diagnostics.num_frames == 10
+
+    tmp = tempfile.mktemp(suffix=".yml")
+    try:
+        save_ghost_model(field, tmp)
+        loaded = load_ghost_model(tmp)
+        assert loaded.diagnostics is not None
+        assert loaded.diagnostics.num_frames == field.diagnostics.num_frames
+        assert loaded.diagnostics.fit_stability == pytest.approx(field.diagnostics.fit_stability)
+        np.testing.assert_allclose(loaded.offset_x, field.offset_x)
+        np.testing.assert_allclose(loaded.offset_y, field.offset_y)
+        np.testing.assert_allclose(loaded.strength, field.strength)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def test_ghost_model_without_diagnostics_still_round_trips():
+    """`GhostFieldDiagnostics` 없이 만든(예: 예전 constant-fit) `GhostField`도
+    여전히 저장/복원 가능해야 한다 - diagnostics는 Optional이다."""
+    field = fit_ghost_field_constant(image_width=100, image_height=100, mean_offset_x_px=4.0, mean_offset_y_px=-2.0, mean_strength_ratio=0.15)
+    assert field.diagnostics is None
+    tmp = tempfile.mktemp(suffix=".yml")
+    try:
+        save_ghost_model(field, tmp)
+        loaded = load_ghost_model(tmp)
+        assert loaded.diagnostics is None
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+# ===========================================================================
+# STEP 8 stabilization 8 - Suppression evaluator mode dispatch
+# ===========================================================================
+
+from calibration.windshield.ghost.evaluator import evaluate_ghost_image
+
+
+def test_suppression_before_after_can_use_shared_dispatcher():
+    """Suppression Worker가 evaluate_ghost_point_source를 하드코딩하는
+    대신 공용 `evaluate_ghost_image` dispatcher를 통해 Before/After를
+    평가할 수 있어야 한다(사용자 스펙 8번, 중복 branching 제거)."""
+    observed = _ghosted_observed_uint8()
+    field = fit_ghost_field_constant(image_width=320, image_height=240, mean_offset_x_px=4.0, mean_offset_y_px=-2.0, mean_strength_ratio=0.15)
+    cfg = _point_source_config()
+
+    before = evaluate_ghost_image(observed, cfg)
+    supp = suppress_ghost(observed, field)
+    after = evaluate_ghost_image(supp.suppressed_image, cfg)
+
+    assert before.mode == "point_source"
+    assert after.mode == "point_source"
+    assert (after.mean_strength_ratio or 0.0) < (before.mean_strength_ratio or 0.0)

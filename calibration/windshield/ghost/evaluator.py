@@ -31,7 +31,7 @@ from calibration.windshield.ghost.config import (
     DEFAULT_MIN_BLOB_AREA_PX,
     GHOST_METRIC_VERSION,
 )
-from calibration.windshield.ghost.edge_detector import detect_edge_ghost
+from calibration.windshield.ghost.edge_detector import detect_edge_ghost, extract_edge_profiles
 from calibration.windshield.ghost.point_detector import detect_bright_blobs, pair_main_and_ghost_blobs
 from calibration.windshield.ghost.spatial_model import build_spatial_map, compute_region_metrics
 from calibration.windshield.ghost.types import (
@@ -106,7 +106,12 @@ def evaluate_ghost_point_source(
             gaussian_sigma=cfg.gaussian_sigma,
             min_peak_distance_px=cfg.min_peak_distance_px,
         )
-        detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=cfg.max_search_radius_px)
+        detections = pair_main_and_ghost_blobs(
+            blobs,
+            max_search_radius_px=cfg.max_search_radius_px,
+            consensus_radius_px=cfg.pairing_consensus_radius_px,
+            min_consensus_candidates=cfg.min_consensus_candidates,
+        )
     except Exception as exc:  # pragma: no cover - defensive
         return GhostEvaluationResult(
             success=False,
@@ -193,6 +198,7 @@ def evaluate_ghost_edge_target(
     if not results:
         warning = "edge intensity profile이 제공되지 않았습니다."
 
+    abs_offsets = [abs(o) for o in offsets]
     return GhostEvaluationResult(
         success=True,
         mode="edge_target",
@@ -201,9 +207,11 @@ def evaluate_ghost_edge_target(
         detection_count=len(detected),
         candidate_count=len(results),
         detection_rate=detection_rate,
-        mean_offset_x_px=_mean_or_none(offsets),
-        median_distance_px=_median_or_none([abs(o) for o in offsets]) if offsets else None,
-        p95_distance_px=_percentile_or_none([abs(o) for o in offsets], 95) if offsets else None,
+        # Point Source의 2D dx/dy(mean_offset_x_px/median_distance_px)와
+        # Edge의 1D scalar offset을 절대 같은 필드로 재사용하지 않는다
+        # (STEP 8 stabilization 2-F번) - edge 전용 필드에만 채운다.
+        edge_offset_median_px=_median_or_none(abs_offsets) if abs_offsets else None,
+        edge_offset_p95_px=_percentile_or_none(abs_offsets, 95) if abs_offsets else None,
         mean_strength_ratio=_mean_or_none(strengths),
         p95_strength_ratio=_percentile_or_none(strengths, 95),
         warning_message=warning,
@@ -265,15 +273,24 @@ def evaluate_ghost_general_likelihood(
 
 
 def evaluate_ghost_dataset(per_frame: list[GhostEvaluationResult], *, mode: str) -> GhostDatasetResult:
-    """여러 프레임의 `GhostEvaluationResult`를 dataset 단위로 집계한다."""
+    """여러 프레임의 `GhostEvaluationResult`를 dataset 단위로 집계한다.
+
+    Edge-target 모드는 point-source의 `median_distance_px`가 아니라 전용
+    `edge_offset_median_px`를 "distance-like" 집계 소스로 쓴다(사용자
+    스펙 - Point/Edge 필드를 절대 섞지 않는다)."""
     successful = [r for r in per_frame if r.success]
-    distances = [r.median_distance_px for r in successful if r.median_distance_px is not None]
+
+    def _distance_like(r: GhostEvaluationResult) -> Optional[float]:
+        return r.edge_offset_median_px if mode == "edge_target" else r.median_distance_px
+
+    distances = [d for r in successful if (d := _distance_like(r)) is not None]
     strengths = [r.mean_strength_ratio for r in successful if r.mean_strength_ratio is not None]
 
     worst_frame_id = None
     worst_val = -1.0
     for r in successful:
-        val = r.median_distance_px if r.median_distance_px is not None else -1.0
+        val = _distance_like(r)
+        val = val if val is not None else -1.0
         if val > worst_val:
             worst_val = val
             worst_frame_id = r.pair_id or None
@@ -296,3 +313,40 @@ def evaluate_ghost_dataset(per_frame: list[GhostEvaluationResult], *, mode: str)
         success=bool(successful),
         warning_message=warning,
     )
+
+
+def evaluate_ghost_image(
+    image_bgr: np.ndarray,
+    config: Optional[GhostEvaluationConfig] = None,
+    *,
+    camera_matrix: Optional[np.ndarray] = None,
+    distortion: Optional[np.ndarray] = None,
+    camera_model: Optional[CameraModelType] = None,
+    pair_id: str = "",
+) -> GhostEvaluationResult:
+    """`config.mode`에 따라 세 evaluator 중 하나로 dispatch하는 단일
+    진입점(STEP 8 stabilization 8번) - Evaluation Worker와 Suppression
+    Worker가 각자 if/else를 중복해서 만들지 않도록 한다.
+
+    Edge-target 모드는 여기서 이미지로부터 1D profile을 직접 추출한다
+    (`extract_edge_profiles`) - 호출자가 profile을 직접 만들 필요가 없다
+    (STEP 8 stabilization 2-B번).
+    """
+    cfg = config or GhostEvaluationConfig()
+    mode = cfg.mode
+    if mode == "point_source":
+        return evaluate_ghost_point_source(
+            image_bgr, cfg, camera_matrix=camera_matrix, distortion=distortion, camera_model=camera_model, pair_id=pair_id,
+        )
+    if mode == "edge_target":
+        try:
+            profiles = extract_edge_profiles(image_bgr, cfg)
+        except Exception as exc:  # pragma: no cover - defensive
+            return GhostEvaluationResult(
+                success=False, mode="edge_target", pair_id=pair_id,
+                error_message=f"edge profile 추출 중 예외 발생: {exc}",
+            )
+        return evaluate_ghost_edge_target(profiles, cfg, pair_id=pair_id)
+    if mode == "general_likelihood":
+        return evaluate_ghost_general_likelihood(image_bgr, cfg, pair_id=pair_id)
+    raise ValueError(f"Unknown ghost evaluation mode: {mode!r}")

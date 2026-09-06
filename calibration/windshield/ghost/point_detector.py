@@ -9,11 +9,23 @@ peak과 Ghost peak(secondary local maximum) 분리(사용자 스펙 6-10번).
 2번째로 밝은 pixel을 그냥 고르는 방식은 절대 쓰지 않는다 - Gaussian
 smoothing -> connected-component blob -> intensity-weighted subpixel
 centroid + integrated blob energy를 사용한다.
+
+STEP 8 stabilization 1번 - Multi-LED array에서는 단순 nearest-neighbor
+pairing이 촘촘하게 배치된 Main LED끼리를 잘못 짝짓는 문제(main-main
+mispair)를 일으킬 수 있다. 이를 막기 위해 `pair_main_and_ghost_blobs()`는
+먼저 전체 candidate (main,ghost) 쌍들의 displacement vector에서 dominant
+cluster(전체 array가 공유하는 진짜 ghost displacement)를 robust하게
+추정하고, 그 vector와 일치하는 후보를 순수 거리 기반보다 우선한다.
+Candidate가 너무 적어(예: LED 1개) consensus를 신뢰할 수 없으면 기존
+local nearest-neighbor(+ghost energy < main energy 제약) 방식으로
+fallback한다.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -24,7 +36,9 @@ from calibration.windshield.ghost.config import (
     DEFAULT_GAUSSIAN_SIGMA,
     DEFAULT_MAX_SEARCH_RADIUS_PX,
     DEFAULT_MIN_BLOB_AREA_PX,
+    DEFAULT_MIN_CONSENSUS_CANDIDATES,
     DEFAULT_MIN_PEAK_DISTANCE_PX,
+    DEFAULT_PAIRING_CONSENSUS_RADIUS_PX,
 )
 from calibration.windshield.ghost.types import GhostPointDetection
 
@@ -134,18 +148,110 @@ def detect_bright_blobs(
     return blobs
 
 
+@dataclass
+class _CandidatePair:
+    main_idx: int
+    ghost_idx: int
+    dx: float
+    dy: float
+    distance: float
+
+
+def _generate_candidate_pairs(blobs: list[BrightBlob], max_search_radius_px: float) -> list[_CandidatePair]:
+    """모든 plausible (main,ghost) 후보를 만든다 - "ghost는 main보다 어둡다"
+    (사용자 스펙 1-A번 "secondary energy < main energy")와
+    `max_search_radius_px` 제약만 적용한, 방향성 있는(ordered) 쌍이다."""
+    candidates: list[_CandidatePair] = []
+    for i, main in enumerate(blobs):
+        for j, ghost in enumerate(blobs):
+            if i == j or ghost.energy >= main.energy:
+                continue
+            dx = ghost.x - main.x
+            dy = ghost.y - main.y
+            dist = math.hypot(dx, dy)
+            if dist <= max_search_radius_px:
+                candidates.append(_CandidatePair(main_idx=i, ghost_idx=j, dx=dx, dy=dy, distance=dist))
+    return candidates
+
+
+def estimate_dominant_ghost_vector(
+    candidates: list[_CandidatePair],
+    *,
+    consensus_radius_px: float = DEFAULT_PAIRING_CONSENSUS_RADIUS_PX,
+    min_consensus_candidates: int = DEFAULT_MIN_CONSENSUS_CANDIDATES,
+) -> Optional[tuple[float, float, int]]:
+    """전체 candidate displacement vector 중 dominant cluster를 찾는다
+    (사용자 스펙 1-A번, "Option A - robust median + inlier"). scikit-learn
+    같은 새 dependency 없이 직접 구현한다.
+
+    절차: 각 candidate vector를 중심으로 `consensus_radius_px` 안에 몇 개의
+    다른 candidate가 있는지 세어(=support) 가장 support가 큰 vector를
+    초기 추정값으로 삼고, 그 반경 안의 inlier들로 median을 다시 계산해
+    최종 dominant vector를 정한다.
+
+    Candidate 수가 `min_consensus_candidates` 미만이거나 최종 inlier 수가
+    그 기준에 못 미치면 `None`을 반환한다 - 호출자는 이 경우 global
+    consensus 없이 local nearest-neighbor로 fallback해야 한다(사용자 스펙
+    1-E번).
+    """
+    if len(candidates) < min_consensus_candidates:
+        return None
+
+    vectors = np.array([[c.dx, c.dy] for c in candidates], dtype=np.float64)
+    best_support = -1
+    best_center = vectors[0]
+    for v in vectors:
+        support = int(np.sum(np.linalg.norm(vectors - v, axis=1) <= consensus_radius_px))
+        if support > best_support:
+            best_support = support
+            best_center = v
+
+    dists = np.linalg.norm(vectors - best_center, axis=1)
+    inliers = vectors[dists <= consensus_radius_px]
+    if inliers.shape[0] < min_consensus_candidates:
+        return None
+
+    refined = np.median(inliers, axis=0)
+    return float(refined[0]), float(refined[1]), int(inliers.shape[0])
+
+
 def pair_main_and_ghost_blobs(
     blobs: list[BrightBlob],
     *,
     max_search_radius_px: float = DEFAULT_MAX_SEARCH_RADIUS_PX,
+    consensus_radius_px: float = DEFAULT_PAIRING_CONSENSUS_RADIUS_PX,
+    min_consensus_candidates: int = DEFAULT_MIN_CONSENSUS_CANDIDATES,
 ) -> list[GhostPointDetection]:
-    """검출된 blob들을 밝기(energy) 내림차순으로 소비하며, 각 "Main" 후보에
-    대해 아직 짝짓지 않은 blob 중 `max_search_radius_px` 안의 가장 가까운
-    blob을 "Ghost"로 짝짓는다(greedy nearest-neighbor - 사용자 스펙 9번).
+    """검출된 blob들을 밝기(energy) 내림차순으로 소비하며 Main/Ghost를
+    짝짓는다.
+
+    STEP 8 stabilization 1번 - 순수 거리 기반 nearest-neighbor 대신, 먼저
+    전체 candidate에서 dominant ghost displacement vector를 추정하고
+    (`estimate_dominant_ghost_vector`), 각 Main에 대해
+
+        score = vector_error(candidate, dominant) + 0.1 * distance
+
+    가 가장 작은 후보를 Ghost로 선택한다 - 촘촘한 LED array에서 이웃
+    Main이 실제 Ghost보다 더 가깝더라도(순수 거리로는 이웃 Main이 이기는
+    경우) displacement vector가 dominant와 맞지 않으면 걸러진다. Dominant
+    vector를 신뢰할 수 없으면(candidate 부족) 기존 순수 거리 기반
+    nearest-neighbor로 fallback한다(사용자 스펙 1-E번, 1-LED 케이스가
+    여기 해당).
 
     반경 안에 후보가 없으면 그 Main은 ghost 없음(`detected=False`)으로
-    남는다. 이미 다른 Main의 Ghost로 소비된 blob은 재사용하지 않는다.
+    남는다. 이미 다른 Main의 Ghost로 소비된 blob은 재사용하지 않는다
+    (사용자 스펙 1-D번).
     """
+    candidates = _generate_candidate_pairs(blobs, max_search_radius_px)
+    dominant = estimate_dominant_ghost_vector(
+        candidates, consensus_radius_px=consensus_radius_px, min_consensus_candidates=min_consensus_candidates,
+    )
+
+    # Main별 candidate lookup - O(n^2) 재계산을 피한다.
+    candidates_by_main: dict[int, list[_CandidatePair]] = {}
+    for c in candidates:
+        candidates_by_main.setdefault(c.main_idx, []).append(c)
+
     order = sorted(range(len(blobs)), key=lambda i: blobs[i].energy, reverse=True)
     consumed = [False] * len(blobs)
     detections: list[GhostPointDetection] = []
@@ -157,16 +263,22 @@ def pair_main_and_ghost_blobs(
         main = blobs[i]
 
         best_j = -1
-        best_dist = None
-        for j in order:
-            if j == i or consumed[j]:
+        best_score = None
+        best_residual: Optional[float] = None
+        for c in candidates_by_main.get(i, []):
+            if consumed[c.ghost_idx]:
                 continue
-            dx = blobs[j].x - main.x
-            dy = blobs[j].y - main.y
-            dist = float(np.hypot(dx, dy))
-            if dist <= max_search_radius_px and (best_dist is None or dist < best_dist):
-                best_dist = dist
-                best_j = j
+            if dominant is not None:
+                ddx, ddy, _support = dominant
+                vector_error = math.hypot(c.dx - ddx, c.dy - ddy)
+                score = vector_error + 0.1 * c.distance
+            else:
+                vector_error = None
+                score = c.distance
+            if best_score is None or score < best_score:
+                best_score = score
+                best_j = c.ghost_idx
+                best_residual = vector_error
 
         if best_j < 0:
             detections.append(GhostPointDetection(main_x=main.x, main_y=main.y, detected=False))
@@ -189,6 +301,7 @@ def pair_main_and_ghost_blobs(
                 distance_px=distance,
                 strength_ratio=strength_ratio,
                 detected=True,
+                pair_residual_px=best_residual,
             )
         )
 

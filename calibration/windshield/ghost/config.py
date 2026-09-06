@@ -12,8 +12,13 @@ initial default일 뿐이며 과학적으로 검증된 값이 아니다.
 
 from __future__ import annotations
 
-GHOST_METRIC_VERSION = 1
-GHOST_MODEL_VERSION = 1
+# STEP 8 stabilization 라운드에서 pairing definition(global consensus)과
+# dataset aggregation(robust median/MAD) 정의 자체가 바뀌었으므로 metric/
+# model version을 올린다 - 단 project_io의 read-side는 여전히 버전 번호와
+# 무관하게 존재하는 필드만 채우므로 v1으로 저장된 기존 프로젝트도 그대로
+# 로드된다(스키마 자체는 전부 하위 호환 - 신규 필드는 Optional).
+GHOST_METRIC_VERSION = 2
+GHOST_MODEL_VERSION = 2
 
 # ---------------------------------------------------------------------------
 # Point-source detection
@@ -26,12 +31,31 @@ DEFAULT_GAUSSIAN_SIGMA = 0.4             # blob 검출 전 smoothing - 너무 �
                                           # close-ghost 분리 사이의 trade-off, 실데이터로 재조정 필요)
 DEFAULT_MIN_PEAK_DISTANCE_PX = 1.5       # 이보다 가까운 두 local maxima는 하나의 peak로 합친다
 
+# Multi-LED global consensus pairing(STEP 8 stabilization 1번) - 단순
+# nearest-neighbor가 촘촘한 LED array에서 main-main을 잘못 짝짓는 문제를
+# 막기 위해, 모든 plausible (main,ghost) candidate의 displacement vector
+# 중 dominant cluster를 먼저 찾고 그 벡터와 일치하는 후보를 우선한다.
+DEFAULT_PAIRING_CONSENSUS_RADIUS_PX = 3.0   # 이 반경 안의 displacement vector들을 "같은 cluster"로 본다
+DEFAULT_MIN_CONSENSUS_CANDIDATES = 3        # 이보다 candidate pair가 적으면 global consensus를 신뢰하지 않고
+                                             # local nearest-neighbor(+ghost<main energy 제약) fallback을 쓴다
+
 # ---------------------------------------------------------------------------
 # Edge-target detection
 # ---------------------------------------------------------------------------
 DEFAULT_EDGE_MIN_GRADIENT = 15.0
 DEFAULT_EDGE_MAX_SEARCH_RADIUS_PX = 30.0
 DEFAULT_EDGE_MIN_SECONDARY_RATIO = 0.05  # 이보다 약한 2차 peak는 noise로 취급, ghost로 보지 않는다
+
+# Image -> 1D profile 추출(STEP 8 stabilization 2번) - 고대비 직선
+# calibration target 기준의 단순한 첫 버전(범용 line detector가 아님).
+DEFAULT_EDGE_CANNY_LOW = 50.0
+DEFAULT_EDGE_CANNY_HIGH = 150.0
+DEFAULT_EDGE_HOUGH_THRESHOLD = 30
+DEFAULT_EDGE_HOUGH_MIN_LINE_LENGTH_PX = 40.0
+DEFAULT_EDGE_HOUGH_MAX_LINE_GAP_PX = 10.0
+DEFAULT_EDGE_PROFILE_HALF_LENGTH_PX = 40.0  # 1D profile이 edge 중심 기준 양쪽으로 뻗는 길이
+DEFAULT_EDGE_MAX_PROFILE_SAMPLES = 16        # dominant edge를 따라 몇 개의 profile을 뽑을지
+DEFAULT_EDGE_ORIENTATION_TOLERANCE_DEG = 20.0  # edge_axis="vertical"/"horizontal" 필터링 허용 오차
 
 # ---------------------------------------------------------------------------
 # General(No-Reference) Likelihood mode - heuristic, ground truth 아님
@@ -40,13 +64,24 @@ DEFAULT_LIKELIHOOD_MIN_GRADIENT = 10.0
 DEFAULT_LIKELIHOOD_MAX_SEARCH_RADIUS_PX = 20.0
 
 # ---------------------------------------------------------------------------
-# Spatial map
+# Spatial map / dataset-level robust aggregation
 # ---------------------------------------------------------------------------
 DEFAULT_SPATIAL_ROWS = 4
 DEFAULT_SPATIAL_COLS = 6
+DEFAULT_MAD_OUTLIER_K = 3.5   # |x-median(x)| <= k*1.4826*MAD 를 벗어나면 outlier로 제외
+
+# ---------------------------------------------------------------------------
+# Dataset directory input(STEP 8 stabilization 3번)
+# ---------------------------------------------------------------------------
+GHOST_DATASET_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp")
 
 # ---------------------------------------------------------------------------
 # Suppression(STEP 8B) - deterministic iterative reconstruction
 # ---------------------------------------------------------------------------
 DEFAULT_SUPPRESSION_ITERATIONS = 4
 DEFAULT_MAX_CORRECTION = 0.5
+# Over-suppression score의 "clean-region unnecessary change" 항을 얼마나
+# 반영할지 / "main edge loss" 항을 얼마나 반영할지(STEP 8 stabilization
+# 7-C번) - 단순 합으로 두되 나중에 실데이터로 재조정 가능하도록 상수화한다.
+DEFAULT_OVER_SUPPRESSION_CLEAN_WEIGHT = 1.0
+DEFAULT_OVER_SUPPRESSION_EDGE_WEIGHT = 1.0

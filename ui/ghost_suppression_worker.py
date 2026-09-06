@@ -9,6 +9,12 @@ Suppression은 Reflection Suppression 모델을 절대 재사용하지 않는다
 스펙 37번). Deterministic iterative reconstruction이라 PyTorch가 필요 없고
 가볍지만, Before/After 비교를 위해 evaluator를 두 번 돌리는 비용이 있어
 Qt main thread 밖에서 실행한다.
+
+STEP 8 stabilization 8번 - Before/After 평가를 `evaluate_ghost_point_source`
+로 하드코딩하지 않고, Evaluation Worker와 동일한 공용 dispatcher
+(`evaluate_ghost_image`)를 쓴다 - Point Source/Edge Target/General
+Likelihood 어떤 모드로 Evaluation을 돌렸든 Suppression Before/After도
+같은 mode-aware evaluator로 비교한다.
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ from __future__ import annotations
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
-from calibration.windshield.ghost.evaluator import evaluate_ghost_point_source
+from calibration.windshield.ghost.evaluator import evaluate_ghost_image
 from calibration.windshield.ghost.suppression import load_ghost_model, suppress_ghost
 from calibration.windshield.ghost.types import GhostEvaluationConfig, GhostField, GhostSuppressionEvaluation
 
@@ -60,14 +66,14 @@ class GhostSuppressionWorker(QObject):
                 kwargs["max_correction"] = self._max_correction
 
             self.progress.emit("Evaluating ghost before suppression...")
-            before = evaluate_ghost_point_source(self._image_bgr, self._eval_config)
+            before = evaluate_ghost_image(self._image_bgr, self._eval_config)
 
             self.progress.emit("Running ghost suppression...")
             supp = suppress_ghost(self._image_bgr, ghost_field, **kwargs)
 
             if supp.success and supp.suppressed_image is not None:
                 self.progress.emit("Evaluating ghost after suppression...")
-                after = evaluate_ghost_point_source(supp.suppressed_image, self._eval_config)
+                after = evaluate_ghost_image(supp.suppressed_image, self._eval_config)
             else:
                 after = before
 
@@ -83,6 +89,10 @@ class GhostSuppressionWorker(QObject):
                 after=after,
                 strength_reduction=strength_reduction,
                 detection_reduction=detection_reduction,
+                # Detail Retention/Over-Suppression(STEP 8 stabilization 7번)
+                # - Ghost Strength Reduction만으로는 성공이 아니므로 항상
+                # 함께 채운다.
+                over_suppression_score=supp.over_suppression_score,
                 success=supp.success,
                 warning_message=supp.warning_message,
                 error_message=supp.error_message,

@@ -76,11 +76,12 @@ from calibration.windshield.reflection import ReflectionDatasetResult, Reflectio
 from calibration.windshield.ghost import (
     GhostDatasetResult,
     GhostEvaluationConfig,
-    fit_ghost_field_constant,
-    fit_ghost_field_from_spatial_map,
+    GhostField,
+    fit_ghost_field_from_dataset,
+    load_ghost_model,
     save_ghost_model,
 )
-from calibration.windshield.ghost.config import DEFAULT_SPATIAL_COLS, DEFAULT_SPATIAL_ROWS
+from calibration.windshield.ghost.config import DEFAULT_SPATIAL_COLS, DEFAULT_SPATIAL_ROWS, GHOST_DATASET_IMAGE_EXTENSIONS
 from calibration.windshield.residual_ray import DEFAULT_GRID_COLS, DEFAULT_GRID_ROWS, DEFAULT_LAMBDA_MAG, DEFAULT_LAMBDA_SMOOTH
 from calibration.windshield.residual_rbf import DEFAULT_RBF_NUM_CENTERS, DEFAULT_RBF_SMOOTHING
 # UI는 neural_residual.py를 절대 import하지 않는다(STEP 5 안정화 라운드
@@ -196,6 +197,12 @@ class WindshieldWorkspace(QWidget):
         self._ghost_results: dict[str, GhostDatasetResult] = {}
         self._ghost_result: GhostDatasetResult | None = None
         self._ghost_image_path = ""
+        self._ghost_dataset_dir = ""
+        # ghost_models(STEP 8 stabilization 4번) - Fit/Load된 GhostField를
+        # 여기 등록해야 project save 시 `.ccproj`에 실제로 저장된다. YAML
+        # export("Save Model...")와는 별개다(4-F번) - YAML 저장을 누르지
+        # 않아도 fit/load된 모델은 project 안에 남아 있어야 한다.
+        self._ghost_models: dict[str, GhostField] = {}
         self._ghost_suppression_model_path = ""
         self._ghost_suppression_input_path = ""
         self._ghost_suppression_result = None
@@ -265,6 +272,7 @@ class WindshieldWorkspace(QWidget):
         self._reflection_result = next(iter(self._reflection_results.values()), None)
         self._ghost_results = dict(getattr(project, "ghost_results", {}) or {})
         self._ghost_result = next(iter(self._ghost_results.values()), None)
+        self._ghost_models = dict(getattr(project, "ghost_models", {}) or {})
         if self._windshield_config is not None:
             self._camera_config = project.camera_config
             self._pattern_config = project.pattern_config
@@ -288,8 +296,9 @@ class WindshieldWorkspace(QWidget):
         dict[WindshieldResultKey, WindshieldCalibrationResult],
         dict[str, ReflectionDatasetResult],
         dict[str, GhostDatasetResult],
+        dict[str, GhostField],
     ]:
-        return self._windshield_config, self._windshield_dataset, self._windshield_results, self._reflection_results, self._ghost_results
+        return self._windshield_config, self._windshield_dataset, self._windshield_results, self._reflection_results, self._ghost_results, self._ghost_models
 
     # ------------------------------------------------------------------
     # ① Base Camera
@@ -1555,11 +1564,23 @@ class WindshieldWorkspace(QWidget):
         mode_row.addStretch(1)
         group_layout.addLayout(mode_row)
 
+        edge_axis_row = QHBoxLayout()
+        edge_axis_row.addWidget(QLabel("Edge Axis (Edge Target only):"))
+        self.ghost_edge_axis_combo = QComboBox()
+        self.ghost_edge_axis_combo.addItems(["Auto", "Vertical", "Horizontal"])
+        self.ghost_edge_axis_combo.setCurrentText("Vertical")
+        edge_axis_row.addWidget(self.ghost_edge_axis_combo)
+        edge_axis_row.addStretch(1)
+        group_layout.addLayout(edge_axis_row)
+
         image_row = QHBoxLayout()
         self.ghost_image_path_label = QLabel("N/A")
         load_image_btn = QPushButton("Load Image...")
         load_image_btn.clicked.connect(self._on_load_ghost_image)
+        load_dataset_btn = QPushButton("Load Dataset Directory...")
+        load_dataset_btn.clicked.connect(self._on_load_ghost_dataset_directory)
         image_row.addWidget(load_image_btn)
+        image_row.addWidget(load_dataset_btn)
         image_row.addWidget(self.ghost_image_path_label, stretch=1)
         group_layout.addLayout(image_row)
 
@@ -1578,6 +1599,15 @@ class WindshieldWorkspace(QWidget):
         group_layout.addWidget(self.ghost_status_label)
         layout.addWidget(group)
 
+        # General(No-Reference) Likelihood 모드는 Point Source/Edge Target과
+        # 의미가 다르므로(사용자 스펙 6-A번) 전용 label로 완전히 분리해
+        # 보여준다 - Ground Truth라는 단어를 절대 쓰지 않는다.
+        self.ghost_likelihood_label = QLabel("")
+        self.ghost_likelihood_label.setWordWrap(True)
+        self.ghost_likelihood_label.setStyleSheet("font-weight: 600;")
+        self.ghost_likelihood_label.setVisible(False)
+        layout.addWidget(self.ghost_likelihood_label)
+
         self.ghost_metrics_table = _ScrollTable(9, 1)
         self.ghost_metrics_table.setHorizontalHeaderLabels(["Value"])
         self.ghost_metrics_table.setVerticalHeaderLabels([
@@ -1588,17 +1618,48 @@ class WindshieldWorkspace(QWidget):
         ])
         layout.addWidget(self.ghost_metrics_table)
 
-        # Displacement(vector field)와 Strength(heatmap)를 절대 하나의 표로
-        # 합치지 않는다(사용자 스펙 "Displacement와 Strength를 한 map에
-        # 억지로 합치지 않는다") - 완전히 분리된 두 개의 표로 보여준다.
+        # Point Source(2D dx/dy)와 Edge Target(1D scalar offset)을 같은
+        # row에 억지로 겹쳐 보여주지 않는다(사용자 스펙 2-F번) - Edge 전용
+        # 행을 별도 table로 분리한다. General Likelihood 모드에서는 두
+        # table 모두 의미가 없으므로 숨긴다(사용자 스펙 6-A번).
+        self.ghost_edge_metrics_table = _ScrollTable(2, 1)
+        self.ghost_edge_metrics_table.setHorizontalHeaderLabels(["Value"])
+        self.ghost_edge_metrics_table.setVerticalHeaderLabels(["Edge Ghost Offset Median [px]", "Edge Ghost Offset P95 [px]"])
+        layout.addWidget(self.ghost_edge_metrics_table)
+
+        # Overlay(Main/Ghost point + arrow) - 사용자 스펙 6-C번.
+        overlay_group = QGroupBox("MAIN / GHOST OVERLAY")
+        overlay_layout = QVBoxLayout(overlay_group)
+        self.ghost_overlay_image_label = QLabel("N/A")
+        self.ghost_overlay_image_label.setMinimumSize(320, 200)
+        self.ghost_overlay_image_label.setAlignment(Qt.AlignCenter)
+        self.ghost_overlay_image_label.setStyleSheet("border: 1px solid gray;")
+        overlay_layout.addWidget(self.ghost_overlay_image_label)
+        layout.addWidget(overlay_group)
+
+        # Displacement(vector field)와 Strength(heatmap)를 절대 하나의
+        # 그림/표로 합치지 않는다(사용자 스펙 "Displacement와 Strength를
+        # 한 map에 억지로 합치지 않는다") - 완전히 분리된 두 이미지 +
+        # 두 표로 보여준다.
         viz_group = QGroupBox("SPATIAL GHOST MAP (never merged: displacement vector field vs strength heatmap)")
         viz_layout = QVBoxLayout(viz_group)
-        viz_layout.addWidget(QLabel("Displacement Vector Field (mean dx, dy per cell):"))
+        viz_layout.addWidget(QLabel("Displacement Vector Field (arrow = direction/magnitude, mean dx/dy per cell):"))
+        self.ghost_vector_field_image_label = QLabel("N/A")
+        self.ghost_vector_field_image_label.setMinimumSize(240, 160)
+        self.ghost_vector_field_image_label.setAlignment(Qt.AlignCenter)
+        self.ghost_vector_field_image_label.setStyleSheet("border: 1px solid gray;")
+        viz_layout.addWidget(self.ghost_vector_field_image_label)
         self.ghost_vector_field_table = _ScrollTable(DEFAULT_SPATIAL_ROWS, DEFAULT_SPATIAL_COLS)
         self.ghost_vector_field_table.setHorizontalHeaderLabels([f"C{c+1}" for c in range(DEFAULT_SPATIAL_COLS)])
         self.ghost_vector_field_table.setVerticalHeaderLabels([f"R{r+1}" for r in range(DEFAULT_SPATIAL_ROWS)])
         viz_layout.addWidget(self.ghost_vector_field_table)
-        viz_layout.addWidget(QLabel("Strength Heatmap (mean strength ratio per cell):"))
+
+        viz_layout.addWidget(QLabel("Strength Heatmap (color = mean strength ratio per cell):"))
+        self.ghost_strength_heatmap_image_label = QLabel("N/A")
+        self.ghost_strength_heatmap_image_label.setMinimumSize(240, 160)
+        self.ghost_strength_heatmap_image_label.setAlignment(Qt.AlignCenter)
+        self.ghost_strength_heatmap_image_label.setStyleSheet("border: 1px solid gray;")
+        viz_layout.addWidget(self.ghost_strength_heatmap_image_label)
         self.ghost_strength_heatmap_table = _ScrollTable(DEFAULT_SPATIAL_ROWS, DEFAULT_SPATIAL_COLS)
         self.ghost_strength_heatmap_table.setHorizontalHeaderLabels([f"C{c+1}" for c in range(DEFAULT_SPATIAL_COLS)])
         self.ghost_strength_heatmap_table.setVerticalHeaderLabels([f"R{r+1}" for r in range(DEFAULT_SPATIAL_ROWS)])
@@ -1676,10 +1737,13 @@ class WindshieldWorkspace(QWidget):
         # STEP 8A evaluator를 그대로 재사용한 Before/After 비교(사용자 스펙
         # "Must reuse the exact same STEP 8A evaluator for Before/After
         # comparison").
-        self.ghost_suppression_metrics_table = _ScrollTable(4, 2)
+        self.ghost_suppression_metrics_table = _ScrollTable(7, 2)
         self.ghost_suppression_metrics_table.setHorizontalHeaderLabels(["Before", "After"])
         self.ghost_suppression_metrics_table.setVerticalHeaderLabels([
             "Ghost Strength Mean", "Detection Count", "Mean Correction", "Max Correction",
+            # Ghost만 지우는 것으로는 성공이 아니다(사용자 스펙 7-E번) -
+            # Detail Retention / Over-Suppression을 항상 나란히 보여준다.
+            "Edge Retention", "Clean Region Change", "Over-Suppression Score",
         ])
         layout.addWidget(self.ghost_suppression_metrics_table)
         layout.addStretch(1)
@@ -2006,7 +2070,26 @@ class WindshieldWorkspace(QWidget):
         if not path:
             return
         self._ghost_image_path = path
+        self._ghost_dataset_dir = ""
         self.ghost_image_path_label.setText(path)
+
+    def _on_load_ghost_dataset_directory(self) -> None:
+        """STEP 8 stabilization 3-A번 - 단일 이미지 대신 dataset 디렉토리
+        전체를 Ghost Evaluation에 쓸 수 있게 한다."""
+        directory = QFileDialog.getExistingDirectory(self, "Load Ghost Dataset Directory")
+        if not directory:
+            return
+        self._ghost_dataset_dir = directory
+        self._ghost_image_path = ""
+        self.ghost_image_path_label.setText(f"[dataset] {directory}")
+
+    def _ghost_dataset_image_paths(self, directory: str) -> list[str]:
+        d = Path(directory)
+        paths = sorted(
+            str(p) for p in d.iterdir()
+            if p.is_file() and p.suffix.lower() in GHOST_DATASET_IMAGE_EXTENSIONS
+        )
+        return paths
 
     def _ghost_mode(self) -> str:
         if self.ghost_edge_target_radio.isChecked():
@@ -2015,27 +2098,26 @@ class WindshieldWorkspace(QWidget):
             return "general_likelihood"
         return "point_source"
 
-    def _on_run_ghost_evaluation(self) -> None:
-        import cv2
+    def _ghost_edge_axis(self) -> str:
+        return self.ghost_edge_axis_combo.currentText().lower()
 
-        if not self._ghost_image_path:
-            QMessageBox.warning(self, "Ghost Evaluation", "Image가 필요합니다.")
-            return
-        image = cv2.imread(self._ghost_image_path, cv2.IMREAD_COLOR)
-        if image is None:
-            QMessageBox.warning(self, "Ghost Evaluation", "이미지를 읽을 수 없습니다.")
+    def _on_run_ghost_evaluation(self) -> None:
+        if self._ghost_dataset_dir:
+            image_paths = self._ghost_dataset_image_paths(self._ghost_dataset_dir)
+            frame_ids = [Path(p).stem for p in image_paths]
+            if not image_paths:
+                QMessageBox.warning(self, "Ghost Evaluation", "디렉토리에서 이미지 파일을 찾지 못했습니다.")
+                return
+        elif self._ghost_image_path:
+            image_paths = [self._ghost_image_path]
+            frame_ids = [Path(self._ghost_image_path).stem]
+        else:
+            QMessageBox.warning(self, "Ghost Evaluation", "Image 또는 Dataset Directory가 필요합니다.")
             return
 
         mode = self._ghost_mode()
-        if mode == "edge_target":
-            QMessageBox.warning(
-                self, "Ghost Evaluation",
-                "Edge Target 모드는 1D intensity profile 입력이 필요합니다 - "
-                "evaluate_ghost_edge_target()을 스크립트/API로 직접 호출하세요.",
-            )
-            return
-        cfg = GhostEvaluationConfig(mode=mode)
-        worker = GhostEvaluationWorker([image], cfg, frame_ids=[Path(self._ghost_image_path).stem])
+        cfg = GhostEvaluationConfig(mode=mode, edge_axis=self._ghost_edge_axis())
+        worker = GhostEvaluationWorker(image_paths, cfg, frame_ids=frame_ids)
         thread = run_worker_in_thread(worker, self)
         self.ghost_run_button.setEnabled(False)
         self.ghost_status_label.setText("Ghost evaluation running...")
@@ -2061,14 +2143,24 @@ class WindshieldWorkspace(QWidget):
             self.ghost_status_label.setText(dataset_result.error_message or dataset_result.warning_message or "No ghost result.")
             return
 
-        status = f"Metric v{frame.metric_version}"
-        if frame.is_likelihood:
-            status += " | Ghost Likelihood: no-reference heuristic, not ground truth."
-        else:
-            status += " | Point-source/edge ghost evaluation (K,D read-only, never re-optimized)."
+        status = f"Metric v{frame.metric_version} | {len(dataset_result.per_frame)} frame(s)"
         if frame.warning_message:
             status += f" | {frame.warning_message}"
         self.ghost_status_label.setText(status)
+
+        # General Likelihood는 Point Source/Edge Target과 의미가 완전히
+        # 다르다(사용자 스펙 6-A번) - 전용 label만 보여주고, 의미 없는
+        # dx/dy/거리/edge 행은 아예 숨긴다.
+        is_general = frame.is_likelihood
+        is_edge = frame.mode == "edge_target"
+        self.ghost_likelihood_label.setVisible(is_general)
+        self.ghost_metrics_table.setVisible(not is_general)
+        self.ghost_edge_metrics_table.setVisible(is_edge and not is_general)
+        if is_general:
+            self.ghost_likelihood_label.setText(
+                f"Ghost Likelihood: {frame.ghost_likelihood:.3f}  (mean over dataset: {_fmt(dataset_result.mean_strength)})\n"
+                "No-reference heuristic - NOT Ground Truth."
+            )
 
         values = [
             frame.mode,
@@ -2085,6 +2177,9 @@ class WindshieldWorkspace(QWidget):
             self.ghost_metrics_table.setItem(row, 0, QTableWidgetItem(str(v)))
         _fit_table_to_rows(self.ghost_metrics_table)
 
+        self.ghost_edge_metrics_table.setItem(0, 0, QTableWidgetItem(_fmt(frame.edge_offset_median_px)))
+        self.ghost_edge_metrics_table.setItem(1, 0, QTableWidgetItem(_fmt(frame.edge_offset_p95_px)))
+
         rows = self.ghost_vector_field_table.rowCount()
         cols = self.ghost_vector_field_table.columnCount()
         for r in range(rows):
@@ -2100,6 +2195,36 @@ class WindshieldWorkspace(QWidget):
             strength_text = f"{cell.mean_strength_ratio:.3f}" if cell.mean_strength_ratio is not None else "N/A"
             self.ghost_strength_heatmap_table.setItem(cell.row, cell.col, QTableWidgetItem(strength_text))
 
+        # 실제 시각화(사용자 스펙 6-C/6-D/6-E번) - 전부 이미 계산된
+        # detections/spatial_map을 그리기만 한다(재분석 없음).
+        self._update_ghost_visualizations(frame)
+
+    def _update_ghost_visualizations(self, frame) -> None:
+        from calibration.windshield.ghost.visualization import (
+            render_ghost_point_overlay,
+            render_strength_heatmap_image,
+            render_vector_field_image,
+        )
+
+        if frame.mode == "point_source" and frame.detections:
+            import cv2
+
+            source_path = self._ghost_image_path or (
+                self._ghost_dataset_image_paths(self._ghost_dataset_dir)[0] if self._ghost_dataset_dir else ""
+            )
+            base_image = cv2.imread(source_path, cv2.IMREAD_COLOR) if source_path else None
+            if base_image is not None:
+                overlay = render_ghost_point_overlay(base_image, frame.detections)
+                self._set_suppression_preview_image(self.ghost_overlay_image_label, overlay)
+
+        if frame.spatial_map:
+            rows = self.ghost_vector_field_table.rowCount()
+            cols = self.ghost_vector_field_table.columnCount()
+            vf_img = render_vector_field_image(frame.spatial_map, rows=rows, cols=cols)
+            self._set_suppression_preview_image(self.ghost_vector_field_image_label, vf_img)
+            heat_img = render_strength_heatmap_image(frame.spatial_map, rows=rows, cols=cols)
+            self._set_suppression_preview_image(self.ghost_strength_heatmap_image_label, heat_img)
+
     # ------------------------------------------------------------------
     # STEP 8B - Ghost Suppression handlers
     # ------------------------------------------------------------------
@@ -2108,49 +2233,47 @@ class WindshieldWorkspace(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "Load Ghost Model", "", "Ghost Model (*.yml *.yaml)")
         if not path:
             return
+        try:
+            field = load_ghost_model(path)
+        except Exception as e:  # noqa: BLE001 - shown directly in the UI
+            QMessageBox.critical(self, "Ghost Suppression", f"모델을 불러오지 못했습니다: {e}")
+            return
         self._ghost_suppression_model_path = path
-        self._ghost_suppression_field = None
+        self._ghost_suppression_field = field
         self.ghost_suppression_model_path_label.setText(path)
+        # project save 시 이 모델도 함께 저장되도록 등록한다(STEP 8
+        # stabilization 4번) - YAML 저장 여부와 무관하게 `.ccproj`에 남는다.
+        self._ghost_models[Path(path).stem] = field
 
     def _on_fit_ghost_model_from_evaluation(self) -> None:
-        """마지막 8A 평가 결과에서 `GhostField`를 직접 fit한다(사용자 스펙
-        "이미 계산된 spatial map을 재사용하는 결정론적 fit") - 별도 학습
-        스텝 없이 즉시 Suppression에 쓸 수 있다."""
+        """Dataset 전체(모든 frame의 detection)에서 `GhostField`를 fit한다
+        (STEP 8 stabilization 3-G번, "반드시 per_frame[0]를 사용하지
+        않는다") - 단일 이미지만 평가했다면 dataset은 frame 1개짜리로
+        취급되어 결과가 기존 constant fit과 동일하다."""
         if self._ghost_result is None or not self._ghost_result.per_frame:
             QMessageBox.warning(self, "Ghost Suppression", "먼저 Evaluation 탭에서 Ghost Evaluation을 실행하세요.")
             return
-        frame = self._ghost_result.per_frame[0]
-        if not self._ghost_image_path:
+        source_path = self._ghost_image_path or (
+            self._ghost_dataset_image_paths(self._ghost_dataset_dir)[0] if self._ghost_dataset_dir else ""
+        )
+        if not source_path:
             QMessageBox.warning(self, "Ghost Suppression", "Evaluation에 쓰인 이미지 크기를 알 수 없습니다.")
             return
         import cv2
 
-        image = cv2.imread(self._ghost_image_path, cv2.IMREAD_COLOR)
+        image = cv2.imread(source_path, cv2.IMREAD_COLOR)
         if image is None:
             QMessageBox.warning(self, "Ghost Suppression", "이미지를 읽을 수 없습니다.")
             return
         h, w = image.shape[:2]
-        if frame.spatial_map:
-            field = fit_ghost_field_from_spatial_map(
-                frame.spatial_map,
-                image_width=w,
-                image_height=h,
-                rows=DEFAULT_SPATIAL_ROWS,
-                cols=DEFAULT_SPATIAL_COLS,
-                default_offset_x=frame.mean_offset_x_px or 0.0,
-                default_offset_y=frame.mean_offset_y_px or 0.0,
-                default_strength=frame.mean_strength_ratio or 0.0,
-            )
-        else:
-            field = fit_ghost_field_constant(
-                image_width=w, image_height=h,
-                mean_offset_x_px=frame.mean_offset_x_px or 0.0,
-                mean_offset_y_px=frame.mean_offset_y_px or 0.0,
-                mean_strength_ratio=frame.mean_strength_ratio or 0.0,
-            )
+        field = fit_ghost_field_from_dataset(
+            self._ghost_result, image_width=w, image_height=h, rows=DEFAULT_SPATIAL_ROWS, cols=DEFAULT_SPATIAL_COLS,
+        )
         self._ghost_suppression_field = field
         self._ghost_suppression_model_path = ""
-        self.ghost_suppression_model_path_label.setText("(fitted from last evaluation, not saved)")
+        self.ghost_suppression_model_path_label.setText("(fitted from dataset, not saved to YAML)")
+        model_key = f"{self._ghost_result.mode}_fitted"
+        self._ghost_models[model_key] = field
 
     def _on_save_ghost_model(self) -> None:
         field = getattr(self, "_ghost_suppression_field", None)
@@ -2186,7 +2309,11 @@ class WindshieldWorkspace(QWidget):
             QMessageBox.warning(self, "Ghost Suppression", "이미지를 읽을 수 없습니다.")
             return
 
-        eval_cfg = GhostEvaluationConfig(mode="point_source")
+        # Before/After 평가는 마지막 Evaluation에 쓰인 mode를 그대로
+        # 따른다(사용자 스펙 8번, mode-aware dispatcher) - 하드코딩된
+        # point_source로 고정하지 않는다.
+        eval_mode = self._ghost_result.mode if self._ghost_result is not None else "point_source"
+        eval_cfg = GhostEvaluationConfig(mode=eval_mode, edge_axis=self._ghost_edge_axis())
         worker = GhostSuppressionWorker(
             self._ghost_suppression_model_path or None,
             image,
@@ -2238,3 +2365,9 @@ class WindshieldWorkspace(QWidget):
         self.ghost_suppression_metrics_table.setItem(2, 1, QTableWidgetItem(f"{supp.mean_correction:.4f}"))
         self.ghost_suppression_metrics_table.setItem(3, 0, QTableWidgetItem("N/A"))
         self.ghost_suppression_metrics_table.setItem(3, 1, QTableWidgetItem(f"{supp.max_correction:.4f}"))
+        self.ghost_suppression_metrics_table.setItem(4, 0, QTableWidgetItem("N/A"))
+        self.ghost_suppression_metrics_table.setItem(4, 1, QTableWidgetItem(_fmt(supp.edge_retention)))
+        self.ghost_suppression_metrics_table.setItem(5, 0, QTableWidgetItem("N/A"))
+        self.ghost_suppression_metrics_table.setItem(5, 1, QTableWidgetItem(_fmt(supp.clean_region_change)))
+        self.ghost_suppression_metrics_table.setItem(6, 0, QTableWidgetItem("N/A"))
+        self.ghost_suppression_metrics_table.setItem(6, 1, QTableWidgetItem(_fmt(supp.over_suppression_score)))

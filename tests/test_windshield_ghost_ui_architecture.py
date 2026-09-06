@@ -88,3 +88,193 @@ def test_ghost_suppression_worker_never_imports_reflection_suppression_module():
     source = _SUPPRESSION_WORKER.read_text(encoding="utf-8")
     assert "import calibration.windshield.reflection_suppression" not in source
     assert "from calibration.windshield.reflection_suppression" not in source
+
+
+# ===========================================================================
+# STEP 8 stabilization - Edge Target UI/Worker 완전 연결 (섹션 2)
+# ===========================================================================
+
+def test_edge_target_mode_is_no_longer_rejected_in_ui():
+    """예전에는 Edge Target 선택 시 "API로 직접 호출하세요"라며 실행을
+    막았다 - stabilization 이후에는 이 차단 코드가 사라져야 한다."""
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "API로 직접 호출하세요" not in source
+    assert "evaluate_ghost_edge_target()을 스크립트" not in source
+
+
+def test_ui_provides_edge_axis_selection():
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "ghost_edge_axis_combo" in source
+    assert "Auto" in source
+
+
+def test_evaluation_worker_uses_shared_dispatcher_not_manual_branching():
+    """Evaluation Worker가 point/general만 처리하고 edge_target을 조용히
+    point_source처럼 잘못 처리하던 문제(사용자 스펙 2-D번)를 막기 위해,
+    이제는 공용 dispatcher(`evaluate_ghost_image`)를 통해 실행해야 한다."""
+    source = _EVAL_WORKER.read_text(encoding="utf-8")
+    assert "evaluate_ghost_image" in source
+
+
+def test_evaluation_worker_reads_images_inside_worker_not_ui_thread():
+    """이미지 파일 로딩(cv2.imread)이 Worker.run() 안에서 일어나야 한다
+    (사용자 스펙 2-E번, Qt main thread에는 파일 선택/설정 읽기만 남긴다)."""
+    source = _EVAL_WORKER.read_text(encoding="utf-8")
+    assert "def run(self)" in source
+    run_body = source.split("def run(self)")[1]
+    assert "cv2.imread" in run_body
+
+
+# ===========================================================================
+# STEP 8 stabilization - Multi-frame Dataset (섹션 3)
+# ===========================================================================
+
+def test_ui_supports_dataset_directory_input():
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "_on_load_ghost_dataset_directory" in source
+    assert "Load Dataset Directory" in source
+
+
+def test_evaluation_worker_reports_per_frame_progress():
+    source = _EVAL_WORKER.read_text(encoding="utf-8")
+    assert "progress.emit" in source
+
+
+def test_fit_from_evaluation_uses_dataset_wide_fit_not_first_frame_only():
+    """사용자 스펙 3-G번 - "반드시 per_frame[0]를 사용하지 않는다": UI
+    fit 핸들러가 `fit_ghost_field_from_dataset`를 쓰고, `per_frame[0]`
+    기반의 예전 `fit_ghost_field_from_spatial_map` 직접 호출은 사라져야
+    한다."""
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "fit_ghost_field_from_dataset" in source
+    fit_fn_body = source.split("def _on_fit_ghost_model_from_evaluation")[1].split("\n    def ")[0]
+    assert "fit_ghost_field_from_dataset(" in fit_fn_body
+    # 예전에는 `frame = self._ghost_result.per_frame[0]`을 fit에 직접 썼다 -
+    # 지금은 dataset 전체를 fit_ghost_field_from_dataset()에 통째로 넘겨야
+    # 하므로, per_frame[0]을 fit 대상으로 꺼내 쓰는 코드가 없어야 한다
+    # (docstring 설명 문장은 허용 - 실제 대입/색인 코드만 금지).
+    assert ".per_frame[0]" not in fit_fn_body
+
+
+# ===========================================================================
+# STEP 8 stabilization - ghost_models .ccproj persistence (섹션 4)
+# ===========================================================================
+
+def test_ghost_models_state_is_tracked_separately():
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "self._ghost_models" in source
+    assert "dict[str, GhostField]" in source
+
+
+def test_ghost_models_round_trips_through_import_and_export_state():
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert 'getattr(project, "ghost_models"' in source
+    assert "self._ghost_models" in source.split("def export_state")[1]
+
+
+def test_main_window_saves_ghost_models_into_calibration_project():
+    main_window = _ROOT / "ui" / "main_window.py"
+    source = main_window.read_text(encoding="utf-8")
+    assert "ghost_models" in source
+    assert "ghost_models=ghost_models" in source
+
+
+def test_ghost_models_registered_on_fit_and_load_not_only_yaml_export():
+    """사용자 스펙 4-F번 - YAML로 저장하지 않아도 fit/load된 모델이
+    project 안에 남아 있어야 한다: fit/load 핸들러가 직접
+    `self._ghost_models[...] = field`를 해야 한다."""
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    fit_section = source.split("def _on_fit_ghost_model_from_evaluation")[1].split("def _on_save_ghost_model")[0]
+    load_section = source.split("def _on_load_ghost_suppression_model")[1].split("def _on_fit_ghost_model_from_evaluation")[0]
+    assert "self._ghost_models[" in fit_section
+    assert "self._ghost_models[" in load_section
+
+
+# ===========================================================================
+# STEP 8 stabilization - Likelihood / Visualization (섹션 6)
+# ===========================================================================
+
+def test_general_likelihood_has_dedicated_ui_label_and_hides_irrelevant_panels():
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "ghost_likelihood_label" in source
+    assert "is_general" in source
+    assert "setVisible(is_general)" in source
+
+
+def test_ui_renders_real_overlay_and_vector_field_and_heatmap_images():
+    """숫자 표뿐 아니라 실제 이미지 기반 시각화(Overlay/Vector Field/
+    Heatmap)가 있어야 한다(사용자 스펙 6-C/6-D/6-E번)."""
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "render_ghost_point_overlay" in source
+    assert "render_vector_field_image" in source
+    assert "render_strength_heatmap_image" in source
+    assert "ghost_overlay_image_label" in source
+    assert "ghost_vector_field_image_label" in source
+    assert "ghost_strength_heatmap_image_label" in source
+
+
+def test_ui_does_not_reimplement_ghost_analysis_for_visualization():
+    """사용자 스펙 6-F번 - UI가 별도 분석 알고리즘을 수행하면 안 된다:
+    시각화 렌더러는 calibration 패키지(순수 NumPy/OpenCV)에 있고, UI는
+    그 결과를 QLabel에 표시만 해야 한다."""
+    viz_module = _ROOT / "calibration" / "windshield" / "ghost" / "visualization.py"
+    assert viz_module.exists()
+    source = viz_module.read_text(encoding="utf-8")
+    assert "import PySide6" not in source
+    assert "from PySide6" not in source
+
+
+def test_point_source_and_edge_target_metrics_are_shown_in_separate_tables():
+    """사용자 스펙 2-F번 - Point Source의 dx/dy와 Edge의 scalar offset을
+    같은 표에 억지로 보여주지 않는다."""
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "ghost_edge_metrics_table" in source
+    assert "ghost_metrics_table" in source
+    assert "ghost_edge_metrics_table" != "ghost_metrics_table"
+
+
+# ===========================================================================
+# STEP 8 stabilization - Suppression Detail Retention (섹션 7)
+# ===========================================================================
+
+def test_suppression_ui_shows_detail_retention_and_over_suppression_metrics():
+    source = _WORKSPACE.read_text(encoding="utf-8")
+    assert "Edge Retention" in source
+    assert "Over-Suppression Score" in source
+    assert "edge_retention" in source
+    assert "over_suppression_score" in source
+
+
+# ===========================================================================
+# STEP 8 stabilization - Suppression evaluator mode dispatch (섹션 8)
+# ===========================================================================
+
+def test_suppression_worker_uses_shared_dispatcher_not_hardcoded_point_source():
+    source = _SUPPRESSION_WORKER.read_text(encoding="utf-8")
+    assert "evaluate_ghost_image(" in source
+    assert "evaluate_ghost_point_source(" not in source  # 실제 호출(괄호 포함)만 금지 - docstring 설명은 허용
+
+
+# ===========================================================================
+# CI - Ghost 전용 GitHub Actions workflow (섹션 5)
+# ===========================================================================
+
+def test_ghost_ci_workflow_exists_and_runs_ghost_tests():
+    workflow = _ROOT / ".github" / "workflows" / "ghost-tests.yml"
+    assert workflow.exists(), ".github/workflows/ghost-tests.yml이 존재하지 않습니다."
+    source = workflow.read_text(encoding="utf-8")
+    assert "test_windshield_ghost.py" in source
+    assert "test_windshield_ghost_suppression.py" in source
+    assert "test_windshield_ghost_ui_architecture.py" in source
+
+
+def test_ghost_ci_workflow_is_separate_from_other_workflows():
+    """사용자 스펙 5-D번 - 기존 workflow를 Ghost 때문에 수정할 필요
+    없음: reflection/neural workflow 파일에 Ghost 테스트를 억지로 넣지
+    않는다."""
+    for name in ("reflection-tests.yml", "reflection-suppression-tests.yml", "neural-tests.yml"):
+        path = _ROOT / ".github" / "workflows" / name
+        if not path.exists():
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert "test_windshield_ghost" not in source

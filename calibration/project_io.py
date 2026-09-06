@@ -100,6 +100,7 @@ from calibration.windshield.ghost.types import (
     GhostDatasetResult,
     GhostEvaluationResult,
     GhostField,
+    GhostFieldDiagnostics,
     GhostPointDetection,
     GhostRegionMetrics,
     GhostSpatialCell,
@@ -829,6 +830,7 @@ def _ghost_point_detection_from_dict(d) -> GhostPointDetection:
         angular_separation_deg=d.get("angular_separation_deg"),
         strength_ratio=d.get("strength_ratio"),
         detected=d.get("detected", False),
+        pair_residual_px=d.get("pair_residual_px"),
     )
 
 
@@ -850,6 +852,11 @@ def _ghost_spatial_cell_from_dict(d) -> GhostSpatialCell:
         mean_distance_px=d.get("mean_distance_px"),
         mean_strength_ratio=d.get("mean_strength_ratio"),
         sample_count=d.get("sample_count", 0),
+        mad_offset_x_px=d.get("mad_offset_x_px"),
+        mad_offset_y_px=d.get("mad_offset_y_px"),
+        mad_strength=d.get("mad_strength"),
+        outlier_rejected_count=d.get("outlier_rejected_count", 0),
+        is_filled=d.get("is_filled", False),
     )
 
 
@@ -870,6 +877,8 @@ def _ghost_evaluation_result_from_dict(d) -> GhostEvaluationResult:
         p95_angular_separation_deg=d.get("p95_angular_separation_deg"),
         mean_strength_ratio=d.get("mean_strength_ratio"),
         p95_strength_ratio=d.get("p95_strength_ratio"),
+        edge_offset_median_px=d.get("edge_offset_median_px"),
+        edge_offset_p95_px=d.get("edge_offset_p95_px"),
         ghost_likelihood=d.get("ghost_likelihood"),
         is_likelihood=d.get("is_likelihood", False),
         regional_metrics={
@@ -899,6 +908,22 @@ def _ghost_dataset_result_from_dict(d) -> GhostDatasetResult:
     )
 
 
+def _ghost_field_diagnostics_from_dict(d) -> Optional[GhostFieldDiagnostics]:
+    if not d:
+        return None
+    return GhostFieldDiagnostics(
+        num_frames=d.get("num_frames", 0),
+        num_detections=d.get("num_detections", 0),
+        grid_rows=d.get("grid_rows", 0),
+        grid_cols=d.get("grid_cols", 0),
+        samples_per_cell=list(d.get("samples_per_cell", [])),
+        global_median_dx=d.get("global_median_dx"),
+        global_median_dy=d.get("global_median_dy"),
+        global_median_strength=d.get("global_median_strength"),
+        fit_stability=d.get("fit_stability"),
+    )
+
+
 def _ghost_field_from_dict(d) -> GhostField:
     return GhostField(
         offset_x=_arr(d.get("offset_x"), np.float32),
@@ -907,6 +932,7 @@ def _ghost_field_from_dict(d) -> GhostField:
         image_width=d.get("image_width", 0.0),
         image_height=d.get("image_height", 0.0),
         model_version=d.get("model_version", 1),
+        diagnostics=_ghost_field_diagnostics_from_dict(d.get("diagnostics")),
     )
 
 
