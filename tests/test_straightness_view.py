@@ -129,7 +129,11 @@ def test_insufficient_points_returns_empty_list(pattern_config):
 # UI 레이어
 # ---------------------------------------------------------------------------
 
-pytest.importorskip("PySide6", reason="PySide6가 설치되어 있지 않음")
+# 정합성 마감 라운드 - 최상위 `PySide6` 패키지 import는 성공해도 실제
+# 컴파일된 확장(QtWidgets.pyd 등) 로드는 서브모듈 import 시점에 비로소
+# 일어난다. 이 skip을 "PySide6.QtWidgets"까지 명시해야, 그 로드가 실패하는
+# 환경(예: DLL 로드 실패)에서 collection error 대신 정상적으로 skip된다.
+pytest.importorskip("PySide6.QtWidgets", reason="PySide6.QtWidgets is not importable in this environment")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 

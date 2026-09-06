@@ -80,3 +80,19 @@ def test_requirements_txt_and_pyproject_agree_on_shared_package_versions():
         if req[name] != pyproject[name]
     }
     assert not mismatches, f"requirements.txt와 pyproject.toml의 최소 버전이 다릅니다: {mismatches}"
+
+
+def test_requirements_txt_and_pyproject_declare_the_exact_same_core_package_set():
+    """정합성 마감 라운드(2차) - `pip install -r requirements.txt`와
+    `pip install -e .`는 README가 "core application 실행에 필요한
+    dependency를 모두 설치"한다고 설명하는 동등한 두 경로다 - 패키지
+    집합 자체가 정확히 같아야 한다(matplotlib/jsonschema가 requirements.txt
+    에만 있고 실제로는 production 코드 어디에서도 쓰이지 않던 - 죽은
+    의존성 - 이전 사례처럼, 한쪽에만 있는 패키지가 다시 생기면 이 테스트가
+    바로 잡는다)."""
+    req = set(_parse_requirements(_ROOT / "requirements.txt"))
+    pyproject = set(_parse_pyproject_dependencies())
+    assert req == pyproject, (
+        f"requirements.txt와 pyproject.toml의 core 패키지 집합이 다릅니다- "
+        f"requirements.txt에만: {req - pyproject}, pyproject.toml에만: {pyproject - req}"
+    )

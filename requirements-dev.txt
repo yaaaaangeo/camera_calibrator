@@ -2,9 +2,15 @@
 -r requirements.txt
 
 pytest>=7.4
-pytest-cov>=4.1  # CI 커버리지 리포트/배지용 (`pytest --cov`)
+# 정합성 마감 라운드 - pytest-cov로 로컬에서 커버리지를 낼 수는 있지만
+# (`pytest --cov=calibration --cov=app --cov=export --cov=ui`), 이 저장소의
+# 실제 GitHub Actions 워크플로우 중 커버리지를 측정/리포트하는 잡은 현재
+# 없다(README 9번 섹션 참고) - "CI 배지용"이라는 예전 설명은 존재하지 않는
+# CI 기능을 가리키고 있었다.
+pytest-cov>=4.1
 
-# tests/test_rosbag_reader.py는 rosbags가 없으면 자동으로 스킵된다
-# (requirements.txt에도 있지만, 개발 환경에서 rosbag 테스트를 반드시
-# 돌리고 싶다면 여기서도 명시적으로 보장).
+# tests/test_rosbag_reader.py는 rosbags가 없으면 자동으로 스킵된다.
+# requirements.txt에는 rosbags가 없다(core dependency가 아님, `.[ros]`
+# extra로만 설치됨) - 개발 환경에서는 rosbag 관련 테스트를 항상 실행하고
+# 싶으므로 여기서 명시적으로 설치한다.
 rosbags>=0.9

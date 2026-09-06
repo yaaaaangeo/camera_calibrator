@@ -2,36 +2,51 @@
 camera_calibrator.ui.windshield_workspace
 ==============================================
 
-Windshield Refraction Calibration 전용 Workspace(사용자 스펙 4/5/24번).
+`WindshieldWorkspace` = Windshield Calibration 전용 최상위 UI
+orchestration(사용자 스펙 4/5/24번). Camera Intrinsic Calibration
+(ui/intrinsic_workspace.py, ui/main_window.py)과 완전히 분리된 화면이다 -
+Base Camera Model(K,D)은 여기서 절대 재보정하지 않는다. 이미 확정된 값을
+"고정"으로 불러와 표시만 한다("🔒 Base K,D fixed").
 
-Camera Intrinsic Calibration(ui/intrinsic_workspace.py, ui/main_window.py)과
-완전히 분리된 화면이다 - Base Camera Model(K,D)은 여기서 절대 다시 계산하지
-않고, 이미 확정된 값을 "고정"으로 불러와 표시만 한다("🔒 Base K,D fixed").
+이 Workspace가 다루는 두 축(절대 하나로 합치지 않는다 - 서로 다른 문제다):
 
-Baseline/Spherical/Residual Ray(Grid+RBF)/Spline(Phase 4) 전부 실제로
-계산할 수 있다 - 더 이상 "Coming soon" 비활성 모델은 없다(Neural Residual/
-Reflection은 이 Workspace의 범위 밖이라 아예 라디오 버튼 자체가 없다).
+    Geometry(기하 보정 - Windshield Model 탭)
+        Baseline / Spherical / Residual Grid / Residual RBF /
+        Neural Residual / Spline
 
-사용자 스펙 5/6번 UI 목업의 6단계(Base Camera/Dataset/Baseline/Windshield
-Model/Validation/Comparison)를 4개 탭으로 압축했다 - Baseline 결과 표시와
-Windshield Model 선택은 사실 "같은 계산의 두 측면"이라 별도 탭으로 나누면
-빈 화면 전환만 늘어난다고 판단했고, Validation(Train/Test)도 같은 결과 화면의
-컬럼 두 개(Train/Test)로 이미 나란히 보여준다. 기능은 전부 존재하되 탭 개수만
-줄인 조직화 상의 단순화다.
+    Photometric(광학적 아티팩트 평가/억제 - 별도 탭)
+        Reflection Evaluation / Reflection Suppression
+        Ghost Evaluation / Ghost Suppression
+
+실제 계산 알고리즘(굴절 모델 피팅, Reflection/Ghost 지표 계산, Suppression
+재구성 등)은 전부 `calibration/windshield/*`에 있다 - 이 파일과 아래 패널
+파일들은 계산을 하지 않는다. Workspace/패널이 하는 일은:
+
+    입력을 모은다(파일 선택, 파라미터 spinbox/radio) →
+    Worker(QThread)를 만들어 계산을 위임한다 →
+    Worker가 돌려준 Result 객체를 받아 표/차트/이미지로 그린다.
+
+탭 구성(사용자 스펙 5/6번 UI 목업의 6단계를 6개 탭으로 그대로 반영):
+
+    ① Base Camera   - 이미 확정된 K,D를 불러와 고정 표시
+    ② Dataset       - Windshield 캘리브레이션용 이미지 검출
+    ③ Windshield Model - Geometry 모델 선택/실행/결과(Train/Test 나란히 표시)
+    ④ Comparison    - Geometry 모델들끼리의 Hold-out 비교표
+    ⑤ Reflection    - Evaluation / Suppression sub-tab
+    ⑥ Ghost         - Evaluation / Suppression sub-tab
 
 Priority 7 안정화 - God Object 분리:
-이 파일은 원래 ~2430줄짜리 단일 클래스(`WindshieldWorkspace`)에 Base Camera/
-Dataset/Geometry/Comparison/Reflection(Evaluation+Suppression)/Ghost
-(Evaluation+Suppression) UI가 전부 들어있었다. 계산 로직은 하나도 바꾸지
-않고, 각 탭의 UI 코드만 아래처럼 mixin 클래스 파일로 옮겼다:
+이 파일은 원래 ~2430줄짜리 단일 클래스(`WindshieldWorkspace`)에 위 6개 탭
+UI가 전부 들어있었다. 계산 로직은 하나도 바꾸지 않고, 각 탭의 UI 코드만
+아래처럼 mixin 클래스 파일로 옮겼다:
 
     ui/windshield_common.py                       - 공유 상수/헬퍼(순환 import 방지용)
-    ui/windshield_geometry_panel.py                - ③ Windshield Model 탭
-    ui/windshield_comparison_panel.py              - ④ Comparison 탭
-    ui/windshield_reflection_panel.py              - ⑤ Reflection Evaluation sub-tab
-    ui/windshield_reflection_suppression_panel.py  - ⑤ Reflection Suppression sub-tab
-    ui/windshield_ghost_panel.py                   - ⑥ Ghost Evaluation sub-tab
-    ui/windshield_ghost_suppression_panel.py       - ⑥ Ghost Suppression sub-tab
+    ui/windshield_geometry_panel.py                - ③ Windshield Model 탭(Geometry)
+    ui/windshield_comparison_panel.py              - ④ Comparison 탭(Geometry)
+    ui/windshield_reflection_panel.py              - ⑤ Reflection Evaluation sub-tab(Photometric)
+    ui/windshield_reflection_suppression_panel.py  - ⑤ Reflection Suppression sub-tab(Photometric)
+    ui/windshield_ghost_panel.py                   - ⑥ Ghost Evaluation sub-tab(Photometric)
+    ui/windshield_ghost_suppression_panel.py       - ⑥ Ghost Suppression sub-tab(Photometric)
 
 `WindshieldWorkspace`는 이 mixin들을 전부 다중 상속해서 하나의 `self`
 (같은 QWidget 인스턴스)를 공유한다 - 어느 mixin에 정의된 메서드/속성이든

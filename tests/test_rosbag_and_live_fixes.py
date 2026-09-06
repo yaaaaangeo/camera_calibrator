@@ -41,7 +41,15 @@ def test_any_reader_called_with_default_typestore():
 
 def test_bag_topic_discovery_worker_runs_lookup_outside_ui_callback(monkeypatch):
     import pytest
-    pytest.importorskip("PySide6")
+    # 정합성 마감 라운드 - `pytest.importorskip("PySide6")`만으로는 부족하다.
+    # `PySide6` 최상위 패키지 import 자체는 성공해도, 실제 컴파일된 확장
+    # (QtCore.pyd 등) 로드는 `from PySide6.QtCore import ...`(ui/worker.py가
+    # 내부에서 함) 시점에 비로소 일어난다 - 이 환경(예: 이 세션의 Windows
+    # sandbox, DLL 로드 실패)처럼 최상위 import는 통과하지만 서브모듈 로드가
+    # 실패하는 경우 이 skip이 못 잡아서 SKIPPED 대신 FAILED로 잘못 보고됐다.
+    # ui/windshield_workspace_ui.py 테스트가 이미 쓰던 패턴(서브모듈까지
+    # importorskip)으로 통일한다.
+    pytest.importorskip("PySide6.QtCore")
     from ui.worker import BagTopicDiscoveryWorker
 
     expected = [object()]
@@ -61,8 +69,8 @@ def test_bag_topic_discovery_worker_runs_lookup_outside_ui_callback(monkeypatch)
 def test_bag_topic_result_is_delivered_on_receiver_gui_thread(monkeypatch):
     """회귀 테스트: 결과 콜백에서 dialog/widget을 만들어도 되는 thread여야 한다."""
     import pytest
-    pytest.importorskip("PySide6")
-    from PySide6.QtCore import QEventLoop, QObject, QThread, Slot
+    pytest.importorskip("PySide6.QtCore")
+    from PySide6.QtCore import QEventLoop, QObject, QThread, QTimer, Slot
     from PySide6.QtWidgets import QApplication
     from ui.worker import BagTopicDiscoveryWorker
 
@@ -87,6 +95,15 @@ def test_bag_topic_result_is_delivered_on_receiver_gui_thread(monkeypatch):
     thread.started.connect(worker.run)
     worker.topics_ready.connect(receiver.receive)
     worker.finished.connect(thread.quit)
+
+    # 안전장치(회귀 방지) - topics_ready 시그널이 어떤 이유로든(예: worker.run()
+    # 내부 예외, cross-thread queued connection이 특정 CI 환경에서 배달되지
+    # 않는 경우 등) 발생하지 않으면 loop.exec()가 timeout 없이 영원히 블록될
+    # 수 있었다 - CI에서 실제로 관측된 비정상적으로 긴 실행 시간(수십 분~
+    # 1시간 이상)의 유력한 원인이었다. 5초 안에 quit되지 않으면 강제로
+    # loop를 빠져나와 receiver.on_own_thread=False로 명확하게 실패시킨다
+    # (무한 대기 대신 빠르고 확정적인 실패).
+    QTimer.singleShot(5000, loop.quit)
 
     thread.start()
     loop.exec()

@@ -46,15 +46,32 @@ source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt`가 설치하는 것:
+`requirements.txt`가 설치하는 core dependency (`pip install -e .`로 설치되는
+`pyproject.toml`의 기본 `dependencies`와 정확히 동일한 집합 - 어느 방법을
+쓰든 같은 core 환경이 만들어진다):
 
 | 패키지 | 용도 |
 |---|---|
 | `opencv-contrib-python-headless` | ChArUco 검출, 캘리브레이션 계산 (cv2.aruco는 contrib에만 있음). GUI는 PySide6가 전담하므로 highgui가 필요 없는 headless wheel을 쓴다 |
 | `numpy` | 행렬/배열 연산 |
-| `PyYAML` | ROS CameraInfo YAML export |
+| `scipy` | Windshield 모델 피팅(root-solve, RBF 보간 등) |
+| `PyYAML` | ROS CameraInfo YAML export, 프로젝트/설정 파일 |
 | `PySide6` | 데스크톱 UI (Qt6) |
-| `rosbags` | (선택) rosbag(.bag/.db3/.mcap)에서 이미지 직접 불러오기. 순수 Python이라 ROS 설치 불필요 |
+
+**`rosbags`는 core dependency가 아니다** - 필요할 때만 optional extra로 설치한다:
+
+| Extra | 설치 커맨드 | 내용 |
+|---|---|---|
+| `.[ros]` | `pip install -e ".[ros]"` | `rosbags>=0.9` - **ROS를 설치하지 않고도** `.bag`/`.db3`/`.mcap` 파일에서 이미지를 오프라인으로 직접 읽는 순수 Python 라이브러리(6.1번 섹션) |
+| `.[neural]` | `pip install -e ".[neural]"` | `torch>=2.0` - Neural Residual Windshield 모델 전용(12.8번 섹션) |
+| `.[dev]` | `pip install -e ".[dev]"` | 테스트 스위트 실행용(`pytest`) + `rosbags`(테스트가 rosbag 관련 코드도 함께 검증하므로) |
+
+> ⚠️ **`rosbags`(오프라인 파일 파서)와 ROS1 live topic 의존성(`rospy`,
+> `sensor_msgs`, `cv_bridge`)을 혼동하지 마세요.** `rosbags`는 pip 패키지로
+> ROS 설치 없이도 동작하지만, 실시간 토픽 구독([실시간 카메라 구독] 버튼,
+> 6.2번 섹션)에 필요한 `rospy`/`rclpy`/`cv_bridge`는 **이 프로젝트의 어떤
+> extra로도 설치되지 않는다** - 실제 ROS1/ROS2 환경이 시스템에 설치되고
+> source되어 있어야만 동작한다.
 
 > ⚠️ `opencv-python`/`opencv-python-headless`/`opencv-contrib-python`(비-headless)
 > 을 `opencv-contrib-python-headless`와 **동시에 설치하면 안 됩니다** (전부
@@ -64,15 +81,19 @@ pip install -r requirements.txt
 **방법 B - pyproject.toml (패키지로 설치, `camera-calibrator` 커맨드 사용 가능)**
 
 ```bash
-pip install -e .            # 기본 설치
-pip install -e ".[ros]"     # rosbag 기능까지 포함
-pip install -e ".[dev]"     # 테스트(pytest)까지 포함
+pip install -e .            # core만 설치(위 표와 동일)
+pip install -e ".[ros]"     # + rosbag 오프라인 읽기
+pip install -e ".[neural]"  # + Neural Residual Windshield 모델
+pip install -e ".[dev]"     # + 테스트 스위트(pytest, rosbags)
 ```
 
 이렇게 설치하면 레포 폴더 밖 어디서든 아래 커맨드로 바로 실행할 수 있습니다
-(3번 섹션 참고). `requirements.txt` 방식과 설치되는 의존성은 동일하며, 어느
-쪽을 쓰든 상관없습니다 - 개발/기여 목적이면 방법 B, 그냥 써보는 목적이면
-방법 A가 조금 더 단순합니다.
+(3번 섹션 참고). `requirements.txt` 방식과 core dependency 집합은 정확히
+동일하며, 어느 쪽을 쓰든 상관없습니다 - 개발/기여 목적이면 방법 B, 그냥
+써보는 목적이면 방법 A가 조금 더 단순합니다. `requirements.txt`만으로는
+`.[ros]`/`.[neural]` 같은 extra 개념이 없으므로, rosbag/Neural 기능이
+필요하면 `pip install rosbags>=0.9` 또는 `pip install torch>=2.0`을 직접
+추가로 설치하세요.
 
 **방법 C - Docker (설치 없이 바로, CI/배치 처리에 특히 유용)**
 
@@ -362,7 +383,7 @@ camera_calibrator/
 
 두 단계로 나뉩니다.
 
-### 5.1 rosbag에서 이미지 불러오기 (`[rosbag에서 불러오기]` 버튼, ROS 설치 불필요)
+### 6.1 rosbag에서 이미지 불러오기 (`[rosbag에서 불러오기]` 버튼, ROS 설치 불필요)
 
 순수 Python 라이브러리 `rosbags`로 ROS1(.bag)/ROS2(.db3, .mcap)를 직접 읽습니다.
 ROS가 설치 안 된 컴퓨터에서도 동작합니다.
@@ -383,7 +404,7 @@ CompressedImage(jpeg/png).
 지원 안 하는 인코딩을 만나면 에러 메시지에 실제 인코딩 이름이 나옵니다
 (예: "발견된 인코딩: 32FC1") - 필요하면 이슈로 알려주시면 추가하겠습니다.
 
-### 5.2 실시간 토픽 구독 (`[실시간 카메라 구독]` 버튼, **ROS1 또는 ROS2 설치 필요**)
+### 6.2 실시간 토픽 구독 (`[실시간 카메라 구독]` 버튼, **ROS1 또는 ROS2 설치 필요**)
 
 이건 다릅니다 - `rospy`/`rclpy`는 pip로 설치되지 않고, 실제 ROS1(noetic 등) 또는
 ROS2(humble 등)가 컴퓨터에 설치되고 환경이 source 되어 있어야만 동작합니다

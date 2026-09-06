@@ -38,7 +38,11 @@ def _detected_charuco() -> tuple[np.ndarray, DetectionResult]:
 
 
 def test_charuco_detection_success_renders_overlay():
-    pytest.importorskip("PySide6")
+    # 정합성 마감 라운드 - 최상위 `PySide6` 패키지 import는 성공해도 실제
+    # 컴파일된 확장(QtWidgets.pyd 등) 로드는 서브모듈 import 시점에 비로소
+    # 일어난다. 이 환경(DLL 로드 실패)처럼 최상위만 통과하고 서브모듈이
+    # 실패하면 이 skip이 못 잡아 SKIPPED 대신 FAILED로 잘못 보고된다.
+    pytest.importorskip("PySide6.QtWidgets")
     from ui.live_capture_dialog import render_detection_overlay
 
     raw, detection = _detected_charuco()
@@ -51,7 +55,11 @@ def test_charuco_detection_success_renders_overlay():
 
 
 def test_detection_failure_returns_unchanged_raw_copy():
-    pytest.importorskip("PySide6")
+    # 정합성 마감 라운드 - 최상위 `PySide6` 패키지 import는 성공해도 실제
+    # 컴파일된 확장(QtWidgets.pyd 등) 로드는 서브모듈 import 시점에 비로소
+    # 일어난다. 이 환경(DLL 로드 실패)처럼 최상위만 통과하고 서브모듈이
+    # 실패하면 이 skip이 못 잡아 SKIPPED 대신 FAILED로 잘못 보고된다.
+    pytest.importorskip("PySide6.QtWidgets")
     from ui.live_capture_dialog import render_detection_overlay
 
     raw = np.full((80, 120, 3), 37, dtype=np.uint8)
@@ -67,7 +75,11 @@ def test_maximum_charuco_corner_count_is_board_internal_intersections():
 
 
 def test_overlay_never_mutates_original_raw_frame():
-    pytest.importorskip("PySide6")
+    # 정합성 마감 라운드 - 최상위 `PySide6` 패키지 import는 성공해도 실제
+    # 컴파일된 확장(QtWidgets.pyd 등) 로드는 서브모듈 import 시점에 비로소
+    # 일어난다. 이 환경(DLL 로드 실패)처럼 최상위만 통과하고 서브모듈이
+    # 실패하면 이 skip이 못 잡아 SKIPPED 대신 FAILED로 잘못 보고된다.
+    pytest.importorskip("PySide6.QtWidgets")
     from ui.live_capture_dialog import render_detection_overlay
 
     raw, detection = _detected_charuco()
@@ -79,7 +91,11 @@ def test_overlay_never_mutates_original_raw_frame():
 
 
 def test_live_detection_worker_keeps_only_one_pending_frame():
-    pytest.importorskip("PySide6")
+    # 정합성 마감 라운드 - 최상위 `PySide6` 패키지 import는 성공해도 실제
+    # 컴파일된 확장(QtWidgets.pyd 등) 로드는 서브모듈 import 시점에 비로소
+    # 일어난다. 이 환경(DLL 로드 실패)처럼 최상위만 통과하고 서브모듈이
+    # 실패하면 이 skip이 못 잡아 SKIPPED 대신 FAILED로 잘못 보고된다.
+    pytest.importorskip("PySide6.QtWidgets")
     from PySide6.QtWidgets import QApplication
     from ui.worker import LiveDetectionWorker
 
@@ -97,7 +113,11 @@ def test_live_detection_worker_keeps_only_one_pending_frame():
 
 
 def test_live_dialog_accepts_legacy_string_pattern_type(tmp_path, monkeypatch):
-    pytest.importorskip("PySide6")
+    # 정합성 마감 라운드 - 최상위 `PySide6` 패키지 import는 성공해도 실제
+    # 컴파일된 확장(QtWidgets.pyd 등) 로드는 서브모듈 import 시점에 비로소
+    # 일어난다. 이 환경(DLL 로드 실패)처럼 최상위만 통과하고 서브모듈이
+    # 실패하면 이 skip이 못 잡아 SKIPPED 대신 FAILED로 잘못 보고된다.
+    pytest.importorskip("PySide6.QtWidgets")
     from PySide6.QtWidgets import QApplication
     import ui.live_capture_dialog as live_module
 
@@ -117,7 +137,11 @@ def test_live_dialog_accepts_legacy_string_pattern_type(tmp_path, monkeypatch):
 
 
 def test_live_dialog_auto_captures_detected_novel_pose_only(tmp_path, monkeypatch):
-    pytest.importorskip("PySide6")
+    # 정합성 마감 라운드 - 최상위 `PySide6` 패키지 import는 성공해도 실제
+    # 컴파일된 확장(QtWidgets.pyd 등) 로드는 서브모듈 import 시점에 비로소
+    # 일어난다. 이 환경(DLL 로드 실패)처럼 최상위만 통과하고 서브모듈이
+    # 실패하면 이 skip이 못 잡아 SKIPPED 대신 FAILED로 잘못 보고된다.
+    pytest.importorskip("PySide6.QtWidgets")
     from PySide6.QtWidgets import QApplication
     from calibration.types import CameraConfig
     import ui.live_capture_dialog as live_module
@@ -147,7 +171,11 @@ def test_live_dialog_auto_captures_detected_novel_pose_only(tmp_path, monkeypatc
 
 
 def test_live_dialog_is_resizable_and_maximizable(tmp_path, monkeypatch):
-    pytest.importorskip("PySide6")
+    # 정합성 마감 라운드 - 최상위 `PySide6` 패키지 import는 성공해도 실제
+    # 컴파일된 확장(QtWidgets.pyd 등) 로드는 서브모듈 import 시점에 비로소
+    # 일어난다. 이 환경(DLL 로드 실패)처럼 최상위만 통과하고 서브모듈이
+    # 실패하면 이 skip이 못 잡아 SKIPPED 대신 FAILED로 잘못 보고된다.
+    pytest.importorskip("PySide6.QtWidgets")
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication
     import ui.live_capture_dialog as live_module

@@ -12,9 +12,14 @@ numpy>=1.24
 # breakage).
 opencv-contrib-python-headless>=4.9
 scipy>=1.11
-matplotlib>=3.8
 PyYAML>=6.0
-jsonschema>=4.0
+# Priority 3 안정화(정합성 마감 라운드) - matplotlib/jsonschema를 이 파일에서
+# 제거했다. 저장소 전체(app/calibration/export/ui/scripts)를 검색한 결과
+# 실제로 import하는 production 코드가 하나도 없었다 - ui/radial_profile_view.py
+# 와 ui/windshield_vector_field_view.py는 docstring에 명시된 대로 matplotlib를
+# 의도적으로 피하고 QPainter로 직접 그린다. jsonschema도 --config 파일 검증
+# 등 어디에도 쓰이지 않는다. 둘 다 requirements-jetson-jp512.txt에는 남아있는데,
+# 그건 별도 환경 정책(그 프로필만의 결정)이라 데스크톱과 억지로 맞추지 않는다.
 # Priority 6 안정화 - PySide6가 이 파일에서 완전히 빠져 있었다(pyproject.toml
 # 에는 있었음). README 2번 섹션은 "방법 A(requirements.txt)로도 GUI가
 # 설치된다"고 안내하지만, 실제로는 이 줄이 없어서 `pip install -r
