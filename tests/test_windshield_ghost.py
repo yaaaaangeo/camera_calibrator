@@ -44,6 +44,59 @@ def _two_dot_image(h=240, w=320, centers=((100, 120), (220, 80)), radius=1) -> n
 
 
 # ---------------------------------------------------------------------------
+# Priority 3 안정화 - Ghost 2-pass spatial pairing이 실제 Point Source
+# production evaluator(evaluate_ghost_point_source)에 연결돼 있는지 확인.
+# 함수와 단위 테스트가 존재하는 것만으로는 "연결됐다"고 볼 수 없으므로,
+# (1) 소스 상에서 실제 호출부를 확인하고, (2) 그 함수가 실제로 호출되는지
+# monkeypatch로 행동 검증한다.
+# ---------------------------------------------------------------------------
+
+def test_evaluate_ghost_point_source_calls_two_pass_pairing_not_single_pass():
+    """evaluator.py 소스 자체를 확인한다 - `pair_main_and_ghost_blobs_two_
+    pass`를 import/호출하고, 예전 single-pass 함수(`pair_main_and_ghost_
+    blobs(`처럼 뒤에 여는 괄호가 바로 오는 호출 형태)는 더 이상 호출하지
+    않아야 한다."""
+    from pathlib import Path
+
+    source = Path(
+        __file__
+    ).resolve().parents[1].joinpath(
+        "calibration", "windshield", "ghost", "evaluator.py"
+    ).read_text(encoding="utf-8")
+
+    assert "pair_main_and_ghost_blobs_two_pass" in source
+    assert "pair_main_and_ghost_blobs(" not in source
+
+
+def test_evaluate_ghost_point_source_actually_invokes_two_pass_function(monkeypatch):
+    """소스 검사만으로는 실제 실행 경로를 증명하지 못하므로, 진짜
+    `pair_main_and_ghost_blobs_two_pass()`를 monkeypatch해서 실제로
+    호출되는지, 그리고 이미지 크기(image_width/image_height)가 올바르게
+    전달되는지까지 행동으로 검증한다."""
+    import calibration.windshield.ghost.evaluator as evaluator_module
+
+    calls = []
+    real_two_pass = evaluator_module.pair_main_and_ghost_blobs_two_pass
+
+    def _fake_two_pass(blobs, *, image_width, image_height, **kwargs):
+        calls.append((image_width, image_height))
+        return real_two_pass(blobs, image_width=image_width, image_height=image_height, **kwargs)
+
+    monkeypatch.setattr(evaluator_module, "pair_main_and_ghost_blobs_two_pass", _fake_two_pass)
+
+    clean = _two_dot_image(h=240, w=320)
+    sample = make_constant_offset_ghost_sample(clean, dx=4.0, dy=-2.0, alpha=0.15)
+    observed = np.clip(sample.observed, 0, 255).astype(np.uint8)
+
+    result = evaluate_ghost_point_source(observed, _point_source_config())
+
+    assert len(calls) == 1, "pair_main_and_ghost_blobs_two_pass()가 정확히 한 번 호출돼야 한다."
+    assert calls[0] == (320, 240), "image_width/image_height가 실제 이미지 크기와 일치해야 한다."
+    assert result.success
+    assert result.detection_count == 2
+
+
+# ---------------------------------------------------------------------------
 # Test A - No Ghost: 입력=clean -> detection ~= 0, strength ~= 0.
 # ---------------------------------------------------------------------------
 
@@ -317,8 +370,19 @@ def test_general_likelihood_column_only_pattern_is_recovered_by_column_profile()
 def test_general_likelihood_row_and_column_rates_never_appear_in_other_modes():
     """Point Source/Edge Target 모드에서는 이 두 필드가 절대 채워지면 안
     된다(사용자 스펙 - General Likelihood 전용 필드가 다른 모드로 새면
-    안 된다)."""
-    result = evaluate_ghost_point_source([BrightBlob(x=10, y=10, energy=100, area_px=5)])
+    안 된다).
+
+    이전 버전은 실수로 `evaluate_ghost_point_source()`에 `BrightBlob`
+    리스트를 직접 넘겼는데(이미지가 아님), 그 시점엔 `detect_bright_blobs`/
+    `pair_main_and_ghost_blobs`가 던진 예외가 함수 내부 try/except에 잡혀
+    success=False인 채로 모든 필드가 기본값(None)인 결과가 돌아온 덕분에
+    "우연히" 통과하고 있었다 - 실제로는 point-source 파이프라인을 전혀
+    실행하지 않은 것이다. 이제는 실제 이미지를 넘겨 진짜 point-source
+    평가가 성공적으로 끝난 뒤에도 likelihood 필드가 비어있는지 검증한다."""
+    img = _two_dot_image()
+    result = evaluate_ghost_point_source(img)
+    assert result.success
+    assert result.mode == "point_source"
     assert result.likelihood_row_detection_rate is None
     assert result.likelihood_column_detection_rate is None
 
@@ -567,6 +631,39 @@ def test_extract_edge_profiles_respects_edge_axis_orientation():
 
     cfg_auto = GhostEvaluationConfig(mode="edge_target", edge_axis="auto")
     assert len(extract_edge_profiles(img, cfg_auto)) >= 3
+
+
+def test_pick_dominant_line_handles_both_opencv_houghlinesp_shapes():
+    """cv2.HoughLinesP()의 반환 shape은 OpenCV 버전에 따라 (N,1,4) 또는
+    (N,4)일 수 있다(OpenCV 5 CI에서 (N,4)로 확인됨 - 이 sandbox의 OpenCV
+    4.11은 항상 (N,1,4)만 내므로 실제 호출로는 재현이 안 되고, 여기서
+    두 shape을 직접 구성해 `_pick_dominant_line()`이 둘 다 같은 결과를
+    내는지 검증한다). 이전에는 `line[0]`이 (N,4) 입력에서 scalar가 되어
+    `TypeError: 'numpy.int32' object is not iterable`가 났다."""
+    from calibration.windshield.ghost.edge_detector import _pick_dominant_line
+
+    lines_n14 = np.array([[[1, 2, 3, 4]]], dtype=np.int32)
+    lines_n4 = np.array([[1, 2, 3, 4]], dtype=np.int32)
+
+    result_n14 = _pick_dominant_line(lines_n14, "auto", 20.0)
+    result_n4 = _pick_dominant_line(lines_n4, "auto", 20.0)
+
+    assert result_n14 is not None
+    assert result_n14 == result_n4 == (1.0, 2.0, 3.0, 4.0)
+
+
+def test_pick_dominant_line_picks_longest_matching_line_regardless_of_shape():
+    """단일 라인이 아니라 여러 라인 중 axis 제약을 만족하는 가장 긴
+    라인을 고르는 기존 로직이 (N,4) shape에서도 그대로 유지되는지 확인."""
+    from calibration.windshield.ghost.edge_detector import _pick_dominant_line
+
+    # 수직에 가까운 짧은 라인 하나 + 수직에 가까운 긴 라인 하나(N,4).
+    lines_n4 = np.array([
+        [10, 0, 10, 5],     # length ~5, vertical
+        [50, 0, 50, 100],   # length ~100, vertical - dominant여야 함
+    ], dtype=np.int32)
+    result = _pick_dominant_line(lines_n4, "vertical", 20.0)
+    assert result == (50.0, 0.0, 50.0, 100.0)
 
 
 def test_extract_edge_profiles_empty_for_blank_image():
@@ -1284,6 +1381,104 @@ def test_regular_led_grid_with_one_unrelated_bright_neighbor():
     for det in detected:
         assert det.offset_x_px == pytest.approx(5.0, abs=0.2)
         assert det.offset_y_px == pytest.approx(-3.0, abs=0.2)
+
+
+# ===========================================================================
+# Priority 4 안정화 - 위 테스트들은 전부 max_search_radius_px=15.0(< LED
+# spacing 30px)라서 이웃 Main/이웃 Main의 Ghost가 애초에 candidate조차 될 수
+# 없었다. 실제로 어려운 상황은 search radius가 LED 간격과 비슷하거나 더
+# 커서(예: 60px) 이웃 Main과 이웃 Main의 Ghost까지 candidate set에 들어오는
+# 경우다 - 이 섹션은 그 조건에서도 pairing이 정확한지 확인한다.
+# ===========================================================================
+
+def test_regular_led_grid_with_large_search_radius_still_pairs_own_ghost():
+    """4x5 grid, spacing=30px, search radius=60px(> spacing) - 이웃 Main과
+    이웃 Main의 Ghost가 전부 geometric하게 candidate가 되는 조건에서도,
+    각 Main이 자기 자신의 Ghost와 정확히 pairing돼야 한다."""
+    blobs = _regular_led_grid_blobs(rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15)
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=60.0)
+    detected = [d for d in detections if d.detected]
+
+    assert len(detected) == 20
+    for det in detected:
+        assert det.offset_x_px == pytest.approx(5.0, abs=0.5)
+        assert det.offset_y_px == pytest.approx(-3.0, abs=0.5)
+        # 이웃 Main 자체(거리 30px, offset이 (30,0) 근처)를 ghost로 선택하지
+        # 않아야 한다 - 진짜 ghost distance(~5.8px)와 뚜렷이 구분된다.
+        assert det.distance_px < 10.0
+
+
+def test_regular_led_grid_large_radius_with_missing_leds():
+    """Large search radius에서도 일부 LED가 빠졌을 때 나머지가 정상적으로
+    pairing되어야 한다."""
+    missing = {(0, 0), (1, 3), (3, 4), (2, 2)}
+    blobs = _regular_led_grid_blobs(rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15, skip_positions=missing)
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=60.0)
+    detected = [d for d in detections if d.detected]
+    assert len(detected) == 20 - len(missing)
+    for det in detected:
+        assert det.offset_x_px == pytest.approx(5.0, abs=0.5)
+        assert det.offset_y_px == pytest.approx(-3.0, abs=0.5)
+
+
+def test_regular_led_grid_large_radius_with_energy_outlier():
+    """Large search radius에서도 ghost energy ratio outlier 하나가 전체
+    pairing을 깨지 않아야 한다."""
+    blobs = _regular_led_grid_blobs(
+        rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15,
+        extra_outlier_ratio_at=(2, 3, 0.7),
+    )
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=60.0)
+    detected = [d for d in detections if d.detected]
+    assert len(detected) == 20
+    for det in detected:
+        assert det.offset_x_px == pytest.approx(5.0, abs=0.5)
+        assert det.offset_y_px == pytest.approx(-3.0, abs=0.5)
+
+
+def test_regular_led_grid_large_radius_via_production_two_pass_pairing():
+    """Priority 3(production wiring)과 Priority 4(large radius)를 함께
+    검증한다 - 실제 production evaluator가 쓰는
+    `pair_main_and_ghost_blobs_two_pass()` 경로도 large radius에서 동일하게
+    정확해야 한다."""
+    blobs = _regular_led_grid_blobs(rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15)
+    detections = pair_main_and_ghost_blobs_two_pass(
+        blobs, image_width=200.0, image_height=200.0, max_search_radius_px=60.0,
+    )
+    detected = [d for d in detections if d.detected]
+    assert len(detected) == 20
+    for det in detected:
+        assert det.offset_x_px == pytest.approx(5.0, abs=0.5)
+        assert det.offset_y_px == pytest.approx(-3.0, abs=0.5)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "알려진 한계(Priority 4 조사 중 발견, 이번 안정화 라운드의 범위를 "
+        "벗어남): LED grid 전체에 걸친 매끄러운 밝기 gradient(vignette)와 "
+        "search radius가 LED 간격보다 클 때(예: 60px > 30px spacing), 밝은 "
+        "Main이 그보다 살짝 어두운 이웃 Main 여러 개를 'ghost<main energy' "
+        "게이트만으로 후보로 착각할 수 있다. 이 grid(20개 Main) 규모에서는 "
+        "그런 Main-Main 후보 수가 실제 Main-Ghost 후보 수(20개)를 넘어서 "
+        "estimate_dominant_ghost_vector()가 진짜 displacement(+5,-3) 대신 "
+        "이웃 Main 방향(+30,0)을 dominant vector로 잘못 고른다. 새로운 "
+        "consensus 알고리즘이나 임의 threshold를 발명하지 않고는 고칠 수 "
+        "없어(이번 라운드의 '새 알고리즘 추가 금지' 범위 밖) 정직하게 "
+        "xfail로 남긴다."
+    ),
+)
+def test_regular_led_grid_large_radius_with_smooth_brightness_gradient_is_a_known_limitation():
+    variation = {(r, c): 1.0 - 0.15 * (r + c) / 8.0 for r in range(4) for c in range(5)}
+    blobs = _regular_led_grid_blobs(
+        rows=4, cols=5, spacing=30.0, dx=5.0, dy=-3.0, ratio=0.15, energy_variation=variation,
+    )
+    detections = pair_main_and_ghost_blobs(blobs, max_search_radius_px=60.0)
+    detected = [d for d in detections if d.detected]
+    assert len(detected) == 20
+    for det in detected:
+        assert det.offset_x_px == pytest.approx(5.0, abs=0.5)
+        assert det.offset_y_px == pytest.approx(-3.0, abs=0.5)
 
 
 # ===========================================================================

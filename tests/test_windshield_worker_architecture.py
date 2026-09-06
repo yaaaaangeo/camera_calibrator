@@ -17,6 +17,9 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _WORKSPACE_PATH = _REPO_ROOT / "ui" / "windshield_workspace.py"
 _WORKER_PATH = _REPO_ROOT / "ui" / "windshield_worker.py"
+# Priority 7 안정화 - _on_run_windshield_calibration()은
+# ui/windshield_geometry_panel.py로 옮겨졌다(계산 로직 변경 없음).
+_GEOMETRY_PANEL_PATH = _REPO_ROOT / "ui" / "windshield_geometry_panel.py"
 
 
 def _calls(text: str, func_name: str) -> bool:
@@ -70,7 +73,7 @@ def test_on_run_windshield_calibration_does_not_call_calibration_functions_direc
     이나 run_residual_ray_calibration_with_diagnostics( 호출이 없어야 한다 -
     실제 계산은 WindshieldCalibrationWorker.run() 안(별도 QThread)에서만
     일어나야 하고, UI 핸들러는 워커를 만들어 thread.start()만 해야 한다."""
-    source = _WORKSPACE_PATH.read_text(encoding="utf-8")
+    source = _GEOMETRY_PANEL_PATH.read_text(encoding="utf-8")
     handler_source = _extract_function_source(source, "_on_run_windshield_calibration")
 
     assert not _calls(handler_source, "run_windshield_calibration")
@@ -81,7 +84,7 @@ def test_on_run_windshield_calibration_does_not_call_calibration_functions_direc
 
 
 def test_on_run_windshield_calibration_disables_run_button_and_shows_running_status():
-    source = _WORKSPACE_PATH.read_text(encoding="utf-8")
+    source = _GEOMETRY_PANEL_PATH.read_text(encoding="utf-8")
     handler_source = _extract_function_source(source, "_on_run_windshield_calibration")
     assert "self.run_button.setEnabled(False)" in handler_source
     assert "Running" in handler_source

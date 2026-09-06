@@ -98,15 +98,30 @@ def test_calling_require_torch_loads_torch_lazily():
 def test_windshield_workspace_ui_does_not_import_reflection_suppression_at_top_level():
     """PySide6 유무와 무관하게 항상 실행 가능한 정적 검사 - UI가
     `calibration.windshield.reflection_suppression`을 top-level에서
-    import하면 안 된다(항상 method 본문 안에서만, 사용자 스펙 12번)."""
-    source = (_PROJECT_ROOT / "ui" / "windshield_workspace.py").read_text(encoding="utf-8")
-    top_level_lines = []
-    for line in source.splitlines():
-        if line.startswith(("class ", "def ")):
-            break
-        top_level_lines.append(line)
-    assert not any("reflection_suppression" in line for line in top_level_lines)
-    assert "reflection_suppression" in source, "expected lazy (in-method) references somewhere"
+    import하면 안 된다(항상 method 본문 안에서만, 사용자 스펙 12번).
+
+    Priority 7 안정화로 이 lazy import는 `ui/windshield_reflection_
+    suppression_panel.py`(Reflection Suppression sub-tab 전용 UI 파일)로
+    옮겨졌다 - `ui/windshield_workspace.py`는 이제 그 파일을 import할 뿐
+    `calibration.windshield.reflection_suppression`을 직접 참조하지
+    않는다. 문자열 "reflection_suppression"이 top-level에 있는지가 아니라
+    `calibration.windshield.reflection_suppression`(실제 torch 의존
+    패키지) import가 top-level에 있는지를 정확히 검사한다 - 파일 이름
+    자체(`windshield_reflection_suppression_panel`)에 그 substring이
+    포함돼 있어 예전 방식(단순 substring 검사)은 분리 이후 오탐한다."""
+    dangerous_pattern = "calibration.windshield.reflection_suppression"
+    for filename in ("windshield_workspace.py", "windshield_reflection_suppression_panel.py"):
+        source = (_PROJECT_ROOT / "ui" / filename).read_text(encoding="utf-8")
+        top_level_lines = []
+        for line in source.splitlines():
+            if line.startswith(("class ", "def ")):
+                break
+            top_level_lines.append(line)
+        assert not any(dangerous_pattern in line for line in top_level_lines), (
+            f"{filename} imports {dangerous_pattern} at top level"
+        )
+    panel_source = (_PROJECT_ROOT / "ui" / "windshield_reflection_suppression_panel.py").read_text(encoding="utf-8")
+    assert dangerous_pattern in panel_source, "expected lazy (in-method) references somewhere"
 
 
 def test_reflection_suppression_worker_only_imports_runtime_inside_run():

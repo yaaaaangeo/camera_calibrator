@@ -1,6 +1,6 @@
 # Camera Calibration Tool
 
-[![Tests](https://github.com/yaaaaangeo/camera_calibrator/actions/workflows/tests.yml/badge.svg)](https://github.com/yaaaaangeo/camera_calibrator/actions/workflows/tests.yml)
+[![General CI](https://github.com/yaaaaangeo/camera_calibrator/actions/workflows/ci.yml/badge.svg)](https://github.com/yaaaaangeo/camera_calibrator/actions/workflows/ci.yml)
 
 **Standard Calibration**으로 Ideal Pinhole / Brown-Conrady / Rational
 (`extended_pinhole`) / Fisheye(Kannala-Brandt) 네 모델을 ChArUco·Chessboard·Circle
@@ -18,11 +18,17 @@ Grid에는 **Advanced Calibration(Object-Releasing)** — 카메라 파라미터
 
 - **Python 3.10 이상** (3.11 권장)
 - OS: Windows / macOS / Linux 모두 가능 (PySide6가 크로스플랫폼)
-- **OpenCV**: 4.7 이상, **5.0.0도 지원** (`opencv-contrib-python==5.0.0.93`으로
-  실제 검증됨). 4.x와 5.x 둘 다에서 전체 테스트 스위트가 통과한다 - OpenCV
-  5.0에서 `cv2.fisheye.CALIB_*` 플래그 위치가 바뀌고 `cv2.fisheye.calibrate()`의
-  요구 shape이 엄격해진 것에 대응하는 코드가 `calibration/models/fisheye.py`에
-  있다 (자세한 내용은 11번 섹션).
+- **OpenCV**: 4.7 이상, 5.0.0도 대상으로 한다(`opencv-contrib-python==5.0.0.93`
+  으로 직접 검증했던 이력이 있음). OpenCV 5.0에서 `cv2.fisheye.CALIB_*` 플래그
+  위치가 바뀌고 `cv2.fisheye.calibrate()`의 요구 shape이 엄격해진 것에
+  대응하는 코드가 `calibration/models/fisheye.py`에 있다(자세한 내용은 11번
+  섹션). Ghost Edge Target의 `cv2.HoughLinesP()` 반환 shape도 OpenCV
+  버전에 따라 `(N,1,4)`/`(N,4)`로 달라질 수 있어 양쪽을 모두 처리하도록
+  `calibration/windshield/ghost/edge_detector.py`에서 고쳤다(12.9번 섹션).
+  **"4.x/5.x 둘 다 전체 테스트 스위트 통과"라는 확정 문구는 실제 OpenCV
+  5 CI 실행 결과로 재확인되기 전까지 여기 적지 않는다** - 로컬로는 OpenCV
+  4.11에서만 검증했다(이 저장소의 OpenCV 5 CI 결과는 12.9번 섹션의 CI 상태
+  표를 참고).
 
 ## 2. 설치
 
@@ -44,15 +50,16 @@ pip install -r requirements.txt
 
 | 패키지 | 용도 |
 |---|---|
-| `opencv-contrib-python` | ChArUco 검출, 캘리브레이션 계산 (cv2.aruco는 contrib에만 있음) |
+| `opencv-contrib-python-headless` | ChArUco 검출, 캘리브레이션 계산 (cv2.aruco는 contrib에만 있음). GUI는 PySide6가 전담하므로 highgui가 필요 없는 headless wheel을 쓴다 |
 | `numpy` | 행렬/배열 연산 |
 | `PyYAML` | ROS CameraInfo YAML export |
 | `PySide6` | 데스크톱 UI (Qt6) |
 | `rosbags` | (선택) rosbag(.bag/.db3/.mcap)에서 이미지 직접 불러오기. 순수 Python이라 ROS 설치 불필요 |
 
-> ⚠️ `opencv-python`과 `opencv-contrib-python`을 **동시에 설치하면 안 됩니다**
-> (둘 다 `cv2`라는 이름을 써서 충돌합니다). 이미 `opencv-python`이 깔려있다면
-> `pip uninstall opencv-python opencv-python-headless` 먼저 실행하세요.
+> ⚠️ `opencv-python`/`opencv-python-headless`/`opencv-contrib-python`(비-headless)
+> 을 `opencv-contrib-python-headless`와 **동시에 설치하면 안 됩니다** (전부
+> `cv2`라는 이름을 써서 충돌합니다 - 마지막에 설치된 것이 이깁니다). 이미
+> 다른 `opencv-*` 패키지가 깔려있다면 먼저 `pip uninstall`로 제거하세요.
 
 **방법 B - pyproject.toml (패키지로 설치, `camera-calibrator` 커맨드 사용 가능)**
 
@@ -148,6 +155,16 @@ ROS1 Noetic live topic 사용은 pip dependency가 아닙니다. `rospy`, `senso
 `cv_bridge`는 ROS/apt 환경에서 관리하고, 필요할 때 ROS 환경을 source한 뒤 실행합니다.
 오프라인 bag 파일 읽기용 `rosbags`도 이 JetPack 5.1.2 core+GUI profile에는 넣지
 않았습니다.
+
+**이 profile의 지원 범위를 정확히 구분합니다** (Python 3.8/3.10 ABI 불일치
+때문에 실제로 이렇게 나뉩니다 - 소스가 실제로 제공하는 범위보다 더 크게
+지원한다고 말하지 않습니다):
+
+| 대상 | 상태 |
+|---|---|
+| JetPack 5.1.2, Python 3.10 venv에서 GUI/core 캘리브레이션 워크플로우(이미지 파일/rosbag 오프라인 처리 포함) | ✅ 지원 |
+| **같은 Python 3.10 venv 안에서** ROS1 Noetic `cv_bridge`로 실시간(live) 토픽 구독 | ❌ 이 profile은 지원하지 않음(`cv_bridge`가 Python 3.8용으로 빌드되어 3.10 인터프리터에서 로드 자체가 불가능) |
+| ROS1 Noetic 환경(별도 시스템 Python 3.8)에서 직접 실행 | 이 프로젝트가 다루는 범위 밖 - ROS 노드를 이 프로젝트 밖에서 별도로 작성해야 함 |
 
 ## 3. 실행
 
@@ -328,7 +345,7 @@ camera_calibrator/
 ├── ui/                       # PySide6 화면 (계산 로직 없음, calibration/*만 호출)
 │   ├── undistort_straightness_view.py  # ② Preview 탭 (원본 | 보정 후+Straightness 오버레이)
 │   └── live_capture_dialog.py   # 실시간 구독 + 라이브 프리뷰 + 수동/자동 캡처 + 구역별 다양성 코칭
-├── .github/workflows/tests.yml  # GitHub Actions CI (push/PR마다 Python 3.10/3.11/3.12 자동 테스트 + 커버리지)
+├── .github/workflows/         # ci.yml(General, 3.10/3.11) + ghost/reflection/reflection-suppression/neural-tests.yml
 ├── .devcontainer/devcontainer.json  # VS Code/Codespaces 개발 컨테이너 (아래 Dockerfile 재사용)
 ├── Dockerfile                    # 헤드리스 CLI 실행 / 개발 컨테이너 베이스
 ├── .dockerignore
@@ -583,8 +600,8 @@ dataset = detect_dataset(paths, pattern)  # 이후 흐름은 위 예시와 동�
 ## 9. 테스트
 
 `tests/` 폴더에 pytest 스위트가 있다 (수백 개 단위, 빠른 것만 돌리면 수 초 -
-전체는 몇 분 정도, OpenCV 4.x/5.x 둘 다에서 통과 확인됨. 정확한 개수는 계속
-늘어나므로 `pytest --collect-only -q`로 직접 확인하는 걸 권장). 코드를 고치다가
+전체는 몇 분 정도. 정확한 개수는 계속 늘어나므로 `pytest --collect-only -q`
+로 직접 확인하는 걸 권장). 코드를 고치다가
 뭔가 깨지면 이게 잡아준다 - 예전엔 검증할 때마다 스크립트를 즉석으로 짰다가
 끝나면 지웠는데, 그러면 다음에 같은 곳이 또 깨져도 아무도 모른다.
 
@@ -633,23 +650,28 @@ fixture(`conftest.py`)를 건드리는 fixture는 `copy.deepcopy()`로 복사본
 `rosbags`가 설치 안 돼 있으면 `test_rosbag_reader.py`는 자동으로 스킵된다
 (선택적 의존성이라 앱도, 테스트도 없어도 동작해야 하므로).
 
-`.github/workflows/tests.yml`로 GitHub Actions CI가 붙어있어 push/PR마다
-Python 3.10/3.11/3.12에서 자동으로 돌아간다 (`test` 잡). 같은 워크플로우 안에
-OpenCV 4.x/5.x 호환성 매트릭스(`opencv-compat`)와 빠른 티어만 도는
-`smoke` 잡도 함께 있다.
+GitHub Actions CI는 워크플로우 5개로 나뉜다 - 전부 push/PR마다 자동으로
+돌아간다:
 
-**커버리지**: Python 3.11 잡에서 `pytest-cov`로 커버리지를 측정한다
-(`calibration/`, `app/`, `export/`, `ui/` 대상). 매 실행마다:
-- Actions 실행 결과 페이지 상단 "Summary"에 모듈별 커버리지 표가 바로 보인다
-  (파일을 따로 열 필요 없음)
-- HTML 상세 리포트(`htmlcov/`)와 원본 `coverage.xml`을 Artifacts로 다운로드할 수
-  있다 (14일 보관)
+| 워크플로우 | 대상 |
+|---|---|
+| `.github/workflows/ci.yml`(General CI) | `pytest -q -m "not slow"`(빠른 핵심 회귀) - Python 3.10/3.11 매트릭스 |
+| `.github/workflows/ghost-tests.yml` | Ghost/Double Image 평가·억제·UI-architecture·Project IO 회귀 |
+| `.github/workflows/reflection-tests.yml` | Reflection 평가·UI-architecture·Project IO·Export 회귀 |
+| `.github/workflows/reflection-suppression-tests.yml` | Reflection Suppression(PyTorch) 회귀 |
+| `.github/workflows/neural-tests.yml` | Neural Residual Windshield 모델(PyTorch) 회귀 |
 
-README 배지는 지금은 통과/실패 여부만 보여준다 - 커버리지 %까지 배지로
-고정하려면 Codecov 같은 외부 서비스 연동이 필요한데, 그건 저장소 소유자가
-직접 Codecov 계정을 만들어 토큰을 등록해야 해서 여기서는 붙이지 않았다
-(원하면 `.github/workflows/tests.yml`의 coverage 단계 뒤에 `codecov/codecov-action`
-스텝만 추가하면 된다).
+General CI(`ci.yml`)는 데스크톱 GUI(PySide6) 의존 테스트까지 포함해서
+돌리므로, ubuntu-latest 기본 이미지에 없는 `libEGL`/`libGL`을 설치하고
+`QT_QPA_PLATFORM=offscreen`으로 헤드리스 실행한다(Xvfb 등 실제 디스플레이
+서버는 쓰지 않는다).
+
+**커버리지**: `requirements-dev.txt`에 `pytest-cov`가 포함되어 있어 로컬에서는
+바로 쓸 수 있다(`pytest --cov=calibration --cov=app --cov=export --cov=ui`).
+다만 이 브랜치의 실제 GitHub Actions 워크플로우 중 커버리지를 측정해서
+Summary/Artifacts로 리포트하는 잡은 **현재 없다** - 필요하면 `ci.yml`에
+`pytest-cov` 실행 + 아티팩트 업로드 스텝을 추가해야 한다(Codecov 같은 외부
+서비스로 배지까지 고정하려면 별도로 계정/토큰 연동도 필요하다).
 
 ## 10. Model Score 가중치 튜닝
 

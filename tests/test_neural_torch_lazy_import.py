@@ -154,13 +154,20 @@ def test_ui_windshield_workspace_import_does_not_load_torch():
 def test_ui_windshield_workspace_source_does_not_reference_neural_residual_module():
     """PySide6 유무와 무관하게 항상 실행 가능한 정적 검사(소스 텍스트 수준) -
     UI가 `calibration.windshield.neural_residual`을 import하는 코드를 다시
-    추가하지 않는지 회귀 방지한다."""
-    source = (_PROJECT_ROOT / "ui" / "windshield_workspace.py").read_text(encoding="utf-8")
-    for line in source.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        assert "windshield.neural_residual" not in stripped, f"UI must not import neural_residual: {line!r}"
+    추가하지 않는지 회귀 방지한다.
+
+    Priority 7 안정화로 `ui/windshield_workspace.py`(God Object)가 여러
+    파일로 나뉘었다 - Residual Ray/Neural 설정 UI는
+    `ui/windshield_geometry_panel.py`로 옮겨졌으므로, 그 파일도 함께
+    검사해야 이 회귀 테스트가 여전히 의미가 있다(workspace.py만 보면 분리
+    이후 이 검사가 사실상 무력화된다)."""
+    for filename in ("windshield_workspace.py", "windshield_geometry_panel.py"):
+        source = (_PROJECT_ROOT / "ui" / filename).read_text(encoding="utf-8")
+        for line in source.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            assert "windshield.neural_residual" not in stripped, f"UI must not import neural_residual ({filename}): {line!r}"
 
 
 def test_worker_does_not_import_neural_residual_at_module_top_level():

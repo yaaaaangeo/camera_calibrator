@@ -55,6 +55,24 @@ def test_general_ci_workflow_does_not_install_neural_extra():
     assert "torch" not in executable_text
 
 
+def test_general_ci_workflow_installs_qt_egl_runtime_dependencies():
+    """PySide6 wheel은 Qt 바이너리를 포함하지만 libEGL/libGL은 ubuntu-latest
+    기본 이미지에 없어서, UI 관련 테스트 파일(test_chessboard.py 등)이
+    `ImportError: libEGL.so.1: cannot open shared object file`로 collection
+    단계에서 죽는다 - General CI가 이 런타임 의존성을 설치해야 한다."""
+    source = _CI_WORKFLOW.read_text(encoding="utf-8")
+    assert "libegl1" in source
+    assert "libgl1" in source
+
+
+def test_general_ci_workflow_runs_pytest_with_offscreen_qt_platform():
+    with open(_CI_WORKFLOW, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    job = next(iter(data["jobs"].values()))
+    pytest_step = next(s for s in job["steps"] if "pytest -q -m" in s.get("run", ""))
+    assert pytest_step.get("env", {}).get("QT_QPA_PLATFORM") == "offscreen"
+
+
 def test_general_ci_workflow_does_not_duplicate_or_replace_feature_specific_workflows():
     """기존 ghost/reflection/reflection-suppression/neural 워크플로우 파일은
     이 라운드에서 건드리지 않는다(존재 여부만 확인 - 내용은 각자 파일의

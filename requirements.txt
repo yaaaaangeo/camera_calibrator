@@ -15,6 +15,12 @@ scipy>=1.11
 matplotlib>=3.8
 PyYAML>=6.0
 jsonschema>=4.0
+# Priority 6 안정화 - PySide6가 이 파일에서 완전히 빠져 있었다(pyproject.toml
+# 에는 있었음). README 2번 섹션은 "방법 A(requirements.txt)로도 GUI가
+# 설치된다"고 안내하지만, 실제로는 이 줄이 없어서 `pip install -r
+# requirements.txt` 후 `python -m app.main`을 실행하면 PySide6 ImportError로
+# 즉시 실패하고 있었다.
+PySide6>=6.6
 
 # Optional - only required for the "Neural Residual" Windshield model
 # (calibration/windshield/neural_residual.py, residual_ray_hint["method"]=="neural").

@@ -25,8 +25,23 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install Qt runtime dependencies
+        # PySide6 wheel은 Qt 바이너리를 자체 포함하지만, 그 바이너리가
+        # 런타임에 동적 링크하는 libEGL/libGL은 ubuntu-latest 기본 이미지에
+        # 없다 - import 단계에서 `ImportError: libEGL.so.1: cannot open
+        # shared object file`로 UI 관련 테스트 파일들이 collection 자체에서
+        # 죽는다(pytest 로직과 무관). Xvfb 등 실제 디스플레이 서버는 필요
+        # 없다 - QT_QPA_PLATFORM=offscreen이 헤드리스로 대체한다.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 \
+            libgl1
+
       - name: Install test dependencies
         run: python -m pip install -e ".[dev]"
 
       - name: Run fast core regression (pytest -m "not slow")
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: python -m pytest -q -m "not slow"

@@ -34,7 +34,10 @@ from calibration.windshield.ghost.config import (
     GHOST_METRIC_VERSION,
 )
 from calibration.windshield.ghost.edge_detector import detect_edge_ghost, extract_edge_profiles
-from calibration.windshield.ghost.point_detector import detect_bright_blobs, pair_main_and_ghost_blobs
+from calibration.windshield.ghost.point_detector import (
+    detect_bright_blobs,
+    pair_main_and_ghost_blobs_two_pass,
+)
 from calibration.windshield.ghost.spatial_model import build_spatial_map, compute_region_metrics
 from calibration.windshield.ghost.types import (
     GhostDatasetResult,
@@ -98,8 +101,16 @@ def evaluate_ghost_point_source(
     camera_model: Optional[CameraModelType] = None,
     pair_id: str = "",
 ) -> GhostEvaluationResult:
-    """LED dot/night light 같은 point-source 이미지에서 Ghost를 평가한다."""
+    """LED dot/night light 같은 point-source 이미지에서 Ghost를 평가한다.
+
+    Pairing은 Phase B-4의 2-pass spatial pairing(`pair_main_and_ghost_blobs_
+    two_pass()`)을 쓴다 - PASS 1(단일 global dominant vector)만으로 부족한
+    경우(windshield 곡률 등으로 위치별 실제 ghost displacement가 달라지는
+    경우) PASS 2가 coarse spatial field 기반 local vector로 재-pairing하고,
+    PASS 2 근거가 부족하면 그 함수 내부에서 이미 PASS 1로 안전하게
+    fallback한다 - 이 함수는 그 fallback 로직을 중복 구현하지 않는다."""
     cfg = config or GhostEvaluationConfig(mode="point_source")
+    h, w = image_bgr.shape[:2]
     try:
         blobs = detect_bright_blobs(
             image_bgr,
@@ -108,8 +119,10 @@ def evaluate_ghost_point_source(
             gaussian_sigma=cfg.gaussian_sigma,
             min_peak_distance_px=cfg.min_peak_distance_px,
         )
-        detections = pair_main_and_ghost_blobs(
+        detections = pair_main_and_ghost_blobs_two_pass(
             blobs,
+            image_width=w,
+            image_height=h,
             max_search_radius_px=cfg.max_search_radius_px,
             consensus_radius_px=cfg.pairing_consensus_radius_px,
             min_consensus_candidates=cfg.min_consensus_candidates,
@@ -122,7 +135,6 @@ def evaluate_ghost_point_source(
             error_message=f"point-source ghost 검출 중 예외 발생: {exc}",
         )
 
-    h, w = image_bgr.shape[:2]
     _angular_separations(detections, camera_matrix=camera_matrix, distortion=distortion, camera_model=camera_model)
 
     detected = [d for d in detections if d.detected]

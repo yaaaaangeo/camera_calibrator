@@ -8,6 +8,16 @@ _WORKSPACE = _ROOT / "ui" / "windshield_workspace.py"
 _WORKER = _ROOT / "ui" / "reflection_worker.py"
 _SUPPRESSION_WORKER = _ROOT / "ui" / "reflection_suppression_worker.py"
 
+# Priority 7 안정화 - Reflection Evaluation/Suppression UI 코드는
+# ui/windshield_reflection_panel.py / ui/windshield_reflection_suppression_
+# panel.py로 옮겨졌다(계산 로직 변경 없음).
+_REFLECTION_PANEL = _ROOT / "ui" / "windshield_reflection_panel.py"
+_REFLECTION_SUPPRESSION_PANEL = _ROOT / "ui" / "windshield_reflection_suppression_panel.py"
+
+
+def _reflection_ui_source() -> str:
+    return _REFLECTION_PANEL.read_text(encoding="utf-8") + "\n" + _REFLECTION_SUPPRESSION_PANEL.read_text(encoding="utf-8")
+
 
 def test_reflection_worker_exists_and_uses_evaluator_only():
     source = _WORKER.read_text(encoding="utf-8")
@@ -23,12 +33,12 @@ def test_reflection_tab_is_separate_from_geometry_comparison():
 
     assert "⑤ Reflection" in source
     assert "_build_reflection_tab" in source
-    assert "ReflectionEvaluationWorker" in source
     assert "_build_comparison_tab" in source
+    assert "ReflectionEvaluationWorker" in _reflection_ui_source()
 
 
 def test_reflection_ui_keeps_raw_metric_labels_and_no_reference_wording():
-    source = _WORKSPACE.read_text(encoding="utf-8")
+    source = _reflection_ui_source()
 
     for label in (
         "Reflection Mean",
@@ -71,7 +81,7 @@ def test_suppression_worker_exists_and_is_separate_from_evaluation_worker():
 
 
 def test_reflection_tab_has_separate_evaluation_and_suppression_subtabs():
-    source = _WORKSPACE.read_text(encoding="utf-8")
+    source = _reflection_ui_source()
     assert "_build_reflection_evaluation_subtab" in source
     assert "_build_reflection_suppression_subtab" in source
     assert '"Evaluation"' in source
@@ -81,14 +91,14 @@ def test_reflection_tab_has_separate_evaluation_and_suppression_subtabs():
 def test_suppression_subtab_has_required_visualization_labels():
     """사용자 스펙 51번 - Original/Predicted Reflection/Reflection Mask/
     Suppressed 4개 시각화가 전부 있어야 한다."""
-    source = _WORKSPACE.read_text(encoding="utf-8")
+    source = _REFLECTION_SUPPRESSION_PANEL.read_text(encoding="utf-8")
     for label in ("suppression_original_image_label", "suppression_reflection_image_label",
                   "suppression_alpha_image_label", "suppression_output_image_label"):
         assert label in source
 
 
 def test_suppression_subtab_has_mode_presets_and_before_after_metrics():
-    source = _WORKSPACE.read_text(encoding="utf-8")
+    source = _REFLECTION_SUPPRESSION_PANEL.read_text(encoding="utf-8")
     for widget in ("suppression_mode_conservative_radio", "suppression_mode_standard_radio", "suppression_mode_strong_radio"):
         assert widget in source
     assert "suppression_metrics_table" in source
@@ -97,7 +107,6 @@ def test_suppression_subtab_has_mode_presets_and_before_after_metrics():
 
 def test_suppression_ui_never_calls_training_functions_directly():
     """사용자 스펙 59번 - GUI 안에서 training loop를 직접 돌리지 않는다."""
-    source = _WORKSPACE.read_text(encoding="utf-8")
-    assert "train_suppression_model" not in source
+    assert "train_suppression_model" not in _reflection_ui_source()
     worker_source = _SUPPRESSION_WORKER.read_text(encoding="utf-8")
     assert "train_suppression_model" not in worker_source

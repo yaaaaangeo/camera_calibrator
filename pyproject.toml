@@ -24,7 +24,14 @@ authors = [{ name = "yaaaaangeo" }]
 dependencies = [
     "opencv-contrib-python-headless>=4.9",
     "numpy>=1.24",
-    "scipy>=1.10",
+    # Priority 6 안정화 - 이전에는 이 파일이 scipy>=1.10, requirements.txt가
+    # scipy>=1.11을 선언해 서로 다른 최소 버전을 요구했다. scipy 1.10 floor가
+    # 실제로 검증된 적이 없어(이 프로젝트가 쓰는 scipy.interpolate.
+    # RBFInterpolator/scipy.spatial.cKDTree/scipy.optimize.least_squares 등은
+    # 훨씬 오래된 버전에서도 존재하지만, requirements.txt의 1.11이 실제
+    # 개발/검증에 쓰인 버전이었다) 더 낮춰서 통일하지 않고, 이미 검증된 쪽인
+    # requirements.txt의 하한선(1.11)에 맞춰 올렸다.
+    "scipy>=1.11",
     "PyYAML>=6.0",
     "PySide6>=6.6",
 ]

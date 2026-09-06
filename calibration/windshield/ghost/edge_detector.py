@@ -165,7 +165,15 @@ def _pick_dominant_line(
     best = None
     best_len = -1.0
     for line in lines:
-        x1, y1, x2, y2 = (float(v) for v in line[0])
+        # cv2.HoughLinesP()의 반환 shape은 OpenCV 버전에 따라 (N,1,4) 또는
+        # (N,4)일 수 있다(OpenCV 5 CI에서 (N,4)로 확인됨) - line[0]이 4개
+        # 좌표의 하위 배열이 아니라 scalar가 되는 경우 `float(v) for v in
+        # line[0]`이 `TypeError: 'numpy.int32' object is not iterable`을
+        # 낸다. reshape(-1)로 두 shape 모두 안전하게 4개 좌표로 펼친다.
+        coords = np.asarray(line).reshape(-1)
+        if coords.size != 4:
+            continue
+        x1, y1, x2, y2 = map(float, coords)
         length = math.hypot(x2 - x1, y2 - y1)
         if length < 1e-6:
             continue
