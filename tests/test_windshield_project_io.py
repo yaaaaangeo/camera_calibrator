@@ -284,6 +284,11 @@ def test_residual_ray_hint_and_spline_hint_round_trip_through_dict():
     assert restored.windshield_config.spline_hint == {"auto_spline": 0.0, "spline_rows": 4.0, "spline_cols": 6.0}
 
 
+# Phase 2 CI 속도 정리 - calibrate_spline()은 물리적으로 정확한 ray-surface
+# intersection 비용 때문에 최소 grid에서도 수 분 걸린다(로컬 실측 약 4분,
+# tests/test_windshield_spline.py 모듈 docstring 참고) - 이 파일의 다른
+# 테스트들(빠름)과 섞이지 않도록 이 테스트 하나만 slow로 뺀다.
+@pytest.mark.slow
 def test_spline_result_round_trips_through_project():
     K, D = default_camera_matrix_distortion()
     dataset = build_synthetic_spherical_windshield_dataset(K, D)

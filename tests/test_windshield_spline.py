@@ -44,6 +44,13 @@ from tests._windshield_test_utils import (
     default_camera_matrix_distortion,
 )
 
+# Phase 2 CI 속도 정리 - 위 모듈 docstring이 밝히듯 calibrate_spline() 1회
+# 호출이 최소 grid에서도 수 분 걸릴 수 있다(물리적으로 정확한 ray-surface
+# intersection 비용) - "not slow" 빠른 티어에 있기엔 너무 무겁다. 이 마킹은
+# 커버리지를 줄이지 않는다 - `pytest`(마커 없이 전체 실행) 또는 `pytest -m
+# slow`로는 여전히 돈다.
+pytestmark = pytest.mark.slow
+
 _MODEL = CameraModelType.BROWN_CONRADY
 
 

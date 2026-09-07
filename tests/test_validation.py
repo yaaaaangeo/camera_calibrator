@@ -185,9 +185,18 @@ def test_holdout_test_evaluation_does_not_mutate_test_frame_reprojection_error(
 def test_sequential_holdout_validation_across_models_keeps_independent_test_errors(
     synthetic_dataset, camera_config, pattern_config,
 ):
-    """Pinhole -> Fisheye 순서로 같은 Dataset을 hold-out 검증해도, 각
+    """Pinhole -> Brown-Conrady 순서로 같은 Dataset을 hold-out 검증해도, 각
     ValidationResult.per_frame_error(test 프레임 기준)는 서로 다른 모델의
-    값을 독립적으로 유지해야 한다."""
+    값을 독립적으로 유지해야 한다.
+
+    이 테스트의 목적은 오직 "mutation independence"(서로 다른 모델의 결과가
+    같은 dict를 공유/덮어쓰지 않는지)이지 특정 카메라 모델의 적합 품질이
+    아니다. 공용 synthetic_dataset fixture(conftest.py)는 Brown-distortion
+    기반 pinhole 사영으로 렌더링된 데이터셋이라 Pinhole/Brown-Conrady 둘 다
+    안정적으로 수렴한다 - Fisheye(Kannala-Brandt)는 애초에 이 데이터셋의
+    생성 모델과 맞지 않아 검증 목적에 맞지 않는다(Fisheye 전용 GT 검증은
+    아래 test_fisheye_holdout_validation_recovers_known_k_d가 실제
+    cv2.fisheye.projectPoints로 만든 GT로 별도로 다룬다)."""
     dataset = copy.deepcopy(synthetic_dataset)
     train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio=0.3, seed=5)
     assert test_ids
@@ -195,17 +204,106 @@ def test_sequential_holdout_validation_across_models_keeps_independent_test_erro
     pinhole_validation = validate_holdout(
         dataset, camera_config, pattern_config, CameraModelType.PINHOLE, train_ids, test_ids
     )
-    fisheye_validation = validate_holdout(
-        dataset, camera_config, pattern_config, CameraModelType.FISHEYE, train_ids, test_ids
+    brown_validation = validate_holdout(
+        dataset, camera_config, pattern_config, CameraModelType.BROWN_CONRADY, train_ids, test_ids
     )
-    assert pinhole_validation.success and fisheye_validation.success
+    assert pinhole_validation.success and brown_validation.success
     assert pinhole_validation.per_frame_error
-    assert fisheye_validation.per_frame_error
+    assert brown_validation.per_frame_error
     # 각 ValidationResult는 자신의 모델 값만 독립적으로 갖고 있어야 한다 -
     # 같은 dict 객체를 공유하거나 서로 덮어쓰면 안 된다.
-    assert pinhole_validation.per_frame_error is not fisheye_validation.per_frame_error
+    assert pinhole_validation.per_frame_error is not brown_validation.per_frame_error
     assert set(pinhole_validation.per_frame_error) <= set(test_ids)
-    assert set(fisheye_validation.per_frame_error) <= set(test_ids)
+    assert set(brown_validation.per_frame_error) <= set(test_ids)
+
+
+def _build_synthetic_fisheye_dataset(n_frames: int = 24, seed: int = 0):
+    """cv2.fisheye.projectPoints()로 실제 Fisheye(Kannala-Brandt) 모델에서
+    직접 생성한 GT 데이터셋. Pinhole/Brown 왜곡으로 만든 공용
+    synthetic_dataset과 달리, 이 데이터는 진짜 Fisheye 모델의 결과라서
+    Fisheye 전용 hold-out 검증의 정답 기준으로 쓸 수 있다."""
+    import cv2
+    import numpy as np
+
+    from calibration.types import CameraConfig, Dataset, DetectionResult, Frame, FrameStatus, ImageInfo
+
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)
+    board = cv2.aruco.CharucoBoard((11, 8), 0.02, 0.015, aruco_dict)
+    pts3d = board.getChessboardCorners().astype(np.float32)
+    n_corners = pts3d.shape[0]
+    ids = np.arange(n_corners, dtype=np.int32).reshape(-1, 1)
+
+    true_K = np.array([[500.0, 0, 320], [0, 500.0, 240], [0, 0, 1]])
+    true_D = np.array([0.05, 0.01, -0.01, 0.002])
+
+    rng = np.random.default_rng(seed)
+    frames = []
+    for i in range(n_frames):
+        rvec = (rng.random(3) - 0.5) * 0.6
+        tvec = np.array([(rng.random() - 0.5) * 0.2, (rng.random() - 0.5) * 0.2, 0.3 + rng.random() * 0.2])
+        proj, _ = cv2.fisheye.projectPoints(
+            pts3d.reshape(-1, 1, 3).astype(np.float64), rvec, tvec, true_K, true_D
+        )
+        proj = proj.reshape(-1, 2)
+        if (proj < 0).any() or (proj[:, 0] > 640).any() or (proj[:, 1] > 480).any():
+            continue
+        info = ImageInfo(image_id=f"fisheye_{i}", path="-", width=640, height=480)
+        det = DetectionResult(
+            image_id=f"fisheye_{i}",
+            success=True,
+            corners=proj.reshape(-1, 1, 2).astype(np.float32),
+            object_points=pts3d.reshape(-1, 1, 3),
+            ids=ids,
+            num_corners=n_corners,
+        )
+        frames.append(Frame(image_info=info, detection=det, status=FrameStatus.DETECTED))
+
+    dataset = Dataset(frames=frames)
+    camera_config = CameraConfig(width=640, height=480, sensor_name="pytest-fisheye-gt")
+    return dataset, camera_config, true_K, true_D
+
+
+def test_fisheye_holdout_validation_recovers_known_k_d(pattern_config):
+    """Fisheye 전용 hold-out 검증: 실제 cv2.fisheye.projectPoints()로 만든
+    GT 데이터셋에서 Train은 K,D를 fitting하고, Test는 (그 K,D를 고정한 채)
+    pose만 추정해서 재투영 오차를 계산해야 한다. 공용 synthetic_dataset은
+    Fisheye 모델로 생성된 데이터가 아니므로(위 sequential-independence
+    테스트 docstring 참고) 이 테스트가 Fisheye의 실제 검증 책임을 진다."""
+    dataset, camera_config, true_K, true_D = _build_synthetic_fisheye_dataset()
+    assert len(dataset.frames) >= 12, "합성 프레임이 너무 적게 생성됨 - 테스트 파라미터 조정 필요"
+
+    train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio=0.3, seed=13)
+    assert train_ids and test_ids
+
+    test_frames_before = {
+        fid: next(f for f in dataset.frames if f.image_info.image_id == fid).reprojection_error
+        for fid in test_ids
+    }
+
+    result = validate_holdout(
+        dataset, camera_config, pattern_config, CameraModelType.FISHEYE, train_ids, test_ids
+    )
+
+    assert result.success, result.error_message
+    # Train: K,D는 GT에 가깝게 fitting돼야 한다 (완전히 발산하지 않았는지 확인).
+    assert result.train_rms is not None and result.train_rms < 5.0
+
+    # Test: per_frame_error에 test 프레임 결과가 남아야 하고, 그 대상은
+    # 정확히 test_ids여야 한다 (train 프레임이 섞여 들어가면 안 됨).
+    assert result.per_frame_error
+    assert set(result.per_frame_error) <= set(test_ids)
+
+    # Test 프레임의 원본 Frame.reprojection_error는 절대 mutate되면 안 된다 -
+    # test 평가는 고정된 K,D로 pose만 추정하는 순수 평가일 뿐이다.
+    for fid in test_ids:
+        frame = next(f for f in dataset.frames if f.image_info.image_id == fid)
+        assert frame.reprojection_error == test_frames_before[fid], (
+            "Fisheye hold-out test 평가가 test Frame.reprojection_error를 mutate했다."
+        )
+
+    # Test RMS 자체도 GT 노이즈 없는 합성 데이터이므로 낮아야 한다 (Test에서
+    # K,D를 건드리지 않고 pose만 잘 추정했다면 재투영 오차는 작아야 정상).
+    assert result.test_rms is not None and result.test_rms < 5.0
 
 
 def test_leak_safe_outlier_pruning_only_removes_train_frames(

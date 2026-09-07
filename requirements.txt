@@ -10,7 +10,13 @@ numpy>=1.24
 # 을 같은 환경에 동시에 설치하지 마라 - 전부 `cv2`라는 같은 모듈 이름을
 # 놓고 경쟁해서 마지막에 설치된 것이 이긴다(원인 파악이 매우 어려운 silent
 # breakage).
-opencv-contrib-python-headless>=4.9
+# Priority 7 안정화 - production 코드(calibration/models/common.py::solve_pnp_for_model)가
+# cv2.fisheye.solvePnP()를 조건 없이 호출한다. 이 함수는 OpenCV 4.10.0에서
+# 추가됐다(opencv/opencv#25028, 2024-02-16 merge, target 4.10.0) - 그 이전
+# 버전에는 아예 없어 AttributeError로 즉시 실패한다. 그래서 최소 버전을
+# >=4.9에서 >=4.10으로 올린다 - requirements-jetson*.txt가 이미
+# opencv-contrib-python-headless==4.10.0.84로 고정돼 있던 것과도 맞춘다.
+opencv-contrib-python-headless>=4.10
 scipy>=1.11
 PyYAML>=6.0
 # Priority 3 안정화(정합성 마감 라운드) - matplotlib/jsonschema를 이 파일에서

@@ -22,7 +22,11 @@ authors = [{ name = "yaaaaangeo" }]
 # Qt5 plugin이 PySide6의 Qt6 platform plugin과 충돌할 여지를 원천 차단).
 # 상세 이유는 requirements.txt 주석 참고.
 dependencies = [
-    "opencv-contrib-python-headless>=4.9",
+    # Priority 7 안정화 - cv2.fisheye.solvePnP()(calibration/models/common.py::
+    # solve_pnp_for_model)는 OpenCV 4.10.0에서 추가됐다(opencv/opencv#25028).
+    # requirements.txt와 동일하게 4.9에서 4.10으로 올린다 - 상세 이유는
+    # requirements.txt 주석 참고.
+    "opencv-contrib-python-headless>=4.10",
     "numpy>=1.24",
     # Priority 6 안정화 - 이전에는 이 파일이 scipy>=1.10, requirements.txt가
     # scipy>=1.11을 선언해 서로 다른 최소 버전을 요구했다. scipy 1.10 floor가

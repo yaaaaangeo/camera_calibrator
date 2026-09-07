@@ -97,8 +97,8 @@ class IntrinsicWorkspace(QWidget):
 
         tabs.addTab(owner.dataset_view, "① Dataset")
         tabs.addTab(owner.preview_view, "② Preview")
-        tabs.addTab(owner.scene_quality_view, "③ Scene Ranking")
-        tabs.addTab(owner.result_view.model_comparison_widget, "④ Model Comparison")
+        tabs.addTab(owner.result_view.model_comparison_widget, "③ Model Comparison")
+        tabs.addTab(owner.scene_quality_view, "④ Scene Ranking")
         owner.tabs = tabs
         workspace = cls(settings_panel, tabs)
         workspace.connect_owner_handlers(owner)

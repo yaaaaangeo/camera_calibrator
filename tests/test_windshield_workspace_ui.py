@@ -84,15 +84,24 @@ def _make_workspace_with_config(qapp):
 
 
 def test_residual_ray_advanced_group_visible_only_when_selected(qapp):
+    """이 workspace는 show()된 적이 없고, 이 group은 ③ Windshield Model 탭
+    안에 있다(현재 선택된 탭이 아님) - QTabWidget은 선택되지 않은 탭
+    페이지를 통째로 hidden 처리하므로, isVisibleTo(workspace)는 group
+    자신의 setVisible() 상태와 무관하게 항상 False가 나온다(Qt의 정상
+    동작이며 production 버그가 아니다). 그래서 여기서는 group 자신에게
+    명시적으로 설정된 visibility state(isHidden())만 확인한다 - "실제 탭을
+    선택했을 때도 보이는가"는 별도의 integration 테스트
+    (test_residual_ray_advanced_group_actually_visible_when_tab_is_shown)가
+    담당한다."""
     workspace = _make_workspace_with_config(qapp)
     buttons = {
         button.property("windshield_model"): button
         for button in workspace._model_button_group.buttons()
     }
     buttons[WindshieldModelType.RESIDUAL_RAY.value].setChecked(True)
-    assert workspace.residual_ray_advanced_group.isVisibleTo(workspace)
+    assert not workspace.residual_ray_advanced_group.isHidden()
     buttons[WindshieldModelType.BASELINE.value].setChecked(True)
-    assert not workspace.residual_ray_advanced_group.isVisibleTo(workspace)
+    assert workspace.residual_ray_advanced_group.isHidden()
 
 
 def test_residual_ray_auto_mode_sets_auto_grid_hint(qapp):
@@ -140,7 +149,7 @@ def test_residual_ray_diagnostics_panel_visible_only_for_residual_ray_result(qap
         base_camera_matrix=K, base_distortion=D, success=True,
     )
     workspace._display_result(baseline_result)
-    assert not workspace.residual_ray_diagnostics_group.isVisibleTo(workspace)
+    assert workspace.residual_ray_diagnostics_group.isHidden()
 
     residual_result = WindshieldCalibrationResult(
         windshield_model=WindshieldModelType.RESIDUAL_RAY,
@@ -149,7 +158,7 @@ def test_residual_ray_diagnostics_panel_visible_only_for_residual_ray_result(qap
         fitted_params={"grid_rows": 3.0, "grid_cols": 4.0, "diag_selection_mode_is_auto": 1.0},
     )
     workspace._display_result(residual_result)
-    assert workspace.residual_ray_diagnostics_group.isVisibleTo(workspace)
+    assert not workspace.residual_ray_diagnostics_group.isHidden()
     assert workspace.diag_selected_grid_label.text() == "3 x 4"
     assert workspace.diag_selection_mode_label.text() == "AUTO"
 
@@ -165,15 +174,15 @@ def test_residual_ray_neural_settings_visible_only_when_neural_method_selected(q
     buttons[WindshieldModelType.RESIDUAL_RAY.value].setChecked(True)
 
     workspace.residual_ray_method_grid_radio.setChecked(True)
-    assert not workspace.residual_neural_settings_group.isVisibleTo(workspace)
+    assert workspace.residual_neural_settings_group.isHidden()
 
     workspace.residual_ray_method_rbf_radio.setChecked(True)
-    assert not workspace.residual_neural_settings_group.isVisibleTo(workspace)
+    assert workspace.residual_neural_settings_group.isHidden()
 
     workspace.residual_ray_method_neural_radio.setChecked(True)
-    assert workspace.residual_neural_settings_group.isVisibleTo(workspace)
-    assert not workspace.residual_grid_settings_group.isVisibleTo(workspace)
-    assert not workspace.residual_rbf_settings_group.isVisibleTo(workspace)
+    assert not workspace.residual_neural_settings_group.isHidden()
+    assert workspace.residual_grid_settings_group.isHidden()
+    assert workspace.residual_rbf_settings_group.isHidden()
 
 
 def test_neural_method_and_hyperparameter_mapping_to_hint(qapp):
@@ -235,7 +244,7 @@ def test_neural_diagnostics_panel_shows_expected_fields(qapp):
     )
     workspace._display_result(neural_result)
 
-    assert workspace.residual_ray_diagnostics_group.isVisibleTo(workspace)
+    assert not workspace.residual_ray_diagnostics_group.isHidden()
     assert workspace.diag_residual_method_label.text() == "Neural"
     assert "32" in workspace.diag_neural_architecture_label.text()
     assert "64" in workspace.diag_neural_architecture_label.text()
@@ -253,9 +262,9 @@ def test_spline_advanced_group_visible_only_when_selected(qapp):
         for button in workspace._model_button_group.buttons()
     }
     buttons[WindshieldModelType.SPLINE.value].setChecked(True)
-    assert workspace.spline_advanced_group.isVisibleTo(workspace)
+    assert not workspace.spline_advanced_group.isHidden()
     buttons[WindshieldModelType.BASELINE.value].setChecked(True)
-    assert not workspace.spline_advanced_group.isVisibleTo(workspace)
+    assert workspace.spline_advanced_group.isHidden()
 
 
 def test_spline_auto_mode_sets_auto_spline_hint(qapp):
@@ -302,7 +311,7 @@ def test_spline_diagnostics_panel_visible_only_for_spline_result(qapp):
         base_camera_matrix=K, base_distortion=D, success=True,
     )
     workspace._display_result(baseline_result)
-    assert not workspace.spline_diagnostics_group.isVisibleTo(workspace)
+    assert workspace.spline_diagnostics_group.isHidden()
 
     spline_result = WindshieldCalibrationResult(
         windshield_model=WindshieldModelType.SPLINE,
@@ -315,9 +324,49 @@ def test_spline_diagnostics_panel_visible_only_for_spline_result(qapp):
         },
     )
     workspace._display_result(spline_result)
-    assert workspace.spline_diagnostics_group.isVisibleTo(workspace)
+    assert not workspace.spline_diagnostics_group.isHidden()
     assert workspace.diag_spline_grid_label.text() == "3 x 4"
     assert workspace.diag_spline_selection_mode_label.text() == "AUTO"
+
+
+def test_residual_ray_and_spline_advanced_groups_actually_visible_when_tab_is_shown(qapp):
+    """위의 isHidden() 기반 단위 테스트들은 "group 자신에게 설정된
+    visibility state"만 확인한다 - 그것만으로는 "실제 화면에 워크스페이스를
+    띄우고 ③ Windshield Model 탭을 골랐을 때 정말로 보이는가"까지는
+    보장하지 못한다. 이 테스트는 workspace.show() + 실제 탭 선택 +
+    processEvents()까지 거친 뒤 isVisibleTo()로 진짜 화면 표시 여부를
+    확인한다."""
+    workspace = _make_workspace_with_config(qapp)
+    workspace.show()
+    try:
+        model_tab_index = next(
+            i for i in range(workspace.tabs.count())
+            if "Windshield Model" in workspace.tabs.tabText(i)
+        )
+        workspace.tabs.setCurrentIndex(model_tab_index)
+        qapp.processEvents()
+
+        buttons = {
+            button.property("windshield_model"): button
+            for button in workspace._model_button_group.buttons()
+        }
+
+        buttons[WindshieldModelType.RESIDUAL_RAY.value].setChecked(True)
+        qapp.processEvents()
+        assert workspace.residual_ray_advanced_group.isVisibleTo(workspace)
+        assert not workspace.spline_advanced_group.isVisibleTo(workspace)
+
+        buttons[WindshieldModelType.SPLINE.value].setChecked(True)
+        qapp.processEvents()
+        assert workspace.spline_advanced_group.isVisibleTo(workspace)
+        assert not workspace.residual_ray_advanced_group.isVisibleTo(workspace)
+
+        buttons[WindshieldModelType.BASELINE.value].setChecked(True)
+        qapp.processEvents()
+        assert not workspace.residual_ray_advanced_group.isVisibleTo(workspace)
+        assert not workspace.spline_advanced_group.isVisibleTo(workspace)
+    finally:
+        workspace.close()
 
 
 def test_vector_field_widget_renders_populated_map_without_crashing(qapp):

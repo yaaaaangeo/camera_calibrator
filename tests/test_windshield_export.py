@@ -83,6 +83,11 @@ def test_export_windshield_yaml_round_trip_spherical(tmp_path):
     )
 
 
+# Phase 2 CI 속도 정리 - calibrate_spline()은 물리적으로 정확한 ray-surface
+# intersection 비용 때문에 최소 grid에서도 수 분 걸린다(로컬 실측 약 4분,
+# tests/test_windshield_spline.py 모듈 docstring 참고) - 이 파일의 다른
+# 테스트들(빠름)과 섞이지 않도록 이 테스트 하나만 slow로 뺀다.
+@pytest.mark.slow
 def test_export_windshield_yaml_round_trip_spline(tmp_path):
     """STEP 4(Spline) - Test N: export -> load -> runtime reconstruction 후
     project_point/unproject_pixel이 원본과 tolerance 내에서 일치해야 한다.

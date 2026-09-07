@@ -394,7 +394,17 @@ def build_circle_grid_object_points(pattern: PatternConfig) -> np.ndarray:
     return objp.reshape(-1, 1, 3)
 
 
-def build_circle_grid_blob_detector() -> cv2.SimpleBlobDetector:
+def build_circle_grid_blob_detector(blob_color: Optional[int] = None) -> cv2.SimpleBlobDetector:
+    """Circle grid 검출용 SimpleBlobDetector 생성.
+
+    blob_color가 None이면(레거시 기본값) filterByColor를 꺼서 area/
+    circularity만으로 blob을 고른다. 0 또는 255를 넘기면 검은/흰 blob만
+    명시적으로 선택한다 - detect_circle_grid()의 기본 경로(호출자가 자기
+    detector를 넘기지 않은 경우)는 실측으로 검증된 이유 때문에 이 극성
+    인자를 실제로 사용한다: findCirclesGrid(특히 CALIB_CB_ASYMMETRIC_GRID)는
+    color polarity가 모호한 상태에서 OpenCV 버전에 따라 불안정하게
+    동작한다.
+    """
     params = cv2.SimpleBlobDetector_Params()
     params.filterByArea = True
     params.minArea = 20.0
@@ -403,7 +413,11 @@ def build_circle_grid_blob_detector() -> cv2.SimpleBlobDetector:
     params.minCircularity = 0.6
     params.filterByConvexity = False
     params.filterByInertia = False
-    params.filterByColor = False
+    if blob_color is None:
+        params.filterByColor = False
+    else:
+        params.filterByColor = True
+        params.blobColor = blob_color
     return cv2.SimpleBlobDetector_create(params)
 
 
@@ -508,28 +522,64 @@ def detect_circle_grid(
     image_id: str,
     blob_detector: Optional[cv2.SimpleBlobDetector] = None,
 ) -> DetectionResult:
-    """Detect symmetric/asymmetric circle grid centers with OpenCV."""
+    """Detect symmetric/asymmetric circle grid centers with OpenCV.
+
+    호출자가 blob_detector를 직접 넘기면 그 detector의 의미(색상 polarity,
+    필터 설정)를 그대로 존중해서 한 번만 시도한다 - 기존 API 계약을 깨지
+    않기 위함이다.
+
+    blob_detector를 넘기지 않으면(기본 경로, build_detect_fn()의 circle
+    grid dispatch가 실제로 쓰는 경로) 아래 순서로 최대 4번 시도한다:
+
+      1. 검은 원/밝은 배경 (blobColor=0)  + CALIB_CB_CLUSTERING
+      2. 검은 원/밝은 배경 (blobColor=0)  (CLUSTERING 없이)
+      3. 밝은 원/어두운 배경 (blobColor=255) + CALIB_CB_CLUSTERING
+      4. 밝은 원/어두운 배경 (blobColor=255) (CLUSTERING 없이)
+
+    실측(로컬 재현)으로 확인된 사실: CALIB_CB_ASYMMETRIC_GRID는 이미지
+    극성(dark/bright)뿐 아니라 CALIB_CB_CLUSTERING 사용 여부에 따라서도
+    검출 성공 여부가 갈린다 - 어느 한 조합만으로는 4x4/5x4 같은 실사용
+    크기의 asymmetric grid를 안정적으로 못 잡는 경우가 있었다. 그래서
+    color와 clustering 두 축을 모두 fallback 대상으로 삼는다. 검은 원이
+    실사용에서 가장 흔하므로 그것부터 시도한다.
+    """
     gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     pattern_size = (pattern.squares_x, pattern.squares_y)
     if pattern.circle_grid_type == CircleGridType.ASYMMETRIC:
-        flags = cv2.CALIB_CB_ASYMMETRIC_GRID | cv2.CALIB_CB_CLUSTERING
+        base_flag = cv2.CALIB_CB_ASYMMETRIC_GRID
         grid_label = "asymmetric"
     else:
-        flags = cv2.CALIB_CB_SYMMETRIC_GRID | cv2.CALIB_CB_CLUSTERING
+        base_flag = cv2.CALIB_CB_SYMMETRIC_GRID
         grid_label = "symmetric"
 
-    if blob_detector is None:
-        blob_detector = build_circle_grid_blob_detector()
+    found = False
+    centers = None
 
-    try:
-        found, centers = cv2.findCirclesGrid(
-            gray,
-            pattern_size,
-            flags=flags,
-            blobDetector=blob_detector,
-        )
-    except cv2.error:
-        found, centers = cv2.findCirclesGrid(gray, pattern_size, flags=flags)
+    if blob_detector is not None:
+        flags = base_flag | cv2.CALIB_CB_CLUSTERING
+        try:
+            found, centers = cv2.findCirclesGrid(
+                gray,
+                pattern_size,
+                flags=flags,
+                blobDetector=blob_detector,
+            )
+        except cv2.error:
+            found, centers = cv2.findCirclesGrid(gray, pattern_size, flags=flags)
+    else:
+        for blob_color in (0, 255):
+            detector = build_circle_grid_blob_detector(blob_color=blob_color)
+            for flags in (base_flag | cv2.CALIB_CB_CLUSTERING, base_flag):
+                try:
+                    found, centers = cv2.findCirclesGrid(
+                        gray, pattern_size, flags=flags, blobDetector=detector
+                    )
+                except cv2.error:
+                    found, centers = False, None
+                if found:
+                    break
+            if found:
+                break
 
     if not found or centers is None:
         return DetectionResult(
@@ -691,10 +741,11 @@ def build_detect_fn(pattern: PatternConfig) -> Callable[[np.ndarray, str], Detec
     if pattern_type == PatternType.CHESSBOARD:
         return lambda img, image_id: detect_chessboard(img, pattern, image_id=image_id)
     if pattern_type == PatternType.CIRCLE_GRID:
-        blob_detector = build_circle_grid_blob_detector()
-        return lambda img, image_id: detect_circle_grid(
-            img, pattern, image_id=image_id, blob_detector=blob_detector
-        )
+        # blob_detector를 넘기지 않는다 - detect_circle_grid()가 이미지마다
+        # dark/bright polarity와 CLUSTERING on/off를 자동으로 시도하는
+        # 기본 fallback 경로를 타게 하기 위함이다 (미리 만든 detector 하나를
+        # 재사용하면 그 fallback이 우회된다).
+        return lambda img, image_id: detect_circle_grid(img, pattern, image_id=image_id)
     if pattern_type == PatternType.APRILGRID:
         aruco_dict = build_aprilgrid_dictionary(pattern)
         detector = build_aprilgrid_detector(aruco_dict)
