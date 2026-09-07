@@ -1,0 +1,6 @@
+# Shell script는 항상 LF여야 한다 - CRLF가 섞이면 bash가 `then`/`fi` 등을
+# 제대로 못 읽어 "unexpected end of file" 같은 문법 오류로 실패한다(실제로
+# scripts/install_jetson.sh가 Windows에서 편집되며 CRLF로 바뀌어 이 문제를
+# 겪었다 - tests/test_jetson_packaging.py::test_jetson_installer_has_valid_bash_syntax
+# 회귀 테스트가 있다). Windows에서 체크아웃해도 이 파일들만은 LF를 유지한다.
+*.sh text eol=lf

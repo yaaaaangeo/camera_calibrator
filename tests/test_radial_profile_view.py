@@ -88,9 +88,17 @@ def test_switching_selected_model_does_not_change_the_scale(qapp):
     assert fixed_scale_before == fixed_scale_after_switch == pytest.approx(8.0 * 1.15)
 
 
-def test_chart_widget_uses_fixed_max_when_provided():
+def test_chart_widget_uses_fixed_max_when_provided(qapp):
     """차트 위젯 자체(순수 페인팅 로직) 단위 테스트 - fixed_max_error를 주면
-    그 프로필 자신의 최댓값이 아니라 주어진 값을 y축 상한으로 써야 한다."""
+    그 프로필 자신의 최댓값이 아니라 주어진 값을 y축 상한으로 써야 한다.
+
+    qapp을 명시적으로 받는다 - QApplication이 아직 없는 상태에서 QWidget
+    (RadialProfileChartWidget)을 만들면 플랫폼에 따라 Fatal Python
+    error(SIGABRT)로 프로세스 자체가 죽을 수 있다(실측:
+    tests/test_windshield_workspace_ui.py에서 동일 패턴을 Linux+offscreen
+    platform으로 재현/확인). 지금은 이 파일의 앞선 테스트가 이미
+    QApplication을 만들어놔서 우연히 안전하지만, 이 테스트만 따로
+    실행하거나 테스트 순서가 바뀌면 재발할 수 있다."""
     chart = RadialProfileChartWidget()
     small_profile = _profile([0.1, 0.2])
 
@@ -99,9 +107,10 @@ def test_chart_widget_uses_fixed_max_when_provided():
     assert chart._profile is small_profile
 
 
-def test_chart_widget_falls_back_to_own_scale_without_fixed_max():
+def test_chart_widget_falls_back_to_own_scale_without_fixed_max(qapp):
     """fixed_max_error를 안 주면(예: 결과가 하나뿐일 때) 기존 동작 그대로
-    자기 자신의 최댓값을 쓴다 - 하위 호환 확인."""
+    자기 자신의 최댓값을 쓴다 - 하위 호환 확인. qapp을 받는 이유는 위
+    test_chart_widget_uses_fixed_max_when_provided 참고."""
     chart = RadialProfileChartWidget()
     profile = _profile([0.1, 0.2])
 

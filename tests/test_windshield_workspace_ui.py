@@ -31,9 +31,18 @@ def qapp():
     yield app
 
 
-def test_all_windshield_models_are_enabled():
+def test_all_windshield_models_are_enabled(qapp):
     """Baseline/Spherical/Residual Ray(Grid+RBF)/Spline(Phase 4) 전부 실제로
-    구현됐으므로 더 이상 비활성화된("Coming soon") 모델이 없어야 한다."""
+    구현됐으므로 더 이상 비활성화된("Coming soon") 모델이 없어야 한다.
+
+    이 파일의 다른 모든 테스트는 qapp fixture를 받는데 이 테스트만 빠져
+    있었다 - QApplication이 생성되기 전에 QWidget(WindshieldWorkspace)을
+    만들면 플랫폼에 따라 조용히 실패하는 대신 프로세스 자체가
+    Fatal Python error(SIGABRT)로 죽는다(Linux + offscreen platform에서
+    실측 재현). 그 경우 pytest가 이 테스트 하나의 실패로 보고하지 못하고
+    이 파일의 나머지 테스트 전체가 통째로 날아간다 - 실제 production
+    코드(WindshieldWorkspace)에는 문제가 없고, QApplication 없이 QWidget을
+    만들면 안 된다는 Qt 자체의 요구사항을 이 테스트만 놓치고 있었다."""
     workspace = WindshieldWorkspace()
     buttons = {
         button.property("windshield_model"): button

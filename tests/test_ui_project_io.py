@@ -116,7 +116,10 @@ def test_load_project_restores_dataset_and_results(qapp, saved_project_path):
         assert win.dataset is not None
         assert win.dataset.num_total == 16
         assert len(win.image_paths) == 16
-        assert len(win.calibration_results) == 3
+        # Standard calibration은 항상 4모델(Ideal Pinhole/Brown-Conrady/
+        # Rational/Fisheye)을 함께 계산한다(README 4번 섹션) - 이 값이 3이던
+        # 시절의 stale한 기대치였다.
+        assert len(win.calibration_results) == 4
         assert win.run_button.isEnabled()
         assert win.dataset_view.table.rowCount() == 16
     finally:

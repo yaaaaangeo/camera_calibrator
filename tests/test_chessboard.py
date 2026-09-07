@@ -215,8 +215,15 @@ def test_ui_default_pattern_type_is_charuco_with_visible_rows(qapp):
     win = MainWindow()
     try:
         assert win.pattern_type_combo.currentData() == PatternType.CHARUCO
-        assert win._pattern_form.isRowVisible(4)  # Marker size
-        assert win._pattern_form.isRowVisible(5)  # Dictionary
+        # pattern_form 행 순서: 0=Calibration method, 1=(정책 안내 라벨),
+        # 2=Pattern type, 3=Squares X, 4=Squares Y, 5=Square size,
+        # 6=Marker size, 7=Dictionary, 8=Grid type, 9=AprilGrid variant
+        # (main_window.py::_on_pattern_type_changed()가 실제로 토글하는
+        # 인덱스와 맞춘다 - 예전엔 앞의 "Calibration method"/정책 라벨 두
+        # 행이 없던 시절 기준 인덱스(4/5)가 그대로 남아있어서, 항상
+        # 보이는 엉뚱한 행(Squares Y/Square size)을 검사하고 있었다).
+        assert win._pattern_form.isRowVisible(6)  # Marker size
+        assert win._pattern_form.isRowVisible(7)  # Dictionary
         assert win.width_spin.value() == 1920
         assert win.height_spin.value() == 1536
         assert win.dictionary_combo.findText("DICT_7X7_50") >= 0
@@ -233,8 +240,9 @@ def test_ui_switching_to_chessboard_hides_marker_and_dictionary_rows(qapp):
         idx = win.pattern_type_combo.findData(PatternType.CHESSBOARD)
         win.pattern_type_combo.setCurrentIndex(idx)
 
-        assert not win._pattern_form.isRowVisible(4)
-        assert not win._pattern_form.isRowVisible(5)
+        # 행 인덱스 설명은 test_ui_default_pattern_type_is_charuco_with_visible_rows 참고.
+        assert not win._pattern_form.isRowVisible(6)  # Marker size
+        assert not win._pattern_form.isRowVisible(7)  # Dictionary
 
         pattern_config = win._current_pattern_config()
         assert pattern_config.type == PatternType.CHESSBOARD
@@ -245,7 +253,14 @@ def test_ui_switching_to_chessboard_hides_marker_and_dictionary_rows(qapp):
 
 
 def test_pipeline_progress_bar_supports_detection_percent_and_calibration_busy_state(qapp):
-    from ui.main_window import MainWindow
+    """total=0(진행률을 모르는 구간, 예: Standard 4모델 계산 중)일 때는
+    고정된 "계산 중..." 문구 대신 트랙 위를 양(🐑)이 걸어가는 애니메이션
+    (_start_busy_sheep/_render_busy_sheep, main_window.py)으로 바뀌었다 -
+    이 테스트는 그 이전의 더 단순한 구현을 기준으로 작성돼 있었다(실측:
+    Linux+offscreen 환경에서 재현/확인. maximum()은 0이 아니라
+    _SHEEP_TRACK_LEN이고, format()은 고정 문자열이 아니라 매 프레임 달라지는
+    트랙 문자열이다)."""
+    from ui.main_window import MainWindow, _SHEEP_TRACK_LEN
 
     win = MainWindow()
     try:
@@ -256,8 +271,8 @@ def test_pipeline_progress_bar_supports_detection_percent_and_calibration_busy_s
 
         win._on_pipeline_progress_value(0, 0)
         assert win.pipeline_progress_bar.minimum() == 0
-        assert win.pipeline_progress_bar.maximum() == 0
-        assert win.pipeline_progress_bar.format() == "계산 중..."
+        assert win.pipeline_progress_bar.maximum() == _SHEEP_TRACK_LEN
+        assert "🐑" in win.pipeline_progress_bar.format()
     finally:
         win.close()
 

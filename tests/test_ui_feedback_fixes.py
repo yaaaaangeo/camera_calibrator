@@ -361,11 +361,13 @@ def test_main_window_uses_documented_top_level_tabs(qapp):
         # External Compare 탭도 제거됐고, 옛 Error Analysis(Undistort
         # Preview/Straightness Map을 합치고 Edge Error Map은 뺀 것)는
         # "② Preview"로 이름이 바뀌었다 - 그만큼 뒤 탭들의 번호가 앞당겨진다.
+        # 사용자 요청으로 Model Comparison과 Scene Ranking 순서를 바꿔서
+        # Model Comparison이 3번째로 오게 했다.
         assert labels == [
             "① Dataset",
             "② Preview",
-            "③ Scene Ranking",
-            "④ Model Comparison",
+            "③ Model Comparison",
+            "④ Scene Ranking",
         ]
         assert win.result_view.model_comparison_scroll_area.widgetResizable()
         assert (
