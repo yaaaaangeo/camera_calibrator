@@ -400,7 +400,23 @@ dark/light 조합).
   전용 검증도 합성 데이터/생성된 fixture만 써서 이 티어에 포함된다.
 - **느린 티어**(`@pytest.mark.slow`): 실제 ChArUco 이미지 렌더링+검출,
   Standard 4모델 전부, Hold-out validation, export까지 포함하는 진짜 통합
-  테스트(`test_pipeline_integration.py` 등).
+  테스트(`test_pipeline_integration.py` 등). Spline Windshield 모델은
+  코너마다 물리적으로 정확한 ray-surface intersection을 풀어야 해서 최소
+  grid에서도 `calibrate_spline()` 1회 호출이 수 분 걸릴 수 있다 - 이 비용을
+  가진 파일/테스트(`test_windshield_spline.py`,
+  `test_windshield_spline_stabilization.py`,
+  `test_windshield_export.py::test_export_windshield_yaml_round_trip_spline`,
+  `test_windshield_project_io.py::test_spline_result_round_trips_through_project`)
+  도 이 티어로 뺐다 - `pytest`(마커 없이 전체 실행)로는 여전히 돈다.
+
+> **알려진 platform-sensitive 실패**: `tests/test_windshield_spherical.py::
+> test_calibrate_spherical_zero_refraction_matches_baseline`은 `n_air ==
+> n_glass`(굴절이 전혀 없는 퇴화 케이스 - sphere 위치/반지름이 수학적으로
+> 식별 불가능해지는 지점)를 검증하는데, 이 optimizer의 수렴 지점이
+> 플랫폼/BLAS 백엔드에 따라 달라 보인다(로컬 Windows에서는 통과, 동일
+> 패키지 버전의 Linux(WSL)에서는 실패 재현). Spherical Windshield 최적화
+> 로직 자체를 건드리는 범위라 이번 라운드에서는 고치지 않았다 - 알려진
+> 이슈로 남겨둔다.
 
 ```bash
 pip install -e ".[dev]"

@@ -190,7 +190,7 @@ CLI 옵션 전체 목록, Python API로 직접 호출하는 방법, 프로젝트
 |---|---|
 | 자동화 테스트(pytest, 매 커밋마다 실행) | 검증됨 |
 | Dedicated Windshield 워크플로우(Ghost/Reflection/Reflection Suppression/Neural) | 각 워크플로우별 최신 실행 결과는 [Actions 탭](https://github.com/yaaaaangeo/camera_calibrator/actions)에서 직접 확인 |
-| General CI(Python 3.10/3.11, 핵심 회귀) | 이번 라운드에서 알려진 실패(Circle Grid 검출, Hold-out validation 테스트 의미, Windshield UI visibility 테스트 의미)를 수정했습니다 - 최신 실행 결과는 위 상단 배지 또는 Actions 탭에서 확인하세요 |
+| General CI(Python 3.10/3.11, 핵심 회귀) | ✅ PASS (커밋 `5bab42a`, [실행 결과](https://github.com/yaaaaangeo/camera_calibrator/actions/runs/34143178397), 2026-09-07 기준 3.10/3.11 둘 다 성공, 약 6분 20초). 이 표는 그 시점의 스냅샷이니 최신 결과는 위 상단 배지나 Actions 탭에서 직접 확인하세요 |
 | 실제 차량(Real Vehicle)에서의 Windshield 보정 검증 | **아직 검증되지 않음(NOT YET VALIDATED)** - 이 저장소에는 실차 캡처 데이터셋이 없습니다 |
 | Jetson 실기기에서의 반복 실행 | 부분적 - 설치 스크립트는 있으나 실기기 반복 검증은 제한적입니다 |
 
