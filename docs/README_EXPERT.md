@@ -317,7 +317,7 @@ Windshield의 이중 표면(안쪽/바깥쪽) 반사가 만드는 유령상(ghos
 | `numpy` | `>=1.24` | 행렬/배열 연산 |
 | `scipy` | `>=1.11` | Windshield 모델 피팅(root-solve, RBF 보간 등) |
 | `PyYAML` | `>=6.0` | ROS CameraInfo YAML export, 프로젝트/설정 파일 |
-| `PySide6` | `>=6.6` | 데스크톱 UI (Qt6) |
+| `PySide6` | `>=6.5.3` | 데스크톱 UI (Qt6). JetPack 5.1.2의 aarch64 wheel 제약과 metadata를 맞추기 위해 core minimum도 6.5.3으로 둔다. |
 
 > ⚠️ `opencv-python`/`opencv-python-headless`/`opencv-contrib-python`
 > (비-headless)을 `opencv-contrib-python-headless`와 동시에 설치하지 마라 -
@@ -409,14 +409,12 @@ dark/light 조합).
   `test_windshield_project_io.py::test_spline_result_round_trips_through_project`)
   도 이 티어로 뺐다 - `pytest`(마커 없이 전체 실행)로는 여전히 돈다.
 
-> **알려진 platform-sensitive 실패**: `tests/test_windshield_spherical.py::
-> test_calibrate_spherical_zero_refraction_matches_baseline`은 `n_air ==
-> n_glass`(굴절이 전혀 없는 퇴화 케이스 - sphere 위치/반지름이 수학적으로
-> 식별 불가능해지는 지점)를 검증하는데, 이 optimizer의 수렴 지점이
-> 플랫폼/BLAS 백엔드에 따라 달라 보인다(로컬 Windows에서는 통과, 동일
-> 패키지 버전의 Linux(WSL)에서는 실패 재현). Spherical Windshield 최적화
-> 로직 자체를 건드리는 범위라 이번 라운드에서는 고치지 않았다 - 알려진
-> 이슈로 남겨둔다.
+> **Spherical zero-refraction policy**: `n_air == n_glass`는 굴절이 없는
+> 퇴화 케이스다. Projection은 Baseline과 같아야 하지만, sphere
+> center/radius는 영상 관측으로 식별되지 않는다. 그래서
+> `calibrate_spherical()`은 이 조건에서 성공한 geometry fit을 꾸며내지 않고
+> `success=False`와 unobservable error를 반환한다. 회귀 테스트는 projection
+> sanity와 calibration observability failure를 분리한다.
 
 ```bash
 pip install -e ".[dev]"
@@ -497,6 +495,10 @@ Spherical/Spline/Neural은 포인트마다 root-solve/surface-intersection이
   가정을 신뢰하지 않는다.** `validate_runtime_projector_vs_exact()`가
   median/P95/P99/Max 픽셀 오차(project)와 각도 오차(unproject)를 실제로
   측정한다.
+  `project_points_with_mask()`는 NaN/Inf/zero-vector/behind-camera 입력을
+  batch 전체 예외로 만들지 않고 해당 row만 `[nan, nan]`, `valid_mask=False`
+  로 반환한다. Validation report는 측정 가능한 sample이 없으면 metric을
+  `None`으로 둔다.
 
 ```bash
 python scripts/benchmark_windshield_runtime.py

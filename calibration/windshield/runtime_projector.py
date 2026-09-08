@@ -34,6 +34,7 @@ Deep learning을 쓰지 않는다 - 기존 project 전반의 robust-statistics/�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -45,6 +46,7 @@ from calibration.windshield.projection import build_projector
 DEFAULT_LUT_ROWS = 64
 DEFAULT_LUT_COLS = 64
 DEFAULT_KNN = 4
+_POINT_EPS = 1e-12
 
 
 class RuntimeWindshieldProjector:
@@ -125,20 +127,46 @@ class RuntimeWindshieldProjector:
         """(N,3) 카메라 좌표 3D 포인트 -> (N,2) 픽셀(근사, 모듈 docstring
         참고). 각 포인트의 방향(원점 기준 단위벡터)만 사용해 LUT의
         k-최근접 방향들을 역거리가중평균(inverse-distance weighting)한다."""
-        points_xyz = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
-        norms = np.linalg.norm(points_xyz, axis=1, keepdims=True)
-        norms = np.where(norms < 1e-12, 1.0, norms)
-        directions = points_xyz / norms
+        uv, _ = self.project_points_with_mask(points_xyz, k=k)
+        return uv
 
+    def project_points_with_mask(self, points_xyz: np.ndarray, *, k: int = DEFAULT_KNN) -> tuple[np.ndarray, np.ndarray]:
+        """Project a mixed-validity point cloud without failing the whole batch."""
+        points_xyz = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
+        uv = np.full((points_xyz.shape[0], 2), np.nan, dtype=np.float64)
+        valid_mask = np.zeros(points_xyz.shape[0], dtype=bool)
+        if points_xyz.shape[0] == 0:
+            return uv, valid_mask
+
+        finite = np.all(np.isfinite(points_xyz), axis=1)
+        finite_points = np.where(finite[:, None], points_xyz, 0.0)
+        norms = np.linalg.norm(finite_points, axis=1)
+        candidate_mask = finite & (norms > _POINT_EPS) & (points_xyz[:, 2] > 0.0)
+        if not np.any(candidate_mask):
+            return uv, valid_mask
+
+        directions = points_xyz[candidate_mask] / norms[candidate_mask, None]
         k_eff = max(1, min(k, self._flat_dirs.shape[0]))
-        dists, idx = self._kdtree.query(directions, k=k_eff)
+        try:
+            dists, idx = self._kdtree.query(directions, k=k_eff)
+        except Exception:
+            return uv, valid_mask
         if k_eff == 1:
             idx = idx[:, None]
             dists = dists[:, None]
+
+        finite_query = np.all(np.isfinite(dists), axis=1) & np.all(idx >= 0, axis=1)
         weights = 1.0 / np.maximum(dists, 1e-9)
         weights /= weights.sum(axis=1, keepdims=True)
         neighbor_uv = self._flat_uv[idx]  # (N, k, 2)
-        return np.sum(neighbor_uv * weights[:, :, None], axis=1)
+        projected = np.sum(neighbor_uv * weights[:, :, None], axis=1)
+        projected_valid = finite_query & np.all(np.isfinite(projected), axis=1)
+
+        candidate_indices = np.flatnonzero(candidate_mask)
+        valid_indices = candidate_indices[projected_valid]
+        uv[valid_indices] = projected[projected_valid]
+        valid_mask[valid_indices] = True
+        return uv, valid_mask
 
 
 def project_points_exact_batch(model: WindshieldModel, points_xyz: np.ndarray) -> np.ndarray:
@@ -194,15 +222,23 @@ class RuntimeProjectorValidationReport:
     accuracy tradeoff"). `project_*`는 픽셀 단위, `unproject_*`는 각도(도)
     단위 - 서로 다른 물리량이라 하나로 섞지 않는다."""
     num_project_samples: int
-    project_median_px: float
-    project_p95_px: float
-    project_p99_px: float
-    project_max_px: float
+    project_median_px: Optional[float]
+    project_p95_px: Optional[float]
+    project_p99_px: Optional[float]
+    project_max_px: Optional[float]
     num_unproject_samples: int
-    unproject_median_deg: float
-    unproject_p95_deg: float
-    unproject_p99_deg: float
-    unproject_max_deg: float
+    unproject_median_deg: Optional[float]
+    unproject_p95_deg: Optional[float]
+    unproject_p99_deg: Optional[float]
+    unproject_max_deg: Optional[float]
+    num_project_requested: int = 0
+    num_project_valid_exact: int = 0
+    num_project_invalid_exact: int = 0
+    num_project_valid_fast: int = 0
+    num_unproject_requested: int = 0
+    num_unproject_valid_exact: int = 0
+    num_unproject_invalid_exact: int = 0
+    num_unproject_valid_fast: int = 0
 
 
 def validate_runtime_projector_vs_exact(
@@ -220,35 +256,81 @@ def validate_runtime_projector_vs_exact(
     points = np.asarray(sample_points_xyz, dtype=np.float64).reshape(-1, 3)
     pixels = np.asarray(sample_pixels_uv, dtype=np.float64).reshape(-1, 2)
 
-    proj_err = np.zeros(0)
-    if points.shape[0] > 0:
-        exact_proj = np.array(
-            [exact.project_point(float(p[0]), float(p[1]), float(p[2])) for p in points]
-        )
-        fast_proj = runtime.project_points(points)
-        proj_err = np.linalg.norm(exact_proj - fast_proj, axis=1)
+    fast_proj, fast_project_mask = runtime.project_points_with_mask(points)
+    exact_proj = np.full_like(fast_proj, np.nan)
+    exact_project_mask = np.zeros(points.shape[0], dtype=bool)
+    for i, p in enumerate(points):
+        if not np.all(np.isfinite(p)) or np.linalg.norm(p) <= _POINT_EPS or p[2] <= 0.0:
+            continue
+        try:
+            uv = exact.project_point(float(p[0]), float(p[1]), float(p[2]))
+        except Exception:
+            continue
+        exact_proj[i] = uv
+        exact_project_mask[i] = np.all(np.isfinite(exact_proj[i]))
+    project_compare_mask = exact_project_mask & fast_project_mask
+    proj_err = (
+        np.linalg.norm(exact_proj[project_compare_mask] - fast_proj[project_compare_mask], axis=1)
+        if np.any(project_compare_mask)
+        else np.zeros(0)
+    )
 
-    ang_err_deg = np.zeros(0)
+    fast_dirs = np.full((pixels.shape[0], 3), np.nan, dtype=np.float64)
+    fast_unproject_mask = np.zeros(pixels.shape[0], dtype=bool)
     if pixels.shape[0] > 0:
-        exact_dirs = np.array(
-            [exact.unproject_pixel(float(uv[0]), float(uv[1])) for uv in pixels]
-        )
-        fast_dirs = runtime.unproject_pixels(pixels)
-        cos_sim = np.clip(np.sum(exact_dirs * fast_dirs, axis=1), -1.0, 1.0)
-        ang_err_deg = np.degrees(np.arccos(cos_sim))
+        try:
+            candidate_fast_dirs = runtime.unproject_pixels(pixels)
+            finite_fast = np.all(np.isfinite(candidate_fast_dirs), axis=1)
+            fast_dirs[finite_fast] = candidate_fast_dirs[finite_fast]
+            fast_unproject_mask[finite_fast] = True
+        except Exception:
+            pass
 
-    def _stat(arr: np.ndarray, pct: float) -> float:
-        return float(np.percentile(arr, pct)) if arr.size else 0.0
+    exact_dirs = np.full_like(fast_dirs, np.nan)
+    exact_unproject_mask = np.zeros(pixels.shape[0], dtype=bool)
+    for i, uv in enumerate(pixels):
+        if not np.all(np.isfinite(uv)):
+            continue
+        try:
+            direction = exact.unproject_pixel(float(uv[0]), float(uv[1]))
+        except Exception:
+            continue
+        exact_dirs[i] = direction
+        exact_unproject_mask[i] = np.all(np.isfinite(exact_dirs[i]))
+    unproject_compare_mask = exact_unproject_mask & fast_unproject_mask
+    if np.any(unproject_compare_mask):
+        exact_cmp = exact_dirs[unproject_compare_mask]
+        fast_cmp = fast_dirs[unproject_compare_mask]
+        exact_norms = np.linalg.norm(exact_cmp, axis=1, keepdims=True)
+        fast_norms = np.linalg.norm(fast_cmp, axis=1, keepdims=True)
+        norm_mask = (exact_norms[:, 0] > _POINT_EPS) & (fast_norms[:, 0] > _POINT_EPS)
+        exact_cmp = exact_cmp[norm_mask] / exact_norms[norm_mask]
+        fast_cmp = fast_cmp[norm_mask] / fast_norms[norm_mask]
+        cos_sim = np.clip(np.sum(exact_cmp * fast_cmp, axis=1), -1.0, 1.0)
+        ang_err_deg = np.degrees(np.arccos(cos_sim))
+    else:
+        ang_err_deg = np.zeros(0)
+
+    def _stat(arr: np.ndarray, pct: float) -> Optional[float]:
+        return float(np.percentile(arr, pct)) if arr.size else None
 
     return RuntimeProjectorValidationReport(
-        num_project_samples=int(points.shape[0]),
+        num_project_samples=int(proj_err.size),
         project_median_px=_stat(proj_err, 50.0),
         project_p95_px=_stat(proj_err, 95.0),
         project_p99_px=_stat(proj_err, 99.0),
-        project_max_px=float(np.max(proj_err)) if proj_err.size else 0.0,
-        num_unproject_samples=int(pixels.shape[0]),
+        project_max_px=float(np.max(proj_err)) if proj_err.size else None,
+        num_unproject_samples=int(ang_err_deg.size),
         unproject_median_deg=_stat(ang_err_deg, 50.0),
         unproject_p95_deg=_stat(ang_err_deg, 95.0),
         unproject_p99_deg=_stat(ang_err_deg, 99.0),
-        unproject_max_deg=float(np.max(ang_err_deg)) if ang_err_deg.size else 0.0,
+        unproject_max_deg=float(np.max(ang_err_deg)) if ang_err_deg.size else None,
+        num_project_requested=int(points.shape[0]),
+        num_project_valid_exact=int(np.count_nonzero(exact_project_mask)),
+        num_project_invalid_exact=int(points.shape[0] - np.count_nonzero(exact_project_mask)),
+        num_project_valid_fast=int(np.count_nonzero(fast_project_mask)),
+        num_unproject_requested=int(pixels.shape[0]),
+        num_unproject_valid_exact=int(np.count_nonzero(exact_unproject_mask)),
+        num_unproject_invalid_exact=int(pixels.shape[0] - np.count_nonzero(exact_unproject_mask)),
+        num_unproject_valid_fast=int(np.count_nonzero(fast_unproject_mask)),
     )

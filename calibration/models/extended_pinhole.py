@@ -27,6 +27,7 @@ Pinhole은 왜곡을 0으로 고정하는 플래그를 걸었지만, Extended Pi
 from __future__ import annotations
 
 import cv2
+import numpy as np
 
 from calibration.types import (
     CalibrationResult,
@@ -44,7 +45,11 @@ from calibration.models.common import (
     validate_finite_calibration_output,
     normalize_distortion_coefficients,
 )
-from calibration.radial_profile import compute_radial_error_profile, compute_radial_error_bands
+from calibration.radial_profile import (
+    collect_per_point_vectors,
+    compute_radial_error_bands,
+    compute_radial_error_profile,
+)
 from calibration.spatial_error_map import compute_spatial_error_map
 from calibration.bootstrap import compute_parameter_bootstrap, add_normal_approximation_ci
 from calibration.residual_stats import compute_residual_stats_for_calibration
@@ -168,7 +173,12 @@ def _calibrate_extended_pinhole_core(
     for frame in frames:
         frame.reprojection_error = per_frame_error[frame.image_info.image_id]
 
-    regional_error = compute_regional_error(frames, per_frame_error, image_size)
+    _pt_xs, _pt_ys, _pt_dxs, _pt_dys = collect_per_point_vectors(
+        frames, list(rvecs), list(tvecs), camera_matrix, dist_coeffs, output_model
+    )
+    regional_error = compute_regional_error(
+        _pt_xs, _pt_ys, np.hypot(_pt_dxs, _pt_dys), image_size
+    )
     radial_profile = compute_radial_error_profile(
         frames, list(rvecs), list(tvecs), camera_matrix, dist_coeffs, image_size,
         CameraModelType.EXTENDED_PINHOLE,

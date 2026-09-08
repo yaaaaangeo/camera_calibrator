@@ -166,7 +166,7 @@ def _test_reprojection_errors(
     camera_matrix: np.ndarray,
     distortion: np.ndarray,
     model: CameraModelType,
-) -> tuple[dict[str, float], list[str], list[float]]:
+) -> tuple[dict[str, float], list[str], list[float], list[float], list[float]]:
     """Train에서 확정된 camera_matrix/distortion을 고정한 채,
     각 test 프레임에 대해 solvePnP로 pose만 새로 구하고 재투영 오차를 계산.
 
@@ -181,6 +181,8 @@ def _test_reprojection_errors(
     errors: dict[str, float] = {}
     failed: list[str] = []
     point_errors: list[float] = []
+    point_xs: list[float] = []
+    point_ys: list[float] = []
     is_fisheye = model == CameraModelType.FISHEYE
 
     for frame in test_frames:
@@ -204,13 +206,15 @@ def _test_reprojection_errors(
         rms = float(np.sqrt(np.mean(per_point ** 2)))
         errors[frame_id] = rms
         point_errors.extend(per_point.tolist())
+        point_xs.extend(detected[:, 0].astype(float).tolist())
+        point_ys.extend(detected[:, 1].astype(float).tolist())
         # Phase A-8 안정화 - 원본 Frame을 mutate하지 않는다. `errors` dict가
         # 이미 이 함수의 반환값으로 나가고, 호출자(_evaluate_on_test)가
         # ValidationResult.per_frame_error에 그대로 담는다 - Pinhole/Brown/
         # Rational/Fisheye를 순차 hold-out 검증해도 각 모델의 값이 서로
         # 덮어쓰이지 않고 독립적으로 보존된다.
 
-    return errors, failed, point_errors
+    return errors, failed, point_errors, point_xs, point_ys
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +308,7 @@ def _evaluate_on_test(
 
     test_dataset = _subset_dataset(dataset, test_ids)
     test_frames = test_dataset.enabled_frames
-    per_frame_error, failed_ids, point_errors = _test_reprojection_errors(
+    per_frame_error, failed_ids, point_errors, point_xs, point_ys = _test_reprojection_errors(
         test_frames, train_result.camera_matrix, train_result.distortion, model
     )
 
@@ -322,11 +326,7 @@ def _evaluate_on_test(
     test_rms = float(np.sqrt(np.mean(np.array(list(per_frame_error.values())) ** 2)))
     test_residual_stats = compute_residual_stats(point_errors)
     image_size = camera_config.width, camera_config.height
-    regional = compute_regional_error(
-        [f for f in test_frames if f.image_info.image_id in per_frame_error],
-        per_frame_error,
-        image_size,
-    )
+    regional = compute_regional_error(point_xs, point_ys, point_errors, image_size)
     edge_rms = regional_edge_average(regional)
 
     # 설계 문서 3.4번 - Line Straightness. Test 프레임(학습에 쓰이지 않은

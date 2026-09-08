@@ -92,6 +92,32 @@ def _make_workspace_with_config(qapp):
     return workspace
 
 
+def test_spherical_advanced_manual_values_can_be_cleared_back_to_auto(qapp):
+    workspace = _make_workspace_with_config(qapp)
+    workspace.glass_index_spin.setValue(1.5)
+    workspace.glass_thickness_spin.setValue(6.0)
+    workspace.sphere_radius_spin.setValue(5.0)
+    workspace.standoff_spin.setValue(0.1)
+    workspace._apply_spherical_advanced_settings()
+
+    assert workspace._windshield_config.glass_refractive_index == pytest.approx(1.5)
+    assert workspace._windshield_config.glass_thickness_m == pytest.approx(0.006)
+    assert workspace._windshield_config.windshield_position_hint == {
+        "sphere_radius": 5.0,
+        "standoff_m": 0.1,
+    }
+
+    workspace.glass_index_spin.setValue(0.0)
+    workspace.glass_thickness_spin.setValue(0.0)
+    workspace.sphere_radius_spin.setValue(0.0)
+    workspace.standoff_spin.setValue(0.0)
+    workspace._apply_spherical_advanced_settings()
+
+    assert workspace._windshield_config.glass_refractive_index is None
+    assert workspace._windshield_config.glass_thickness_m is None
+    assert workspace._windshield_config.windshield_position_hint is None
+
+
 def test_residual_ray_advanced_group_visible_only_when_selected(qapp):
     """이 workspace는 show()된 적이 없고, 이 group은 ③ Windshield Model 탭
     안에 있다(현재 선택된 탭이 아님) - QTabWidget은 선택되지 않은 탭

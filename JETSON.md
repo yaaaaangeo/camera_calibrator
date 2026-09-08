@@ -1,7 +1,8 @@
 # Jetson AGX Orin 64GB 설치 및 실시간 캘리브레이션
 
-지원 기준은 JetPack 6.2.1, Ubuntu 22.04, aarch64, Python 3.10, ROS 2
-Humble입니다. 일반 `requirements.txt` 대신 Jetson 전용 고정 버전을 사용합니다.
+기본 지원 기준은 JetPack 6.2.1, Ubuntu 22.04, aarch64, Python 3.10, ROS 2
+Humble입니다. JetPack 5.1.2 / Ubuntu 20.04용 별도 프로필도 있으며, 일반
+`requirements.txt` 대신 Jetson 전용 고정 버전을 사용합니다.
 
 ## 1. ROS 2 준비
 
@@ -85,3 +86,21 @@ camera-calibrator --verbose --log-file jetson-live.log
 
 실제 Jetson 장치와 카메라 드라이버 조합은 이 저장소의 일반 CI에서 재현할 수
 없으므로, 위 현장 확인을 배포 승인 조건으로 사용합니다.
+
+## 6. JetPack 5.1.2 / ROS1 Noetic 제한
+
+JetPack 5.1.2 프로필은 `scripts/install_jetson_jp512.sh`와
+`requirements-jetson-jp512.txt`를 사용합니다. 이 프로필은 Python 3.10
+venv를 만들며, ROS1 Noetic의 `cv_bridge`는 Ubuntu 20.04의 Python 3.8용으로
+빌드되어 있으므로 같은 venv 안에서 live topic을 직접 구독하지 않습니다.
+
+지원되는 경로:
+
+- 이미지 파일 기반 calibration
+- `rosbags` 기반 rosbag offline input
+- 별도 Python 3.8 ROS bridge process / IPC bridge를 통한 연동
+
+지원하지 않는 경로:
+
+- Python 3.10 venv 안에서 ROS1 Noetic `cv_bridge`를 직접 import해 live topic
+  구독

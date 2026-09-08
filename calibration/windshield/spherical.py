@@ -101,6 +101,7 @@ DEFAULT_GLASS_REFRACTIVE_INDEX = 1.52   # 일반적인 laminated 자동차 유�
 DEFAULT_GLASS_THICKNESS_M = 0.005       # ~5mm, 일반적인 windshield 두께 근사치
 DEFAULT_INITIAL_RADIUS_M = 5.0          # 일반적인 대곡률 근사치(특정 차종 아님)
 DEFAULT_INITIAL_STANDOFF_M = 1.0        # 카메라-windshield 대략적 거리 근사치
+REFRACTIVE_INDEX_OBSERVABILITY_EPS = 1e-6
 
 MIN_CORNERS_FOR_FIT = 20
 MAX_ACCEPTABLE_CORNER_FAILURE_RATE = 0.10
@@ -284,6 +285,9 @@ class SphericalWindshieldModel(WindshieldModel):
             d_cam, _ORIGIN, self._center, self._radius, self._thickness, self._n_air, self._n_glass
         )
 
+    def _has_refraction(self) -> bool:
+        return abs(self._n_glass - self._n_air) >= REFRACTIVE_INDEX_OBSERVABILITY_EPS
+
     def unproject_pixel(self, u: float, v: float) -> tuple[float, float, float]:
         """픽셀 -> 굴절을 반영한 외부 광선 방향(단위 벡터).
 
@@ -293,6 +297,8 @@ class SphericalWindshieldModel(WindshieldModel):
         이 근사를 쓰지 않고 실제 exit point를 명시적으로 사용한다 - 그쪽이
         정확도가 중요한 forward projection이기 때문이다.
         """
+        if not self._has_refraction():
+            return self._baseline.unproject_pixel(u, v)
         d_cam = np.asarray(self._baseline.unproject_pixel(u, v), dtype=np.float64)
         _, d_out = self._refract_camera_ray(d_cam)
         return float(d_out[0]), float(d_out[1]), float(d_out[2])
@@ -302,6 +308,8 @@ class SphericalWindshieldModel(WindshieldModel):
         초기값으로 삼아 작은 2변수 root-solve로 푼다(전체 이미지를 뒤지는
         brute-force가 아니다).
         """
+        if not self._has_refraction():
+            return self._baseline.project_point(x, y, z)
         target = np.array([x, y, z], dtype=np.float64)
         initial_uv = np.asarray(self._baseline.project_point(x, y, z), dtype=np.float64)
 
@@ -338,6 +346,8 @@ class SphericalWindshieldModel(WindshieldModel):
         사이의 각도(도) - 학습(fitting)에 쓰인 것과 동일한 ray-alignment
         잔차를 각도로 표현한 것. 교차/굴절이 불가능하면 None(값을 억지로
         만들지 않는다)."""
+        if not self._has_refraction():
+            return None
         d_cam = np.asarray(self._baseline.unproject_pixel(u, v), dtype=np.float64)
         try:
             point, direction = self._refract_camera_ray(d_cam)
@@ -636,8 +646,7 @@ def _evaluate_spherical(
     radial_bands = bin_radial_error_bands(radii, errors, max_radius)
     spatial_map = bin_spatial_errors(xs, ys, dxs, dys, image_size)
 
-    frames_with_error = [f for f in frames if f.image_info.image_id in per_frame_error]
-    regional_error = compute_regional_error(frames_with_error, per_frame_error, image_size)
+    regional_error = compute_regional_error(xs, ys, errors, image_size)
 
     return _SphericalEvalOutcome(
         per_frame_error=per_frame_error,
@@ -703,6 +712,12 @@ def calibrate_spherical(
     n_air = DEFAULT_AIR_REFRACTIVE_INDEX
     n_glass = config.glass_refractive_index if config.glass_refractive_index is not None else DEFAULT_GLASS_REFRACTIVE_INDEX
     thickness = config.glass_thickness_m if config.glass_thickness_m is not None else DEFAULT_GLASS_THICKNESS_M
+
+    if abs(n_glass - n_air) < REFRACTIVE_INDEX_OBSERVABILITY_EPS:
+        return _failure_result(
+            config, train_ids, test_ids,
+            "Spherical geometry is unobservable when refractive indices are equal or nearly equal.",
+        )
 
     train_frames = _subset_frames(windshield_dataset, train_ids)
     if len(train_frames) < MIN_FRAMES_REQUIRED:

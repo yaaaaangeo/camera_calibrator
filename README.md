@@ -118,7 +118,7 @@ python -m app.main
 | **Train RMS** | 계산에 실제로 쓴 사진들에서, 계산된 카메라 값으로 얼마나 정확히 맞는지(픽셀 단위 오차). |
 | **Hold-out(Test) RMS** | 계산에는 **쓰지 않고 일부러 남겨둔** 사진으로 확인한 오차. |
 | **Median / P95** | 오차들을 크기 순으로 줄 세웠을 때 중간값(Median) / 상위 5% 지점(P95). RMS 하나만 보면 안 보이는 "가끔 많이 틀리는 사진"이 있는지 보여줍니다. |
-| **Edge RMS** | 사진 가장자리 쪽에서의 오차. 가장자리에서만 유독 크면 왜곡 보정이 그쪽에서 덜 된 것입니다. |
+| **Edge RMS** | 사진 가장자리 영역 코너 포인트들의 RMS 오차. 가장자리에서만 유독 크면 왜곡 보정이 그쪽에서 덜 된 것입니다. |
 
 가장 중요한 건 **Train RMS만 보지 말고 Hold-out RMS도 같이 보는 것**입니다.
 
@@ -161,6 +161,13 @@ Road           최종적으로 도로/세상이 보이는 모습
 차이는 [전문가 문서 6~8번 섹션](docs/README_EXPERT.md#6-windshield-geometry)
 에 있습니다.
 
+Spherical 모델에서 유리 굴절률을 공기와 같게 두면 "굴절이 없음"은
+확인할 수 있지만, 그 상태로는 구의 중심/반지름을 식별할 수 없습니다. 또한
+실시간 Camera-LiDAR 투영처럼 포인트가 아주 많을 때는 exact projector와
+빠른 LUT projector가 분리되어 있으며, LUT 정확도는 실제 사용 범위에서
+검증해야 합니다. CAD/STEP 기반 windshield surface prior는 현재 필수 기능이
+아니며, 향후 optional 기능으로만 다룹니다.
+
 ## 8. 설치에서 막히면
 
 | 증상 | 원인/해결 |
@@ -188,11 +195,11 @@ CLI 옵션 전체 목록, Python API로 직접 호출하는 방법, 프로젝트
 
 | 대상 | 상태 |
 |---|---|
-| 자동화 테스트(pytest, 매 커밋마다 실행) | 검증됨 |
+| 자동화 테스트(pytest, 매 커밋마다 실행) | 최신 상태는 상단 배지와 [Actions 탭](https://github.com/yaaaaangeo/camera_calibrator/actions)이 source of truth입니다 |
 | Dedicated Windshield 워크플로우(Ghost/Reflection/Reflection Suppression/Neural) | 각 워크플로우별 최신 실행 결과는 [Actions 탭](https://github.com/yaaaaangeo/camera_calibrator/actions)에서 직접 확인 |
-| General CI(Python 3.10/3.11, 핵심 회귀) | ✅ PASS (커밋 `5bab42a`, [실행 결과](https://github.com/yaaaaangeo/camera_calibrator/actions/runs/34143178397), 2026-09-07 기준 3.10/3.11 둘 다 성공, 약 6분 20초). 이 표는 그 시점의 스냅샷이니 최신 결과는 위 상단 배지나 Actions 탭에서 직접 확인하세요 |
+| General CI(Python 3.10/3.11, 핵심 회귀) | 이 문서에 고정된 PASS/FAIL 스냅샷을 두지 않습니다. 최신 결과는 상단 배지나 Actions 탭에서 확인하세요 |
 | 실제 차량(Real Vehicle)에서의 Windshield 보정 검증 | **아직 검증되지 않음(NOT YET VALIDATED)** - 이 저장소에는 실차 캡처 데이터셋이 없습니다 |
-| Jetson 실기기에서의 반복 실행 | 부분적 - 설치 스크립트는 있으나 실기기 반복 검증은 제한적입니다 |
+| Jetson 실기기에서의 반복 실행 | 코드/패키징만 준비됨, 실기기 검증 아님. JetPack 5.1.2의 Python 3.10 venv는 ROS1 Noetic Python 3.8 `cv_bridge` 기반 live topic을 직접 지원하지 않습니다 |
 
 이 표가 실제 최신 상태와 다르다고 느껴지면, 문구를 그대로 믿지 말고 위
 Actions 링크에서 최신 실행 결과를 직접 확인하세요. 더 자세한 상태 구분은

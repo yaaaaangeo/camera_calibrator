@@ -54,6 +54,7 @@ from calibration.windshield.neural_config import (
 )
 from calibration.windshield.residual_ray import DEFAULT_GRID_COLS, DEFAULT_GRID_ROWS, DEFAULT_LAMBDA_MAG, DEFAULT_LAMBDA_SMOOTH
 from calibration.windshield.residual_rbf import DEFAULT_RBF_NUM_CENTERS, DEFAULT_RBF_SMOOTHING
+from calibration.windshield.spherical import DEFAULT_GLASS_THICKNESS_M
 from calibration.windshield.spline import (
     DEFAULT_LAMBDA_CURVE as SPLINE_DEFAULT_LAMBDA_CURVE,
     DEFAULT_LAMBDA_MAG as SPLINE_DEFAULT_LAMBDA_MAG,
@@ -131,6 +132,12 @@ class GeometryPanelMixin:
         self.glass_index_spin.setSpecialValueText("(default ~1.52)")
         self.glass_index_spin.setValue(_UNSET_SPINBOX_VALUE)
         advanced_form.addRow("Glass refractive index:", self.glass_index_spin)
+        self.glass_thickness_spin = QDoubleSpinBox()
+        self.glass_thickness_spin.setRange(0.0, 50.0)
+        self.glass_thickness_spin.setDecimals(2)
+        self.glass_thickness_spin.setSpecialValueText(f"(default ~{DEFAULT_GLASS_THICKNESS_M * 1000.0:.0f} mm)")
+        self.glass_thickness_spin.setValue(_UNSET_SPINBOX_VALUE)
+        advanced_form.addRow("Glass thickness (mm):", self.glass_thickness_spin)
         self.sphere_radius_spin = QDoubleSpinBox()
         self.sphere_radius_spin.setRange(0.0, 100.0)
         self.sphere_radius_spin.setDecimals(2)
@@ -558,8 +565,16 @@ class GeometryPanelMixin:
         없다 - live valueChanged 핸들러로 연결하지 않는 이유이기도 하다(탭
         ①을 거치지 않고 이 스핀박스를 먼저 만지면 config가 아직 없을 수 있음)."""
         assert self._windshield_config is not None
-        if self.glass_index_spin.value() > _UNSET_SPINBOX_VALUE:
-            self._windshield_config.glass_refractive_index = self.glass_index_spin.value()
+        self._windshield_config.glass_refractive_index = (
+            self.glass_index_spin.value()
+            if self.glass_index_spin.value() > _UNSET_SPINBOX_VALUE
+            else None
+        )
+        self._windshield_config.glass_thickness_m = (
+            self.glass_thickness_spin.value() / 1000.0
+            if self.glass_thickness_spin.value() > _UNSET_SPINBOX_VALUE
+            else None
+        )
         radius = self.sphere_radius_spin.value()
         standoff = self.standoff_spin.value()
         hint: dict[str, float] = {}
@@ -567,8 +582,7 @@ class GeometryPanelMixin:
             hint["sphere_radius"] = radius
         if standoff > _UNSET_SPINBOX_VALUE:
             hint["standoff_m"] = standoff
-        if hint:
-            self._windshield_config.windshield_position_hint = hint
+        self._windshield_config.windshield_position_hint = hint or None
 
     def _on_run_windshield_calibration(self) -> None:
         if self._windshield_config is None:

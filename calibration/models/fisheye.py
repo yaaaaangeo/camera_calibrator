@@ -51,7 +51,11 @@ from calibration.models.common import (
     compute_regional_error,
     validate_finite_calibration_output,
 )
-from calibration.radial_profile import compute_radial_error_profile, compute_radial_error_bands
+from calibration.radial_profile import (
+    collect_per_point_vectors,
+    compute_radial_error_bands,
+    compute_radial_error_profile,
+)
 from calibration.spatial_error_map import compute_spatial_error_map
 from calibration.residual_stats import compute_residual_stats_for_calibration
 from calibration.bootstrap import compute_parameter_bootstrap
@@ -399,7 +403,12 @@ def calibrate_fisheye(
     for frame in frames:
         frame.reprojection_error = per_frame_error[frame.image_info.image_id]
 
-    regional_error = compute_regional_error(frames, per_frame_error, image_size)
+    _pt_xs, _pt_ys, _pt_dxs, _pt_dys = collect_per_point_vectors(
+        frames, list(rvecs), list(tvecs), K, D, CameraModelType.FISHEYE
+    )
+    regional_error = compute_regional_error(
+        _pt_xs, _pt_ys, np.hypot(_pt_dxs, _pt_dys), image_size
+    )
     radial_profile = compute_radial_error_profile(
         frames, list(rvecs), list(tvecs), K, D, image_size, CameraModelType.FISHEYE
     )

@@ -38,7 +38,11 @@ from calibration.models.common import (
     infer_image_size,
     validate_finite_calibration_output,
 )
-from calibration.radial_profile import compute_radial_error_bands, compute_radial_error_profile
+from calibration.radial_profile import (
+    collect_per_point_vectors,
+    compute_radial_error_bands,
+    compute_radial_error_profile,
+)
 from calibration.residual_stats import compute_residual_stats_for_calibration
 from calibration.spatial_error_map import compute_spatial_error_map
 from calibration.types import (
@@ -456,7 +460,13 @@ def calibrate_object_releasing_brown_conrady(
         if frame.image_info.image_id in per_frame_error:
             frame.reprojection_error = per_frame_error[frame.image_info.image_id]
 
-    regional_error = compute_regional_error(frames, per_frame_error, image_size)
+    _pt_xs, _pt_ys, _pt_dxs, _pt_dys = collect_per_point_vectors(
+        frames, list(rvecs), list(tvecs), camera_matrix, dist_coeffs,
+        CameraModelType.EXTENDED_PINHOLE,
+    )
+    regional_error = compute_regional_error(
+        _pt_xs, _pt_ys, np.hypot(_pt_dxs, _pt_dys), image_size
+    )
     radial_profile = compute_radial_error_profile(
         frames, list(rvecs), list(tvecs), camera_matrix, dist_coeffs, image_size,
         CameraModelType.EXTENDED_PINHOLE,

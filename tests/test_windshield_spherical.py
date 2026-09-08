@@ -21,7 +21,6 @@ import pytest
 from calibration.types import CameraModelType
 from calibration.validation import split_train_test
 from calibration.windshield.base import WindshieldConfig, WindshieldModelType
-from calibration.windshield.baseline import calibrate_baseline
 from calibration.windshield.projection import build_projector
 from calibration.windshield.spherical import (
     DEFAULT_AIR_REFRACTIVE_INDEX,
@@ -139,25 +138,40 @@ def test_calibrate_spherical_recovers_approximate_sphere_geometry():
     assert np.linalg.norm(fitted_center - DEFAULT_SPHERE_CENTER) < DEFAULT_SPHERE_RADIUS
 
 
-def test_calibrate_spherical_zero_refraction_matches_baseline():
-    """n_air == n_glass면 굴절이 전혀 없으므로, 어떤 sphere를 골라도 residual은
-    Baseline과 거의 같아야 한다(사용자 스펙 28-7 Zero-refraction sanity)."""
+def test_spherical_zero_refraction_projection_matches_baseline():
     K, D = default_camera_matrix_distortion()
-    dataset = build_synthetic_windshield_dataset(K, D)  # Baseline용 - 굴절 없이 생성됨
+    from calibration.windshield.baseline import BaselineWindshieldModel
+
+    baseline = BaselineWindshieldModel(K, D, _MODEL)
+    spherical = SphericalWindshieldModel(
+        K, D, _MODEL,
+        sphere_center=np.array([0.0, 0.0, -5.0]),
+        sphere_radius=6.0,
+        n_air=DEFAULT_AIR_REFRACTIVE_INDEX,
+        n_glass=DEFAULT_AIR_REFRACTIVE_INDEX,
+    )
+
+    for point in ((0.0, 0.0, 3.0), (0.2, -0.1, 5.0), (-0.4, 0.25, 8.0)):
+        assert spherical.project_point(*point) == pytest.approx(baseline.project_point(*point), abs=1e-9)
+    for pixel in ((640.0, 400.0), (500.0, 350.0), (780.0, 460.0)):
+        assert spherical.unproject_pixel(*pixel) == pytest.approx(baseline.unproject_pixel(*pixel), abs=1e-12)
+
+
+def test_calibrate_spherical_zero_refraction_reports_unobservable_geometry():
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_windshield_dataset(K, D)
     camera_config = default_camera_config()
     train_ids = [f.image_info.image_id for f in dataset.frames]
 
-    baseline_config = WindshieldConfig(base_model_name=_MODEL, base_camera_matrix=K, base_distortion=D)
-    baseline_result = calibrate_baseline(dataset, baseline_config, camera_config, train_ids, [])
-
     spherical_config = _config(
-        K, D, glass_refractive_index=DEFAULT_AIR_REFRACTIVE_INDEX,
+        K, D,
+        glass_refractive_index=DEFAULT_AIR_REFRACTIVE_INDEX,
         windshield_position_hint={"sphere_center_z": -5.0, "sphere_radius": 6.0},
     )
     spherical_result = calibrate_spherical(dataset, spherical_config, camera_config, train_ids, [])
 
-    assert spherical_result.success
-    assert spherical_result.residual_stats.rmse < baseline_result.residual_stats.rmse + 0.05
+    assert spherical_result.success is False
+    assert "unobservable" in spherical_result.error_message
 
 
 def test_calibrate_spherical_train_test_split_has_no_leakage():

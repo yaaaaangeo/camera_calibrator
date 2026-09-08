@@ -168,6 +168,76 @@ def test_runtime_projector_batch_output_shape_matches_input_count():
     assert runtime.unproject_pixels(pixels).shape == (53, 3)
 
 
+def test_runtime_projector_project_points_with_mask_handles_invalid_points():
+    K, D = default_camera_matrix_distortion()
+    model = BaselineWindshieldModel(K, D, _MODEL)
+    runtime = RuntimeWindshieldProjector(model, IMG_W, IMG_H)
+    points = np.array([
+        [0.1, 0.0, 5.0],
+        [0.0, 0.0, 0.0],
+        [np.nan, 0.0, 5.0],
+        [np.inf, 0.0, 5.0],
+        [0.1, 0.0, -1.0],
+    ])
+
+    uv, valid_mask = runtime.project_points_with_mask(points)
+
+    assert valid_mask.tolist() == [True, False, False, False, False]
+    assert np.all(np.isfinite(uv[0]))
+    assert np.all(np.isnan(uv[~valid_mask]))
+    np.testing.assert_allclose(runtime.project_points(points), uv, equal_nan=True)
+
+
+def test_runtime_projector_validation_zero_samples_reports_none_not_zero():
+    K, D = default_camera_matrix_distortion()
+    model = BaselineWindshieldModel(K, D, _MODEL)
+    runtime = RuntimeWindshieldProjector(model, IMG_W, IMG_H)
+
+    report = validate_runtime_projector_vs_exact(
+        runtime,
+        sample_points_xyz=np.empty((0, 3)),
+        sample_pixels_uv=np.empty((0, 2)),
+    )
+
+    assert report.project_median_px is None
+    assert report.project_max_px is None
+    assert report.unproject_median_deg is None
+    assert report.unproject_max_deg is None
+    assert report.num_project_requested == 0
+    assert report.num_unproject_requested == 0
+
+
+def test_runtime_projector_validation_counts_partial_exact_projection_failures(monkeypatch):
+    K, D = default_camera_matrix_distortion()
+    model = BaselineWindshieldModel(K, D, _MODEL)
+    runtime = RuntimeWindshieldProjector(model, IMG_W, IMG_H)
+    original_project_point = model.project_point
+
+    def flaky_project_point(x, y, z):
+        if x > 0.2:
+            raise ValueError("synthetic exact failure")
+        return original_project_point(x, y, z)
+
+    monkeypatch.setattr(model, "project_point", flaky_project_point)
+    points = np.array([
+        [0.1, 0.0, 5.0],
+        [0.3, 0.0, 5.0],
+    ])
+
+    report = validate_runtime_projector_vs_exact(
+        runtime,
+        sample_points_xyz=points,
+        sample_pixels_uv=_sample_pixels(3),
+    )
+
+    assert report.num_project_requested == 2
+    assert report.num_project_valid_exact == 1
+    assert report.num_project_invalid_exact == 1
+    assert report.num_project_valid_fast == 2
+    assert report.num_project_samples == 1
+    assert report.project_median_px is not None
+
+
 def test_project_points_exact_batch_matches_scalar_loop_exactly_for_baseline():
     """Baseline은 진짜 벡터화된 경로(project_points_batch)를 타므로,
     scalar 반복 호출과 수치적으로 완전히 같아야 한다(근사가 아니라 exact

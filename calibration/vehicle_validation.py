@@ -154,18 +154,19 @@ def build_session_photometric_summary(
         summary.reflection_mode = reflection_result.mode
         summary.evaluated = True
 
-    if ghost_result is not None and ghost_result.mode != "general_likelihood":
+    ghost_success = ghost_result is not None and ghost_result.success
+    if ghost_success and ghost_result.mode != "general_likelihood":
         if ghost_result.mean_strength is not None:
             summary.ghost_mean_strength = ghost_result.mean_strength
             summary.ghost_p95_strength = ghost_result.p95_strength
             summary.ghost_mode = ghost_result.mode
             summary.evaluated = True
-    elif ghost_result is not None and ghost_result.mode == "general_likelihood":
+    elif ghost_success and ghost_result.mode == "general_likelihood":
         summary.ghost_mean_likelihood = ghost_result.mean_ghost_likelihood
         summary.ghost_mode = ghost_result.mode
         summary.evaluated = True
 
-    if ghost_result is not None:
+    if ghost_success:
         summary.ghost_num_valid_frames = ghost_result.num_valid_frames
 
     return summary

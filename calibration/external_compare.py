@@ -2100,7 +2100,16 @@ def _evaluate_side(
     residual_stats = compute_residual_stats(point_errors)
     image_size = (camera_config.width, camera_config.height)
     scored_frames = [f for f in frames if f.image_info.image_id in per_frame_error]
-    regional = compute_regional_error(scored_frames, per_frame_error, image_size)
+    point_errors_xy_arr = np.asarray(point_errors_xy, dtype=np.float64)
+    if point_errors_xy_arr.size:
+        regional = compute_regional_error(
+            point_errors_xy_arr[:, 0],
+            point_errors_xy_arr[:, 1],
+            point_errors_xy_arr[:, 2],
+            image_size,
+        )
+    else:
+        regional = compute_regional_error([], [], [], image_size)
     edge_rms = regional_edge_average(regional)
     straightness, _n_lines = compute_straightness_residual(
         scored_frames, pattern_config, camera_matrix, distortion, model,

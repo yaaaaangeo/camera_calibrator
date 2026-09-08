@@ -222,39 +222,46 @@ def classify_regions(cx: float, cy: float, w: int, h: int) -> list[str]:
 
 
 def compute_regional_error(
-    frames: list[Frame],
-    per_frame_error: dict[str, float],
+    xs: np.ndarray | list[float],
+    ys: np.ndarray | list[float],
+    errors: np.ndarray | list[float],
     image_size: tuple[int, int],
 ) -> RegionalError:
-    """설계 문서 4번 - Center/Left/Right/Top/Bottom/Corner RMS.
+    """Corner-level Center/Left/Right/Top/Bottom/Corner RMS.
 
-    Standard 4모델(Pinhole/Brown-Conrady/Extended/Fisheye) 모두 이 함수를
-    그대로 재사용하므로, 영역 구분 기준이 모델마다 달라질 걱정 없이 공정하게
-    비교할 수 있다.
+    각 검출 코너의 관측 픽셀 좌표로 영역을 분류하고, 영역별 값은
+    per-frame RMS 평균이 아니라 해당 코너들의 pooled RMS로 계산한다.
     """
     w, h = image_size
     buckets: dict[str, list[float]] = {
         "center": [], "left": [], "right": [], "top": [], "bottom": [], "corner": [],
     }
 
-    for frame in frames:
-        error = per_frame_error.get(frame.image_info.image_id)
-        center = frame.detection.board_center_px if frame.detection else None
-        if error is None or center is None:
-            continue
-        for region in classify_regions(center[0], center[1], w, h):
-            buckets[region].append(error)
+    point_xs = np.asarray(xs, dtype=np.float64).reshape(-1)
+    point_ys = np.asarray(ys, dtype=np.float64).reshape(-1)
+    point_errors = np.asarray(errors, dtype=np.float64).reshape(-1)
+    if not (point_xs.size == point_ys.size == point_errors.size):
+        point_count = min(point_xs.size, point_ys.size, point_errors.size)
+        point_xs = point_xs[:point_count]
+        point_ys = point_ys[:point_count]
+        point_errors = point_errors[:point_count]
 
-    def _avg(values: list[float]) -> float | None:
-        return float(np.mean(values)) if values else None
+    for x, y, error in zip(point_xs, point_ys, point_errors):
+        if not (np.isfinite(x) and np.isfinite(y) and np.isfinite(error)):
+            continue
+        for region in classify_regions(float(x), float(y), w, h):
+            buckets[region].append(float(error))
+
+    def _rms(values: list[float]) -> float | None:
+        return float(np.sqrt(np.mean(np.square(values)))) if values else None
 
     return RegionalError(
-        center=_avg(buckets["center"]),
-        left=_avg(buckets["left"]),
-        right=_avg(buckets["right"]),
-        top=_avg(buckets["top"]),
-        bottom=_avg(buckets["bottom"]),
-        corner=_avg(buckets["corner"]),
+        center=_rms(buckets["center"]),
+        left=_rms(buckets["left"]),
+        right=_rms(buckets["right"]),
+        top=_rms(buckets["top"]),
+        bottom=_rms(buckets["bottom"]),
+        corner=_rms(buckets["corner"]),
     )
 
 

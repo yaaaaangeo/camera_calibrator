@@ -269,8 +269,7 @@ def evaluate_residual_ray_model(
     radial_bands = bin_radial_error_bands(radii, errors, max_radius)
     spatial_map = bin_spatial_errors(xs, ys, dxs, dys, image_size)
 
-    frames_with_error = [f for f in frames if f.image_info.image_id in per_frame_error]
-    regional_error = compute_regional_error(frames_with_error, per_frame_error, image_size)
+    regional_error = compute_regional_error(xs, ys, errors, image_size)
 
     return ResidualEvalOutcome(
         per_frame_error=per_frame_error,

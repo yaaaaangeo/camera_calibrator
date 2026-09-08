@@ -24,14 +24,14 @@ PyYAML>=6.0
 # 실제로 import하는 production 코드가 하나도 없었다 - ui/radial_profile_view.py
 # 와 ui/windshield_vector_field_view.py는 docstring에 명시된 대로 matplotlib를
 # 의도적으로 피하고 QPainter로 직접 그린다. jsonschema도 --config 파일 검증
-# 등 어디에도 쓰이지 않는다. 둘 다 requirements-jetson-jp512.txt에는 남아있는데,
-# 그건 별도 환경 정책(그 프로필만의 결정)이라 데스크톱과 억지로 맞추지 않는다.
+# 등 어디에도 쓰이지 않는다. JetPack 5.1.2 profile에서도 repository-wide
+# search 결과에 맞춰 둘 다 제거했다.
 # Priority 6 안정화 - PySide6가 이 파일에서 완전히 빠져 있었다(pyproject.toml
 # 에는 있었음). README 2번 섹션은 "방법 A(requirements.txt)로도 GUI가
 # 설치된다"고 안내하지만, 실제로는 이 줄이 없어서 `pip install -r
 # requirements.txt` 후 `python -m app.main`을 실행하면 PySide6 ImportError로
 # 즉시 실패하고 있었다.
-PySide6>=6.6
+PySide6>=6.5.3
 
 # Optional - only required for the "Neural Residual" Windshield model
 # (calibration/windshield/neural_residual.py, residual_ray_hint["method"]=="neural").

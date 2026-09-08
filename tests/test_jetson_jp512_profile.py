@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REQ = ROOT / "requirements-jetson-jp512.txt"
 PREFLIGHT = ROOT / "scripts" / "jetson_jp512_preflight.py"
+INSTALLER = ROOT / "scripts" / "install_jetson_jp512.sh"
 
 
 def _requirement_names() -> set[str]:
@@ -23,9 +24,7 @@ def test_jetson_jp512_requirements_include_core_gui_dependencies():
         "numpy",
         "scipy",
         "opencv-contrib-python-headless",
-        "matplotlib",
         "pyyaml",
-        "jsonschema",
         "shiboken6",
         "pyside6-essentials",
         "pyside6-addons",
@@ -36,6 +35,11 @@ def test_jetson_jp512_requirements_include_core_gui_dependencies():
 def test_jetson_jp512_requirements_keep_ros_out_of_pip_profile():
     forbidden = {"rosbag", "rospy", "sensor_msgs", "cv_bridge", "rclpy"}
     assert _requirement_names().isdisjoint(forbidden)
+
+
+def test_jetson_jp512_requirements_do_not_keep_unused_desktop_dependencies():
+    unused = {"matplotlib", "jsonschema"}
+    assert _requirement_names().isdisjoint(unused)
 
 
 def test_jetson_jp512_preflight_checks_required_capabilities():
@@ -51,3 +55,9 @@ def test_jetson_jp512_preflight_checks_required_capabilities():
         "import PySide6",
     ):
         assert needle in text
+
+
+def test_jetson_jp512_installer_is_explicit_about_ros1_live_topic_limit():
+    text = INSTALLER.read_text(encoding="utf-8")
+    assert "Python 3.10 venv에서는 ROS1 Noetic" in text
+    assert "live topic을 직접 지원하지 않습니다" in text

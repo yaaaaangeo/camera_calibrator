@@ -14,9 +14,7 @@
 numpy==1.26.4
 scipy==1.11.4
 opencv-contrib-python-headless==4.10.0.84
-matplotlib==3.8.4
 PyYAML==6.0.2
-jsonschema==4.22.0
 
 # Qt for Python. 6.5.3 provides cp37-abi3 manylinux_2_31_aarch64 wheels,
 # matching Ubuntu 20.04's glibc 2.31 baseline.

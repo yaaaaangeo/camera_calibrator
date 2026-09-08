@@ -29,9 +29,7 @@ def main() -> int:
     try:
         import numpy  # noqa: F401
         import scipy  # noqa: F401
-        import matplotlib  # noqa: F401
         import yaml  # noqa: F401
-        import jsonschema  # noqa: F401
     except Exception as exc:  # noqa: BLE001
         failures.append(f"scientific/runtime import failed: {exc}")
 
@@ -61,9 +59,13 @@ def main() -> int:
         import rospy  # noqa: F401
         from sensor_msgs.msg import CompressedImage, Image  # noqa: F401
 
-        warnings.append("ROS1 Noetic Python packages are visible in the current environment.")
+        warnings.append(
+            "ROS1 Noetic Python packages are visible, but Python 3.10 venv live-topic cv_bridge is unsupported."
+        )
     except Exception:
-        warnings.append("ROS1 Noetic Python packages not visible; source the ROS environment if live ROS is needed.")
+        warnings.append(
+            "ROS1 Noetic live topic via Python 3.8 cv_bridge is unsupported in this Python 3.10 venv."
+        )
 
     if failures:
         print("JetPack 5.1.2 preflight FAILED:", file=sys.stderr)

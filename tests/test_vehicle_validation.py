@@ -120,6 +120,22 @@ def test_photometric_summary_point_source_ghost_fills_strength_not_likelihood():
     assert summary.ghost_mean_likelihood is None
 
 
+def test_photometric_summary_excludes_failed_ghost_result():
+    failed = GhostDatasetResult(
+        mode="point_source",
+        success=False,
+        error_message="all frames invalid",
+        mean_strength=0.15,
+        p95_strength=0.22,
+        num_valid_frames=3,
+    )
+    summary = build_session_photometric_summary(_metadata(), ghost_result=failed)
+    assert summary.evaluated is False
+    assert summary.ghost_mean_strength is None
+    assert summary.ghost_p95_strength is None
+    assert summary.ghost_num_valid_frames is None
+
+
 def test_photometric_summary_includes_reflection_when_successful():
     reflection_result = ReflectionDatasetResult(
         mode="reference", success=True, mean_strength=0.05, p95_strength=0.1, coverage=0.3,

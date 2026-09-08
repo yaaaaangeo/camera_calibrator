@@ -37,7 +37,7 @@ dependencies = [
     # requirements.txt의 하한선(1.11)에 맞춰 올렸다.
     "scipy>=1.11",
     "PyYAML>=6.0",
-    "PySide6>=6.6",
+    "PySide6>=6.5.3",
 ]
 
 [project.optional-dependencies]

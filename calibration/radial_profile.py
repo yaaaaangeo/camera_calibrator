@@ -9,10 +9,10 @@ camera_calibrator.calibration.radial_profile
     "이미지 중심으로부터의 거리(radius)에 따른 재투영 오차를 그래프로
      표시하면, 렌즈 외곽에서 모델이 잘 동작하는지 바로 확인 가능하다."
 
-RegionalError(center/left/right/top/bottom/corner, models/common.py)는
-"프레임 단위"로 하나의 대표 위치(board_center_px)만 보고 영역을 나누지만,
-이 모듈은 "코너 포인트 단위"로 모든 코너 각각의 (반지름, 오차)를 모아
-구간별 평균을 낸다. 화각 전역의 경향(중심 vs 외곽)을 훨씬 세밀하게 보여준다.
+RegionalError(center/left/right/top/bottom/corner, models/common.py)와
+이 모듈은 같은 "코너 포인트 단위" residual 벡터를 사용한다. RegionalError는
+각 코너의 관측 픽셀 좌표로 영역을 나눈 뒤 영역별 pooled RMS를 만들고,
+radial profile은 중심으로부터의 반지름 구간별 통계를 만든다.
 
 pinhole.py / extended_pinhole.py / fisheye.py(brown_conrady.py는
 extended_pinhole.py를 재사용) 모두 이 함수를 동일하게 호출해서

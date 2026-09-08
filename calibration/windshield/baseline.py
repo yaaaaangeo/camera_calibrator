@@ -101,7 +101,6 @@ def _evaluate_frames(
     residual_stats = compute_residual_stats_for_calibration(
         ok_frames, rvecs, tvecs, camera_matrix, distortion, image_size, model
     )
-    regional_error = compute_regional_error(ok_frames, per_frame_error, image_size)
     radial_profile = compute_radial_error_profile(
         ok_frames, rvecs, tvecs, camera_matrix, distortion, image_size, model
     )
@@ -112,7 +111,8 @@ def _evaluate_frames(
         ok_frames, rvecs, tvecs, camera_matrix, distortion, image_size, model
     )
 
-    _, _, dxs, dys = collect_per_point_vectors(ok_frames, rvecs, tvecs, camera_matrix, distortion, model)
+    xs, ys, dxs, dys = collect_per_point_vectors(ok_frames, rvecs, tvecs, camera_matrix, distortion, model)
+    regional_error = compute_regional_error(xs, ys, np.hypot(dxs, dys), image_size)
     mean_dx = float(dxs.mean()) if dxs.size else None
     mean_dy = float(dys.mean()) if dys.size else None
 
