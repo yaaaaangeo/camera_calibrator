@@ -123,6 +123,7 @@ def _cross_validation_summary(
             "straightness_source": val.straightness_source,
             "straightness_breakdown": val.straightness_breakdown,
             "failed_test_frame_ids": val.failed_test_frame_ids,
+            "failed_test_frame_reasons": val.failed_test_frame_reasons,
             "error_message": val.error_message,
         }
     return {

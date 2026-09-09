@@ -76,6 +76,7 @@ from ui.worker import (
     SceneSubsetCalibrationWorker,
     run_worker_in_thread,
 )
+from ui.kfold_worker import RepeatedKFoldWorker
 from calibration.scene_quality import add_original_comparison_warnings, compute_scene_quality_analysis
 from ui.library_view import LibraryView
 from ui.windshield_workspace import WindshieldWorkspace
@@ -1457,6 +1458,33 @@ class MainWindow(QMainWindow):
         ok = sum(1 for r in results if r.success)
         self.status_label.setText(f"Cross-dataset validation 완료: {ok}/{len(results)} 성공")
         self._autosave()
+
+    def _on_repeated_kfold_requested(self, k: int, n_repeats: int) -> None:
+        """논문용 Repeated K-Fold(Brown-Conrady/Rational/Fisheye 동일 fold
+        partition 비교) 실행. calibration/kfold.py::run_repeated_kfold_all_models
+        가 실제 계산을 전부 담당하고, 여기서는 QThread 배선만 한다."""
+        if self.dataset is None or self.camera_config is None or self.pattern_config is None:
+            QMessageBox.warning(self, "Repeated K-Fold 불가", "먼저 데이터셋을 불러오세요.")
+            return
+
+        worker = RepeatedKFoldWorker(
+            self.dataset, self.camera_config, self.pattern_config, k=k, n_repeats=n_repeats,
+        )
+        thread = run_worker_in_thread(worker, self)
+        worker.progress.connect(self.status_label.setText)
+        worker.results_ready.connect(self._on_repeated_kfold_results_ready)
+        worker.error.connect(self._on_error)
+
+        self._kfold_thread, self._kfold_worker = thread, worker
+        self.result_view.kfold_run_button.setEnabled(False)
+        thread.finished.connect(lambda: self.result_view.kfold_run_button.setEnabled(True))
+        thread.start()
+
+    def _on_repeated_kfold_results_ready(self, results: dict) -> None:
+        self.result_view.set_repeated_kfold_results(results)
+        total = next(iter(results.values())).total_folds if results else 0
+        ok = sum(r.n_successful_runs for r in results.values())
+        self.status_label.setText(f"Repeated K-Fold 완료: {ok}/{total * len(results)} fold 성공 (모델별 표 참고)")
 
     # ------------------------------------------------------------------
     # Export

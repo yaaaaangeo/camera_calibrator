@@ -167,11 +167,17 @@ def _normalization_scales(
     return np.asarray(scales, dtype=np.float64)
 
 
+def _svd_rank_tolerance(shape: tuple[int, ...], singular_values: np.ndarray) -> float:
+    if not singular_values.size:
+        return 0.0
+    return float(np.finfo(float).eps * max(shape) * singular_values[0])
+
+
 def _svd_diagnostics(J: np.ndarray) -> tuple[np.ndarray, int, float | None, float | None, float | None]:
     singular = np.linalg.svd(J, compute_uv=False)
     if not singular.size:
         return singular, 0, None, None, None
-    tol = float(np.finfo(float).eps * max(J.shape) * singular[0])
+    tol = _svd_rank_tolerance(J.shape, singular)
     rank = int(np.sum(singular > tol))
     min_sv = float(singular[-1])
     max_sv = float(singular[0])
@@ -179,15 +185,34 @@ def _svd_diagnostics(J: np.ndarray) -> tuple[np.ndarray, int, float | None, floa
     return singular, rank, condition, min_sv, max_sv
 
 
-def _correlation_matrix_from_normalized_jacobian(J: np.ndarray, rank: int) -> list[list[float]]:
-    if J.shape[1] == 0:
+def _covariance_from_jacobian_svd(J: np.ndarray) -> np.ndarray | None:
+    """SVD-based covariance-like matrix from a normalized Jacobian.
+
+    For J = U S Vt, pinv(J.T @ J) is V diag(1 / s_i^2) V.T. Computing it
+    through the SVD of J avoids explicitly forming J.T @ J, whose condition
+    number is approximately cond(J)^2.
+    """
+    if J.ndim != 2 or J.shape[1] == 0:
+        return None
+    try:
+        _u, singular, vt = np.linalg.svd(J, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    if not singular.size:
+        return None
+    tol = _svd_rank_tolerance(J.shape, singular)
+    inv_sigma_sq = np.zeros_like(singular, dtype=np.float64)
+    valid = singular > tol
+    inv_sigma_sq[valid] = 1.0 / (singular[valid] * singular[valid])
+    covariance = (vt.T * inv_sigma_sq) @ vt
+    if not np.all(np.isfinite(covariance)):
+        return None
+    return np.asarray(covariance, dtype=np.float64)
+
+
+def _correlation_matrix_from_covariance(covariance: np.ndarray | None) -> list[list[float]]:
+    if covariance is None or covariance.ndim != 2 or covariance.shape[0] == 0:
         return []
-    if J.shape[1] == 1 or J.shape[0] < 2:
-        return [[1.0]]
-    if rank < J.shape[1]:
-        return []
-    hessian = np.asarray(J.T @ J, dtype=np.float64)
-    covariance = np.linalg.pinv(hessian)
     diag = np.diag(covariance)
     if np.any(diag <= 0) or not np.all(np.isfinite(diag)):
         return []
@@ -198,6 +223,22 @@ def _correlation_matrix_from_normalized_jacobian(J: np.ndarray, rank: int) -> li
     np.fill_diagonal(corr, 1.0)
     corr = np.clip(corr, -1.0, 1.0)
     return [[float(v) for v in row] for row in corr.tolist()]
+
+
+def _correlation_matrix_from_normalized_jacobian(J: np.ndarray, rank: int) -> list[list[float]]:
+    """SVD-based covariance from normalized Jacobian, turned into a correlation matrix.
+
+    Rank-deficient input is intentionally NOT covered by the SVD covariance path -
+    when rank < J.shape[1] this still returns [] (correlation unavailable) rather
+    than trying to reinterpret a rank-deficient result as meaningful correlation.
+    """
+    if J.shape[1] == 0:
+        return []
+    if J.shape[1] == 1 or J.shape[0] < 2:
+        return [[1.0]]
+    if rank < J.shape[1]:
+        return []
+    return _correlation_matrix_from_covariance(_covariance_from_jacobian_svd(J))
 
 
 def _correlations_from_matrix(
@@ -320,7 +361,7 @@ def compute_observability_report(
     if raw_condition is not None and (math.isinf(raw_condition) or raw_condition >= condition_warning_threshold):
         report.warnings.append(f"High raw condition number: {raw_condition:.3g}.")
     if not corr_matrix and report.jacobian_cols > 1:
-        report.warnings.append("Parameter correlation unavailable from the normalized normal matrix.")
+        report.warnings.append("Parameter correlation unavailable from the normalized Jacobian.")
     if max_corr is not None and max_corr >= correlation_warning_threshold:
         report.warnings.append(f"Strong parameter correlation detected: {max_corr:.3f}.")
     report.warnings.append(

@@ -107,6 +107,7 @@ class IntrinsicWorkspace(QWidget):
     def connect_owner_handlers(self, owner) -> None:
         owner.result_view.export_opencv_requested.connect(owner._on_export_opencv)
         owner.result_view.cross_dataset_requested.connect(owner._on_cross_dataset_requested)
+        owner.result_view.repeated_kfold_requested.connect(owner._on_repeated_kfold_requested)
         owner.scene_quality_view.recalibrate_requested.connect(owner._on_subset_recalibrate_requested)
         owner.scene_quality_view.model_changed.connect(owner._on_scene_quality_model_changed)
         owner.scene_quality_view.export_subset_requested.connect(owner._on_export_subset_calibration)

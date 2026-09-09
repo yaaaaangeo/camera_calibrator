@@ -333,6 +333,164 @@ def solve_pnp_for_model(
     return bool(ok), rvec, tvec
 
 
+def _finite_pose(rvec, tvec) -> bool:
+    return (
+        rvec is not None and tvec is not None
+        and np.all(np.isfinite(rvec)) and np.all(np.isfinite(tvec))
+    )
+
+
+def _solve_pnp_fisheye_robust(
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray,
+) -> tuple[bool, np.ndarray, np.ndarray, str]:
+    """Fisheye test-pose 추정 전용 fallback chain (Hold-out 원칙 준수: 이 함수
+    안 어디에서도 camera_matrix/distortion을 다시 추정하거나 수정하지 않는다 -
+    세 단계 모두 "이미 확정된 K,D로 pose만 구한다"는 동일한 문제를 푸는
+    서로 다른 방법일 뿐이다).
+
+    cv2.fisheye.solvePnP()는 내부적으로 반복 Newton 방식 undistort +
+    solvePnP를 쓰는데, 실제 검출 코너(노이즈, 이미지 주변부 강한 왜곡)에서는
+    합성 데이터보다 훨씬 쉽게 수렴 실패(cv2.error) 또는 ok=False를 반환한다.
+    이 함수는 그 단일 실패 지점을 3단계로 완화한다:
+
+        1) cv2.fisheye.solvePnP(obj, img, K, D) - 1차 선택지, Fisheye 왜곡
+           모델을 직접 반영한다.
+        2) cv2.fisheye.undistortPoints(img, K, D, P=K)로 코너를 point-wise로
+           pinhole-domain pixel 좌표로 편 뒤(undistortPoints 자체도 K,D를
+           고정값으로만 쓴다), distCoeffs=0인 cv2.solvePnP(ITERATIVE)로 재시도.
+           1번이 발산한 코너에서도 undistort는 코너별로 독립적이라 성공할 수
+           있다.
+        3) 같은 undistort된 좌표에 SOLVEPNP_IPPE(평면 타겟 전용 closed-form,
+           ChArUco/Chessboard는 항상 평면이므로 적용 가능)로 후보 pose(들)를
+           구한 뒤, 각 후보를 cv2.fisheye.projectPoints()로 원래 Fisheye
+           왜곡 도메인에 재투영해 원본 검출 코너와 RMS를 비교한다. IPPE는
+           평면 타겟의 pose ambiguity 때문에 반사(mirror) 후보를 낼 수 있어,
+           대상 포인트가 카메라 앞(양의 depth)에 있는 후보만 candidate로
+           인정하고 그중 RMS가 가장 작은 것을 채택한다.
+
+    Returns:
+        (success, rvec, tvec, reason) - reason은 " | "로 이어붙인 단계별
+        실패 사유(성공 시에는 어떤 단계에서 성공했는지)를 담은 사람이 읽을
+        수 있는 요약 문자열. 세세한 로그를 켜켜이 쌓기보다는, 실패한
+        frame별로 "어디서 왜 실패했는지" 한 줄로 판단할 수 있게 하는 데
+        목적이 있다(ValidationResult.failed_test_frame_reasons에 그대로
+        저장된다).
+    """
+    K = np.asarray(camera_matrix, dtype=np.float64)
+    D = np.asarray(distortion, dtype=np.float64).reshape(-1, 1)
+    obj64 = np.asarray(object_points, dtype=np.float64).reshape(-1, 1, 3)
+    img64 = np.asarray(image_points, dtype=np.float64).reshape(-1, 1, 2)
+    zero3 = np.zeros((3, 1), dtype=np.float64)
+
+    # --- 1단계: cv2.fisheye.solvePnP 직접 -----------------------------
+    try:
+        ok1, rvec1, tvec1 = cv2.fisheye.solvePnP(obj64, img64, K, D)
+        if ok1 and _finite_pose(rvec1, tvec1):
+            return True, rvec1, tvec1, "fisheye.solvePnP"
+        stage1_reason = (
+            "fisheye.solvePnP: returned False" if not ok1
+            else "fisheye.solvePnP: non-finite result"
+        )
+    except cv2.error as exc:
+        stage1_reason = f"fisheye.solvePnP: {exc}"
+
+    # --- 2/3단계 공통 준비: fisheye 왜곡을 point-wise로 제거 -----------
+    # (undistortPoints는 K,D를 "그대로" 쓴다 - 재추정이 아니라 좌표 변환)
+    try:
+        undistorted = cv2.fisheye.undistortPoints(img64, K, D, P=K)
+        undistorted = np.asarray(undistorted, dtype=np.float64).reshape(-1, 1, 2)
+        if not np.all(np.isfinite(undistorted)):
+            raise cv2.error("undistortPoints produced non-finite points")
+    except cv2.error as exc:
+        return False, zero3, zero3, f"{stage1_reason} | undistortPoints: {exc}"
+
+    # --- 2단계: undistort된 pixel 좌표 + 일반 ITERATIVE solvePnP -------
+    try:
+        ok2, rvec2, tvec2 = cv2.solvePnP(
+            obj64, undistorted, K, None, flags=cv2.SOLVEPNP_ITERATIVE
+        )
+        if ok2 and _finite_pose(rvec2, tvec2):
+            return True, rvec2, tvec2, "undistort+ITERATIVE"
+        stage2_reason = (
+            "undistort+ITERATIVE: returned False" if not ok2
+            else "undistort+ITERATIVE: non-finite result"
+        )
+    except cv2.error as exc:
+        stage2_reason = f"undistort+ITERATIVE: {exc}"
+
+    # --- 3단계: planar IPPE 후보 + Fisheye 재투영 RMS로 최선 후보 선택 --
+    try:
+        n_solutions, rvecs, tvecs, _errs = cv2.solvePnPGeneric(
+            obj64, undistorted, K, None, flags=cv2.SOLVEPNP_IPPE
+        )
+    except cv2.error as exc:
+        return False, zero3, zero3, f"{stage1_reason} | {stage2_reason} | IPPE: {exc}"
+
+    obj_flat = obj64.reshape(-1, 3)
+    img_flat = img64.reshape(-1, 2)
+    best_pose: tuple[np.ndarray, np.ndarray] | None = None
+    best_rms = float("inf")
+    for rvec_c, tvec_c in zip(rvecs or [], tvecs or []):
+        rvec_c = np.asarray(rvec_c, dtype=np.float64).reshape(3, 1)
+        tvec_c = np.asarray(tvec_c, dtype=np.float64).reshape(3, 1)
+        if not _finite_pose(rvec_c, tvec_c):
+            continue
+        R, _ = cv2.Rodrigues(rvec_c)
+        cam_depth = (R @ obj_flat.T + tvec_c).T[:, 2]
+        if np.any(cam_depth <= 0):
+            continue  # target이 카메라 뒤/평면에 걸치는 물리적으로 불가능한 후보
+        try:
+            proj, _ = cv2.fisheye.projectPoints(obj_flat.reshape(-1, 1, 3), rvec_c, tvec_c, K, D)
+        except cv2.error:
+            continue
+        proj = proj.reshape(-1, 2)
+        if not np.all(np.isfinite(proj)):
+            continue
+        rms = float(np.sqrt(np.mean(np.sum((proj - img_flat) ** 2, axis=1))))
+        if np.isfinite(rms) and rms < best_rms:
+            best_rms = rms
+            best_pose = (rvec_c, tvec_c)
+
+    if best_pose is None:
+        return (
+            False, zero3, zero3,
+            f"{stage1_reason} | {stage2_reason} | IPPE: no positive-depth solution",
+        )
+    return True, best_pose[0], best_pose[1], "IPPE"
+
+
+def solve_pnp_for_model_robust(
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray,
+    model: CameraModelType,
+) -> tuple[bool, np.ndarray, np.ndarray, str]:
+    """solve_pnp_for_model()과 같은 문제(Test pose 추정, K/D는 고정하고 절대
+    바꾸지 않음)를 풀지만, 실패 진단 문자열을 함께 반환하고 Fisheye에는
+    3단계 fallback chain(_solve_pnp_fisheye_robust 참고)을 적용한다.
+
+    solve_pnp_for_model()은 다른 모듈(calibration/windshield 등)에서 이미
+    쓰고 있어 기존 동작(단발성 호출, 3-튜플 반환)을 그대로 유지해야 하므로
+    건드리지 않는다 - 이 함수는 그 위에 추가된 새 진입점이다. Fisheye가
+    아닌 모델은 fallback 없이 solve_pnp_for_model()과 동일하게 1회만
+    시도한다 (이번 변경의 목적은 Fisheye Hold-out 0/12 실패 문제이지,
+    다른 모델의 동작을 바꾸는 게 아니다).
+    """
+    if model == CameraModelType.FISHEYE:
+        return _solve_pnp_fisheye_robust(object_points, image_points, camera_matrix, distortion)
+    try:
+        ok, rvec, tvec = cv2.solvePnP(object_points, image_points, camera_matrix, distortion)
+    except cv2.error as exc:
+        return False, np.zeros((3, 1)), np.zeros((3, 1)), f"solvePnP: {exc}"
+    if ok and _finite_pose(rvec, tvec):
+        return True, rvec, tvec, "solvePnP"
+    return False, rvec, tvec, ("solvePnP: returned False" if not ok else "solvePnP: non-finite result")
+
+
 def project_points_for_model(
     object_points: np.ndarray,
     rvec: np.ndarray,

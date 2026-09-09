@@ -25,6 +25,7 @@ from calibration.validation import (
     validate_cross_datasets,
     validate_holdout,
 )
+from calibration.models.common import solve_pnp_for_model_robust
 from calibration.models.pinhole import calibrate_pinhole
 
 
@@ -304,6 +305,246 @@ def test_fisheye_holdout_validation_recovers_known_k_d(pattern_config):
     # Test RMS 자체도 GT 노이즈 없는 합성 데이터이므로 낮아야 한다 (Test에서
     # K,D를 건드리지 않고 pose만 잘 추정했다면 재투영 오차는 작아야 정상).
     assert result.test_rms is not None and result.test_rms < 5.0
+
+
+# ---------------------------------------------------------------------------
+# Fisheye Hold-out test pose 추정 - 3단계 fallback (fisheye.solvePnP ->
+# undistort+ITERATIVE -> planar IPPE) 회귀 테스트.
+#
+# 이전에는 cv2.fisheye.solvePnP() 한 번만 호출하고 실패하면(ok=False 또는
+# cv2.error) 그 frame을 그냥 실패로 처리했다 - solve_pnp_for_model_robust()가
+# 그 단일 실패 지점을 fallback chain으로 완화한다. 세 단계 모두 "이미
+# 확정된 K,D로 pose만 추정한다"는 Hold-out 원칙을 지킨다 - 아래 테스트들은
+# 그 K,D가 어느 단계를 거치든 절대 바뀌지 않는다는 것도 함께 확인한다.
+# ---------------------------------------------------------------------------
+
+def _project_fisheye_frame(pts3d, K, D, rvec, tvec):
+    import cv2
+    import numpy as np
+
+    proj, _ = cv2.fisheye.projectPoints(pts3d.reshape(-1, 1, 3).astype(np.float64), rvec, tvec, K, D)
+    return proj.reshape(-1, 2)
+
+
+def test_fisheye_pose_fallback_normal_case_succeeds_at_stage_one():
+    """정상적인 wide-FOV Fisheye 케이스에서는 1차(cv2.fisheye.solvePnP)에서
+    바로 성공해야 하고, 재투영 오차가 작아야 하며, K/D 값이 바뀌면 안 된다."""
+    import numpy as np
+
+    K = np.array([[500.0, 0, 320], [0, 500.0, 240], [0, 0, 1]])
+    D = np.array([0.05, 0.01, -0.01, 0.002])
+    K_before, D_before = K.copy(), D.copy()
+
+    pts3d = np.array(
+        [[x * 0.02, y * 0.02, 0.0] for y in range(8) for x in range(11)], dtype=np.float64
+    )
+    rvec = np.array([0.05, -0.03, 0.02])
+    tvec = np.array([0.02, -0.01, 0.35])
+    proj = _project_fisheye_frame(pts3d, K, D, rvec, tvec)
+
+    ok, rvec_est, tvec_est, reason = solve_pnp_for_model_robust(
+        pts3d.reshape(-1, 1, 3), proj.reshape(-1, 1, 2), K, D, CameraModelType.FISHEYE
+    )
+    assert ok, reason
+    assert reason == "fisheye.solvePnP"
+
+    reproj = _project_fisheye_frame(pts3d, K, D, rvec_est, tvec_est)
+    rms = float(((reproj - proj) ** 2).sum(axis=1).mean() ** 0.5)
+    assert rms < 1.0, f"복원된 pose의 재투영 오차가 너무 크다: {rms}"
+
+    # K,D는 어떤 이유로도 수정되면 안 된다 (Hold-out 핵심 원칙).
+    assert (K == K_before).all()
+    assert (D == D_before).all()
+
+
+def test_fisheye_pose_fallback_strong_distortion_wide_fov_case():
+    """왜곡이 강하고 시야각이 넓은 케이스에서도(어느 fallback 단계를 거치든)
+    NaN/Inf 없이 pose가 복원돼야 하고, 대체로 낮은 재투영 오차를 보이며(중앙값
+    기준 - 일부 극단적으로 비스듬한 합성 pose 하나쯤은 solvePnP 자체의 고유
+    난이도로 오차가 커질 수 있어 개별 프레임 하드 threshold 대신 median으로
+    판단한다), K,D는 그대로여야 한다."""
+    import numpy as np
+
+    K = np.array([[300.0, 0, 320], [0, 300.0, 240], [0, 0, 1]])
+    D = np.array([0.12, 0.04, -0.02, 0.005])  # 강한 distortion, 넓은 FOV
+    K_before, D_before = K.copy(), D.copy()
+
+    pts3d = np.array(
+        [[x * 0.02, y * 0.02, 0.0] for y in range(8) for x in range(11)], dtype=np.float64
+    )
+    pts3d -= pts3d.mean(axis=0, keepdims=True)
+
+    rng = np.random.default_rng(21)
+    rmses = []
+    for i in range(15):
+        rvec = (rng.random(3) - 0.5) * 1.0
+        tvec = np.array([(rng.random() - 0.5) * 0.3, (rng.random() - 0.5) * 0.3, 0.25 + rng.random() * 0.2])
+        proj = _project_fisheye_frame(pts3d, K, D, rvec, tvec)
+        if not np.all(np.isfinite(proj)) or (proj < -500).any() or (proj > 1200).any():
+            continue
+
+        ok, rvec_est, tvec_est, reason = solve_pnp_for_model_robust(
+            pts3d.reshape(-1, 1, 3), proj.reshape(-1, 1, 2), K, D, CameraModelType.FISHEYE
+        )
+        assert ok, f"frame {i} pose 추정 실패: {reason}"
+        reproj = _project_fisheye_frame(pts3d, K, D, rvec_est, tvec_est)
+        assert np.all(np.isfinite(reproj)), f"frame {i}: fallback 결과에 NaN/Inf ({reason})"
+        rms = float(((reproj - proj) ** 2).sum(axis=1).mean() ** 0.5)
+        rmses.append(rms)
+
+    assert len(rmses) >= 10, "강한 distortion/wide-FOV synthetic case가 너무 적게 생성됨"
+    assert float(np.median(rmses)) < 1.0, f"강한 distortion 케이스의 median 재투영 오차가 너무 크다: {rmses}"
+    assert max(rmses) < 20.0, f"이상치성 폭주(NaN은 아니지만 비정상적으로 큰 오차) 발생: {rmses}"
+    assert (K == K_before).all()
+    assert (D == D_before).all()
+
+
+def test_fisheye_pose_fallback_stage2_recovers_when_stage1_forced_to_fail(monkeypatch):
+    """cv2.fisheye.solvePnP가 실패하도록 강제 monkeypatch해도, 2단계
+    (undistort + ITERATIVE)가 성공하면 여전히 정상적인 pose를 복원해야 한다."""
+    import cv2
+    import numpy as np
+
+    import calibration.models.common as common
+
+    K = np.array([[500.0, 0, 320], [0, 500.0, 240], [0, 0, 1]])
+    D = np.array([0.05, 0.01, -0.01, 0.002])
+    pts3d = np.array(
+        [[x * 0.02, y * 0.02, 0.0] for y in range(8) for x in range(11)], dtype=np.float64
+    )
+    rvec = np.array([0.05, -0.03, 0.02])
+    tvec = np.array([0.02, -0.01, 0.35])
+    proj = _project_fisheye_frame(pts3d, K, D, rvec, tvec)
+
+    def fail_solve_pnp(*args, **kwargs):
+        raise cv2.error("forced failure for test")
+
+    monkeypatch.setattr(common.cv2.fisheye, "solvePnP", fail_solve_pnp)
+
+    ok, rvec_est, tvec_est, reason = solve_pnp_for_model_robust(
+        pts3d.reshape(-1, 1, 3), proj.reshape(-1, 1, 2), K, D, CameraModelType.FISHEYE
+    )
+    assert ok, reason
+    assert reason == "undistort+ITERATIVE"
+    assert "fisheye.solvePnP" not in reason  # 실제로 stage2를 탄 게 맞는지
+
+    reproj = _project_fisheye_frame(pts3d, K, D, rvec_est, tvec_est)
+    rms = float(((reproj - proj) ** 2).sum(axis=1).mean() ** 0.5)
+    assert rms < 1.0
+
+
+def test_fisheye_pose_fallback_stage3_ippe_recovers_when_stage1_and_stage2_fail(monkeypatch):
+    """1,2단계를 모두 강제로 실패시켜도 3단계(planar IPPE + Fisheye 재투영
+    RMS 기반 후보 선택)가 성공하면 낮은 재투영 오차의 pose를 복원해야 한다."""
+    import cv2
+    import numpy as np
+
+    import calibration.models.common as common
+
+    K = np.array([[500.0, 0, 320], [0, 500.0, 240], [0, 0, 1]])
+    D = np.array([0.05, 0.01, -0.01, 0.002])
+    pts3d = np.array(
+        [[x * 0.02, y * 0.02, 0.0] for y in range(8) for x in range(11)], dtype=np.float64
+    )
+    rvec = np.array([0.05, -0.03, 0.02])
+    tvec = np.array([0.02, -0.01, 0.35])
+    proj = _project_fisheye_frame(pts3d, K, D, rvec, tvec)
+
+    def fail_fisheye_solve_pnp(*args, **kwargs):
+        raise cv2.error("forced stage1 failure")
+
+    def fail_solve_pnp(*args, **kwargs):
+        return False, np.zeros((3, 1)), np.zeros((3, 1))
+
+    monkeypatch.setattr(common.cv2.fisheye, "solvePnP", fail_fisheye_solve_pnp)
+    monkeypatch.setattr(common.cv2, "solvePnP", fail_solve_pnp)
+
+    ok, rvec_est, tvec_est, reason = solve_pnp_for_model_robust(
+        pts3d.reshape(-1, 1, 3), proj.reshape(-1, 1, 2), K, D, CameraModelType.FISHEYE
+    )
+    assert ok, reason
+    assert reason == "IPPE"
+
+    reproj = _project_fisheye_frame(pts3d, K, D, rvec_est, tvec_est)
+    rms = float(((reproj - proj) ** 2).sum(axis=1).mean() ** 0.5)
+    assert rms < 2.0
+
+
+def test_fisheye_pose_fallback_all_stages_fail_records_reason(monkeypatch):
+    """세 단계 모두 실패하면 (ok=False, reason에 각 단계 사유가 누적된 문자열)을
+    반환해야 한다 - 어느 단계에서 왜 실패했는지 디버깅할 수 있어야 한다."""
+    import cv2
+    import numpy as np
+
+    import calibration.models.common as common
+
+    K = np.array([[500.0, 0, 320], [0, 500.0, 240], [0, 0, 1]])
+    D = np.array([0.05, 0.01, -0.01, 0.002])
+    pts3d = np.array(
+        [[x * 0.02, y * 0.02, 0.0] for y in range(8) for x in range(11)], dtype=np.float64
+    )
+    rvec = np.array([0.05, -0.03, 0.02])
+    tvec = np.array([0.02, -0.01, 0.35])
+    proj = _project_fisheye_frame(pts3d, K, D, rvec, tvec)
+
+    def fail_fisheye_solve_pnp(*args, **kwargs):
+        raise cv2.error("forced stage1 failure")
+
+    def fail_solve_pnp(*args, **kwargs):
+        return False, np.zeros((3, 1)), np.zeros((3, 1))
+
+    def no_candidates_generic(*args, **kwargs):
+        return 0, (), (), None
+
+    monkeypatch.setattr(common.cv2.fisheye, "solvePnP", fail_fisheye_solve_pnp)
+    monkeypatch.setattr(common.cv2, "solvePnP", fail_solve_pnp)
+    monkeypatch.setattr(common.cv2, "solvePnPGeneric", no_candidates_generic)
+
+    ok, _rvec, _tvec, reason = solve_pnp_for_model_robust(
+        pts3d.reshape(-1, 1, 3), proj.reshape(-1, 1, 2), K, D, CameraModelType.FISHEYE
+    )
+    assert not ok
+    assert "fisheye.solvePnP" in reason
+    assert "undistort+ITERATIVE" in reason
+    assert "IPPE" in reason
+
+
+def test_fisheye_holdout_recovers_via_fallback_when_direct_solvepnp_fails(monkeypatch, pattern_config):
+    """validate_holdout() 레벨 통합 테스트: cv2.fisheye.solvePnP를 강제로
+    실패시켜도(1차 fallback 유도), 나머지 fallback 단계로 test 프레임들이
+    여전히 정상 평가돼야 한다 - K,D는 재추정되지 않고, 실패 frame을 몰래
+    골라내지도 않는다(모든 test frame에 같은 solver policy 적용)."""
+    import cv2
+
+    import calibration.models.common as common
+
+    dataset, camera_config, _true_K, _true_D = _build_synthetic_fisheye_dataset()
+    train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio=0.3, seed=13)
+    assert train_ids and test_ids
+
+    baseline = validate_holdout(
+        dataset, camera_config, pattern_config, CameraModelType.FISHEYE, train_ids, test_ids
+    )
+    assert baseline.success and baseline.per_frame_error
+    baseline_success_count = len(baseline.per_frame_error)
+
+    def fail_fisheye_solve_pnp(*args, **kwargs):
+        raise cv2.error("forced failure for holdout integration test")
+
+    monkeypatch.setattr(common.cv2.fisheye, "solvePnP", fail_fisheye_solve_pnp)
+
+    fallback_result = validate_holdout(
+        dataset, camera_config, pattern_config, CameraModelType.FISHEYE, train_ids, test_ids
+    )
+    assert fallback_result.success, fallback_result.error_message
+    # fallback을 거쳤어도 (거의) 같은 수의 test frame이 성공해야 한다 - 1차
+    # solvePnP 실패가 곧바로 frame 손실로 이어지지 않는다는 것이 이 fallback의
+    # 존재 이유다.
+    assert len(fallback_result.per_frame_error) == baseline_success_count
+    assert not fallback_result.failed_test_frame_ids
+    # 성공한 frame들은 stage2(undistort+ITERATIVE)를 거쳤을 것 - 실패 사유
+    # 기록 자체는 성공한 frame에는 안 남는다(실패 목록이 비어 있으므로).
+    assert fallback_result.failed_test_frame_reasons == {}
 
 
 def test_leak_safe_outlier_pruning_only_removes_train_frames(

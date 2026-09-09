@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -33,6 +34,7 @@ from calibration.types import (
     CrossDatasetValidationResult,
     ModelScore,
     ObjectReleasingValidationResult,
+    RepeatedKFoldResult,
     StandardVsObjectReleasingComparison,
     ValidationResult,
 )
@@ -225,6 +227,7 @@ class _PageScrollTableWidget(QTableWidget):
 class ResultView(QWidget):
     export_opencv_requested = Signal(object)  # CameraModelType
     cross_dataset_requested = Signal()
+    repeated_kfold_requested = Signal(int, int)  # k, n_repeats
 
     def __init__(self, parent: QWidget | None = None, *, standalone: bool = True):
         super().__init__(parent)
@@ -265,6 +268,48 @@ class ResultView(QWidget):
         self.recommendation_label.setWordWrap(True)
         compare_layout.addWidget(self.recommendation_label)
         model_layout.addWidget(compare_group)
+
+        # --- Repeated K-Fold (논문용 Multi-Metric raw statistics) ---
+        # Brown-Conrady/Rational/Fisheye를 정확히 같은 fold partition으로
+        # 평가해서(calibration/kfold.py::run_repeated_kfold_all_models) 단일
+        # Hold-out split의 우연성과 무관하게 mean ± std를 비교할 수 있게 한다.
+        # "③ Model Comparison" 탭(이미 실제 앱에서 보임)에 둔다 - Validation
+        # 탭은 현재 앱 구조(Lite 4-tab)에서 어디에도 연결되지 않아 보이지
+        # 않으므로, 여기 두어야 실제로 실행 가능한 경로가 된다.
+        kfold_group = QGroupBox("Repeated K-Fold (Paper Metrics)")
+        kfold_layout = QVBoxLayout(kfold_group)
+        kfold_controls = QHBoxLayout()
+        kfold_controls.addWidget(QLabel("K:"))
+        self.kfold_k_spin = QSpinBox()
+        self.kfold_k_spin.setRange(2, 20)
+        self.kfold_k_spin.setValue(5)
+        kfold_controls.addWidget(self.kfold_k_spin)
+        kfold_controls.addWidget(QLabel("Repeats:"))
+        self.kfold_repeats_spin = QSpinBox()
+        self.kfold_repeats_spin.setRange(1, 50)
+        self.kfold_repeats_spin.setValue(5)
+        kfold_controls.addWidget(self.kfold_repeats_spin)
+        self.kfold_run_button = QPushButton("Run Repeated K-Fold")
+        self.kfold_run_button.clicked.connect(
+            lambda: self.repeated_kfold_requested.emit(
+                self.kfold_k_spin.value(), self.kfold_repeats_spin.value()
+            )
+        )
+        kfold_controls.addWidget(self.kfold_run_button)
+        kfold_controls.addStretch(1)
+        kfold_layout.addLayout(kfold_controls)
+        self.kfold_summary_label = QLabel("아직 Repeated K-Fold를 실행하지 않았습니다.")
+        self.kfold_summary_label.setWordWrap(True)
+        kfold_layout.addWidget(self.kfold_summary_label)
+        self.kfold_table = QTableWidget(0, 6)
+        self.kfold_table.setHorizontalHeaderLabels(
+            ["Model", "Test RMS", "Test P95", "Edge RMS", "Straightness", "Folds"]
+        )
+        self.kfold_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.kfold_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        kfold_layout.addWidget(self.kfold_table)
+        model_layout.addWidget(kfold_group)
+
         self.advanced_group = QGroupBox("▶ Advanced Calibration")
         self.advanced_group.setObjectName("advancedCalibrationPanel")
         self.advanced_group.setCheckable(True)
@@ -468,6 +513,17 @@ class ResultView(QWidget):
             test_frame_count = str(len(val.test_frame_ids)) if val else "N/A"
             successful_test_frame_count = str(len(val.per_frame_error)) if val else "N/A"
             failed_test_frame_count = str(len(val.failed_test_frame_ids)) if val else "N/A"
+            # frame별 pose 추정 실패 사유(Fisheye fallback 단계 등) - 전체 요약은
+            # Failure Reason 셀 텍스트에 짧게 붙이고, frame별 detail은 tooltip으로.
+            failed_reason_tooltip = ""
+            if val and val.failed_test_frame_ids:
+                per_frame_reasons = getattr(val, "failed_test_frame_reasons", {}) or {}
+                failed_reason_tooltip = "\n".join(
+                    f"{fid}: {per_frame_reasons.get(fid, '(사유 미기록)')}"
+                    for fid in val.failed_test_frame_ids
+                )
+                if not failure_reason_text:
+                    failure_reason_text = f"{len(val.failed_test_frame_ids)} test frame(s) pose 추정 실패"
             train_rms = _fmt(cal.rms_error) if cal and cal.success else "FAIL"
             test_rms = _fmt(val.test_rms) if val and val.success else "N/A"
             if val and val.success and val.edge_rms is not None:
@@ -513,6 +569,11 @@ class ResultView(QWidget):
                 # 판정 셀만 semantic GOOD 색으로 강조한다.
                 if row == len(self._row_labels) - 1 and recommend:
                     item.setForeground(qcolor(Theme.GOOD))
+                # "Failed Test Frames"/"Failure Reason" 행에는 frame별 실패
+                # 사유(예: Fisheye fallback 단계)를 tooltip으로 붙여서, 표에는
+                # 요약만 두고 detail은 hover로 볼 수 있게 한다.
+                if failed_reason_tooltip and self._row_labels[row] in ("Failed Test Frames", "Failure Reason"):
+                    item.setToolTip(failed_reason_tooltip)
                 self.table.setItem(row, col, item)
 
         self._update_model_status()
@@ -580,6 +641,37 @@ class ResultView(QWidget):
             ]
             for col, value in enumerate(values):
                 self.cross_dataset_table.setItem(row, col, QTableWidgetItem(str(value)))
+
+    def set_repeated_kfold_results(self, results: dict[CameraModelType, RepeatedKFoldResult]) -> None:
+        """calibration/kfold.py::run_repeated_kfold_all_models()의 결과(모델별
+        RepeatedKFoldResult)를 표로 보여준다. 특정 모델이 이기도록 색칠/정렬
+        조작하지 않는다 - raw mean ± std를 그대로 나열만 한다."""
+        self.kfold_table.setRowCount(len(results))
+        if not results:
+            self.kfold_summary_label.setText("아직 Repeated K-Fold를 실행하지 않았습니다.")
+            return
+
+        any_result = next(iter(results.values()))
+        self.kfold_summary_label.setText(
+            f"Repeated {any_result.k}-Fold x {any_result.n_repeats} - 모델별 successful folds는 표를 참고하세요."
+        )
+        for row, (model, result) in enumerate(results.items()):
+            straight = (
+                f"{_fmt(result.mean_test_straightness)} ± {_fmt(result.std_test_straightness)}"
+                if result.n_straightness_folds > 0 else "N/A"
+            )
+            values = [
+                _MODEL_LABELS.get(model, model.value),
+                f"{_fmt(result.mean_test_rms)} ± {_fmt(result.std_test_rms)}",
+                f"{_fmt(result.mean_test_p95)} ± {_fmt(result.std_test_p95)}",
+                f"{_fmt(result.mean_edge_rms)} ± {_fmt(result.std_edge_rms)}",
+                straight,
+                f"{result.n_successful_runs}/{result.total_folds} "
+                f"(fully {result.fully_successful_folds}, partial {result.partial_success_folds}, "
+                f"failed {result.failed_folds})",
+            ]
+            for col, value in enumerate(values):
+                self.kfold_table.setItem(row, col, QTableWidgetItem(str(value)))
 
     def select_model(self, model: CameraModelType) -> None:
         idx = self.model_combo.findData(model)

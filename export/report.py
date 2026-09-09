@@ -247,7 +247,7 @@ def _section_model_comparison(
         return f"<tr><th>{_esc(label)}</th>{cells}</tr>"
 
     status_vals, train_vals, test_frame_vals, successful_test_frame_vals = [], [], [], []
-    failed_test_frame_vals, failure_reason_vals = [], []
+    failed_test_frame_vals, failure_reason_vals, failure_detail_vals = [], [], []
     test_vals, edge_vals, straight_vals = [], [], []
     aic_vals, bic_vals, score_vals, confidence_vals, chosen_vals = [], [], [], [], []
     for m in _MODEL_ORDER:
@@ -266,6 +266,18 @@ def _section_model_comparison(
         test_frame_vals.append(str(len(val.test_frame_ids)) if val else "N/A")
         successful_test_frame_vals.append(str(len(val.per_frame_error)) if val else "N/A")
         failed_test_frame_vals.append(str(len(val.failed_test_frame_ids)) if val else "N/A")
+        # frame별 pose 추정 실패 사유(Fisheye fallback 단계 등) - report는
+        # hover가 없는 정적 문서라 detail 행을 별도로 둔다(비어 있으면 "-").
+        if val and val.failed_test_frame_ids:
+            per_frame_reasons = getattr(val, "failed_test_frame_reasons", {}) or {}
+            failure_detail_vals.append(
+                "; ".join(
+                    f"{fid}: {per_frame_reasons.get(fid, '(사유 미기록)')}"
+                    for fid in val.failed_test_frame_ids
+                )
+            )
+        else:
+            failure_detail_vals.append("-")
         train_vals.append(_fmt(cal.rms_error) if cal and cal.success else "FAIL")
         test_vals.append(_fmt(val.test_rms) if val and val.success else "N/A")
         if val and val.success and val.edge_rms is not None:
@@ -304,6 +316,7 @@ def _section_model_comparison(
         + row("Successful Test Frames", successful_test_frame_vals)
         + row("Failed Test Frames", failed_test_frame_vals)
         + row("Failure Reason", failure_reason_vals)
+        + row("Pose Failure Detail (per frame)", failure_detail_vals)
         + row("Test RMS", test_vals)
         + row("Test Edge RMS", edge_vals)
         + row("Straightness", straight_vals)

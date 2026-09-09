@@ -254,6 +254,16 @@ def _spatial_error_map_from_dict(d) -> SpatialErrorMap | None:
     return SpatialErrorMap(cells=cells, rows=d.get("rows", 4), cols=d.get("cols", 4))
 
 
+# correlation_method 필드가 저장되지 않은 구버전 .ccproj를 로드할 때 쓰는 기본값.
+#
+# 이 필드가 추가되기 전까지 이 코드베이스의 parameter correlation 계산은 항상
+# np.corrcoef(raw Jacobian, rowvar=False) 기반 구현 하나뿐이었다(git 히스토리로
+# 확인됨 - 다른 구현이 존재한 적이 없다). 따라서 필드가 없다는 것 자체가 "그
+# corrcoef 기반 legacy 구현으로 계산됐다"는 것을 신뢰성 있게 나타내는 신호이며,
+# 새 covariance_from_normalized_jacobian 방식으로 계산된 것처럼 라벨링하면 안 된다.
+_LEGACY_CORRELATION_METHOD = "legacy_jacobian_column_correlation"
+
+
 def _observability_report_from_dict(d) -> ObservabilityReport | None:
     if d is None:
         return None
@@ -273,7 +283,11 @@ def _observability_report_from_dict(d) -> ObservabilityReport | None:
         max_singular_value=d.get("max_singular_value"),
         max_abs_correlation=d.get("max_abs_correlation"),
         correlation_matrix=d.get("correlation_matrix", []),
-        correlation_method=d.get("correlation_method", "covariance_from_normalized_jacobian"),
+        # 필드가 저장돼 있으면 그 값을 그대로 신뢰한다(새 프로젝트라면
+        # "covariance_from_normalized_jacobian", 이미 legacy로 라벨링된
+        # 값이라면 그것도 그대로 보존). 필드 자체가 없는 구버전 프로젝트만
+        # legacy 기본값으로 복원한다 - 새 방식으로 계산됐다고 잘못 표시하지 않는다.
+        correlation_method=d.get("correlation_method", _LEGACY_CORRELATION_METHOD),
         observability_score=d.get("observability_score"),
         observability_grade=d.get("observability_grade"),
         top_correlations=[
@@ -387,6 +401,7 @@ def _validation_result_from_dict(d: dict) -> ValidationResult:
         test_residual_stats=_residual_stats_from_dict(d.get("test_residual_stats")),
         success=d.get("success", True), error_message=d.get("error_message"),
         failed_test_frame_ids=d.get("failed_test_frame_ids", []),
+        failed_test_frame_reasons=d.get("failed_test_frame_reasons", {}),
         per_frame_error=d.get("per_frame_error", {}),
         evidence_gate=_holdout_evidence_gate_from_dict(d.get("evidence_gate")),
     )

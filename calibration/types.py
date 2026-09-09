@@ -560,6 +560,13 @@ class ObservabilityReport:
     max_singular_value: Optional[float] = None
     max_abs_correlation: Optional[float] = None
     correlation_matrix: list[list[float]] = field(default_factory=list)
+    # 새로 계산되는 리포트는 항상 이 값("covariance_from_normalized_jacobian",
+    # normalized Jacobian의 SVD에서 유도한 covariance-like matrix)을 쓴다.
+    # 구버전 .ccproj에는 이 필드 자체가 없었는데, 그 시절 correlation_matrix는
+    # np.corrcoef(raw Jacobian, rowvar=False) 기반이었다("legacy_jacobian_column_correlation").
+    # 필드가 없는 legacy 프로젝트를 로드할 때 이 기본값으로 잘못 라벨링하면 안 되므로,
+    # 복원 로직(calibration/project_codecs/intrinsic.py:_observability_report_from_dict)은
+    # 이 dataclass 기본값을 쓰지 않고 명시적으로 legacy 라벨을 채운다.
     correlation_method: str = "covariance_from_normalized_jacobian"
     observability_score: Optional[float] = None  # 0~100, 높을수록 좋음
     observability_grade: Optional[str] = None  # "GOOD" | "WARNING" | "POOR"
@@ -749,6 +756,13 @@ class ValidationResult:
     success: bool = True
     error_message: Optional[str] = None
     failed_test_frame_ids: list[str] = field(default_factory=list)
+    # frame_id -> 사람이 읽을 수 있는 실패 사유 요약(예: "fisheye.solvePnP:
+    # returned False", "undistort+ITERATIVE: returned False", "IPPE: no
+    # positive-depth solution"). Fisheye Hold-out test pose 추정이 solvePnP
+    # 실패 한 번으로 프레임 전체를 버리던 문제를 디버깅하기 위해 추가 -
+    # solve_pnp_for_model_robust()의 fallback 단계별 사유를 그대로 문자열로만
+    # 담는다(원본 예외 객체/스택은 저장하지 않아 결과가 무거워지지 않는다).
+    failed_test_frame_reasons: dict[str, str] = field(default_factory=dict)
     # Phase A-8 안정화 - 이 모델의 hold-out test 평가에서 나온 frame별 RMS
     # (frame_id -> rms_px). 이전에는 원본 Dataset의 Frame.reprojection_error를
     # 직접 덮어썼는데, Pinhole/Brown-Conrady/Rational/Fisheye를 순차적으로
@@ -893,6 +907,28 @@ class KFoldResult:
     mean_test_p95: Optional[float] = None
     std_test_p95: Optional[float] = None
     n_successful_folds: int = 0
+    # 논문용 Multi-Metric 확장 - Test RMS/P95 외에 Hold-out Test Edge RMS와
+    # Test Straightness도 fold 간 mean/std/min/max로 aggregate한다. 반드시
+    # ValidationResult.edge_rms(= Hold-out **test** edge에서 계산된 값)만
+    # 쓴다 - Train regional_error fallback은 여기 절대 섞이지 않는다(그런
+    # fallback 자체가 없다 - edge_rms는 애초에 test 프레임으로만 계산됨).
+    mean_edge_rms: Optional[float] = None
+    std_edge_rms: Optional[float] = None
+    min_edge_rms: Optional[float] = None
+    max_edge_rms: Optional[float] = None
+    # straightness_source == "test"인 fold만 aggregate에 포함한다.
+    # "train_fallback"(test 프레임에서 직선을 못 뽑아 train으로 대체한 값)은
+    # 절대 섞지 않는다 - 그런 fold는 diagnostic으로만 남기고 straightness
+    # aggregate에서는 missing으로 취급한다(임의의 숫자로 채우거나 최악
+    # penalty를 주지 않는다).
+    mean_test_straightness: Optional[float] = None
+    std_test_straightness: Optional[float] = None
+    min_test_straightness: Optional[float] = None
+    max_test_straightness: Optional[float] = None
+    # straightness aggregate에 실제로 포함된 fold 수(위 4개 값의 표본 크기) -
+    # n_successful_folds보다 작을 수 있다(Test Straightness를 계산 못 한 fold가
+    # 있으면). 0이면 straightness aggregate 전체가 missing이라는 뜻.
+    n_straightness_folds: int = 0
 
 
 @dataclass
@@ -910,6 +946,32 @@ class RepeatedKFoldResult:
     mean_test_p95: Optional[float] = None
     std_test_p95: Optional[float] = None
     n_successful_runs: int = 0
+    # KFoldResult와 같은 이유로 - Test Edge RMS/Test Straightness도
+    # k*n_repeats개 fold 전체(성공한 fold만)를 모아 mean/std/min/max로
+    # aggregate한다. straightness는 straightness_source == "test"인 fold만
+    # 포함(train_fallback은 diagnostic 전용, 절대 섞지 않음).
+    mean_edge_rms: Optional[float] = None
+    std_edge_rms: Optional[float] = None
+    min_edge_rms: Optional[float] = None
+    max_edge_rms: Optional[float] = None
+    mean_test_straightness: Optional[float] = None
+    std_test_straightness: Optional[float] = None
+    min_test_straightness: Optional[float] = None
+    max_test_straightness: Optional[float] = None
+    n_straightness_folds: int = 0
+    # 논문용 fold 상태 diagnostic - "25 folds 중 몇 개가 완전히 정상 평가됐는지"를
+    # 바로 확인할 수 있게 한다(특히 Fisheye가 일부 test frame에서 pose 추정에
+    # 실패하는 경우를 조용히 숨기지 않기 위함).
+    #   total_folds = k * n_repeats (설계상 실행되어야 했던 fold 수)
+    #   fully_successful_folds = 성공 + 실패한 test frame이 0개인 fold
+    #   partial_success_folds = 성공했지만 일부 test frame의 pose 추정은 실패한 fold
+    #   failed_folds = validate_holdout 자체가 실패했거나(success=False),
+    #       train 프레임 부족 등으로 애초에 fold가 실행조차 안 된 경우까지 포함
+    #       (fully_successful_folds + partial_success_folds + failed_folds == total_folds)
+    total_folds: int = 0
+    fully_successful_folds: int = 0
+    partial_success_folds: int = 0
+    failed_folds: int = 0
 
 
 # ---------------------------------------------------------------------------

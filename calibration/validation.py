@@ -43,7 +43,7 @@ from calibration.models.common import (
     compute_regional_error,
     project_points_for_model,
     regional_edge_average,
-    solve_pnp_for_model,
+    solve_pnp_for_model_robust,
 )
 from calibration.models.pinhole import calibrate_pinhole
 from calibration.models.brown_conrady import calibrate_brown_conrady
@@ -166,20 +166,35 @@ def _test_reprojection_errors(
     camera_matrix: np.ndarray,
     distortion: np.ndarray,
     model: CameraModelType,
-) -> tuple[dict[str, float], list[str], list[float], list[float], list[float]]:
+) -> tuple[dict[str, float], list[str], list[float], list[float], list[float], dict[str, str]]:
     """Train에서 확정된 camera_matrix/distortion을 고정한 채,
     각 test 프레임에 대해 solvePnP로 pose만 새로 구하고 재투영 오차를 계산.
 
+    Fisheye는 solve_pnp_for_model_robust()의 3단계 fallback chain
+    (fisheye.solvePnP -> undistort+ITERATIVE -> planar IPPE)을 거친다 - K,D는
+    어느 단계에서도 다시 추정되지 않고 그대로 고정값으로만 쓰인다(각 단계는
+    "이미 확정된 K,D로 pose만 구한다"는 동일한 문제의 다른 풀이일 뿐). 다른
+    모델은 기존과 동일하게 1회 cv2.solvePnP만 시도한다.
+
     Returns:
         per_frame_error: {frame_id: rms_px} (프레임 단위 RMS)
-        failed_frame_ids: solvePnP/투영이 실패한 프레임 id 목록
-        (실패해도 예외를 던지지 않고 목록에 남겨 사용자가 원인 파악 가능하게 함)
+        failed_frame_ids: 모든 fallback 단계가 실패한 프레임 id 목록
+        (실패해도 예외를 던지지 않고 목록에 남겨 사용자가 원인 파악 가능하게 함.
+        논문/공정성 원칙: 특정 모델이 불리해 보이는 프레임을 여기서 조용히
+        골라내지 않는다 - 모든 test 프레임에 같은 solver policy를 적용하고,
+        실패하면 그대로 failed_frame_ids/failed_reasons에 남긴다.)
         point_errors: 모든 코너 포인트 각각의 재투영 오차(Euclidean distance) -
             설계 문서 10/11번 - Test 쪽에도 MAE/Median/P90/P95/P99 등을 계산하려면
             프레임 단위 RMS만으로는 부족하고 코너 포인트 단위 원본 오차가 필요하다.
+        failed_reasons: {frame_id: reason} - 어느 단계에서 왜 실패했는지
+            사람이 읽을 수 있는 요약(예: "fisheye.solvePnP: returned False",
+            "undistort+ITERATIVE: returned False", "IPPE: no positive-depth
+            solution"). 디버깅용 - ValidationResult.failed_test_frame_reasons에
+            그대로 저장된다.
     """
     errors: dict[str, float] = {}
     failed: list[str] = []
+    failed_reasons: dict[str, str] = {}
     point_errors: list[float] = []
     point_xs: list[float] = []
     point_ys: list[float] = []
@@ -191,14 +206,18 @@ def _test_reprojection_errors(
         img = det.corners
         frame_id = frame.image_info.image_id
 
+        ok, rvec, tvec, reason = solve_pnp_for_model_robust(obj, img, camera_matrix, distortion, model)
+        if not ok:
+            failed.append(frame_id)
+            failed_reasons[frame_id] = reason
+            continue
+
         try:
-            ok, rvec, tvec = solve_pnp_for_model(obj, img, camera_matrix, distortion, model)
-            if not ok:
-                raise cv2.error("solvePnP returned False")
             projected = project_points_for_model(obj, rvec, tvec, camera_matrix, distortion, model)
             detected = (img.astype(np.float64) if is_fisheye else img).reshape(-1, 2)
-        except cv2.error:
+        except cv2.error as exc:
             failed.append(frame_id)
+            failed_reasons[frame_id] = f"{reason} pose, projectPoints failed: {exc}"
             continue
 
         diff = detected - projected
@@ -214,7 +233,7 @@ def _test_reprojection_errors(
         # Rational/Fisheye를 순차 hold-out 검증해도 각 모델의 값이 서로
         # 덮어쓰이지 않고 독립적으로 보존된다.
 
-    return errors, failed, point_errors, point_xs, point_ys
+    return errors, failed, point_errors, point_xs, point_ys, failed_reasons
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +328,7 @@ def _evaluate_on_test(
 
     test_dataset = _subset_dataset(dataset, test_ids)
     test_frames = test_dataset.enabled_frames
-    per_frame_error, failed_ids, point_errors, point_xs, point_ys = _test_reprojection_errors(
+    per_frame_error, failed_ids, point_errors, point_xs, point_ys, failed_reasons = _test_reprojection_errors(
         test_frames, train_result.camera_matrix, train_result.distortion, model
     )
 
@@ -322,6 +341,7 @@ def _evaluate_on_test(
             success=False,
             error_message="모든 test 프레임에서 pose 추정(solvePnP)이 실패했습니다.",
             failed_test_frame_ids=failed_ids,
+            failed_test_frame_reasons=failed_reasons,
         )
 
     test_rms = float(np.sqrt(np.mean(np.array(list(per_frame_error.values())) ** 2)))
@@ -371,6 +391,7 @@ def _evaluate_on_test(
         test_residual_stats=test_residual_stats,
         success=True,
         failed_test_frame_ids=failed_ids,
+        failed_test_frame_reasons=failed_reasons,
         per_frame_error=per_frame_error,
         evidence_gate=evidence_gate,
     )
@@ -819,6 +840,10 @@ def format_validation_table(results: dict[CameraModelType, ValidationResult]) ->
             notes.append(f"  [{labels[m.value]}] {r.error_message}")
         if r.failed_test_frame_ids:
             notes.append(f"  [{labels[m.value]}] pose 추정 실패 프레임: {r.failed_test_frame_ids}")
+            for fid in r.failed_test_frame_ids:
+                reason = r.failed_test_frame_reasons.get(fid)
+                if reason:
+                    notes.append(f"      {fid}: {reason}")
     if notes:
         lines.append("")
         lines.extend(notes)
