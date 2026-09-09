@@ -24,6 +24,7 @@ from calibration.types import (
     ObjectReleasingValidationResult,
     OutlierResult,
     PatternConfig,
+    RepeatedKFoldResult,
     SceneQualityAnalysis,
     StandardVsObjectReleasingComparison,
     SubsetCalibrationResult,
@@ -52,6 +53,14 @@ class IntrinsicState:
     calibration_method: CalibrationMethod = CalibrationMethod.STANDARD
     scene_quality_analysis: SceneQualityAnalysis | None = None
     subset_calibration_result: SubsetCalibrationResult | None = None
+    # Paper Evidence 단계 - Repeated K-Fold(calibration/kfold.py::
+    # run_repeated_kfold_all_models) 결과. "Run Repeated K-Fold" 버튼을 누를
+    # 때마다 계산되어 여기 저장되고, "Export Paper Metrics"는 이 저장된
+    # 결과를 그대로 쓴다(버튼을 누를 때마다 다시 계산하지 않는다). 이
+    # 결과는 .ccproj에 영구 저장되지 않는다 - 프로젝트를 다시 열거나 새
+    # calibration을 실행하면 비워지고(stale 방지), 필요하면 다시 실행해야
+    # 한다는 제약을 그대로 둔다.
+    repeated_kfold_results: dict[CameraModelType, RepeatedKFoldResult] = field(default_factory=dict)
 
 
 class IntrinsicWorkspace(QWidget):
@@ -108,6 +117,7 @@ class IntrinsicWorkspace(QWidget):
         owner.result_view.export_opencv_requested.connect(owner._on_export_opencv)
         owner.result_view.cross_dataset_requested.connect(owner._on_cross_dataset_requested)
         owner.result_view.repeated_kfold_requested.connect(owner._on_repeated_kfold_requested)
+        owner.result_view.export_paper_metrics_requested.connect(owner._on_export_paper_metrics_requested)
         owner.scene_quality_view.recalibrate_requested.connect(owner._on_subset_recalibrate_requested)
         owner.scene_quality_view.model_changed.connect(owner._on_scene_quality_model_changed)
         owner.scene_quality_view.export_subset_requested.connect(owner._on_export_subset_calibration)

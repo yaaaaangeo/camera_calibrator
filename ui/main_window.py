@@ -59,6 +59,7 @@ from calibration.types import (
 from calibration.sanity_check import run_sanity_checks
 from calibration.ros_live import ROS_LIVE_BACKEND
 from calibration.project_io import load_project, save_project, PROJECT_EXTENSION
+import calibration.paper_evidence as paper_evidence
 from export.opencv import export_opencv_yaml
 
 from ui.calibration_home_view import CalibrationHomeView
@@ -199,6 +200,14 @@ class MainWindow(QMainWindow):
     @outlier_result.setter
     def outlier_result(self, value):
         self.intrinsic_state.outlier_result = value
+
+    @property
+    def repeated_kfold_results(self):
+        return self.intrinsic_state.repeated_kfold_results
+
+    @repeated_kfold_results.setter
+    def repeated_kfold_results(self, value):
+        self.intrinsic_state.repeated_kfold_results = value
 
     @property
     def calibration_method(self):
@@ -952,6 +961,11 @@ class MainWindow(QMainWindow):
         self.validation_results = {}
         self.cross_dataset_results = []
         self.scores = []
+        # 새 calibration 실행은 이전 Repeated K-Fold 결과를 무효화한다 -
+        # dataset/calibration이 바뀌었는데 옛 fold 결과를 Paper Metrics로
+        # export하면 안 되므로(stale result 방지), 여기서 항상 비운다.
+        self.repeated_kfold_results = {}
+        self.result_view.set_repeated_kfold_results({})
         self.object_releasing_result = None
         self.scene_quality_analysis = None
         self.subset_calibration_result = None
@@ -1482,10 +1496,19 @@ class MainWindow(QMainWindow):
 
         self._kfold_thread, self._kfold_worker = thread, worker
         self.result_view.kfold_run_button.setEnabled(False)
+        # 계산 중에는 Export Paper Metrics도 막는다 - 계산이 끝나기 전에는
+        # (아직 self.repeated_kfold_results가 새 값으로 갱신되지 않았으므로)
+        # export할 게 없거나, 있어도 이번 실행이 끝나길 기다리는 게 맞다.
+        self.result_view.kfold_export_button.setEnabled(False)
         thread.finished.connect(lambda: self.result_view.kfold_run_button.setEnabled(True))
+        thread.finished.connect(lambda: self.result_view.kfold_export_button.setEnabled(True))
         thread.start()
 
     def _on_repeated_kfold_results_ready(self, results: dict) -> None:
+        # Export Paper Metrics는 이 저장된 결과를 그대로 쓴다 - 버튼을 누를
+        # 때 다시 계산하지 않는다. 새 calibration 실행/project 로드 시에는
+        # _on_run_pipeline()/project 로드 핸들러가 이 값을 비워 stale export를 막는다.
+        self.repeated_kfold_results = results
         self.result_view.set_repeated_kfold_results(results)
         total = next(iter(results.values())).total_folds if results else 0
         ok = sum(r.n_successful_runs for r in results.values())
@@ -1498,8 +1521,65 @@ class MainWindow(QMainWindow):
         self.result_view.set_repeated_kfold_error(message)
         self._on_error(message)
 
+    def _on_export_paper_metrics_requested(self) -> None:
+        """"Export Paper Metrics" - calibration/paper_evidence.py가 이미
+        계산해 둔 export_paper_metrics()를 그대로 호출한다. 이 핸들러는
+        계산을 전혀 하지 않는다 - self.repeated_kfold_results(Run Repeated
+        K-Fold가 채워 둔 저장된 결과)를 그대로 쓰고, 버튼을 누를 때
+        K-Fold를 다시 계산하지 않는다.
+
+        기존 OpenCV YAML Export(_on_export_opencv, deployment용 K/D 저장)와
+        완전히 별개다 - 여기는 논문 분석용 raw evidence(CSV/JSON)만 만든다.
+        """
+        if not self.calibration_results:
+            QMessageBox.warning(self, "Export Paper Metrics 불가", "먼저 Calibration을 실행하세요.")
+            return
+        if not self.validation_results:
+            QMessageBox.warning(self, "Export Paper Metrics 불가", "먼저 Validation을 실행하세요.")
+            return
+        if not self.repeated_kfold_results:
+            QMessageBox.warning(
+                self, "Export Paper Metrics 불가",
+                "논문용 Repeated K-Fold 결과가 없습니다. 먼저 Run Repeated K-Fold를 실행하세요.",
+            )
+            return
+
+        directory = QFileDialog.getExistingDirectory(self, "Export Paper Metrics - 저장 폴더 선택")
+        if not directory:
+            return  # 사용자가 취소함 - 아무 파일도 만들지 않는다.
+
+        try:
+            # Paper Intrinsic Stability(fx/fy/cx/cy)와 All-Parameter
+            # Stability(overall_stability, distortion 포함 가능)는
+            # ParameterUncertainty 안에 이미 별도 필드로 분리되어 있다 -
+            # ui/stability_view.py와 동일하게 bootstrap 결과를 우선한다.
+            stability_by_model = {
+                model: (cal.param_uncertainty_bootstrap or cal.param_uncertainty)
+                for model, cal in self.calibration_results.items()
+            }
+            any_repeated = next(iter(self.repeated_kfold_results.values()))
+            metadata = paper_evidence.build_paper_metadata(
+                self.camera_config, self.pattern_config, self.dataset,
+                k=any_repeated.k, n_repeats=any_repeated.n_repeats, base_seed=any_repeated.base_seed,
+            )
+            written = paper_evidence.export_paper_metrics(
+                directory,
+                single_holdout=self.validation_results,
+                repeated=self.repeated_kfold_results,
+                stability_by_model=stability_by_model,
+                metadata=metadata,
+            )
+        except Exception as e:  # noqa: BLE001 - export 실패가 GUI를 죽이면 안 됨
+            QMessageBox.critical(self, "Export Paper Metrics 실패", f"Paper Metrics export 중 오류가 발생했습니다:\n{e}")
+            return
+
+        file_list = "\n".join(f"- {name}" for name in sorted(written.keys()))
+        message = f"Paper Metrics export 완료\n{directory}\n\nGenerated:\n{file_list}"
+        QMessageBox.information(self, "Export Paper Metrics", message)
+        self.status_label.setText(f"Paper Metrics export 완료: {directory} ({len(written)}개 파일)")
+
     # ------------------------------------------------------------------
-    # Export
+    # Export (OpenCV YAML - deployment용, Paper Metrics와 완전히 별개)
     # ------------------------------------------------------------------
 
     def _on_export_button_clicked(self) -> None:
@@ -1646,6 +1726,12 @@ class MainWindow(QMainWindow):
         self.outlier_result = project.outlier_result
         self.scene_quality_analysis = project.scene_quality_analysis
         self.subset_calibration_result = project.subset_calibration_result
+        # Repeated K-Fold 결과는 .ccproj에 저장되지 않는다(계산 비용이 크고,
+        # 이 프로젝트가 로드된 dataset/calibration과 실제로 짝이 맞는
+        # 결과인지 보장할 방법이 없다) - 프로젝트를 불러오면 항상 비우고,
+        # 필요하면 사용자가 다시 "Run Repeated K-Fold"를 눌러야 한다.
+        self.repeated_kfold_results = {}
+        self.result_view.set_repeated_kfold_results({})
         self.image_paths = [f.image_info.path for f in project.dataset.frames]
         self.windshield_workspace.import_state(project)
         IntrinsicWorkspace.sync_owner_state(self)

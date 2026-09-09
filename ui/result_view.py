@@ -239,6 +239,7 @@ class ResultView(QWidget):
     export_opencv_requested = Signal(object)  # CameraModelType
     cross_dataset_requested = Signal()
     repeated_kfold_requested = Signal(int, int)  # k, n_repeats
+    export_paper_metrics_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None, *, standalone: bool = True):
         super().__init__(parent)
@@ -345,6 +346,24 @@ class ResultView(QWidget):
         self.kfold_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._reset_kfold_result_rows(placeholder="아직 실행되지 않음")
         kfold_layout.addWidget(self.kfold_table)
+
+        # --- Paper Evidence export - 기존 OpenCV YAML Export(배포용 K/D
+        # 저장, export_widget 쪽)와는 완전히 별개다. calibration/paper_evidence.py
+        # 가 이미 계산해 둔 raw evidence(fold-level CSV, pairwise win count,
+        # ranking sensitivity, stability, split manifest 등)를 그대로
+        # 파일로 저장할 뿐 이 버튼 자체는 아무것도 계산하지 않는다.
+        paper_evidence_row = QHBoxLayout()
+        self.kfold_export_button = QPushButton("Export Paper Metrics")
+        self.kfold_export_button.setToolTip(
+            "논문 분석용 raw evidence(CSV/JSON)를 폴더에 저장합니다 - 배포용 "
+            "OpenCV YAML Export와는 별개입니다. Calibration/Validation/"
+            "Run Repeated K-Fold를 먼저 완료해야 합니다."
+        )
+        self.kfold_export_button.clicked.connect(self.export_paper_metrics_requested.emit)
+        paper_evidence_row.addWidget(self.kfold_export_button)
+        paper_evidence_row.addStretch(1)
+        kfold_layout.addLayout(paper_evidence_row)
+
         model_layout.addWidget(kfold_group)
 
         self.advanced_group = QGroupBox("▶ Advanced Calibration")

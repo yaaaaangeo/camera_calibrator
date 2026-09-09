@@ -642,29 +642,43 @@ def export_paper_metrics(
     for model, pu in stability_by_model.items():
         if pu is None:
             continue
-        for label, ref, mean, std, ci_low, ci_high, stab in (
-            ("fx", pu.fx_reference, pu.fx_mean, pu.fx_std, pu.fx_ci_low, pu.fx_ci_high, pu.fx_stability),
-            ("fy", pu.fy_reference, pu.fy_mean, pu.fy_std, pu.fy_ci_low, pu.fy_ci_high, pu.fy_stability),
-            ("cx", pu.cx_reference, pu.cx_mean, pu.cx_std, pu.cx_ci_low, pu.cx_ci_high, pu.cx_stability),
-            ("cy", pu.cy_reference, pu.cy_mean, pu.cy_std, pu.cy_ci_low, pu.cy_ci_high, pu.cy_stability),
+        # model당 한 번만 계산되는 provenance(방법/집계 stability)를 매
+        # parameter row에 그대로 반복해 붙인다 - Paper Intrinsic Stability
+        # (fx/fy/cx/cy만)와 All-Parameter Stability(distortion 포함 가능,
+        # recommender.py가 실제로 쓰는 legacy overall_stability)가 CSV
+        # 한 줄만 봐도 절대 헷갈리지 않도록 명시적으로 분리된 열로 둔다.
+        model_context = {
+            "model": model.value,
+            "method": pu.method,
+            "paper_intrinsic_stability": pu.paper_intrinsic_stability,
+            "all_parameter_stability": pu.overall_stability,
+        }
+        for label, ref, mean, std, ci_low, ci_high, cv, stab in (
+            ("fx", pu.fx_reference, pu.fx_mean, pu.fx_std, pu.fx_ci_low, pu.fx_ci_high, pu.fx_relative_cv, pu.fx_stability),
+            ("fy", pu.fy_reference, pu.fy_mean, pu.fy_std, pu.fy_ci_low, pu.fy_ci_high, pu.fy_relative_cv, pu.fy_stability),
+            ("cx", pu.cx_reference, pu.cx_mean, pu.cx_std, pu.cx_ci_low, pu.cx_ci_high, pu.cx_relative_cv, pu.cx_stability),
+            ("cy", pu.cy_reference, pu.cy_mean, pu.cy_std, pu.cy_ci_low, pu.cy_ci_high, pu.cy_relative_cv, pu.cy_stability),
         ):
             stability_rows.append({
-                "model": model.value, "parameter": label, "category": "intrinsic",
-                "reference": ref, "mean": mean, "std": std,
+                **model_context,
+                "parameter": label, "category": "intrinsic",
+                "reference": ref, "mean": mean, "std": std, "cv": cv,
                 "ci_low": ci_low, "ci_high": ci_high, "stability_score": stab,
                 "near_zero_reference": False, "diagnostic": None,
             })
         for stat in pu.distortion_stats:
             stability_rows.append({
-                "model": model.value, "parameter": stat.label or f"d{stat.index}", "category": "distortion",
-                "reference": stat.reference, "mean": stat.mean, "std": stat.std,
+                **model_context,
+                "parameter": stat.label or f"d{stat.index}", "category": "distortion",
+                "reference": stat.reference, "mean": stat.mean, "std": stat.std, "cv": stat.relative_cv,
                 "ci_low": stat.ci_low, "ci_high": stat.ci_high, "stability_score": stat.stability_score,
                 "near_zero_reference": stat.near_zero_reference, "diagnostic": stat.diagnostic,
             })
     written["stability_parameters.csv"] = _write_csv(
         out / "stability_parameters.csv", stability_rows,
         fieldnames=[
-            "model", "parameter", "category", "reference", "mean", "std",
+            "model", "method", "paper_intrinsic_stability", "all_parameter_stability",
+            "parameter", "category", "reference", "mean", "std", "cv",
             "ci_low", "ci_high", "stability_score", "near_zero_reference", "diagnostic",
         ],
     )
