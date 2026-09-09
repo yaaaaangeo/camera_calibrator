@@ -322,10 +322,11 @@ def _diagnose_observability(patterns: list[FailurePattern], cal: CalibrationResu
             [f"Jacobian rank is {obs.rank}/{obs.jacobian_cols}."],
             "Reduce model complexity or capture poses that excite the missing parameters.",
         )
-    if obs.condition_number is not None and (math.isinf(obs.condition_number) or obs.condition_number >= 1e8):
+    condition = obs.normalized_condition_number if obs.normalized_condition_number is not None else obs.condition_number
+    if condition is not None and (math.isinf(condition) or condition >= 1e8):
         _add(
             patterns, "ill_conditioned_observability", DiagnosisSeverity.WARNING, "Calibration is ill-conditioned",
-            [f"Condition number is {obs.condition_number:.3g}."],
+            [f"Normalized condition number is {condition:.3g}."],
             "Add views with stronger depth, tilt, and edge variation; consider a simpler camera model.",
         )
     if obs.max_abs_correlation is not None and obs.max_abs_correlation >= 0.98:

@@ -138,13 +138,63 @@ def compute_numeric_jacobian(
     return J, labels
 
 
-def _correlation_matrix_from_jacobian(J: np.ndarray) -> list[list[float]]:
+def _normalization_scales(
+    result: CalibrationResult,
+    dataset: Dataset,
+    labels: list[str],
+) -> np.ndarray:
+    width = None
+    height = None
+    for frame in dataset.enabled_frames:
+        if frame.image_info.width and frame.image_info.height:
+            width = float(frame.image_info.width)
+            height = float(frame.image_info.height)
+            break
+    if (width is None or height is None) and result.camera_matrix is not None:
+        width = max(float(result.camera_matrix[0, 2]) * 2.0, 1.0)
+        height = max(float(result.camera_matrix[1, 2]) * 2.0, 1.0)
+    width = max(float(width or 1.0), 1.0)
+    height = max(float(height or 1.0), 1.0)
+
+    scales = []
+    for label in labels:
+        if label in ("fx", "cx"):
+            scales.append(width)
+        elif label in ("fy", "cy"):
+            scales.append(height)
+        else:
+            scales.append(1.0)
+    return np.asarray(scales, dtype=np.float64)
+
+
+def _svd_diagnostics(J: np.ndarray) -> tuple[np.ndarray, int, float | None, float | None, float | None]:
+    singular = np.linalg.svd(J, compute_uv=False)
+    if not singular.size:
+        return singular, 0, None, None, None
+    tol = float(np.finfo(float).eps * max(J.shape) * singular[0])
+    rank = int(np.sum(singular > tol))
+    min_sv = float(singular[-1])
+    max_sv = float(singular[0])
+    condition = float(max_sv / min_sv) if min_sv > 0 else math.inf
+    return singular, rank, condition, min_sv, max_sv
+
+
+def _correlation_matrix_from_normalized_jacobian(J: np.ndarray, rank: int) -> list[list[float]]:
     if J.shape[1] == 0:
         return []
     if J.shape[1] == 1 or J.shape[0] < 2:
         return [[1.0]]
-    corr = np.asarray(np.corrcoef(J, rowvar=False), dtype=np.float64)
-    corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+    if rank < J.shape[1]:
+        return []
+    hessian = np.asarray(J.T @ J, dtype=np.float64)
+    covariance = np.linalg.pinv(hessian)
+    diag = np.diag(covariance)
+    if np.any(diag <= 0) or not np.all(np.isfinite(diag)):
+        return []
+    denom = np.sqrt(np.outer(diag, diag))
+    corr = covariance / denom
+    if not np.all(np.isfinite(corr)):
+        return []
     np.fill_diagonal(corr, 1.0)
     corr = np.clip(corr, -1.0, 1.0)
     return [[float(v) for v in row] for row in corr.tolist()]
@@ -230,20 +280,20 @@ def compute_observability_report(
         report.warnings.append("Observability could not be computed: no usable residual Jacobian.")
         return report
 
-    singular = np.linalg.svd(J, compute_uv=False)
-    tol = float(np.finfo(float).eps * max(J.shape) * singular[0]) if singular.size else 0.0
-    min_sv = float(singular[-1]) if singular.size else None
-    max_sv = float(singular[0]) if singular.size else None
-    if min_sv is not None and min_sv > 0:
-        condition = float(max_sv / min_sv)
-    else:
-        condition = math.inf
+    raw_singular, raw_rank, raw_condition, _raw_min_sv, _raw_max_sv = _svd_diagnostics(J)
+    scales = _normalization_scales(result, dataset, labels)
+    Jn = J * scales.reshape(1, -1)
+    singular, rank, condition, min_sv, max_sv = _svd_diagnostics(Jn)
 
-    corr_matrix = _correlation_matrix_from_jacobian(J)
+    corr_matrix = _correlation_matrix_from_normalized_jacobian(Jn, rank)
     max_corr, top_corr = _correlations_from_matrix(corr_matrix, labels, top_correlation_count)
     report.singular_values = [float(v) for v in singular.tolist()]
-    report.rank = int(np.sum(singular > tol))
+    report.raw_singular_values = [float(v) for v in raw_singular.tolist()]
+    report.rank = rank
     report.condition_number = condition
+    report.raw_condition_number = raw_condition
+    report.normalized_condition_number = condition
+    report.normalization_scales = {label: float(scale) for label, scale in zip(labels, scales)}
     report.min_singular_value = min_sv
     report.max_singular_value = max_sv
     report.max_abs_correlation = max_corr
@@ -252,7 +302,7 @@ def compute_observability_report(
     report.observability_score = score_observability(
         rank=report.rank,
         jacobian_cols=report.jacobian_cols,
-        condition_number=report.condition_number,
+        condition_number=report.normalized_condition_number,
         max_abs_correlation=report.max_abs_correlation,
     )
     report.observability_grade = grade_observability(report.observability_score)
@@ -261,10 +311,21 @@ def compute_observability_report(
         report.warnings.append(
             f"Jacobian rank deficient: rank {report.rank}/{report.jacobian_cols}."
         )
+    if raw_rank < report.jacobian_cols:
+        report.warnings.append(
+            f"Raw Jacobian rank deficient before parameter normalization: rank {raw_rank}/{report.jacobian_cols}."
+        )
     if math.isinf(condition) or condition >= condition_warning_threshold:
-        report.warnings.append(f"High condition number: {condition:.3g}.")
+        report.warnings.append(f"High normalized condition number: {condition:.3g}.")
+    if raw_condition is not None and (math.isinf(raw_condition) or raw_condition >= condition_warning_threshold):
+        report.warnings.append(f"High raw condition number: {raw_condition:.3g}.")
+    if not corr_matrix and report.jacobian_cols > 1:
+        report.warnings.append("Parameter correlation unavailable from the normalized normal matrix.")
     if max_corr is not None and max_corr >= correlation_warning_threshold:
         report.warnings.append(f"Strong parameter correlation detected: {max_corr:.3f}.")
+    report.warnings.append(
+        "Observability is fixed-pose local intrinsic observability; per-frame extrinsic coupling is not marginalized."
+    )
     if report.observability_grade == "POOR":
         report.warnings.append(f"Observability grade is POOR ({report.observability_score:.1f}/100).")
     return report

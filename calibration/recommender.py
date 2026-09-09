@@ -331,7 +331,11 @@ def _apply_selection_reasons(
             reasons.append(f"Stable Parameters ({stability_value:.1f}/100)")
 
     if not reasons:
-        strongest = sorted(recommended.components.items(), key=lambda kv: kv[1])[:3]
+        evidence_keys = set(recommended.evidence_components)
+        strongest = sorted(
+            ((k, v) for k, v in recommended.components.items() if k in evidence_keys),
+            key=lambda kv: kv[1],
+        )[:3]
         labels = {
             "train": "Train RMS",
             "test": "Test RMS",
@@ -585,6 +589,19 @@ def compute_model_scores(
     n_bic = _normalize_comparable(raw_bic, eligible_models)
     n_stability = _normalize_comparable(raw_stability, eligible_models)
     n_observability = _normalize_comparable(raw_observability, eligible_models)
+    comparable_evidence = {
+        "train": bool(eligible_models),
+        "test": bool(eligible_models),
+        "edge": _all_present(e_edge, eligible_models),
+        "line": _all_present(e_line, eligible_models),
+        "complexity": bool(eligible_models),
+        "p95": _all_present(raw_p95, eligible_models),
+        "radial": _all_present(raw_radial, eligible_models),
+        "aic": _all_present(raw_aic, eligible_models),
+        "bic": _all_present(raw_bic, eligible_models),
+        "stability": _all_present(raw_stability, eligible_models),
+        "observability": _all_present(raw_observability, eligible_models),
+    }
 
     for m in models:
         parameter_count = parameter_count_for_model(m)
@@ -612,11 +629,17 @@ def compute_model_scores(
                 "observability": weights.w_observability * n_observability[m],
             }
             total = sum(components.values())
+        evidence_components = [
+            key for key in components
+            if comparable_evidence.get(key, False)
+            and (key != "observability" or _observability_positive_evidence_allowed(calibration_results[m]))
+        ]
         scores.append(
             ModelScore(
                 model_name=m,
                 score=total,
                 components=components,
+                evidence_components=evidence_components,
                 is_selection_eligible=is_eligible,
                 selection_status=status,
                 selection_ineligibility_reason=ineligibility_reason,
@@ -692,6 +715,21 @@ def build_recommendation_message(
     """
     recommended = next((s for s in scores if s.is_recommended), None)
     if recommended is None:
+        calibrated = [m for m, cal in calibration_results.items() if cal and cal.success]
+        if calibrated:
+            statuses = []
+            for m in calibrated:
+                _eligible, status, reason = model_selection_status(
+                    calibration_results.get(m), validation_results.get(m)
+                )
+                statuses.append(
+                    f"{_LABELS.get(m, m.value)}: {status}" + (f" - {reason}" if reason else "")
+                )
+            return (
+                "캘리브레이션은 성공했지만 완전한 Hold-out validation evidence를 가진 모델이 없어 "
+                "자동 추천을 수행하지 않았습니다. Validation Status와 Failure Reason을 확인하세요."
+                + (f"\n{chr(10).join(statuses)}" if statuses else "")
+            )
         return "모든 모델의 캘리브레이션이 실패해 추천할 수 없습니다."
 
     model = recommended.model_name
@@ -731,8 +769,12 @@ def build_recommendation_message(
 
     reasons = []
     # 가장 기여도가 낮은(=가장 유리했던) 항목을 근거로 든다
+    evidence_keys = set(recommended.evidence_components)
     sorted_components = sorted(
-        ((k, v) for k, v in recommended.components.items() if k in metric_names_kr),
+        (
+            (k, v) for k, v in recommended.components.items()
+            if k in metric_names_kr and k in evidence_keys
+        ),
         key=lambda kv: kv[1],
     )
     top_reasons = [metric_names_kr[k] for k, v in sorted_components[:2] if v <= 0.15]
@@ -882,8 +924,13 @@ def compare_model_rankings(
     if not scores_before or not scores_after:
         return "비교할 순위 정보가 없습니다."
 
-    ranked_before = sorted(scores_before, key=lambda s: s.score)
-    ranked_after = sorted(scores_after, key=lambda s: s.score)
+    ranked_before = sorted((s for s in scores_before if s.is_selection_eligible), key=lambda s: s.score)
+    ranked_after = sorted((s for s in scores_after if s.is_selection_eligible), key=lambda s: s.score)
+    ineligible_before = [s for s in scores_before if not s.is_selection_eligible]
+    ineligible_after = [s for s in scores_after if not s.is_selection_eligible]
+
+    if not ranked_before and not ranked_after:
+        return "비교할 selection-eligible 순위 정보가 없습니다."
 
     rec_before = next((s.model_name for s in scores_before if s.is_recommended), None)
     rec_after = next((s.model_name for s in scores_after if s.is_recommended), None)
@@ -900,6 +947,19 @@ def compare_model_rankings(
             if i < len(ranked_after) else "N/A"
         )
         lines.append(f"{i+1}위  {before_str:<28} -> {after_str}")
+
+    if ineligible_before or ineligible_after:
+        lines.append("")
+        lines.append("Not eligible:")
+        for label, items in (("Before", ineligible_before), ("After", ineligible_after)):
+            if not items:
+                continue
+            text = ", ".join(
+                f"{_LABELS[s.model_name]} - {s.selection_status}"
+                + (f" ({s.selection_ineligibility_reason})" if s.selection_ineligibility_reason else "")
+                for s in items
+            )
+            lines.append(f"{label}: {text}")
 
     lines.append("")
     if rec_before is not None and rec_after is not None and rec_before != rec_after:

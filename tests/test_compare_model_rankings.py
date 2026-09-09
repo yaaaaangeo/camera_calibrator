@@ -87,3 +87,23 @@ class TestCompareModelRankings:
         ]
         text = compare_model_rankings(before, after)
         assert "N/A" in text
+
+    def test_ineligible_models_are_not_assigned_ranking_numbers(self):
+        before = [
+            _score(CameraModelType.PINHOLE, 0.2, recommended=True),
+            ModelScore(
+                model_name=CameraModelType.FISHEYE,
+                score=float("inf"),
+                is_selection_eligible=False,
+                selection_status="VALIDATION INCOMPLETE",
+                selection_ineligibility_reason="Hold-out Test RMS is unavailable.",
+            ),
+        ]
+        after = list(before)
+
+        text = compare_model_rankings(before, after)
+
+        assert any(line.startswith("1\uc704") and "Ideal Pinhole" in line for line in text.splitlines())
+        assert not any(line.startswith("2\uc704") and "Fisheye" in line for line in text.splitlines())
+        assert "Not eligible:" in text
+        assert "Fisheye - VALIDATION INCOMPLETE" in text

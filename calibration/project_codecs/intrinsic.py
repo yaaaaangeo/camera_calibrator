@@ -265,10 +265,15 @@ def _observability_report_from_dict(d) -> ObservabilityReport | None:
         singular_values=d.get("singular_values", []),
         rank=d.get("rank", 0),
         condition_number=d.get("condition_number"),
+        raw_condition_number=d.get("raw_condition_number"),
+        normalized_condition_number=d.get("normalized_condition_number"),
+        normalization_scales=d.get("normalization_scales", {}),
+        raw_singular_values=d.get("raw_singular_values", []),
         min_singular_value=d.get("min_singular_value"),
         max_singular_value=d.get("max_singular_value"),
         max_abs_correlation=d.get("max_abs_correlation"),
         correlation_matrix=d.get("correlation_matrix", []),
+        correlation_method=d.get("correlation_method", "covariance_from_normalized_jacobian"),
         observability_score=d.get("observability_score"),
         observability_grade=d.get("observability_grade"),
         top_correlations=[
@@ -494,6 +499,7 @@ def _model_score_from_dict(d: dict) -> ModelScore:
     return ModelScore(
         model_name=CameraModelType(d["model_name"]), score=score,
         components=d.get("components", {}), is_recommended=d.get("is_recommended", False),
+        evidence_components=d.get("evidence_components", []),
         is_selection_eligible=d.get("is_selection_eligible", True),
         selection_status=d.get("selection_status", "ELIGIBLE"),
         selection_ineligibility_reason=d.get("selection_ineligibility_reason"),

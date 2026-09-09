@@ -552,10 +552,15 @@ class ObservabilityReport:
     singular_values: list[float] = field(default_factory=list)
     rank: int = 0
     condition_number: Optional[float] = None
+    raw_condition_number: Optional[float] = None
+    normalized_condition_number: Optional[float] = None
+    normalization_scales: dict[str, float] = field(default_factory=dict)
+    raw_singular_values: list[float] = field(default_factory=list)
     min_singular_value: Optional[float] = None
     max_singular_value: Optional[float] = None
     max_abs_correlation: Optional[float] = None
     correlation_matrix: list[list[float]] = field(default_factory=list)
+    correlation_method: str = "covariance_from_normalized_jacobian"
     observability_score: Optional[float] = None  # 0~100, 높을수록 좋음
     observability_grade: Optional[str] = None  # "GOOD" | "WARNING" | "POOR"
     top_correlations: list[ParameterCorrelation] = field(default_factory=list)
@@ -968,6 +973,7 @@ class ModelScore:
     model_name: CameraModelType
     score: float
     components: dict[str, float] = field(default_factory=dict)  # 항목별 기여도 (디버깅/설명용)
+    evidence_components: list[str] = field(default_factory=list)
     is_recommended: bool = False
     is_selection_eligible: bool = True
     selection_status: str = "ELIGIBLE"

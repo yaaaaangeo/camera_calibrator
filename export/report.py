@@ -556,13 +556,19 @@ def _section_chosen_model_detail(cal: CalibrationResult | None, val: ValidationR
         rows.append(("Jacobian", f"{obs.jacobian_rows} x {obs.jacobian_cols} ({obs.num_points} points)"))
         rows.append(("Jacobian Rank", f"{obs.rank} / {obs.jacobian_cols}"))
         rows.append((
-            "Condition Number",
-            f"{obs.condition_number:.3g}" if obs.condition_number is not None else "N/A",
+            "Normalized Condition Number",
+            f"{obs.normalized_condition_number:.3g}"
+            if obs.normalized_condition_number is not None else "N/A",
+        ))
+        rows.append((
+            "Raw Condition Number",
+            f"{obs.raw_condition_number:.3g}" if obs.raw_condition_number is not None else "N/A",
         ))
         if obs.min_singular_value is not None and obs.max_singular_value is not None:
             rows.append(("Singular Value Range", f"{obs.min_singular_value:.3g} ~ {obs.max_singular_value:.3g}"))
         if obs.max_abs_correlation is not None:
             rows.append(("Max Parameter Correlation", f"{obs.max_abs_correlation:.3f}"))
+        rows.append(("Parameter Correlation Method", obs.correlation_method))
 
     if cal.undistortion_quality:
         uq = cal.undistortion_quality
@@ -611,7 +617,7 @@ def _section_chosen_model_detail(cal: CalibrationResult | None, val: ValidationR
 
     if cal.observability:
         obs = cal.observability
-        detail += "<h4>Observability (Jacobian / SVD)</h4>"
+        detail += "<h4>Observability (Fixed-Pose Local Intrinsic Jacobian / SVD)</h4>"
         if obs.top_correlations:
             corr_rows = "".join(
                 f"<tr><td>{_esc(c.param_a)}</td><td>{_esc(c.param_b)}</td>"

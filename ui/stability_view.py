@@ -43,10 +43,10 @@ class StabilityView(QWidget):
         self.summary_label.setWordWrap(True)
         layout.addWidget(self.summary_label)
 
-        self.table = QTableWidget(0, 12)
+        self.table = QTableWidget(0, 13)
         self.table.setHorizontalHeaderLabels([
             "Model", "fx std", "fy std", "cx std", "cy std", "Param Stability",
-            "Bootstrap N", "Observability", "Condition", "Max Corr",
+            "Bootstrap N", "Observability", "Norm Condition", "Raw Condition", "Max Corr",
             "Undistortion", "Final Confidence",
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -102,7 +102,11 @@ class StabilityView(QWidget):
                     f"{obs.observability_grade or 'N/A'} {_fmt_score(obs.observability_score)}"
                     if obs else "N/A"
                 ),
-                f"{obs.condition_number:.3g}" if obs and obs.condition_number is not None else "N/A",
+                (
+                    f"{obs.normalized_condition_number:.3g}"
+                    if obs and obs.normalized_condition_number is not None else "N/A"
+                ),
+                f"{obs.raw_condition_number:.3g}" if obs and obs.raw_condition_number is not None else "N/A",
                 f"{obs.max_abs_correlation:.3f}" if obs and obs.max_abs_correlation is not None else "N/A",
                 f"{uq.quality_grade.value.upper()} {_fmt_score(uq.quality_score)}" if uq else "N/A",
                 (

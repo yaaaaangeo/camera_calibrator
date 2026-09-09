@@ -259,6 +259,7 @@ def build_export_dict(
              "is_selection_eligible": s.is_selection_eligible,
              "selection_status": s.selection_status,
              "selection_ineligibility_reason": s.selection_ineligibility_reason,
+             "evidence_components": s.evidence_components,
              "components": s.components, "parameter_count": s.parameter_count,
              "residual_sum_squares": s.residual_sum_squares,
              "num_observations": s.num_observations, "aic": s.aic, "bic": s.bic,

@@ -351,3 +351,68 @@ def test_poor_observability_is_not_positive_selection_reason():
     recommended = next(s for s in scores if s.is_recommended)
 
     assert all("Best Observability" not in reason for reason in recommended.selection_reasons)
+
+
+def test_poor_observability_is_not_used_by_generic_fallback_reason():
+    cal = {
+        CameraModelType.PINHOLE: CalibrationResult(
+            model_name=CameraModelType.PINHOLE, rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4),
+            observability=ObservabilityReport(
+                jacobian_cols=4, rank=4, condition_number=1e12,
+                normalized_condition_number=1e12,
+                max_abs_correlation=0.99, observability_score=0.0,
+                observability_grade="POOR",
+            ),
+            success=True,
+        ),
+        CameraModelType.BROWN_CONRADY: CalibrationResult(
+            model_name=CameraModelType.BROWN_CONRADY, rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4),
+            observability=ObservabilityReport(
+                jacobian_cols=9, rank=9, condition_number=1e12,
+                normalized_condition_number=1e12,
+                max_abs_correlation=0.99, observability_score=0.0,
+                observability_grade="POOR",
+            ),
+            success=True,
+        ),
+    }
+    val = {
+        CameraModelType.PINHOLE: _val(test_rms=0.4),
+        CameraModelType.BROWN_CONRADY: _val(test_rms=0.4),
+    }
+    weights = ModelScoreWeights(
+        w_train=0.0, w_test=0.0, w_edge=0.0, w_line=0.0, w_complexity=0.0,
+        w_p95=0.0, w_radial=0.0, w_aic=0.0, w_bic=0.0, w_stability=0.0,
+        w_observability=1.0,
+    )
+
+    scores = compute_model_scores(cal, val, weights)
+    message = build_recommendation_message(scores, cal, val)
+
+    assert "Best Observability" not in message
+    assert "Low weighted Observability" not in message
+
+
+def test_recommendation_message_distinguishes_validation_incomplete_from_calibration_failure():
+    cal = {
+        CameraModelType.PINHOLE: CalibrationResult(
+            model_name=CameraModelType.PINHOLE, rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4), success=True,
+        ),
+    }
+    val = {
+        CameraModelType.PINHOLE: ValidationResult(
+            train_frame_ids=["train-1"], test_frame_ids=[],
+            success=True, error_message="No test split.",
+        ),
+    }
+
+    scores = compute_model_scores(cal, val)
+    message = build_recommendation_message(scores, cal, val)
+
+    assert "캘리브레이션은 성공" in message
+    assert "Hold-out validation evidence" in message
+    assert "VALIDATION INCOMPLETE" in message
+    assert "캘리브레이션이 실패" not in message

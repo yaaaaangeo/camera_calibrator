@@ -99,6 +99,11 @@ def test_numeric_jacobian_and_svd_report_for_pinhole():
     assert len(report.singular_values) == 4
     assert report.condition_number is not None
     assert report.condition_number > 0
+    assert report.condition_number == report.normalized_condition_number
+    assert report.raw_condition_number is not None
+    assert report.normalization_scales == {"fx": 640.0, "fy": 480.0, "cx": 640.0, "cy": 480.0}
+    assert len(report.raw_singular_values) == 4
+    assert report.correlation_method == "covariance_from_normalized_jacobian"
     assert report.rank <= 4
     assert report.observability_score is not None
     assert 0.0 <= report.observability_score <= 100.0
@@ -107,6 +112,20 @@ def test_numeric_jacobian_and_svd_report_for_pinhole():
     assert all(len(row) == 4 for row in report.correlation_matrix)
     assert all(abs(report.correlation_matrix[i][i] - 1.0) < 1e-9 for i in range(4))
     assert all(-1.0 <= v <= 1.0 for row in report.correlation_matrix for v in row)
+    assert any("fixed-pose local intrinsic observability" in w for w in report.warnings)
+
+
+def test_normalized_observability_reduces_pixel_unit_scale_sensitivity():
+    dataset, result = _dataset_and_result()
+
+    report = compute_observability_report(result, dataset)
+
+    assert report.raw_condition_number is not None
+    assert report.normalized_condition_number is not None
+    assert report.raw_condition_number != report.normalized_condition_number
+    assert report.normalization_scales["fx"] == 640.0
+    assert report.normalization_scales["fy"] == 480.0
+    assert report.normalized_condition_number == report.condition_number
 
 
 def test_observability_score_and_grade_thresholds():
@@ -144,14 +163,19 @@ def test_observability_is_exported_to_json_report_and_project(camera_config):
         singular_values=[10.0, 0.1],
         rank=2,
         condition_number=100.0,
+        raw_condition_number=1000.0,
+        normalized_condition_number=100.0,
+        normalization_scales={"fx": 640.0, "fy": 480.0},
+        raw_singular_values=[100.0, 0.1],
         min_singular_value=0.1,
         max_singular_value=10.0,
         max_abs_correlation=0.9,
         correlation_matrix=[[1.0, 0.9], [0.9, 1.0]],
+        correlation_method="covariance_from_normalized_jacobian",
         observability_score=75.0,
         observability_grade="WARNING",
         top_correlations=[ParameterCorrelation("fx", "fy", 0.9)],
-        warnings=["High condition number: 100."],
+        warnings=["High normalized condition number: 100."],
     )
     cal = {CameraModelType.PINHOLE: result}
     val = {CameraModelType.PINHOLE: ValidationResult(test_rms=0.1, success=True)}
@@ -176,10 +200,13 @@ def test_observability_is_exported_to_json_report_and_project(camera_config):
     assert obs_payload.correlation_matrix == [[1.0, 0.9], [0.9, 1.0]]
     assert obs_payload.observability_score == 75.0
     assert obs_payload.observability_grade == "WARNING"
-    assert "Observability (Jacobian / SVD)" in html
+    assert "Observability (Fixed-Pose Local Intrinsic Jacobian / SVD)" in html
     assert "Parameter Correlation Matrix" in html
     assert "WARNING (75.0/100)" in html
-    assert "Condition Number" in html
+    assert "Normalized Condition Number" in html
+    assert "Raw Condition Number" in html
     assert restored.calibration_results[CameraModelType.PINHOLE].observability.condition_number == 100.0
+    assert restored.calibration_results[CameraModelType.PINHOLE].observability.raw_condition_number == 1000.0
+    assert restored.calibration_results[CameraModelType.PINHOLE].observability.normalization_scales["fx"] == 640.0
     assert restored.calibration_results[CameraModelType.PINHOLE].observability.correlation_matrix == [[1.0, 0.9], [0.9, 1.0]]
     assert restored.calibration_results[CameraModelType.PINHOLE].observability.observability_grade == "WARNING"
