@@ -9,17 +9,25 @@ tests/test_recommender.py
 
 from __future__ import annotations
 
-from calibration.recommender import compute_final_result
+from calibration.recommender import compute_final_result, compute_model_scores, format_score_table
 from calibration.types import (
     CalibrationResult,
     CameraModelType,
+    ModelScoreWeights,
     QualityGrade,
+    ResidualStats,
     ValidationResult,
 )
 
 
-def _cal(rms: float, success: bool = True) -> CalibrationResult:
-    return CalibrationResult(model_name=CameraModelType.EXTENDED_PINHOLE, rms_error=rms, success=success)
+def _cal(rms: float, success: bool = True, p95: float | None = None) -> CalibrationResult:
+    stats = ResidualStats(n=100, rmse=rms, p95=p95) if p95 is not None else None
+    return CalibrationResult(
+        model_name=CameraModelType.EXTENDED_PINHOLE,
+        rms_error=rms,
+        residual_stats=stats,
+        success=success,
+    )
 
 
 def _val(test_rms=None, edge_rms=None, straightness=None) -> ValidationResult:
@@ -93,3 +101,39 @@ def test_missing_validation_falls_back_to_train_rms_only():
     assert final.overall_grade in (QualityGrade.VERY_GOOD, QualityGrade.GOOD)
     assert final.confidence is not None
     assert "Hold-out validation is missing or failed." in final.confidence.warnings
+
+
+def test_model_score_test_p95_does_not_fallback_to_train_residual_p95():
+    """Test P95 must come only from hold-out test residual stats, not calibration stats."""
+    cal = {
+        CameraModelType.PINHOLE: CalibrationResult(
+            model_name=CameraModelType.PINHOLE,
+            rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4, p95=0.1),
+            success=True,
+        ),
+        CameraModelType.BROWN_CONRADY: CalibrationResult(
+            model_name=CameraModelType.BROWN_CONRADY,
+            rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4, p95=10.0),
+            success=True,
+        ),
+    }
+    val = {
+        CameraModelType.PINHOLE: ValidationResult(test_rms=0.5, success=True),
+        CameraModelType.BROWN_CONRADY: ValidationResult(test_rms=0.5, success=True),
+    }
+    weights = ModelScoreWeights(
+        w_train=0.0, w_test=0.0, w_edge=0.0, w_line=0.0, w_complexity=0.0,
+        w_p95=1.0, w_radial=0.0, w_aic=0.0, w_bic=0.0, w_stability=0.0,
+        w_observability=0.0,
+    )
+
+    scores = compute_model_scores(cal, val, weights)
+
+    assert {s.components["p95"] for s in scores} == {0.0}
+    table = format_score_table(scores, cal, val)
+    p95_line = next(line for line in table.splitlines() if line.startswith("Test P95"))
+    assert p95_line.count("N/A") == 2
+    assert "0.100" not in p95_line
+    assert "10.000" not in p95_line

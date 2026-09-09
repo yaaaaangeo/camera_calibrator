@@ -64,8 +64,6 @@ def _fmt_pct(v: float | None) -> str:
 def _p95(cal: CalibrationResult | None, val: ValidationResult | None) -> float | None:
     if val and val.test_residual_stats:
         return val.test_residual_stats.p95
-    if cal and cal.residual_stats:
-        return cal.residual_stats.p95
     return None
 
 

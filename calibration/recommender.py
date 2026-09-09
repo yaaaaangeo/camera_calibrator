@@ -115,11 +115,7 @@ def _test_p95(result: ValidationResult | None) -> float | None:
 
 
 def _model_p95(calibration: CalibrationResult, validation: ValidationResult | None) -> float | None:
-    test_p95 = _test_p95(validation)
-    if test_p95 is not None:
-        return test_p95
-    stats = calibration.residual_stats
-    return stats.p95 if stats else None
+    return _test_p95(validation)
 
 
 def _radial_error_score(result: CalibrationResult) -> float | None:

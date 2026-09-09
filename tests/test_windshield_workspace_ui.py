@@ -78,6 +78,41 @@ def test_vector_field_widget_handles_empty_data_without_crashing(qapp):
     widget.repaint()  # paintEvent를 직접 호출해 예외 없이 끝나는지 확인
 
 
+def test_load_base_from_session_accepts_string_model_keys(qapp, monkeypatch):
+    import numpy as np
+    from PySide6.QtWidgets import QInputDialog
+    from calibration.types import CalibrationResult, CameraModelType
+
+    workspace = WindshieldWorkspace()
+    K = np.array([[900.0, 0.0, 640.0], [0.0, 900.0, 400.0], [0.0, 0.0, 1.0]])
+    D = np.array([[-0.15], [0.05], [0.0], [0.0], [0.0]])
+    result = CalibrationResult(
+        model_name=CameraModelType.BROWN_CONRADY,
+        camera_matrix=K,
+        distortion=D,
+        success=True,
+    )
+    chosen = {}
+
+    def fake_get_item(parent, title, label, items, current, editable):
+        chosen["items"] = list(items)
+        return "Brown-Conrady", True
+
+    monkeypatch.setattr(QInputDialog, "getItem", fake_get_item)
+
+    workspace.load_base_from_calibration_results(
+        {CameraModelType.BROWN_CONRADY.value: result},
+        None,
+        None,
+    )
+    workspace._on_load_from_session()
+
+    assert chosen["items"] == ["Brown-Conrady"]
+    assert workspace._windshield_config is not None
+    assert workspace._windshield_config.base_model_name == CameraModelType.BROWN_CONRADY
+    assert "Brown-Conrady" in workspace.base_info_label.text()
+
+
 def _make_workspace_with_config(qapp):
     import numpy as np
     from calibration.types import CameraModelType

@@ -111,6 +111,29 @@ from ui.windshield_reflection_panel import ReflectionPanelMixin
 from ui.windshield_reflection_suppression_panel import ReflectionSuppressionPanelMixin
 
 
+def _camera_model_label(model: CameraModelType | str) -> str:
+    try:
+        enum_model = CameraModelType(model)
+    except ValueError:
+        return str(model)
+    return _MODEL_LABELS.get(enum_model, enum_model.value)
+
+
+def _camera_model_from_key_or_result(
+    model: CameraModelType | str,
+    result: CalibrationResult | None,
+) -> CameraModelType | str:
+    try:
+        return CameraModelType(model)
+    except ValueError:
+        if result is not None:
+            try:
+                return CameraModelType(result.model_name)
+            except ValueError:
+                pass
+        return model
+
+
 class WindshieldWorkspace(
     GeometryPanelMixin,
     ComparisonPanelMixin,
@@ -156,7 +179,7 @@ class WindshieldWorkspace(
         # MainWindow가 load_base_from_calibration_results()로 넘겨주는,
         # 현재 세션에서 이미 계산된 Standard 4모델 결과 (Base Camera 탭의
         # "Load from current session" 버튼이 여기서 고른다).
-        self._session_calibration_results: dict[CameraModelType, CalibrationResult] = {}
+        self._session_calibration_results: dict[CameraModelType | str, CalibrationResult] = {}
         self._session_camera_config: CameraConfig | None = None
         self._session_pattern_config: PatternConfig | None = None
 
@@ -193,7 +216,7 @@ class WindshieldWorkspace(
     # ------------------------------------------------------------------
     def load_base_from_calibration_results(
         self,
-        calibration_results: dict[CameraModelType, CalibrationResult],
+        calibration_results: dict[CameraModelType | str, CalibrationResult],
         camera_config: CameraConfig | None,
         pattern_config: PatternConfig | None,
     ) -> None:
@@ -201,7 +224,10 @@ class WindshieldWorkspace(
         현재 세션에서 이미 계산된 결과를 "Load from current session" 버튼으로
         바로 쓸 수 있게 후보로만 등록한다 - 여기서 자동으로 Base를 확정하지는
         않는다(사용자가 명시적으로 모델을 선택해야 함)."""
-        self._session_calibration_results = calibration_results or {}
+        self._session_calibration_results = {
+            _camera_model_from_key_or_result(model, result): result
+            for model, result in (calibration_results or {}).items()
+        }
         self._session_camera_config = camera_config
         self._session_pattern_config = pattern_config
 
@@ -275,7 +301,7 @@ class WindshieldWorkspace(
         return page
 
     def _pick_calibration_result(
-        self, calibration_results: dict[CameraModelType, CalibrationResult]
+        self, calibration_results: dict[CameraModelType | str, CalibrationResult]
     ) -> CalibrationResult | None:
         candidates = {
             m: r for m, r in calibration_results.items()
@@ -284,8 +310,8 @@ class WindshieldWorkspace(
         if not candidates:
             QMessageBox.warning(self, "Base Camera", "사용 가능한 (성공한) Calibration 결과가 없습니다.")
             return None
-        labels = [_MODEL_LABELS.get(m, m.value) for m in candidates]
-        label_to_model = {_MODEL_LABELS.get(m, m.value): m for m in candidates}
+        labels = [_camera_model_label(m) for m in candidates]
+        label_to_model = {_camera_model_label(m): m for m in candidates}
         choice, ok = QInputDialog.getItem(self, "Base Camera Model 선택", "Model:", labels, 0, False)
         if not ok or not choice:
             return None
@@ -298,7 +324,7 @@ class WindshieldWorkspace(
         pattern_config: PatternConfig | None,
     ) -> None:
         self._windshield_config = WindshieldConfig(
-            base_model_name=calibration_result.model_name,
+            base_model_name=CameraModelType(calibration_result.model_name),
             base_camera_matrix=calibration_result.camera_matrix.copy(),
             base_distortion=calibration_result.distortion.copy(),
         )
@@ -322,7 +348,7 @@ class WindshieldWorkspace(
             else "\n(패턴 정보 없음 - Dataset 검출을 하려면 '현재 세션' 또는 '.ccproj'로 불러오세요)"
         )
         self.base_info_label.setText(
-            f"Camera Model : {_MODEL_LABELS.get(cfg.base_model_name, cfg.base_model_name.value)}\n"
+            f"Camera Model : {_camera_model_label(cfg.base_model_name)}\n"
             f"fx={K[0,0]:.2f}  fy={K[1,1]:.2f}  cx={K[0,2]:.2f}  cy={K[1,2]:.2f}\n"
             f"Distortion   : [{', '.join(f'{v:.5f}' for v in D.ravel())}]\n"
             f"Image Size   : {res}"

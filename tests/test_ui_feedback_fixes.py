@@ -22,7 +22,13 @@ pytest.importorskip("PySide6.QtWidgets", reason="PySide6.QtWidgets is not import
 
 from PySide6.QtWidgets import QApplication
 
-from calibration.types import CalibrationMethod, CalibrationResult, CameraModelType
+from calibration.types import (
+    CalibrationMethod,
+    CalibrationResult,
+    CameraModelType,
+    ResidualStats,
+    ValidationResult,
+)
 
 
 @pytest.fixture(scope="module")
@@ -447,6 +453,34 @@ def test_model_status_label_warns_on_unrun_model(qapp):
         view.select_model(CameraModelType.FISHEYE)
         assert "계산되지 않았습니다" in view.model_status_label.text()
         assert not view.export_opencv_button.isEnabled()
+    finally:
+        view.close()
+
+
+def test_result_view_test_p95_does_not_fallback_to_train_residual_p95(qapp):
+    from ui.result_view import ResultView
+
+    view = ResultView()
+    try:
+        result = CalibrationResult(
+            model_name=CameraModelType.PINHOLE,
+            rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4, p95=9.9),
+            success=True,
+        )
+        validation = ValidationResult(test_rms=0.5, success=True)
+
+        view.set_comparison(
+            {CameraModelType.PINHOLE: result},
+            {CameraModelType.PINHOLE: validation},
+            [],
+        )
+
+        p95_row = [
+            view.table.verticalHeaderItem(i).text()
+            for i in range(view.table.rowCount())
+        ].index("Test P95")
+        assert view.table.item(p95_row, 0).text() == "N/A"
     finally:
         view.close()
 
