@@ -22,6 +22,7 @@ ndarray_wrapper 인자로 둘을 고른다.
 from __future__ import annotations
 
 import dataclasses
+import math
 from datetime import datetime
 from typing import Any
 
@@ -46,7 +47,10 @@ def json_safe(obj: Any, ndarray_wrapper: bool = True) -> Any:
             return {"__ndarray__": True, "dtype": str(obj.dtype), "data": obj.tolist()}
         return obj.tolist()
     if isinstance(obj, (np.floating,)):
-        return float(obj)
+        value = float(obj)
+        return value if math.isfinite(value) else None
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, datetime):

@@ -1,5 +1,21 @@
 {
   "bootstrap_stability": {
+    "brown_conrady": {
+      "available": true,
+      "has_distortion_stats": false,
+      "keys": [
+        "available",
+        "cx_std",
+        "cy_std",
+        "distortion_stats",
+        "fx_std",
+        "fy_std",
+        "method",
+        "n_bootstrap_success",
+        "overall_stability"
+      ],
+      "method": "covariance"
+    },
     "extended_pinhole": {
       "available": true,
       "has_distortion_stats": false,
@@ -54,9 +70,31 @@
     "height": 1080,
     "width": 1920
   },
-  "chosen_model": "extended_pinhole",
+  "chosen_model": "pinhole",
   "cross_validation": {
     "holdout": {
+      "brown_conrady": {
+        "has_test_residual_stats": true,
+        "has_train_residual_stats": true,
+        "keys": [
+          "edge_rms_px",
+          "error_message",
+          "failed_test_frame_ids",
+          "straightness_breakdown",
+          "straightness_residual_px",
+          "straightness_source",
+          "success",
+          "test_frame_ids",
+          "test_residual_stats",
+          "test_rms_px",
+          "train_frame_ids",
+          "train_residual_stats",
+          "train_rms_px"
+        ],
+        "num_test_frames": 3,
+        "num_train_frames": 13,
+        "success": true
+      },
       "extended_pinhole": {
         "has_test_residual_stats": true,
         "has_train_residual_stats": true,
@@ -66,6 +104,7 @@
           "failed_test_frame_ids",
           "straightness_breakdown",
           "straightness_residual_px",
+          "straightness_source",
           "success",
           "test_frame_ids",
           "test_residual_stats",
@@ -87,6 +126,7 @@
           "failed_test_frame_ids",
           "straightness_breakdown",
           "straightness_residual_px",
+          "straightness_source",
           "success",
           "test_frame_ids",
           "test_residual_stats",
@@ -108,6 +148,7 @@
           "failed_test_frame_ids",
           "straightness_breakdown",
           "straightness_residual_px",
+          "straightness_source",
           "success",
           "test_frame_ids",
           "test_residual_stats",
@@ -122,6 +163,7 @@
       }
     },
     "holdout_models": [
+      "brown_conrady",
       "extended_pinhole",
       "fisheye",
       "pinhole"
@@ -156,7 +198,7 @@
   },
   "export_format_version": 1,
   "final_calibration_summary": {
-    "chosen_model": "extended_pinhole",
+    "chosen_model": "pinhole",
     "has_confidence": true,
     "has_diagnosis": true,
     "has_observability": true,
@@ -178,7 +220,7 @@
     "overall_grade": "poor"
   },
   "final_result": {
-    "chosen_model": "extended_pinhole",
+    "chosen_model": "pinhole",
     "has_confidence": true,
     "has_diagnosis": true,
     "keys": [
@@ -207,13 +249,14 @@
       ],
       "has_aic": true,
       "has_bic": true,
-      "has_selection_reasons": false,
-      "is_recommended": false,
+      "has_selection_reasons": true,
+      "is_recommended": true,
       "keys": [
         "aic",
         "bic",
         "components",
         "is_recommended",
+        "is_selection_eligible",
         "model",
         "num_observations",
         "parameter_count",
@@ -222,7 +265,9 @@
         "selection_confidence",
         "selection_confidence_level",
         "selection_confidence_reason",
-        "selection_reasons"
+        "selection_ineligibility_reason",
+        "selection_reasons",
+        "selection_status"
       ],
       "model": "pinhole"
     },
@@ -242,13 +287,14 @@
       ],
       "has_aic": true,
       "has_bic": true,
-      "has_selection_reasons": true,
-      "is_recommended": true,
+      "has_selection_reasons": false,
+      "is_recommended": false,
       "keys": [
         "aic",
         "bic",
         "components",
         "is_recommended",
+        "is_selection_eligible",
         "model",
         "num_observations",
         "parameter_count",
@@ -257,9 +303,11 @@
         "selection_confidence",
         "selection_confidence_level",
         "selection_confidence_reason",
-        "selection_reasons"
+        "selection_ineligibility_reason",
+        "selection_reasons",
+        "selection_status"
       ],
-      "model": "extended_pinhole"
+      "model": "brown_conrady"
     },
     {
       "component_keys": [
@@ -275,6 +323,32 @@
         "test",
         "train"
       ],
+      "has_aic": true,
+      "has_bic": true,
+      "has_selection_reasons": false,
+      "is_recommended": false,
+      "keys": [
+        "aic",
+        "bic",
+        "components",
+        "is_recommended",
+        "is_selection_eligible",
+        "model",
+        "num_observations",
+        "parameter_count",
+        "residual_sum_squares",
+        "score",
+        "selection_confidence",
+        "selection_confidence_level",
+        "selection_confidence_reason",
+        "selection_ineligibility_reason",
+        "selection_reasons",
+        "selection_status"
+      ],
+      "model": "extended_pinhole"
+    },
+    {
+      "component_keys": [],
       "has_aic": false,
       "has_bic": false,
       "has_selection_reasons": false,
@@ -284,6 +358,7 @@
         "bic",
         "components",
         "is_recommended",
+        "is_selection_eligible",
         "model",
         "num_observations",
         "parameter_count",
@@ -292,14 +367,41 @@
         "selection_confidence",
         "selection_confidence_level",
         "selection_confidence_reason",
-        "selection_reasons"
+        "selection_ineligibility_reason",
+        "selection_reasons",
+        "selection_status"
       ],
       "model": "fisheye"
     }
   ],
   "models": {
-    "extended_pinhole": {
+    "brown_conrady": {
       "distortion_coefficient_count": 5,
+      "has_camera_matrix": true,
+      "has_observability": true,
+      "has_residual_stats": true,
+      "has_undistortion_quality": true,
+      "keys": [
+        "camera_matrix",
+        "distortion_coefficient_count",
+        "distortion_coefficients",
+        "error_message",
+        "observability",
+        "parameter_uncertainty",
+        "parameter_uncertainty_bootstrap",
+        "per_frame_error_px",
+        "radial_error_profile",
+        "regional_error_px",
+        "residual_stats",
+        "rms_reprojection_error_px",
+        "success",
+        "undistortion_quality",
+        "validation"
+      ],
+      "success": true
+    },
+    "extended_pinhole": {
+      "distortion_coefficient_count": 8,
       "has_camera_matrix": true,
       "has_observability": true,
       "has_residual_stats": true,

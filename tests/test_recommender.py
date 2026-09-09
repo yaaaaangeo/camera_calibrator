@@ -9,12 +9,19 @@ tests/test_recommender.py
 
 from __future__ import annotations
 
-from calibration.recommender import compute_final_result, compute_model_scores, format_score_table
+from calibration.recommender import (
+    build_recommendation_message,
+    compute_final_result,
+    compute_model_scores,
+    format_score_table,
+)
 from calibration.types import (
     CalibrationResult,
     CameraModelType,
     ModelScoreWeights,
+    ObservabilityReport,
     QualityGrade,
+    RegionalError,
     ResidualStats,
     ValidationResult,
 )
@@ -32,8 +39,21 @@ def _cal(rms: float, success: bool = True, p95: float | None = None) -> Calibrat
 
 def _val(test_rms=None, edge_rms=None, straightness=None) -> ValidationResult:
     return ValidationResult(
-        train_frame_ids=[], test_frame_ids=[],
-        test_rms=test_rms, edge_rms=edge_rms, straightness_residual=straightness, success=True,
+        train_frame_ids=["train-1"], test_frame_ids=["test-1"],
+        test_rms=test_rms, edge_rms=edge_rms, straightness_residual=straightness,
+        straightness_source="test" if straightness is not None else None,
+        test_residual_stats=ResidualStats(n=10, rmse=test_rms, p95=(test_rms * 2.0 if test_rms is not None else None))
+        if test_rms is not None else None,
+        per_frame_error={"test-1": test_rms} if test_rms is not None else {},
+        success=True,
+    )
+
+
+def _p95_only_weights() -> ModelScoreWeights:
+    return ModelScoreWeights(
+        w_train=0.0, w_test=0.0, w_edge=0.0, w_line=0.0, w_complexity=0.0,
+        w_p95=1.0, w_radial=0.0, w_aic=0.0, w_bic=0.0, w_stability=0.0,
+        w_observability=0.0,
     )
 
 
@@ -103,8 +123,8 @@ def test_missing_validation_falls_back_to_train_rms_only():
     assert "Hold-out validation is missing or failed." in final.confidence.warnings
 
 
-def test_model_score_test_p95_does_not_fallback_to_train_residual_p95():
-    """Test P95 must come only from hold-out test residual stats, not calibration stats."""
+def test_model_with_missing_core_validation_is_not_selection_eligible():
+    """A calibrated model without core hold-out residual stats is not a recommendation candidate."""
     cal = {
         CameraModelType.PINHOLE: CalibrationResult(
             model_name=CameraModelType.PINHOLE,
@@ -131,9 +151,203 @@ def test_model_score_test_p95_does_not_fallback_to_train_residual_p95():
 
     scores = compute_model_scores(cal, val, weights)
 
-    assert {s.components["p95"] for s in scores} == {0.0}
+    assert all(not s.is_selection_eligible for s in scores)
+    assert all(s.selection_status == "VALIDATION INCOMPLETE" for s in scores)
     table = format_score_table(scores, cal, val)
     p95_line = next(line for line in table.splitlines() if line.startswith("Test P95"))
+    score_line = next(line for line in table.splitlines() if line.startswith("Score"))
+    assert p95_line.count("N/A") == 2
+    assert score_line.count("Not eligible") == 2
+    assert "0.100" not in p95_line
+    assert "10.000" not in p95_line
+
+
+def test_model_score_test_p95_does_not_fallback_to_train_residual_p95_when_stats_lack_p95():
+    cal = {
+        CameraModelType.PINHOLE: CalibrationResult(
+            model_name=CameraModelType.PINHOLE,
+            rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4, p95=0.1),
+            success=True,
+        ),
+        CameraModelType.BROWN_CONRADY: CalibrationResult(
+            model_name=CameraModelType.BROWN_CONRADY,
+            rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4, p95=10.0),
+            success=True,
+        ),
+    }
+    val = {
+        CameraModelType.PINHOLE: ValidationResult(
+            train_frame_ids=["train-1"], test_frame_ids=["test-1"], test_rms=0.5,
+            test_residual_stats=ResidualStats(n=100, rmse=0.5, p95=None),
+            per_frame_error={"test-1": 0.5}, success=True,
+        ),
+        CameraModelType.BROWN_CONRADY: ValidationResult(
+            train_frame_ids=["train-1"], test_frame_ids=["test-1"], test_rms=0.5,
+            test_residual_stats=ResidualStats(n=100, rmse=0.5, p95=None),
+            per_frame_error={"test-1": 0.5}, success=True,
+        ),
+    }
+
+    scores = compute_model_scores(cal, val, weights=_p95_only_weights())
+    table = format_score_table(scores, cal, val)
+    p95_line = next(line for line in table.splitlines() if line.startswith("Test P95"))
+
+    assert all(s.is_selection_eligible for s in scores)
+    assert {s.components["p95"] for s in scores} == {0.0}
     assert p95_line.count("N/A") == 2
     assert "0.100" not in p95_line
     assert "10.000" not in p95_line
+
+
+def test_validation_failed_model_is_excluded_from_recommendation_candidates():
+    cal = {
+        CameraModelType.BROWN_CONRADY: CalibrationResult(
+            model_name=CameraModelType.BROWN_CONRADY, rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4), success=True,
+        ),
+        CameraModelType.EXTENDED_PINHOLE: CalibrationResult(
+            model_name=CameraModelType.EXTENDED_PINHOLE, rms_error=0.5,
+            residual_stats=ResidualStats(n=100, rmse=0.5), success=True,
+        ),
+        CameraModelType.FISHEYE: CalibrationResult(
+            model_name=CameraModelType.FISHEYE, rms_error=0.1,
+            residual_stats=ResidualStats(n=100, rmse=0.1), success=True,
+        ),
+    }
+    val = {
+        CameraModelType.BROWN_CONRADY: _val(test_rms=0.4, edge_rms=0.4),
+        CameraModelType.EXTENDED_PINHOLE: _val(test_rms=0.5, edge_rms=0.5),
+        CameraModelType.FISHEYE: ValidationResult(
+            train_frame_ids=["train-1"], test_frame_ids=["test-1"],
+            success=False, error_message="solvePnP failed",
+        ),
+    }
+
+    scores = compute_model_scores(cal, val)
+    by_model = {s.model_name: s for s in scores}
+
+    assert not by_model[CameraModelType.FISHEYE].is_selection_eligible
+    assert by_model[CameraModelType.FISHEYE].selection_status == "VALIDATION INCOMPLETE"
+    assert by_model[CameraModelType.FISHEYE].selection_confidence == 0.0
+    assert not by_model[CameraModelType.FISHEYE].is_recommended
+    assert sum(1 for s in scores if s.is_recommended) == 1
+    assert next(s for s in scores if s.is_recommended).model_name != CameraModelType.FISHEYE
+
+
+def test_test_edge_rms_does_not_fallback_to_train_regional_error():
+    cal = {
+        CameraModelType.PINHOLE: CalibrationResult(
+            model_name=CameraModelType.PINHOLE,
+            rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4),
+            regional_error=RegionalError(corner=0.1),
+            success=True,
+        ),
+        CameraModelType.BROWN_CONRADY: CalibrationResult(
+            model_name=CameraModelType.BROWN_CONRADY,
+            rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4),
+            regional_error=RegionalError(corner=10.0),
+            success=True,
+        ),
+    }
+    val = {
+        CameraModelType.PINHOLE: ValidationResult(
+            train_frame_ids=["train-1"], test_frame_ids=["test-1"], test_rms=0.5,
+            edge_rms=None, test_residual_stats=ResidualStats(n=100, rmse=0.5, p95=1.0),
+            per_frame_error={"test-1": 0.5}, success=True,
+        ),
+        CameraModelType.BROWN_CONRADY: ValidationResult(
+            train_frame_ids=["train-1"], test_frame_ids=["test-1"], test_rms=0.5,
+            edge_rms=None, test_residual_stats=ResidualStats(n=100, rmse=0.5, p95=1.0),
+            per_frame_error={"test-1": 0.5}, success=True,
+        ),
+    }
+    weights = ModelScoreWeights(
+        w_train=0.0, w_test=0.0, w_edge=1.0, w_line=0.0, w_complexity=0.0,
+        w_p95=0.0, w_radial=0.0, w_aic=0.0, w_bic=0.0, w_stability=0.0,
+        w_observability=0.0,
+    )
+
+    scores = compute_model_scores(cal, val, weights)
+    table = format_score_table(scores, cal, val)
+    edge_line = next(line for line in table.splitlines() if line.startswith("Edge RMS"))
+
+    assert {s.components["edge"] for s in scores} == {0.0}
+    assert edge_line.count("N/A") == 2
+    assert "0.100" not in edge_line
+    assert "10.000" not in edge_line
+
+
+def test_train_fallback_straightness_is_not_positive_holdout_evidence():
+    cal = {
+        CameraModelType.BROWN_CONRADY: CalibrationResult(
+            model_name=CameraModelType.BROWN_CONRADY, rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4), success=True,
+        ),
+        CameraModelType.EXTENDED_PINHOLE: CalibrationResult(
+            model_name=CameraModelType.EXTENDED_PINHOLE, rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4), success=True,
+        ),
+    }
+    val = {
+        CameraModelType.BROWN_CONRADY: ValidationResult(
+            train_frame_ids=["train-1"], test_frame_ids=["test-1"], test_rms=0.4,
+            straightness_residual=0.8, straightness_source="test",
+            test_residual_stats=ResidualStats(n=100, rmse=0.4, p95=0.8),
+            per_frame_error={"test-1": 0.4}, success=True,
+        ),
+        CameraModelType.EXTENDED_PINHOLE: ValidationResult(
+            train_frame_ids=["train-1"], test_frame_ids=["test-1"], test_rms=0.4,
+            straightness_residual=0.5, straightness_source="train_fallback",
+            test_residual_stats=ResidualStats(n=100, rmse=0.4, p95=0.8),
+            per_frame_error={"test-1": 0.4}, success=True,
+        ),
+    }
+    weights = ModelScoreWeights(
+        w_train=0.0, w_test=0.0, w_edge=0.0, w_line=1.0, w_complexity=0.0,
+        w_p95=0.0, w_radial=0.0, w_aic=0.0, w_bic=0.0, w_stability=0.0,
+        w_observability=0.0,
+    )
+
+    scores = compute_model_scores(cal, val, weights)
+    message = build_recommendation_message(scores, cal, val)
+
+    assert {s.components["line"] for s in scores} == {0.0}
+    assert "Best Test Straightness" not in message
+
+
+def test_poor_observability_is_not_positive_selection_reason():
+    cal = {
+        CameraModelType.PINHOLE: CalibrationResult(
+            model_name=CameraModelType.PINHOLE, rms_error=0.4,
+            residual_stats=ResidualStats(n=100, rmse=0.4),
+            observability=ObservabilityReport(
+                jacobian_cols=4, rank=4, condition_number=1e12,
+                max_abs_correlation=0.99, observability_score=0.0,
+                observability_grade="POOR",
+            ),
+            success=True,
+        ),
+        CameraModelType.BROWN_CONRADY: CalibrationResult(
+            model_name=CameraModelType.BROWN_CONRADY, rms_error=0.5,
+            residual_stats=ResidualStats(n=100, rmse=0.5),
+            observability=ObservabilityReport(
+                jacobian_cols=9, rank=9, condition_number=1e12,
+                max_abs_correlation=0.99, observability_score=0.0,
+                observability_grade="POOR",
+            ),
+            success=True,
+        ),
+    }
+    val = {
+        CameraModelType.PINHOLE: _val(test_rms=0.4, edge_rms=0.4),
+        CameraModelType.BROWN_CONRADY: _val(test_rms=0.5, edge_rms=0.5),
+    }
+
+    scores = compute_model_scores(cal, val)
+    recommended = next(s for s in scores if s.is_recommended)
+
+    assert all("Best Observability" not in reason for reason in recommended.selection_reasons)

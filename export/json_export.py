@@ -120,6 +120,7 @@ def _cross_validation_summary(
             "test_residual_stats": val.test_residual_stats,
             "edge_rms_px": val.edge_rms,
             "straightness_residual_px": val.straightness_residual,
+            "straightness_source": val.straightness_source,
             "straightness_breakdown": val.straightness_breakdown,
             "failed_test_frame_ids": val.failed_test_frame_ids,
             "error_message": val.error_message,
@@ -244,6 +245,7 @@ def build_export_dict(
                 "test_rms_px": val.test_rms,
                 "edge_rms_px": val.edge_rms,
                 "line_straightness_residual_px": val.straightness_residual,
+                "line_straightness_source": val.straightness_source,
                 "num_train_frames": len(val.train_frame_ids),
                 "num_test_frames": len(val.test_frame_ids),
             }
@@ -251,7 +253,12 @@ def build_export_dict(
 
     if model_scores:
         payload["model_scores"] = [
-            {"model": s.model_name.value, "score": s.score, "is_recommended": s.is_recommended,
+            {"model": s.model_name.value,
+             "score": s.score if s.is_selection_eligible else None,
+             "is_recommended": s.is_recommended,
+             "is_selection_eligible": s.is_selection_eligible,
+             "selection_status": s.selection_status,
+             "selection_ineligibility_reason": s.selection_ineligibility_reason,
              "components": s.components, "parameter_count": s.parameter_count,
              "residual_sum_squares": s.residual_sum_squares,
              "num_observations": s.num_observations, "aic": s.aic, "bic": s.bic,

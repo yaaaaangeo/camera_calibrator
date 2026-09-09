@@ -143,11 +143,13 @@ def test_result_view_table_has_no_complexity_row(qapp):
     from ui.result_view import ResultView
 
     view = ResultView()
-    assert view.table.rowCount() == 14
+    assert view.table.rowCount() == 19
     labels = [view.table.verticalHeaderItem(i).text() for i in range(view.table.rowCount())]
     assert "Complexity" not in labels
     assert labels == [
-        "Train RMS", "Test RMS", "Test P95", "Edge RMS", "Straightness",
+        "Validation Status", "Train RMS", "Test Frames", "Successful Test Frames",
+        "Failed Test Frames", "Failure Reason", "Test RMS", "Test P95",
+        "Test Edge RMS", "Straightness",
         "Radial Edge", "AIC", "BIC", "Stability", "Observability",
         "Undistortion", "Model Score", "Selection Conf.", "Recommend",
     ]

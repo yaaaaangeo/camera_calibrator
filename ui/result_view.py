@@ -36,7 +36,7 @@ from calibration.types import (
     StandardVsObjectReleasingComparison,
     ValidationResult,
 )
-from calibration.models.common import regional_edge_average
+from calibration.recommender import model_selection_status
 from ui.theme import Theme, qcolor, set_tone
 
 _MODEL_LABELS = {
@@ -248,7 +248,9 @@ class ResultView(QWidget):
         compare_group = QGroupBox("Model Comparison & Validation & Score")
         compare_layout = QVBoxLayout(compare_group)
         self._row_labels = [
-            "Train RMS", "Test RMS", "Test P95", "Edge RMS", "Straightness",
+            "Validation Status", "Train RMS", "Test Frames", "Successful Test Frames",
+            "Failed Test Frames", "Failure Reason", "Test RMS", "Test P95",
+            "Test Edge RMS", "Straightness",
             "Radial Edge", "AIC", "BIC", "Stability", "Observability",
             "Undistortion", "Model Score", "Selection Conf.", "Recommend",
         ]
@@ -455,15 +457,27 @@ class ResultView(QWidget):
             val = validation_results.get(m)
             score = score_by_model.get(m)
 
+            _eligible, status, ineligible_reason = model_selection_status(cal, val)
+            validation_status = score.selection_status if score else status
+            failure_reason_text = (
+                (score.selection_ineligibility_reason if score else None)
+                or ineligible_reason
+                or (val.error_message if val and val.error_message else None)
+                or ""
+            )
+            test_frame_count = str(len(val.test_frame_ids)) if val else "N/A"
+            successful_test_frame_count = str(len(val.per_frame_error)) if val else "N/A"
+            failed_test_frame_count = str(len(val.failed_test_frame_ids)) if val else "N/A"
             train_rms = _fmt(cal.rms_error) if cal and cal.success else "FAIL"
             test_rms = _fmt(val.test_rms) if val and val.success else "N/A"
             if val and val.success and val.edge_rms is not None:
                 edge_rms = _fmt(val.edge_rms)
-            elif cal and cal.success and cal.regional_error:
-                edge_rms = _fmt(regional_edge_average(cal.regional_error))
             else:
                 edge_rms = "N/A"
-            straightness = _fmt(val.straightness_residual) if val else "N/A"
+            straightness = _fmt(val.straightness_residual) if val and val.straightness_residual is not None else "N/A"
+            if straightness != "N/A" and getattr(val, "straightness_source", None):
+                suffix = "TEST" if val.straightness_source == "test" else "TRAIN fallback"
+                straightness = f"{straightness} ({suffix})"
             p95 = _fmt(_p95(cal, val))
             radial = _fmt(_radial_edge(cal))
             aic = f"{score.aic:.1f}" if score and score.aic is not None else "N/A"
@@ -477,7 +491,9 @@ class ResultView(QWidget):
                 f"{cal.undistortion_quality.quality_score:.0f}% {cal.undistortion_quality.quality_grade.value}".strip()
                 if cal and cal.undistortion_quality else "N/A"
             )
-            score_str = f"{score.score:.3f}" if score else "N/A"
+            score_str = f"{score.score:.3f}" if score and score.is_selection_eligible else (
+                "Not eligible" if score else "N/A"
+            )
             selection_conf = (
                 f"{score.selection_confidence:.0f}% {score.selection_confidence_level}"
                 if score and score.selection_confidence is not None and score.selection_confidence_level else "N/A"
@@ -486,7 +502,8 @@ class ResultView(QWidget):
 
             for row, value in enumerate(
                 [
-                    train_rms, test_rms, p95, edge_rms, straightness,
+                    validation_status, train_rms, test_frame_count, successful_test_frame_count,
+                    failed_test_frame_count, failure_reason_text, test_rms, p95, edge_rms, straightness,
                     radial, aic, bic, stability, observability,
                     undistortion, score_str, selection_conf, recommend,
                 ]

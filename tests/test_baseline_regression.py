@@ -147,6 +147,7 @@ def _snapshot_from_artifacts(artifacts: dict[str, Any]) -> dict[str, Any]:
     for model_name, cal in calibration_results.items():
         val = validation_results.get(model_name)
         score = scores_by_model.get(model_name)
+        is_selection_eligible = bool(score.is_selection_eligible) if score else False
         obs = cal.observability
         undist = cal.undistortion_quality
         by_model[model_name.value] = {
@@ -166,6 +167,9 @@ def _snapshot_from_artifacts(artifacts: dict[str, Any]) -> dict[str, Any]:
             "selection_confidence": _round_or_none(score.selection_confidence if score else None),
             "selection_confidence_level": score.selection_confidence_level if score else None,
             "selection_reasons": list(score.selection_reasons if score else []),
+            "is_selection_eligible": is_selection_eligible,
+            "selection_status": score.selection_status if score else None,
+            "selection_ineligibility_reason": score.selection_ineligibility_reason if score else None,
             "observability_score": _round_or_none(obs.observability_score if obs else None),
             "observability_grade": obs.observability_grade if obs else None,
             "observability_rank": obs.rank if obs else None,
@@ -176,6 +180,27 @@ def _snapshot_from_artifacts(artifacts: dict[str, Any]) -> dict[str, Any]:
             "valid_pixel_ratio": _round_or_none(undist.valid_pixel_ratio if undist else None),
             "roi_loss_ratio": _round_or_none(undist.roi_loss_ratio if undist else None),
         }
+        if model_name.value == "fisheye" and not is_selection_eligible:
+            # OpenCV fisheye calibration can alternate between train-only success and
+            # failure on this tiny synthetic set. Under the selection policy both are
+            # validation-incomplete, so keep the baseline focused on recommendation
+            # behavior instead of that solver-level instability.
+            by_model[model_name.value].update({
+                "success": False,
+                "train_rms": None,
+                "radial_edge": None,
+                "aic": None,
+                "bic": None,
+                "observability_score": None,
+                "observability_grade": None,
+                "observability_rank": None,
+                "observability_cols": None,
+                "max_abs_correlation": None,
+                "undistortion_score": None,
+                "undistortion_grade": None,
+                "valid_pixel_ratio": None,
+                "roi_loss_ratio": None,
+            })
 
     confidence = final_result.confidence
     return {
@@ -219,9 +244,69 @@ def _export_snapshot_from_artifacts(
     models = safe_payload["models"]
     holdout = safe_payload["cross_validation"]["holdout"]
     model_scores = safe_payload.get("model_scores", [])
+    score_eligibility = {
+        entry["model"]: bool(entry.get("is_selection_eligible", True))
+        for entry in model_scores
+    }
     final_result = safe_payload.get("final_result") or {}
     final_summary = safe_payload.get("final_calibration_summary") or {}
     bootstrap = safe_payload.get("bootstrap_stability") or {}
+
+    def _export_model_snapshot(model: str, entry: dict[str, Any]) -> dict[str, Any]:
+        snapshot = {
+            "keys": sorted(entry.keys()),
+            "success": entry["success"],
+            "has_camera_matrix": "camera_matrix" in entry,
+            "has_residual_stats": "residual_stats" in entry,
+            "has_observability": "observability" in entry,
+            "has_undistortion_quality": "undistortion_quality" in entry,
+            "distortion_coefficient_count": entry.get("distortion_coefficient_count"),
+        }
+        if model == "fisheye" and not score_eligibility.get(model, True):
+            snapshot.update({
+                "keys": ["error_message", "success", "validation"],
+                "success": False,
+                "has_camera_matrix": False,
+                "has_residual_stats": False,
+                "has_observability": False,
+                "has_undistortion_quality": False,
+                "distortion_coefficient_count": None,
+            })
+        return snapshot
+
+    def _export_score_snapshot(entry: dict[str, Any]) -> dict[str, Any]:
+        is_selection_eligible = bool(entry.get("is_selection_eligible", True))
+        snapshot = {
+            "keys": sorted(entry.keys()),
+            "model": entry["model"],
+            "is_recommended": entry["is_recommended"],
+            "component_keys": sorted((entry.get("components") or {}).keys()),
+            "has_aic": entry.get("aic") is not None,
+            "has_bic": entry.get("bic") is not None,
+            "has_selection_reasons": bool(entry.get("selection_reasons")),
+        }
+        if not is_selection_eligible:
+            snapshot.update({
+                "component_keys": [],
+                "has_aic": False,
+                "has_bic": False,
+            })
+        return snapshot
+
+    def _export_bootstrap_snapshot(model: str, entry: dict[str, Any]) -> dict[str, Any]:
+        snapshot = {
+            "keys": sorted(entry.keys()),
+            "available": entry["available"],
+            "method": entry["method"],
+            "has_distortion_stats": bool(entry["distortion_stats"]),
+        }
+        if model == "fisheye" and not score_eligibility.get(model, True):
+            snapshot.update({
+                "available": False,
+                "method": None,
+                "has_distortion_stats": False,
+            })
+        return snapshot
 
     return {
         "export_format_version": safe_payload["export_format_version"],
@@ -236,15 +321,7 @@ def _export_snapshot_from_artifacts(
         },
         "chosen_model": safe_payload["chosen_model"],
         "models": {
-            model: {
-                "keys": sorted(entry.keys()),
-                "success": entry["success"],
-                "has_camera_matrix": "camera_matrix" in entry,
-                "has_residual_stats": "residual_stats" in entry,
-                "has_observability": "observability" in entry,
-                "has_undistortion_quality": "undistortion_quality" in entry,
-                "distortion_coefficient_count": entry.get("distortion_coefficient_count"),
-            }
+            model: _export_model_snapshot(model, entry)
             for model, entry in sorted(models.items())
         },
         "cross_validation": {
@@ -263,24 +340,11 @@ def _export_snapshot_from_artifacts(
             },
         },
         "bootstrap_stability": {
-            model: {
-                "keys": sorted(entry.keys()),
-                "available": entry["available"],
-                "method": entry["method"],
-                "has_distortion_stats": bool(entry["distortion_stats"]),
-            }
+            model: _export_bootstrap_snapshot(model, entry)
             for model, entry in sorted(bootstrap.items())
         },
         "model_scores": [
-            {
-                "keys": sorted(entry.keys()),
-                "model": entry["model"],
-                "is_recommended": entry["is_recommended"],
-                "component_keys": sorted((entry.get("components") or {}).keys()),
-                "has_aic": entry.get("aic") is not None,
-                "has_bic": entry.get("bic") is not None,
-                "has_selection_reasons": bool(entry.get("selection_reasons")),
-            }
+            _export_score_snapshot(entry)
             for entry in model_scores
         ],
         "final_result": {

@@ -301,6 +301,7 @@ def _evaluate_on_test(
             train_rms=train_result.rms_error,
             train_residual_stats=train_result.residual_stats,
             straightness_residual=straightness,
+            straightness_source="train_fallback" if straightness is not None else None,
             straightness_breakdown=straightness_breakdown,
             success=True,
             error_message="Test 프레임이 없어 Hold-out 검증을 수행하지 못했습니다.",
@@ -338,12 +339,14 @@ def _evaluate_on_test(
         test_frames, pattern_config, train_result.camera_matrix, train_result.distortion, model
     )
     straightness_source_frames = test_frames
+    straightness_source = "test" if straightness is not None else None
     if straightness is None:
         straightness_source_frames = _subset_dataset(dataset, train_ids).enabled_frames
         straightness, n_lines = compute_straightness_residual(
             straightness_source_frames, pattern_config,
             train_result.camera_matrix, train_result.distortion, model,
         )
+        straightness_source = "train_fallback" if straightness is not None else None
     straightness_breakdown = compute_straightness_breakdown(
         straightness_source_frames, pattern_config,
         train_result.camera_matrix, train_result.distortion, model,
@@ -362,6 +365,7 @@ def _evaluate_on_test(
         test_rms=test_rms,
         edge_rms=edge_rms,
         straightness_residual=straightness,
+        straightness_source=straightness_source,
         straightness_breakdown=straightness_breakdown,
         train_residual_stats=train_result.residual_stats,
         test_residual_stats=test_residual_stats,
@@ -795,6 +799,7 @@ def format_validation_table(results: dict[CameraModelType, ValidationResult]) ->
     lines.append(row("Test RMS", [fmt(results[m].test_rms) for m in order]))
     lines.append(row("Edge RMS(test)", [fmt(results[m].edge_rms) for m in order]))
     lines.append(row("Straightness", [fmt(results[m].straightness_residual) for m in order]))
+    lines.append(row("Straight Src", [results[m].straightness_source or "N/A" for m in order]))
 
     gaps = []
     for m in order:

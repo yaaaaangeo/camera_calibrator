@@ -727,6 +727,7 @@ class ValidationResult:
     test_rms: Optional[float] = None            # test intrinsic 재최적화 금지 원칙 준수
     edge_rms: Optional[float] = None
     straightness_residual: Optional[float] = None  # V2, 없으면 None
+    straightness_source: Optional[str] = None  # "test" | "train_fallback" | None
     # 설계 문서 15번 - straightness_residual(스칼라 하나) 대신 방향/위치별로
     # 쪼갠 값. straightness_residual == straightness_breakdown.overall_error다
     # (하위 호환을 위해 둘 다 채운다).
@@ -968,6 +969,9 @@ class ModelScore:
     score: float
     components: dict[str, float] = field(default_factory=dict)  # 항목별 기여도 (디버깅/설명용)
     is_recommended: bool = False
+    is_selection_eligible: bool = True
+    selection_status: str = "ELIGIBLE"
+    selection_ineligibility_reason: Optional[str] = None
     # 설계 문서 24/25번 - AIC/BIC. score 공식에는 아직 직접 섞지 않고
     # 모델 비교/리포트가 원본 값을 그대로 보여줄 수 있게 함께 보관한다.
     parameter_count: int = 0

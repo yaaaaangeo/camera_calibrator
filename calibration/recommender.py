@@ -34,7 +34,6 @@ from calibration.types import (
     QualityGrade,
     ValidationResult,
 )
-from calibration.models.common import regional_edge_average
 from calibration.diagnosis import diagnose_calibration
 
 # 모델별 distortion 자유도. 실제 CalibrationResult.distortion
@@ -118,6 +117,36 @@ def _model_p95(calibration: CalibrationResult, validation: ValidationResult | No
     return _test_p95(validation)
 
 
+def model_selection_status(
+    calibration: CalibrationResult | None,
+    validation: ValidationResult | None,
+) -> tuple[bool, str, str | None]:
+    if calibration is None or not calibration.success:
+        reason = "Calibration failed."
+        if calibration and calibration.error_message:
+            reason = f"Calibration failed: {calibration.error_message}"
+        return False, "CALIBRATION FAILED", reason
+    if validation is None:
+        return False, "VALIDATION INCOMPLETE", "Hold-out validation was not run."
+    if not validation.success:
+        return False, "VALIDATION INCOMPLETE", validation.error_message or "Hold-out validation failed."
+    if not validation.test_frame_ids:
+        return False, "VALIDATION INCOMPLETE", validation.error_message or "No hold-out test frames."
+    if validation.test_rms is None:
+        return False, "VALIDATION INCOMPLETE", "Hold-out Test RMS is unavailable."
+    if validation.test_residual_stats is None:
+        return False, "VALIDATION INCOMPLETE", "Hold-out test residual statistics are unavailable."
+    return True, "ELIGIBLE", None
+
+
+def is_model_selection_eligible(
+    calibration: CalibrationResult | None,
+    validation: ValidationResult | None,
+) -> bool:
+    eligible, _status, _reason = model_selection_status(calibration, validation)
+    return eligible
+
+
 def _radial_error_score(result: CalibrationResult) -> float | None:
     """Radial bands에서 외곽 쪽 P95/RMS를 대표 radial penalty로 뽑는다."""
     profile = result.radial_bands or result.radial_profile
@@ -184,6 +213,16 @@ def _observability_penalty(result: CalibrationResult) -> float | None:
     return max(penalties) if penalties else 0.0
 
 
+def _observability_positive_evidence_allowed(result: CalibrationResult) -> bool:
+    obs = result.observability
+    return bool(
+        obs is not None
+        and obs.observability_score is not None
+        and obs.observability_score >= 50.0
+        and obs.observability_grade != "POOR"
+    )
+
+
 def _parameter_stability_score(result: CalibrationResult) -> float | None:
     penalty = _parameter_stability_penalty(result)
     return 100.0 - penalty if penalty is not None else None
@@ -199,6 +238,22 @@ def _is_best_higher(values: dict[CameraModelType, float | None], model: CameraMo
     value = values.get(model)
     valid = [v for v in values.values() if v is not None]
     return value is not None and valid and value >= max(valid) - 1e-9
+
+
+def _all_present(values: dict[CameraModelType, float | None], models: list[CameraModelType]) -> bool:
+    return bool(models) and all(values.get(m) is not None for m in models)
+
+
+def _normalize_comparable(
+    values: dict[CameraModelType, float | None],
+    comparable_models: list[CameraModelType],
+) -> dict[CameraModelType, float]:
+    if not comparable_models:
+        return {k: 0.0 for k in values}
+    if any(values.get(m) is None for m in comparable_models):
+        return {k: 0.0 for k in values}
+    masked = {k: (v if k in comparable_models else None) for k, v in values.items()}
+    return _normalize(masked)
 
 
 def _fmt_px(value: float) -> str:
@@ -220,22 +275,21 @@ def _apply_selection_reasons(
 
     model = recommended.model_name
     score_by_model = {s.model_name: s for s in scores}
-    models = [s.model_name for s in scores if calibration_results[s.model_name].success]
+    models = [
+        s.model_name for s in scores
+        if is_model_selection_eligible(calibration_results.get(s.model_name), validation_results.get(s.model_name))
+    ]
     test_rms = {
         m: validation_results[m].test_rms
-        if validation_results.get(m) and validation_results[m].success else None
         for m in models
     }
     test_p95 = {m: _model_p95(calibration_results[m], validation_results.get(m)) for m in models}
-    edge = {}
-    for m in models:
-        vr = validation_results.get(m)
-        if vr and vr.success and vr.edge_rms is not None:
-            edge[m] = vr.edge_rms
-        elif calibration_results[m].regional_error:
-            edge[m] = regional_edge_average(calibration_results[m].regional_error)
-        else:
-            edge[m] = None
+    edge = {m: validation_results[m].edge_rms for m in models}
+    line = {
+        m: validation_results[m].straightness_residual
+        if validation_results[m].straightness_source == "test" else None
+        for m in models
+    }
     radial = {m: _radial_error_score(calibration_results[m]) for m in models}
     aic = {m: score_by_model[m].aic for m in models}
     bic = {m: score_by_model[m].bic for m in models}
@@ -245,18 +299,29 @@ def _apply_selection_reasons(
     reasons: list[str] = []
 
     lower_metrics = [
-        ("Lowest Test RMS", test_rms, _fmt_px),
-        ("Lowest Test P95", test_p95, _fmt_px),
-        ("Lowest Edge Error", edge, _fmt_px),
-        ("Best Radial Error", radial, _fmt_px),
-        ("Best AIC", aic, _fmt_plain),
-        ("Best BIC", bic, _fmt_plain),
-        ("Best Observability", observability, lambda v: f"penalty {v:.1f}/100"),
+        ("Lowest Test RMS", test_rms, _fmt_px, True),
+        ("Lowest Test P95", test_p95, _fmt_px, _all_present(test_p95, models)),
+        ("Lowest Edge Error", edge, _fmt_px, _all_present(edge, models)),
+        ("Best Test Straightness", line, _fmt_px, _all_present(line, models)),
+        ("Best Radial Error", radial, _fmt_px, _all_present(radial, models)),
+        ("Best AIC", aic, _fmt_plain, _all_present(aic, models)),
+        ("Best BIC", bic, _fmt_plain, _all_present(bic, models)),
     ]
-    for label, values, formatter in lower_metrics:
+    for label, values, formatter, comparable in lower_metrics:
+        if not comparable:
+            continue
         value = values.get(model)
         if value is not None and _is_best_lower(values, model):
             reasons.append(f"{label} ({formatter(value)})")
+
+    observability_value = observability.get(model)
+    if (
+        observability_value is not None
+        and _all_present(observability, models)
+        and _observability_positive_evidence_allowed(calibration_results[model])
+        and _is_best_lower(observability, model)
+    ):
+        reasons.append(f"Best Observability (penalty {observability_value:.1f}/100)")
 
     stability_value = stability.get(model)
     if stability_value is not None:
@@ -304,7 +369,10 @@ def _apply_per_model_confidence(scores: list[ModelScore], ranked: list[ModelScor
     for s in failed:
         s.selection_confidence = 0.0
         s.selection_confidence_level = "LOW"
-        s.selection_confidence_reason = "Calibration failed, so this model is not a selection candidate."
+        s.selection_confidence_reason = (
+            s.selection_ineligibility_reason
+            or "This model is not a selection candidate."
+        )
 
     if not ranked:
         return
@@ -312,7 +380,7 @@ def _apply_per_model_confidence(scores: list[ModelScore], ranked: list[ModelScor
         only = ranked[0]
         only.selection_confidence = 100.0
         only.selection_confidence_level = "HIGH"
-        only.selection_confidence_reason = "Only one model calibrated successfully."
+        only.selection_confidence_reason = "Only one model has complete hold-out validation evidence."
         return
 
     best_score = ranked[0].score
@@ -341,7 +409,7 @@ def _apply_selection_confidence(
     test P95, edge RMS)이 거의 같으면 LOW로 낮춘다. 즉 "추천은 이 모델이지만
     둘이 사실상 비슷하다"는 상황을 숨기지 않는다.
     """
-    eligible = [s for s in scores if calibration_results[s.model_name].success]
+    eligible = [s for s in scores if s.is_selection_eligible]
     ranked = sorted(eligible, key=lambda s: (round(s.score, 6), complexity_counts.get(s.model_name, 0)))
     _apply_per_model_confidence(scores, ranked)
     if not ranked:
@@ -443,53 +511,61 @@ def compute_model_scores(
         if result.calibration_method != CalibrationMethod.OBJECT_RELEASING
     ]
     complexity_counts = _complexity_counts()
+    eligibility = {
+        m: model_selection_status(calibration_results.get(m), validation_results.get(m))
+        for m in models
+    }
+    eligible_models = [m for m in models if eligibility[m][0]]
 
-    e_train = {m: (calibration_results[m].rms_error if calibration_results[m].success else None) for m in models}
+    e_train = {m: (calibration_results[m].rms_error if eligibility[m][0] else None) for m in models}
 
     e_test = {}
     for m in models:
         vr = validation_results.get(m)
-        e_test[m] = vr.test_rms if (vr and vr.success) else None
+        e_test[m] = vr.test_rms if eligibility[m][0] else None
 
-    # Edge는 Hold-out(test)에서 나온 값을 우선 쓴다 - "새로운 데이터의 외곽 오차"가
-    # "학습 데이터 외곽 오차"보다 일반화 성능을 더 잘 반영하기 때문.
-    # 없으면 Train 쪽 regional_error로 대체.
+    # Edge는 Hold-out(test)에서 나온 값만 쓴다. Train regional_error는 Test Edge가 아니다.
     e_edge = {}
     for m in models:
         vr = validation_results.get(m)
-        if vr and vr.success and vr.edge_rms is not None:
-            e_edge[m] = vr.edge_rms
-        elif calibration_results[m].success and calibration_results[m].regional_error:
-            e_edge[m] = regional_edge_average(calibration_results[m].regional_error)
-        else:
-            e_edge[m] = None
+        e_edge[m] = vr.edge_rms if eligibility[m][0] and vr else None
 
     # Straightness (calibration/straightness.py, validate_holdout에서 채워짐).
-    # 프레임이 너무 적어 라인을 하나도 못 만든 모델은 None으로 남고,
-    # _normalize가 "값이 하나라도 있으면 없는 모델에 불리하게" 처리한다.
+    # Model selection에서는 hold-out test frame에서 측정된 값만 사용한다.
+    # Train fallback은 UI/diagnostic 표시용이며 selection evidence가 아니다.
     e_line = {}
     for m in models:
         vr = validation_results.get(m)
-        e_line[m] = vr.straightness_residual if vr else None
+        e_line[m] = (
+            vr.straightness_residual
+            if eligibility[m][0] and vr and vr.straightness_source == "test"
+            else None
+        )
 
-    complexity = {m: float(complexity_counts.get(m, 0)) for m in models}
+    complexity = {m: float(complexity_counts.get(m, 0)) if eligibility[m][0] else None for m in models}
 
     n_train = _normalize(e_train)
     n_test = _normalize(e_test)
-    n_edge = _normalize(e_edge)
-    n_line = _normalize(e_line)
+    n_edge = _normalize_comparable(e_edge, eligible_models)
+    n_line = _normalize_comparable(e_line, eligible_models)
     n_complexity = _normalize(complexity)
 
     raw_aic: dict[CameraModelType, float | None] = {}
     raw_bic: dict[CameraModelType, float | None] = {}
     raw_p95 = {
         m: _model_p95(calibration_results[m], validation_results.get(m))
-        if calibration_results[m].success else None
+        if eligibility[m][0] else None
         for m in models
     }
-    raw_radial = {m: _radial_error_score(calibration_results[m]) for m in models}
-    raw_stability = {m: _parameter_stability_penalty(calibration_results[m]) for m in models}
-    raw_observability = {m: _observability_penalty(calibration_results[m]) for m in models}
+    raw_radial = {m: _radial_error_score(calibration_results[m]) if eligibility[m][0] else None for m in models}
+    raw_stability = {
+        m: _parameter_stability_penalty(calibration_results[m]) if eligibility[m][0] else None
+        for m in models
+    }
+    raw_observability = {
+        m: _observability_penalty(calibration_results[m]) if eligibility[m][0] else None
+        for m in models
+    }
 
     scores: list[ModelScore] = []
     for m in models:
@@ -503,12 +579,12 @@ def compute_model_scores(
         raw_aic[m] = aic
         raw_bic[m] = bic
 
-    n_p95 = _normalize(raw_p95)
-    n_radial = _normalize(raw_radial)
-    n_aic = _normalize(raw_aic)
-    n_bic = _normalize(raw_bic)
-    n_stability = _normalize(raw_stability)
-    n_observability = _normalize(raw_observability)
+    n_p95 = _normalize_comparable(raw_p95, eligible_models)
+    n_radial = _normalize_comparable(raw_radial, eligible_models)
+    n_aic = _normalize_comparable(raw_aic, eligible_models)
+    n_bic = _normalize_comparable(raw_bic, eligible_models)
+    n_stability = _normalize_comparable(raw_stability, eligible_models)
+    n_observability = _normalize_comparable(raw_observability, eligible_models)
 
     for m in models:
         parameter_count = parameter_count_for_model(m)
@@ -518,25 +594,32 @@ def compute_model_scores(
             num_observations=n_obs,
             parameter_count=parameter_count,
         )
-        components = {
-            "train": weights.w_train * n_train[m],
-            "test": weights.w_test * n_test[m],
-            "edge": weights.w_edge * n_edge[m],
-            "line": weights.w_line * n_line[m],
-            "complexity": weights.w_complexity * n_complexity[m],
-            "p95": weights.w_p95 * n_p95[m],
-            "radial": weights.w_radial * n_radial[m],
-            "aic": weights.w_aic * n_aic[m],
-            "bic": weights.w_bic * n_bic[m],
-            "stability": weights.w_stability * n_stability[m],
-            "observability": weights.w_observability * n_observability[m],
-        }
-        total = sum(components.values())
+        is_eligible, status, ineligibility_reason = eligibility[m]
+        components = {}
+        total = math.inf
+        if is_eligible:
+            components = {
+                "train": weights.w_train * n_train[m],
+                "test": weights.w_test * n_test[m],
+                "edge": weights.w_edge * n_edge[m],
+                "line": weights.w_line * n_line[m],
+                "complexity": weights.w_complexity * n_complexity[m],
+                "p95": weights.w_p95 * n_p95[m],
+                "radial": weights.w_radial * n_radial[m],
+                "aic": weights.w_aic * n_aic[m],
+                "bic": weights.w_bic * n_bic[m],
+                "stability": weights.w_stability * n_stability[m],
+                "observability": weights.w_observability * n_observability[m],
+            }
+            total = sum(components.values())
         scores.append(
             ModelScore(
                 model_name=m,
                 score=total,
                 components=components,
+                is_selection_eligible=is_eligible,
+                selection_status=status,
+                selection_ineligibility_reason=ineligibility_reason,
                 parameter_count=parameter_count,
                 residual_sum_squares=rss,
                 num_observations=n_obs,
@@ -550,8 +633,8 @@ def compute_model_scores(
     if (
         extended_score is not None
         and fisheye_score is not None
-        and calibration_results[CameraModelType.EXTENDED_PINHOLE].success
-        and calibration_results[CameraModelType.FISHEYE].success
+        and extended_score.is_selection_eligible
+        and fisheye_score.is_selection_eligible
         and extended_score.score < fisheye_score.score
     ):
         extended_p95 = raw_p95.get(CameraModelType.EXTENDED_PINHOLE)
@@ -575,8 +658,8 @@ def compute_model_scores(
             fisheye_score.components["fisheye_validation_tie_break"] = adjustment
             fisheye_score.score += adjustment
 
-    # 학습 자체가 실패한 모델은 추천 후보에서 제외
-    eligible = [s for s in scores if calibration_results[s.model_name].success]
+    # 완성된 hold-out core evidence가 있는 모델만 추천 후보로 인정한다.
+    eligible = [s for s in scores if s.is_selection_eligible]
     if eligible:
         # 점수가 같으면 더 단순한 모델을 우선한다 (Occam's razor).
         best = min(eligible, key=lambda s: (round(s.score, 6), complexity_counts.get(s.model_name, 0)))
@@ -621,7 +704,11 @@ def build_recommendation_message(
     # 전부 0으로 정규화되어 "가장 유리한 항목"처럼 보이지만, 실제로는 측정된
     # 적이 없다. 측정이 하나라도 있었던 지표만 근거 후보로 인정한다.
     line_measured = any(
-        (validation_results.get(m) and validation_results[m].straightness_residual is not None)
+        (
+            is_model_selection_eligible(calibration_results.get(m), validation_results.get(m))
+            and validation_results[m].straightness_source == "test"
+            and validation_results[m].straightness_residual is not None
+        )
         for m in validation_results
     )
     metric_names_kr = {
@@ -714,12 +801,15 @@ def format_score_table(
         vr = validation_results.get(m)
         if vr and vr.success and vr.edge_rms is not None:
             raw_edge.append(fmt(vr.edge_rms))
-        elif calibration_results[m].success and calibration_results[m].regional_error:
-            raw_edge.append(fmt(regional_edge_average(calibration_results[m].regional_error)))
         else:
             raw_edge.append("N/A")
 
-    score_vals = [f"{score_by_model[m].score:.3f}" if score_by_model.get(m) else "N/A" for m in order]
+    score_vals = [
+        f"{score_by_model[m].score:.3f}"
+        if score_by_model.get(m) and score_by_model[m].is_selection_eligible
+        else "Not eligible"
+        for m in order
+    ]
     radial_vals = [fmt(_radial_error_score(calibration_results[m])) for m in order]
     aic_vals = [fmt(score_by_model[m].aic) if score_by_model.get(m) else "N/A" for m in order]
     bic_vals = [fmt(score_by_model[m].bic) if score_by_model.get(m) else "N/A" for m in order]
@@ -745,6 +835,11 @@ def format_score_table(
     ]
     rec_vals = ["⭐" if score_by_model.get(m) and score_by_model[m].is_recommended else "" for m in order]
 
+    selection_status_vals = [
+        score_by_model[m].selection_status if score_by_model.get(m) else "N/A"
+        for m in order
+    ]
+
     lines = [
         row("", labels),
         row("Train RMS", train_vals),
@@ -756,6 +851,7 @@ def format_score_table(
         row("BIC", bic_vals),
         row("Stability", stability_vals),
         row("Obs Penalty", observability_vals),
+        row("Selection", selection_status_vals),
         row("Score", score_vals),
         row("Confidence", confidence_vals),
         row("Recommend", rec_vals),

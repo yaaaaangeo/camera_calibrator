@@ -42,15 +42,29 @@ def _cal(model: CameraModelType, rmse: float, n: int = 100) -> CalibrationResult
 
 
 def _val(rms: float) -> ValidationResult:
-    return ValidationResult(test_rms=rms, edge_rms=rms, straightness_residual=rms, success=True)
+    return ValidationResult(
+        train_frame_ids=["train-1"],
+        test_frame_ids=["test-1"],
+        test_rms=rms,
+        edge_rms=rms,
+        straightness_residual=rms,
+        straightness_source="test",
+        test_residual_stats=ResidualStats(n=100, rmse=rms, p95=rms * 2.0),
+        per_frame_error={"test-1": rms},
+        success=True,
+    )
 
 
 def _val_with_p95(rms: float, p95: float) -> ValidationResult:
     return ValidationResult(
+        train_frame_ids=["train-1"],
+        test_frame_ids=["test-1"],
         test_rms=rms,
         edge_rms=rms,
         straightness_residual=rms,
+        straightness_source="test",
         test_residual_stats=ResidualStats(n=100, rmse=rms, p95=p95),
+        per_frame_error={"test-1": rms},
         success=True,
     )
 
@@ -168,7 +182,7 @@ def test_json_export_includes_information_criteria_in_model_scores():
     assert exported_score["bic"] is not None
     assert exported_score["selection_confidence"] == 100.0
     assert exported_score["selection_confidence_level"] == "HIGH"
-    assert exported_score["selection_confidence_reason"] == "Only one model calibrated successfully."
+    assert exported_score["selection_confidence_reason"] == "Only one model has complete hold-out validation evidence."
 
 
 def test_close_models_get_low_selection_confidence_warning():

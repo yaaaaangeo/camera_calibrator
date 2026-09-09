@@ -38,7 +38,8 @@ from calibration.types import (
     RepeatedKFoldResult,
     ValidationResult,
 )
-from calibration.models.common import regional_edge_average, distortion_coeff_labels
+from calibration.models.common import distortion_coeff_labels
+from calibration.recommender import model_selection_status
 from calibration.quality import coverage_percentage
 from calibration.sanity_check import run_sanity_check, SanitySeverity
 from calibration.residual_stats import compute_cdf
@@ -245,25 +246,43 @@ def _section_model_comparison(
         cells = "".join(f"<td>{_esc(v)}</td>" for v in values)
         return f"<tr><th>{_esc(label)}</th>{cells}</tr>"
 
-    train_vals, test_vals, edge_vals, straight_vals = [], [], [], []
+    status_vals, train_vals, test_frame_vals, successful_test_frame_vals = [], [], [], []
+    failed_test_frame_vals, failure_reason_vals = [], []
+    test_vals, edge_vals, straight_vals = [], [], []
     aic_vals, bic_vals, score_vals, confidence_vals, chosen_vals = [], [], [], [], []
     for m in _MODEL_ORDER:
         cal = calibration_results.get(m)
         val = validation_results.get(m)
         score = score_by_model.get(m)
+        _eligible, status, ineligibility_reason = model_selection_status(cal, val)
 
+        status_vals.append(score.selection_status if score else status)
+        failure_reason_vals.append(
+            (score.selection_ineligibility_reason if score else None)
+            or ineligibility_reason
+            or (val.error_message if val and val.error_message else None)
+            or ""
+        )
+        test_frame_vals.append(str(len(val.test_frame_ids)) if val else "N/A")
+        successful_test_frame_vals.append(str(len(val.per_frame_error)) if val else "N/A")
+        failed_test_frame_vals.append(str(len(val.failed_test_frame_ids)) if val else "N/A")
         train_vals.append(_fmt(cal.rms_error) if cal and cal.success else "FAIL")
         test_vals.append(_fmt(val.test_rms) if val and val.success else "N/A")
         if val and val.success and val.edge_rms is not None:
             edge_vals.append(_fmt(val.edge_rms))
-        elif cal and cal.success and cal.regional_error:
-            edge_vals.append(_fmt(regional_edge_average(cal.regional_error)))
         else:
             edge_vals.append("N/A")
-        straight_vals.append(_fmt(val.straightness_residual) if val else "N/A")
+        straight = _fmt(val.straightness_residual) if val and val.straightness_residual is not None else "N/A"
+        if straight != "N/A" and getattr(val, "straightness_source", None):
+            suffix = "TEST" if val.straightness_source == "test" else "TRAIN fallback"
+            straight = f"{straight} ({suffix})"
+        straight_vals.append(straight)
         aic_vals.append(f"{score.aic:.1f}" if score and score.aic is not None else "N/A")
         bic_vals.append(f"{score.bic:.1f}" if score and score.bic is not None else "N/A")
-        score_vals.append(f"{score.score:.3f}" if score else "N/A")
+        score_vals.append(
+            f"{score.score:.3f}" if score and score.is_selection_eligible
+            else ("Not eligible" if score else "N/A")
+        )
         confidence_vals.append(
             f"{score.selection_confidence_level} {score.selection_confidence:.0f}%"
             if score and score.selection_confidence_level and score.selection_confidence is not None
@@ -279,9 +298,14 @@ def _section_model_comparison(
 
     table = (
         '<table class="compare"><thead><tr><th></th>' + header + "</tr></thead><tbody>"
+        + row("Validation Status", status_vals)
         + row("Train RMS", train_vals)
+        + row("Test Frames", test_frame_vals)
+        + row("Successful Test Frames", successful_test_frame_vals)
+        + row("Failed Test Frames", failed_test_frame_vals)
+        + row("Failure Reason", failure_reason_vals)
         + row("Test RMS", test_vals)
-        + row("Edge RMS", edge_vals)
+        + row("Test Edge RMS", edge_vals)
         + row("Straightness", straight_vals)
         + row("AIC", aic_vals)
         + row("BIC", bic_vals)

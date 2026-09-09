@@ -11,6 +11,7 @@ dict -> dataclass 디코더(`_pattern_config_from_dict` ~ `_final_result_from_di
 from __future__ import annotations
 
 import numpy as np
+import math
 
 from calibration.project_codecs.common import _arr
 from calibration.types import (
@@ -375,6 +376,7 @@ def _validation_result_from_dict(d: dict) -> ValidationResult:
         test_frame_ids=d.get("test_frame_ids", []),
         train_rms=d.get("train_rms"), test_rms=d.get("test_rms"), edge_rms=d.get("edge_rms"),
         straightness_residual=d.get("straightness_residual"),
+        straightness_source=d.get("straightness_source"),
         straightness_breakdown=_straightness_breakdown_from_dict(d.get("straightness_breakdown")),
         train_residual_stats=_residual_stats_from_dict(d.get("train_residual_stats")),
         test_residual_stats=_residual_stats_from_dict(d.get("test_residual_stats")),
@@ -486,9 +488,15 @@ def _subset_calibration_result_from_dict(d) -> SubsetCalibrationResult | None:
 
 
 def _model_score_from_dict(d: dict) -> ModelScore:
+    score = d.get("score")
+    if score is None and not d.get("is_selection_eligible", True):
+        score = math.inf
     return ModelScore(
-        model_name=CameraModelType(d["model_name"]), score=d["score"],
+        model_name=CameraModelType(d["model_name"]), score=score,
         components=d.get("components", {}), is_recommended=d.get("is_recommended", False),
+        is_selection_eligible=d.get("is_selection_eligible", True),
+        selection_status=d.get("selection_status", "ELIGIBLE"),
+        selection_ineligibility_reason=d.get("selection_ineligibility_reason"),
         parameter_count=d.get("parameter_count", 0),
         residual_sum_squares=d.get("residual_sum_squares"),
         num_observations=d.get("num_observations", 0),

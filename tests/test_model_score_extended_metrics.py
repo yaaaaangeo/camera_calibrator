@@ -45,10 +45,14 @@ def _cal(model: CameraModelType, rmse: float) -> CalibrationResult:
 
 def _val(rms: float, p95: float) -> ValidationResult:
     return ValidationResult(
+        train_frame_ids=["train-1"],
+        test_frame_ids=["test-1"],
         test_rms=rms,
         edge_rms=rms,
         straightness_residual=rms,
+        straightness_source="test",
         test_residual_stats=ResidualStats(n=50, rmse=rms, p95=p95),
+        per_frame_error={"test-1": rms},
         success=True,
     )
 
