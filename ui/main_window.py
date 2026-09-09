@@ -1467,13 +1467,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Repeated K-Fold 불가", "먼저 데이터셋을 불러오세요.")
             return
 
+        # ResultView.start_repeated_kfold_progress()는 이미 버튼 클릭 시점에
+        # ResultView._on_kfold_run_clicked()에서 호출됐다(progress bar/상태
+        # 표를 즉시 0/total, WAITING으로 되돌려 "실행 중" 신호를 바로 보여줌) -
+        # 여기서는 실제 백그라운드 계산을 시작하는 QThread 배선만 한다.
         worker = RepeatedKFoldWorker(
             self.dataset, self.camera_config, self.pattern_config, k=k, n_repeats=n_repeats,
         )
         thread = run_worker_in_thread(worker, self)
         worker.progress.connect(self.status_label.setText)
+        worker.progress_event.connect(self.result_view.update_repeated_kfold_progress)
         worker.results_ready.connect(self._on_repeated_kfold_results_ready)
-        worker.error.connect(self._on_error)
+        worker.error.connect(self._on_repeated_kfold_error)
 
         self._kfold_thread, self._kfold_worker = thread, worker
         self.result_view.kfold_run_button.setEnabled(False)
@@ -1485,6 +1490,13 @@ class MainWindow(QMainWindow):
         total = next(iter(results.values())).total_folds if results else 0
         ok = sum(r.n_successful_runs for r in results.values())
         self.status_label.setText(f"Repeated K-Fold 완료: {ok}/{total * len(results)} fold 성공 (모델별 표 참고)")
+
+    def _on_repeated_kfold_error(self, message: str) -> None:
+        """일반 _on_error와 달리, progress bar는 그대로 두고(어디까지
+        진행됐었는지 보여줌) RUNNING이었던 모델 행만 FAILED로 표시한다 -
+        Run 버튼 재활성화는 기존과 동일하게 thread.finished가 처리한다."""
+        self.result_view.set_repeated_kfold_error(message)
+        self._on_error(message)
 
     # ------------------------------------------------------------------
     # Export

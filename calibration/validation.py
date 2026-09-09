@@ -21,6 +21,7 @@ x distance(near/far) 기준 stratified split을 사용한다 (문서 3.3번 권�
 
 from __future__ import annotations
 
+import math
 import random
 
 import cv2
@@ -35,6 +36,7 @@ from calibration.types import (
     Frame,
     OutlierResult,
     PatternConfig,
+    SpatialErrorMap,
     ValidationResult,
 )
 from calibration.models.common import (
@@ -52,6 +54,7 @@ from calibration.models.fisheye import calibrate_fisheye
 from calibration.holdout_evidence import evaluate_holdout_evidence
 from calibration.residual_stats import compute_residual_stats
 from calibration.straightness import compute_straightness_residual, compute_straightness_breakdown
+from calibration.spatial_error_map import bin_spatial_errors
 
 
 # ---------------------------------------------------------------------------
@@ -943,3 +946,95 @@ def format_straightness_comparison(results: dict[CameraModelType, ValidationResu
         metric_row("Overall", "overall_error"),
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Paper Evidence 단계 - Held-out Spatial Accuracy
+#
+# 논문의 Spatial Accuracy 절은 반드시 Hold-out **test** residual에서 나와야
+# 한다 - Train calibration residual map(같은 프레임으로 fit한 K,D의 잔차)을
+# Test spatial accuracy인 것처럼 보여주면 leakage나 다름없다. 이 함수는
+# _test_reprojection_errors()와 정확히 같은 계약(Train에서 확정된 K,D를
+# 고정하고 test 프레임의 pose만 solve_pnp_for_model_robust로 추정)을 쓰되,
+# 집계된 RMS/Edge 하나로 뭉개는 대신 point-level (x,y,dx,dy)까지 보존해서
+# calibration/spatial_error_map.py의 기존 그리드 집계(bin_spatial_errors)에
+# 그대로 넘긴다 - 투영/집계 로직을 새로 만들지 않는다.
+# ---------------------------------------------------------------------------
+
+def compute_holdout_spatial_evidence(
+    dataset: Dataset,
+    camera_config: CameraConfig,
+    model: CameraModelType,
+    test_ids: list[str],
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray,
+    rows: int = 4,
+    cols: int = 4,
+) -> tuple[SpatialErrorMap, list[dict]]:
+    """Hold-out test 프레임의 point-level 재투영 오차를 (a) 시각화용
+    SpatialErrorMap(칸별 RMS/P95/평균방향)과 (b) CSV export용 raw row
+    (x, y, dx, dy, magnitude, model, frame_id, grid_row, grid_col) 둘 다로
+    반환한다.
+
+    camera_matrix/distortion은 호출부가 이미 Train에서 확정한 값을 그대로
+    받아 고정하고, 이 함수 안에서는 어떤 이유로도 재추정하지 않는다(Fisheye는
+    solve_pnp_for_model_robust의 3단계 fallback을 포함해 test pose만 다시
+    구한다 - K,D는 인자로 받은 값 그대로 모든 fallback 단계에 전달될 뿐이다).
+    pose 추정이 끝내 실패한 프레임은 (이미 실패 목록에 남는 hold-out 정책과
+    동일하게) 이 spatial evidence에서도 조용히 제외된다 - 실패를 감추는 게
+    아니라, 애초에 dx/dy를 계산할 pose가 없기 때문이다.
+    """
+    test_dataset = _subset_dataset(dataset, test_ids)
+    test_frames = test_dataset.enabled_frames
+    image_size = (camera_config.width, camera_config.height)
+    is_fisheye = model == CameraModelType.FISHEYE
+
+    xs: list[float] = []
+    ys: list[float] = []
+    dxs: list[float] = []
+    dys: list[float] = []
+    point_rows: list[dict] = []
+
+    for frame in test_frames:
+        det = frame.detection
+        obj = det.object_points
+        img = det.corners
+        frame_id = frame.image_info.image_id
+
+        ok, rvec, tvec, _reason = solve_pnp_for_model_robust(obj, img, camera_matrix, distortion, model)
+        if not ok:
+            continue
+        try:
+            projected = project_points_for_model(obj, rvec, tvec, camera_matrix, distortion, model)
+            detected = (img.astype(np.float64) if is_fisheye else img).reshape(-1, 2)
+        except cv2.error:
+            continue
+
+        diff = detected - projected
+        for (x, y), (dx, dy) in zip(detected.tolist(), diff.tolist()):
+            xs.append(float(x)); ys.append(float(y))
+            dxs.append(float(dx)); dys.append(float(dy))
+            point_rows.append({
+                "x": float(x), "y": float(y),
+                "dx": float(dx), "dy": float(dy),
+                "magnitude": float(math.hypot(dx, dy)),
+                "model": model.value, "frame_id": frame_id,
+            })
+
+    smap = bin_spatial_errors(
+        np.asarray(xs), np.asarray(ys), np.asarray(dxs), np.asarray(dys),
+        image_size, rows=rows, cols=cols,
+    )
+
+    # point_rows에도 grid_row/grid_col을 채운다 - bin_spatial_errors와 완전히
+    # 동일한 인덱싱 규칙(행=위->아래, 열=왼쪽->오른쪽, // 나눗셈 후 clip)을 쓴다.
+    w, h = image_size
+    cell_w = w / cols if cols > 0 else float(max(w, 1))
+    cell_h = h / rows if rows > 0 else float(max(h, 1))
+    for r in point_rows:
+        col_idx = min(max(int(r["x"] // cell_w), 0), max(cols - 1, 0)) if cell_w > 0 else 0
+        row_idx = min(max(int(r["y"] // cell_h), 0), max(rows - 1, 0)) if cell_h > 0 else 0
+        r["grid_row"] = row_idx
+        r["grid_col"] = col_idx
+
+    return smap, point_rows

@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from calibration.kfold import (
+    KFoldProgressEvent,
     compute_kfold_validation,
     compute_repeated_kfold,
     format_kfold_result,
@@ -415,3 +416,223 @@ class TestFisheyeKFoldIntegration:
         # mutation을 잡기 위한 방어적 확인).
         assert (true_K == K_before).all()
         assert (true_D == D_before).all()
+
+
+# ---------------------------------------------------------------------------
+# Repeated K-Fold progress reporting (fold 단위 진행률 콜백).
+#
+# 75 fold(K=5 x Repeats=5 x 3모델) 계산이 오래 걸려도 사용자가 "멈춘 건지
+# 계산 중인지" 알 수 있게 하는 게 목적이라, 여기서는 실제 cv2 calibration
+# 대신 빠른 monkeypatch된 validate_holdout으로 progress event의 구조/순서/
+# 카운터 정합성만 검증한다(계산 자체는 TestMultiMetricAggregation 등
+# 다른 클래스가 이미 검증한다).
+# ---------------------------------------------------------------------------
+
+def _fast_fake_validate_holdout(dataset, camera_config, pattern_config, model, train_ids, test_ids, **kwargs):
+    from calibration.types import ResidualStats, ValidationResult
+
+    return ValidationResult(
+        train_frame_ids=list(train_ids), test_frame_ids=list(test_ids),
+        train_rms=1.0, test_rms=1.0, edge_rms=0.5,
+        straightness_residual=0.05, straightness_source="test",
+        test_residual_stats=ResidualStats(p95=1.5),
+        success=True,
+    )
+
+
+class TestKFoldProgressReporting:
+    def test_total_folds_for_5x5x3_models_is_75(
+        self, synthetic_dataset, camera_config, pattern_config, monkeypatch
+    ):
+        import calibration.validation as validation_module
+        monkeypatch.setattr(validation_module, "validate_holdout", _fast_fake_validate_holdout)
+
+        events: list[KFoldProgressEvent] = []
+        run_repeated_kfold_all_models(
+            synthetic_dataset, camera_config, pattern_config,
+            k=5, n_repeats=5, base_seed=1, n_jobs=1, cache=None,
+            progress_callback=events.append,
+        )
+        all_completed = [e for e in events if e.stage == "all_completed"]
+        assert len(all_completed) == 1
+        assert all_completed[0].total_folds == 75
+        assert all_completed[0].completed_folds == 75
+
+    def test_progress_never_regresses_and_increments_by_exactly_one_per_fold(
+        self, synthetic_dataset, camera_config, pattern_config, monkeypatch
+    ):
+        import calibration.validation as validation_module
+        monkeypatch.setattr(validation_module, "validate_holdout", _fast_fake_validate_holdout)
+
+        events: list[KFoldProgressEvent] = []
+        run_repeated_kfold_all_models(
+            synthetic_dataset, camera_config, pattern_config,
+            k=5, n_repeats=5, base_seed=1, n_jobs=1, cache=None,
+            progress_callback=events.append,
+        )
+
+        completed_seq = [e.completed_folds for e in events]
+        assert completed_seq == sorted(completed_seq), "completed_folds가 역행했다"
+
+        fold_events = [e for e in events if e.stage == "fold_completed"]
+        assert len(fold_events) == 75, "정확히 75번의 fold_completed 이벤트가 있어야 한다"
+        fold_completed_values = [e.completed_folds for e in fold_events]
+        assert fold_completed_values == list(range(1, 76)), (
+            "fold 하나가 끝날 때마다 completed_folds가 정확히 1씩 증가해야 한다"
+        )
+
+    def test_model_completed_fires_exactly_once_per_model_with_full_count(
+        self, synthetic_dataset, camera_config, pattern_config, monkeypatch
+    ):
+        import calibration.validation as validation_module
+        monkeypatch.setattr(validation_module, "validate_holdout", _fast_fake_validate_holdout)
+
+        events: list[KFoldProgressEvent] = []
+        run_repeated_kfold_all_models(
+            synthetic_dataset, camera_config, pattern_config,
+            k=5, n_repeats=5, base_seed=1, n_jobs=1, cache=None,
+            progress_callback=events.append,
+        )
+
+        for model in (CameraModelType.BROWN_CONRADY, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE):
+            model_completed = [e for e in events if e.stage == "model_completed" and e.model == model]
+            assert len(model_completed) == 1, f"{model}의 model_completed 이벤트가 정확히 1개여야 한다"
+            event = model_completed[0]
+            assert event.model_completed_folds == 25
+            assert event.model_total_folds == 25
+            assert event.partial_result is not None
+            assert event.partial_result.total_folds == 25
+            assert event.partial_result.mean_test_rms == pytest.approx(1.0)
+
+            started = [e for e in events if e.stage == "model_started" and e.model == model]
+            assert len(started) == 1, f"{model}의 model_started 이벤트가 정확히 1개여야 한다"
+
+    def test_model_order_and_status_progression_matches_brown_rational_fisheye(
+        self, synthetic_dataset, camera_config, pattern_config, monkeypatch
+    ):
+        """모델 시작 순서가 Brown -> Rational -> Fisheye로 유지되는지, 그리고
+        아직 시작하지 않은 모델에 대해서는 이벤트가 미리 나오지 않는지."""
+        import calibration.validation as validation_module
+        monkeypatch.setattr(validation_module, "validate_holdout", _fast_fake_validate_holdout)
+
+        events: list[KFoldProgressEvent] = []
+        run_repeated_kfold_all_models(
+            synthetic_dataset, camera_config, pattern_config,
+            k=5, n_repeats=5, base_seed=1, n_jobs=1, cache=None,
+            progress_callback=events.append,
+        )
+        started_order = [e.model for e in events if e.stage == "model_started"]
+        assert started_order == [
+            CameraModelType.BROWN_CONRADY, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE,
+        ]
+
+        # Fisheye의 model_started보다 앞서는 이벤트에는 Fisheye의 fold_completed가
+        # 있으면 안 된다 (아직 시작 안 한 모델의 진행 이벤트가 미리 새어나오면 안 됨).
+        fisheye_start_idx = next(i for i, e in enumerate(events) if e.stage == "model_started" and e.model == CameraModelType.FISHEYE)
+        for e in events[:fisheye_start_idx]:
+            if e.stage == "fold_completed":
+                assert e.model != CameraModelType.FISHEYE
+
+    def test_progress_thread_safe_with_n_jobs_greater_than_one(
+        self, synthetic_dataset, camera_config, pattern_config, monkeypatch
+    ):
+        """n_jobs>1(repeat 단위 병렬 실행)에서도 completed_folds가 역행하거나
+        중복 값을 갖지 않아야 한다 - Lock으로 보호된 카운터인지 확인."""
+        import calibration.validation as validation_module
+        monkeypatch.setattr(validation_module, "validate_holdout", _fast_fake_validate_holdout)
+
+        events: list[KFoldProgressEvent] = []
+        run_repeated_kfold_all_models(
+            synthetic_dataset, camera_config, pattern_config,
+            k=5, n_repeats=5, base_seed=1, n_jobs=3, cache=None,
+            progress_callback=events.append,
+        )
+
+        fold_events = [e for e in events if e.stage == "fold_completed"]
+        assert len(fold_events) == 75
+        fold_completed_values = [e.completed_folds for e in fold_events]
+        # 병렬 실행이라 관찰 순서 자체는 완벽히 정렬 안 될 수 있어도(콜백이
+        # 서로 다른 thread에서 호출됨), "중복 없이 1~75 각각 정확히 한 번씩"은
+        # 반드시 성립해야 한다 - Lock이 없다면 두 thread가 같은 값을 relay하거나
+        # 카운터를 잃어버릴 수 있다.
+        assert sorted(fold_completed_values) == list(range(1, 76)), (
+            "n_jobs>1에서 progress 카운터가 중복되거나 값을 잃어버렸다"
+        )
+        all_completed = [e for e in events if e.stage == "all_completed"]
+        assert len(all_completed) == 1
+        assert all_completed[0].completed_folds == 75
+
+    def test_compute_repeated_kfold_single_model_progress_uses_model_scope(
+        self, synthetic_dataset, camera_config, pattern_config, monkeypatch
+    ):
+        """compute_repeated_kfold를 단독으로(run_repeated_kfold_all_models
+        없이) 호출하면, completed_folds/total_folds가 이 모델 하나의 진행과
+        같아야 한다(모델이 하나뿐이므로 전역=모델 범위)."""
+        import calibration.validation as validation_module
+        monkeypatch.setattr(validation_module, "validate_holdout", _fast_fake_validate_holdout)
+
+        events: list[KFoldProgressEvent] = []
+        compute_repeated_kfold(
+            synthetic_dataset, camera_config, pattern_config, CameraModelType.BROWN_CONRADY,
+            k=5, n_repeats=5, base_seed=1, n_jobs=1, cache=None,
+            progress_callback=events.append,
+        )
+        for e in events:
+            assert e.completed_folds == e.model_completed_folds
+            assert e.total_folds == e.model_total_folds == 25
+            assert e.model == CameraModelType.BROWN_CONRADY
+
+        fold_events = [e for e in events if e.stage == "fold_completed"]
+        assert [e.completed_folds for e in fold_events] == list(range(1, 26))
+        model_completed = [e for e in events if e.stage == "model_completed"]
+        assert len(model_completed) == 1
+        assert model_completed[0].partial_result is not None
+
+    def test_progress_callback_default_none_is_fully_backward_compatible(
+        self, synthetic_dataset, camera_config, pattern_config
+    ):
+        """progress_callback/fold_done_callback을 아예 안 넘기는 기존
+        호출부가 (인자 개수/에러 없이) 그대로 동작해야 하고, 같은 seed면
+        결과도 동일해야 한다 - progress 콜백 유무가 계산 결과에 영향을
+        주면 안 된다."""
+        result_first = compute_kfold_validation(
+            synthetic_dataset, camera_config, pattern_config, CameraModelType.PINHOLE,
+            k=4, seed=9, n_jobs=1, cache=None,
+        )
+        result_second = compute_kfold_validation(
+            synthetic_dataset, camera_config, pattern_config, CameraModelType.PINHOLE,
+            k=4, seed=9, n_jobs=1, cache=None,
+        )
+        assert result_first.mean_test_rms == pytest.approx(result_second.mean_test_rms)
+        assert result_first.n_successful_folds == result_second.n_successful_folds
+
+        repeated_result = compute_repeated_kfold(
+            synthetic_dataset, camera_config, pattern_config, CameraModelType.PINHOLE,
+            k=4, n_repeats=2, base_seed=9, n_jobs=1, cache=None,
+        )
+        assert repeated_result.n_successful_runs > 0
+
+        all_models_result = run_repeated_kfold_all_models(
+            synthetic_dataset, camera_config, pattern_config,
+            k=3, n_repeats=1, base_seed=9, n_jobs=1, cache=None,
+        )
+        assert len(all_models_result) == 3
+
+    def test_callback_exception_does_not_break_calibration(
+        self, synthetic_dataset, camera_config, pattern_config, monkeypatch
+    ):
+        """progress callback이 예외를 던져도 K-Fold 계산 자체는 정상 완료돼야
+        한다(콜백은 UI 쪽 코드일 수 있으므로 절대 계산을 막으면 안 됨)."""
+        import calibration.validation as validation_module
+        monkeypatch.setattr(validation_module, "validate_holdout", _fast_fake_validate_holdout)
+
+        def _raising_callback(event):
+            raise RuntimeError("boom - UI 쪽에서 터진 척하는 콜백")
+
+        result = compute_repeated_kfold(
+            synthetic_dataset, camera_config, pattern_config, CameraModelType.PINHOLE,
+            k=5, n_repeats=5, base_seed=1, n_jobs=1, cache=None,
+            progress_callback=_raising_callback,
+        )
+        assert result.n_successful_runs == 25
+        assert result.mean_test_rms == pytest.approx(1.0)

@@ -29,6 +29,7 @@ from calibration.types import (
     Dataset,
     DatasetQualityScore,
     DetectionResult,
+    DistortionCoeffStat,
     DiagnosisReport,
     DiagnosisSeverity,
     DiversityScores,
@@ -185,6 +186,21 @@ def _dataset_from_dict(d: dict) -> Dataset:
     )
 
 
+def _distortion_coeff_stat_from_dict(d) -> DistortionCoeffStat:
+    return DistortionCoeffStat(
+        index=d.get("index", 0), label=d.get("label", ""),
+        mean=d.get("mean"), std=d.get("std"), median=d.get("median"),
+        min=d.get("min"), max=d.get("max"),
+        ci_low=d.get("ci_low"), ci_high=d.get("ci_high"),
+        stability_score=d.get("stability_score"),
+        # Paper Evidence 단계 추가 필드 - 구버전 프로젝트에는 없으므로 .get()
+        # 기본값(None/False)으로 안전하게 복원(재계산/재해석하지 않는다).
+        reference=d.get("reference"), relative_cv=d.get("relative_cv"),
+        near_zero_reference=d.get("near_zero_reference", False),
+        diagnostic=d.get("diagnostic"),
+    )
+
+
 def _param_uncertainty_from_dict(d) -> ParameterUncertainty | None:
     if d is None:
         return None
@@ -193,10 +209,35 @@ def _param_uncertainty_from_dict(d) -> ParameterUncertainty | None:
         cx_std=d.get("cx_std"), cy_std=d.get("cy_std"),
         method=d.get("method", "covariance"),
         n_bootstrap_success=d.get("n_bootstrap_success"),
+        n_bootstrap_total=d.get("n_bootstrap_total"),
         fx_ci_low=d.get("fx_ci_low"), fx_ci_high=d.get("fx_ci_high"),
         fy_ci_low=d.get("fy_ci_low"), fy_ci_high=d.get("fy_ci_high"),
         cx_ci_low=d.get("cx_ci_low"), cx_ci_high=d.get("cx_ci_high"),
         cy_ci_low=d.get("cy_ci_low"), cy_ci_high=d.get("cy_ci_high"),
+        fx_mean=d.get("fx_mean"), fy_mean=d.get("fy_mean"),
+        cx_mean=d.get("cx_mean"), cy_mean=d.get("cy_mean"),
+        fx_median=d.get("fx_median"), fy_median=d.get("fy_median"),
+        cx_median=d.get("cx_median"), cy_median=d.get("cy_median"),
+        fx_min=d.get("fx_min"), fx_max=d.get("fx_max"),
+        fy_min=d.get("fy_min"), fy_max=d.get("fy_max"),
+        cx_min=d.get("cx_min"), cx_max=d.get("cx_max"),
+        cy_min=d.get("cy_min"), cy_max=d.get("cy_max"),
+        fx_stability=d.get("fx_stability"), fy_stability=d.get("fy_stability"),
+        cx_stability=d.get("cx_stability"), cy_stability=d.get("cy_stability"),
+        overall_stability=d.get("overall_stability"),
+        distortion_stats=[_distortion_coeff_stat_from_dict(s) for s in d.get("distortion_stats", [])],
+        # Paper Evidence 단계 추가 필드(전부 additive) - 구버전 프로젝트에는
+        # 없으므로 .get()이 자연히 None을 반환해 "계산 안 됨"으로 복원된다
+        # (새 covariance_from_normalized_jacobian류 기본값처럼 잘못된 값으로
+        # 채워지지 않는다).
+        paper_intrinsic_stability=d.get("paper_intrinsic_stability"),
+        distortion_stability_summary=d.get("distortion_stability_summary"),
+        fx_reference=d.get("fx_reference"), fy_reference=d.get("fy_reference"),
+        cx_reference=d.get("cx_reference"), cy_reference=d.get("cy_reference"),
+        fx_relative_cv=d.get("fx_relative_cv"), fy_relative_cv=d.get("fy_relative_cv"),
+        cx_relative_cv=d.get("cx_relative_cv"), cy_relative_cv=d.get("cy_relative_cv"),
+        lowest_stability_parameter=d.get("lowest_stability_parameter"),
+        lowest_stability_value=d.get("lowest_stability_value"),
     )
 
 

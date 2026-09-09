@@ -351,6 +351,19 @@ class DistortionCoeffStat:
     ci_low: Optional[float] = None
     ci_high: Optional[float] = None
     stability_score: Optional[float] = None  # 0~100, 설계 문서 23번
+    # Paper Evidence 단계 추가 - "왜" stability_score가 낮은지 진단할 수 있게
+    # reference(전체 데이터 fit 값)와 순수 CV(=std/|bootstrap mean|, reference와
+    # 섞지 않은 값 - 논문 수식 CV_p = sigma_p/mu_p 그대로)를 별도로 남긴다.
+    # stability_score 자체(위 필드)의 계산식은 절대 바꾸지 않는다 - 그 값을
+    # 소비하는 recommender/UI가 조용히 달라지면 안 되기 때문이다.
+    reference: Optional[float] = None
+    relative_cv: Optional[float] = None
+    # reference(전체 데이터 fit 값)가 0에 가까우면 std가 아주 작아도 상대
+    # CV가 폭발할 수 있다 - "이 계수가 실제로 불안정해서"가 아니라 "0 근처라
+    # 상대 지표 자체가 통계적으로 의미가 약해서" stability가 낮게 보일 수
+    # 있다는 것을 명시적으로 표시한다(값 자체를 보정하지 않는다).
+    near_zero_reference: bool = False
+    diagnostic: Optional[str] = None  # 예: "near-zero coefficient; relative CV unstable"
 
 
 @dataclass
@@ -371,6 +384,7 @@ class ParameterUncertainty:
     cy_std: Optional[float] = None
     method: str = "covariance"  # "covariance" | "bootstrap"
     n_bootstrap_success: Optional[int] = None  # method="bootstrap"일 때만 의미 있음
+    n_bootstrap_total: Optional[int] = None  # 시도한 전체 재표본 수(compute_parameter_bootstrap의 n_bootstrap) - "18/20"처럼 보여주기 위함
     fx_ci_low: Optional[float] = None
     fx_ci_high: Optional[float] = None
     fy_ci_low: Optional[float] = None
@@ -406,9 +420,50 @@ class ParameterUncertainty:
     fy_stability: Optional[float] = None
     cx_stability: Optional[float] = None
     cy_stability: Optional[float] = None
-    overall_stability: Optional[float] = None  # 위 항목(+distortion) 전부의 평균
+    # "All-Parameter Stability" - fx/fy/cx/cy stability + distortion_stats의
+    # stability_score까지 전부 평균한 값(설계 문서 23번 원래 정의 그대로,
+    # 값 계산식은 절대 바꾸지 않는다). recommender.py의 모델 선택 점수가
+    # 이미 이 필드를 소비하고 있어 backward compatibility가 필요하다 -
+    # 이름을 paper metric으로 바꾸지 않고 "all-parameter"라는 의미를
+    # docstring/UI/report에 명확히 남기는 방식으로만 구분한다.
+    overall_stability: Optional[float] = None
     # 설계 문서 20/21번 - distortion 계수(k1,k2,...)별 bootstrap 통계
     distortion_stats: list["DistortionCoeffStat"] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Paper Evidence 단계 추가 필드 (모두 additive - 위 필드들은 값/의미
+    # 그대로 유지, recommender.py는 여전히 overall_stability만 본다).
+    #
+    # 논문이 실제로 쓰는 Stability 정의: CV_p = sigma_p / mu_p, p in
+    # {fx, fy, cx, cy}; Stability = 100 * (1 - mean(CV_p)). distortion
+    # coefficient는 이 정의에 들어가지 않는다 - 특히 k3/k4처럼 reference가
+    # 0에 가까운 계수는 std가 작아도 상대 CV가 폭발해 overall_stability를
+    # 크게 끌어내릴 수 있다("Fisheye Stability 62%"가 fx/fy/cx/cy 자체의
+    # 불안정 때문인지, 이 near-zero distortion 분모 문제 때문인지는
+    # paper_intrinsic_stability vs overall_stability를 나란히 봐야 구분된다).
+    # ------------------------------------------------------------------
+    paper_intrinsic_stability: Optional[float] = None  # fx/fy/cx/cy stability 4개만의 평균
+    # distortion_stats의 stability_score만 모은 요약(참고용 diagnostic -
+    # 이 값 자체도 recommender에는 쓰이지 않는다. 논문 본문에 쓸 metric이
+    # 아니라 "distortion 쪽이 얼마나 불안정한지" 확인용).
+    distortion_stability_summary: Optional[float] = None
+    # fx/fy/cx/cy 각각의 reference(전체 데이터 fit 값)와 순수 CV(=std/|mean|,
+    # reference와 섞지 않음 - 논문 수식 그대로) - fx_stability 등 기존
+    # 필드의 계산식(reference와 blending된 scale)은 바꾸지 않고, 이 값들은
+    # 진단/투명성 목적의 추가 정보다.
+    fx_reference: Optional[float] = None
+    fy_reference: Optional[float] = None
+    cx_reference: Optional[float] = None
+    cy_reference: Optional[float] = None
+    fx_relative_cv: Optional[float] = None
+    fy_relative_cv: Optional[float] = None
+    cx_relative_cv: Optional[float] = None
+    cy_relative_cv: Optional[float] = None
+    # "어느 파라미터 때문에 stability가 낮은가"를 UI가 바로 보여줄 수 있게 -
+    # fx/fy/cx/cy + 모든 distortion coefficient label 중 stability_score가
+    # 가장 낮은 것의 이름(예: "k4"). 동점/데이터 없음이면 None.
+    lowest_stability_parameter: Optional[str] = None
+    lowest_stability_value: Optional[float] = None
 
     def is_within_threshold(self, fx: float, fy: float, ratio: float = 0.01) -> bool:
         """fx, fy 표준편차가 추정값의 1% 이내인지 (기본 threshold)"""
@@ -899,6 +954,11 @@ class KFoldResult:
     test가 되게 함으로써 완화한다.
     """
     k: int = 5
+    # Paper Evidence 단계 추가 - 이 KFoldResult를 만든 split_k_folds() seed.
+    # fold-level raw export(model/repeat_index/fold_index/seed row)에
+    # 필요하고, "같은 seed면 항상 같은 fold partition"이라는 재현성 주장을
+    # 검증하려면 어떤 seed였는지가 결과에 같이 남아 있어야 한다.
+    seed: Optional[int] = None
     fold_validation_results: list[ValidationResult] = field(default_factory=list)
     mean_test_rms: Optional[float] = None
     std_test_rms: Optional[float] = None
@@ -938,6 +998,10 @@ class RepeatedKFoldResult:
     """
     k: int = 5
     n_repeats: int = 5
+    # Paper Evidence 단계 추가 - repeat r의 seed는 base_seed + r
+    # (compute_repeated_kfold와 동일한 공식). fold-level raw export의
+    # "seed" 컬럼과 split_manifest가 이 값을 그대로 사용한다.
+    base_seed: int = 42
     kfold_results: list[KFoldResult] = field(default_factory=list)
     mean_test_rms: Optional[float] = None
     std_test_rms: Optional[float] = None

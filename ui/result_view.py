@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from calibration.kfold import KFoldProgressEvent
 from calibration.types import (
     CalibrationResult,
     CameraModelType,
@@ -40,6 +42,15 @@ from calibration.types import (
 )
 from calibration.recommender import model_selection_status
 from ui.theme import Theme, qcolor, set_tone
+
+# Repeated K-Fold는 항상 이 순서(Brown-Conrady -> Rational -> Fisheye)로
+# 실행된다(calibration/kfold.py::run_repeated_kfold_all_models와 동일 순서) -
+# progress/결과 표를 고정된 3행으로 두고 이 순서로 채운다.
+_KFOLD_MODEL_ORDER = [
+    CameraModelType.BROWN_CONRADY,
+    CameraModelType.EXTENDED_PINHOLE,
+    CameraModelType.FISHEYE,
+]
 
 _MODEL_LABELS = {
     CameraModelType.PINHOLE: "Ideal Pinhole",
@@ -290,23 +301,49 @@ class ResultView(QWidget):
         self.kfold_repeats_spin.setValue(5)
         kfold_controls.addWidget(self.kfold_repeats_spin)
         self.kfold_run_button = QPushButton("Run Repeated K-Fold")
-        self.kfold_run_button.clicked.connect(
-            lambda: self.repeated_kfold_requested.emit(
-                self.kfold_k_spin.value(), self.kfold_repeats_spin.value()
-            )
-        )
+        self.kfold_run_button.clicked.connect(self._on_kfold_run_clicked)
         kfold_controls.addWidget(self.kfold_run_button)
         kfold_controls.addStretch(1)
         kfold_layout.addLayout(kfold_controls)
+
+        # --- 전체 진행률 - "37 / 75 folds completed (49%)"를 그대로 QProgressBar
+        # 포맷 토큰(%v/%m/%p)으로 표현한다. 75 fold 계산이 오래 걸려도 이 바가
+        # 계속 움직이는 걸 보면 "멈춘 게 아니라 계산 중"이라는 걸 바로 알 수 있다.
+        self.kfold_progress_bar = QProgressBar()
+        self.kfold_progress_bar.setRange(0, 1)
+        self.kfold_progress_bar.setValue(0)
+        self.kfold_progress_bar.setFormat("Repeated K-Fold를 아직 실행하지 않았습니다.")
+        self.kfold_progress_bar.setTextVisible(True)
+        kfold_layout.addWidget(self.kfold_progress_bar)
+
+        # --- 모델별 상태(WAITING/RUNNING/COMPLETE/FAILED) + 완료 fold 수 ---
+        self.kfold_status_table = QTableWidget(len(_KFOLD_MODEL_ORDER), 3)
+        self.kfold_status_table.setHorizontalHeaderLabels(["Model", "Status", "Folds"])
+        self.kfold_status_table.setVerticalHeaderLabels(["" for _ in _KFOLD_MODEL_ORDER])
+        self.kfold_status_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.kfold_status_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.kfold_status_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        for row, model in enumerate(_KFOLD_MODEL_ORDER):
+            self.kfold_status_table.setItem(row, 0, QTableWidgetItem(_MODEL_LABELS.get(model, model.value)))
+            self.kfold_status_table.setItem(row, 1, QTableWidgetItem("-"))
+            self.kfold_status_table.setItem(row, 2, QTableWidgetItem("-"))
+        self._fit_table_to_rows(self.kfold_status_table)
+        kfold_layout.addWidget(self.kfold_status_table)
+
         self.kfold_summary_label = QLabel("아직 Repeated K-Fold를 실행하지 않았습니다.")
         self.kfold_summary_label.setWordWrap(True)
         kfold_layout.addWidget(self.kfold_summary_label)
-        self.kfold_table = QTableWidget(0, 6)
+        # 결과 표는 모델 3개 고정 행(Brown-Conrady/Rational/Fisheye 순서) -
+        # 모델 하나가 끝나는 즉시 그 행만 채우고 나머지는 "Running..."/
+        # "Waiting..."으로 남겨서, 75 fold 전체가 끝날 때까지 표가 통째로
+        # 비어있지 않게 한다.
+        self.kfold_table = QTableWidget(len(_KFOLD_MODEL_ORDER), 6)
         self.kfold_table.setHorizontalHeaderLabels(
             ["Model", "Test RMS", "Test P95", "Edge RMS", "Straightness", "Folds"]
         )
         self.kfold_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.kfold_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._reset_kfold_result_rows(placeholder="아직 실행되지 않음")
         kfold_layout.addWidget(self.kfold_table)
         model_layout.addWidget(kfold_group)
 
@@ -642,12 +679,126 @@ class ResultView(QWidget):
             for col, value in enumerate(values):
                 self.cross_dataset_table.setItem(row, col, QTableWidgetItem(str(value)))
 
+    # ------------------------------------------------------------------
+    # Repeated K-Fold - 고정 3행(Brown-Conrady/Rational/Fisheye) 표 +
+    # 실시간 진행률(progress bar, 모델별 WAITING/RUNNING/COMPLETE/FAILED).
+    # 계산/metric/fold split은 전혀 손대지 않는다 - 여기는 오직 이미 계산된
+    # KFoldProgressEvent/RepeatedKFoldResult를 화면에 어떻게 보여줄지만 담당.
+    # ------------------------------------------------------------------
+
+    def _reset_kfold_result_rows(self, placeholder: str = "N/A") -> None:
+        self.kfold_table.setRowCount(len(_KFOLD_MODEL_ORDER))
+        for row, model in enumerate(_KFOLD_MODEL_ORDER):
+            values = [_MODEL_LABELS.get(model, model.value)] + [placeholder] * 5
+            for col, value in enumerate(values):
+                self.kfold_table.setItem(row, col, QTableWidgetItem(str(value)))
+
+    def _set_kfold_status_row(self, row: int, status: str, completed: int, total: int) -> None:
+        self.kfold_status_table.setItem(row, 1, QTableWidgetItem(status))
+        self.kfold_status_table.setItem(row, 2, QTableWidgetItem(f"{completed}/{total}"))
+
+    def _mark_kfold_row_running(self, row: int) -> None:
+        """metric column(1~5) 전체를 "Running..."으로 표시 - 모델 하나가 아직
+        진행 중일 때 일부 칸만 Waiting으로 남아 헷갈리지 않게 한다."""
+        for col in range(1, 6):
+            self.kfold_table.setItem(row, col, QTableWidgetItem("Running..."))
+
+    def _fill_kfold_result_row(self, row: int, model: CameraModelType, result: RepeatedKFoldResult) -> None:
+        straight = (
+            f"{_fmt(result.mean_test_straightness)} ± {_fmt(result.std_test_straightness)}"
+            if result.n_straightness_folds > 0 else "N/A"
+        )
+        values = [
+            _MODEL_LABELS.get(model, model.value),
+            f"{_fmt(result.mean_test_rms)} ± {_fmt(result.std_test_rms)}",
+            f"{_fmt(result.mean_test_p95)} ± {_fmt(result.std_test_p95)}",
+            f"{_fmt(result.mean_edge_rms)} ± {_fmt(result.std_edge_rms)}",
+            straight,
+            f"{result.n_successful_runs}/{result.total_folds} "
+            f"(fully {result.fully_successful_folds}, partial {result.partial_success_folds}, "
+            f"failed {result.failed_folds})",
+        ]
+        for col, value in enumerate(values):
+            self.kfold_table.setItem(row, col, QTableWidgetItem(str(value)))
+
+    def _on_kfold_run_clicked(self) -> None:
+        k = self.kfold_k_spin.value()
+        n_repeats = self.kfold_repeats_spin.value()
+        self.start_repeated_kfold_progress(k, n_repeats)
+        self.repeated_kfold_requested.emit(k, n_repeats)
+
+    def start_repeated_kfold_progress(self, k: int, n_repeats: int) -> None:
+        """Run 버튼을 누른 직후(실제 계산이 아직 시작 전이어도) 호출한다.
+
+        기존 결과가 "새로 실행 중인 값"과 헷갈리지 않도록 결과 표를
+        즉시 비우고("아직 실행되지 않음"이 아니라 이번 실행이 채울
+        placeholder로), progress bar/상태 표를 0/total, 첫 모델(Brown-
+        Conrady)만 RUNNING, 나머지는 WAITING으로 되돌린다 - 실제
+        model_started 이벤트가 도착하면 다시 정확한 값으로 갱신된다.
+        """
+        model_total = k * n_repeats
+        total = model_total * len(_KFOLD_MODEL_ORDER)
+        self.kfold_progress_bar.setRange(0, max(total, 1))
+        self.kfold_progress_bar.setValue(0)
+        self.kfold_progress_bar.setFormat("%v / %m folds completed (%p%)")
+        for row, _model in enumerate(_KFOLD_MODEL_ORDER):
+            status = "RUNNING" if row == 0 else "WAITING"
+            self._set_kfold_status_row(row, status, 0, model_total)
+        self._reset_kfold_result_rows(placeholder="Waiting...")
+        if _KFOLD_MODEL_ORDER:
+            self._mark_kfold_row_running(0)
+        self.kfold_summary_label.setText(
+            f"Repeated {k}-Fold x {n_repeats} 실행 중 (Previous result가 있었다면 지워졌습니다)."
+        )
+
+    def update_repeated_kfold_progress(self, event: KFoldProgressEvent) -> None:
+        """RepeatedKFoldWorker.progress_event(object)에 연결해서 쓴다 - fold
+        하나가 끝날 때마다(또는 모델 시작/완료/전체 완료 시) 실시간으로
+        progress bar/상태 표/결과 표를 갱신한다. completed_folds/total_folds는
+        이미 calibration/kfold.py가 전역(3모델 전체) 기준으로 계산해 주므로
+        여기서는 그대로 표시만 한다."""
+        self.kfold_progress_bar.setRange(0, max(event.total_folds, 1))
+        self.kfold_progress_bar.setValue(event.completed_folds)
+        self.kfold_progress_bar.setFormat("%v / %m folds completed (%p%)")
+
+        if event.model is not None and event.model in _KFOLD_MODEL_ORDER:
+            row = _KFOLD_MODEL_ORDER.index(event.model)
+            if event.stage == "model_started":
+                self._set_kfold_status_row(row, "RUNNING", 0, event.model_total_folds)
+                self._mark_kfold_row_running(row)
+            elif event.stage == "fold_completed":
+                self._set_kfold_status_row(row, "RUNNING", event.model_completed_folds, event.model_total_folds)
+            elif event.stage == "model_completed":
+                self._set_kfold_status_row(row, "COMPLETE", event.model_completed_folds, event.model_total_folds)
+                if event.partial_result is not None:
+                    self._fill_kfold_result_row(row, event.model, event.partial_result)
+            # 다음 모델 행은 그 모델의 model_started가 오기 전까지 WAITING 그대로 둔다.
+
+        if event.stage == "all_completed":
+            self.kfold_summary_label.setText(
+                f"Repeated K-Fold 완료: {event.completed_folds}/{event.total_folds} fold 처리됨 (모델별 표 참고)"
+            )
+
+    def set_repeated_kfold_error(self, message: str) -> None:
+        """실행 실패 시 - progress bar 값은 그대로 남겨서 어디까지 진행됐는지
+        보여주고(뒤로 되돌리지 않음), 아직 COMPLETE로 안 채워진 채 RUNNING
+        이었던 모델 행만 FAILED로 표시한다."""
+        for row in range(len(_KFOLD_MODEL_ORDER)):
+            status_item = self.kfold_status_table.item(row, 1)
+            if status_item is not None and status_item.text() == "RUNNING":
+                status_item.setText("FAILED")
+        self.kfold_summary_label.setText(f"Repeated K-Fold 실패: {message}")
+
     def set_repeated_kfold_results(self, results: dict[CameraModelType, RepeatedKFoldResult]) -> None:
-        """calibration/kfold.py::run_repeated_kfold_all_models()의 결과(모델별
-        RepeatedKFoldResult)를 표로 보여준다. 특정 모델이 이기도록 색칠/정렬
-        조작하지 않는다 - raw mean ± std를 그대로 나열만 한다."""
-        self.kfold_table.setRowCount(len(results))
+        """calibration/kfold.py::run_repeated_kfold_all_models()의 최종 결과
+        (모델별 RepeatedKFoldResult)로 표/상태/progress bar를 확정한다.
+        특정 모델이 이기도록 색칠/정렬 조작하지 않는다 - raw mean ± std를
+        그대로 나열만 한다. 실시간 갱신은 이미 update_repeated_kfold_progress
+        (model_completed 이벤트)가 해 두었을 것이므로, 이 메서드는 최종
+        일관성을 보장하는 역할(예: progress_event 연결이 안 된 경우에도
+        결과가 정확히 표시됨)이다."""
         if not results:
+            self._reset_kfold_result_rows(placeholder="아직 실행되지 않음")
             self.kfold_summary_label.setText("아직 Repeated K-Fold를 실행하지 않았습니다.")
             return
 
@@ -655,23 +806,16 @@ class ResultView(QWidget):
         self.kfold_summary_label.setText(
             f"Repeated {any_result.k}-Fold x {any_result.n_repeats} - 모델별 successful folds는 표를 참고하세요."
         )
-        for row, (model, result) in enumerate(results.items()):
-            straight = (
-                f"{_fmt(result.mean_test_straightness)} ± {_fmt(result.std_test_straightness)}"
-                if result.n_straightness_folds > 0 else "N/A"
-            )
-            values = [
-                _MODEL_LABELS.get(model, model.value),
-                f"{_fmt(result.mean_test_rms)} ± {_fmt(result.std_test_rms)}",
-                f"{_fmt(result.mean_test_p95)} ± {_fmt(result.std_test_p95)}",
-                f"{_fmt(result.mean_edge_rms)} ± {_fmt(result.std_edge_rms)}",
-                straight,
-                f"{result.n_successful_runs}/{result.total_folds} "
-                f"(fully {result.fully_successful_folds}, partial {result.partial_success_folds}, "
-                f"failed {result.failed_folds})",
-            ]
-            for col, value in enumerate(values):
-                self.kfold_table.setItem(row, col, QTableWidgetItem(str(value)))
+        total = sum(r.total_folds for r in results.values())
+        self.kfold_progress_bar.setRange(0, max(total, 1))
+        self.kfold_progress_bar.setValue(total)
+        self.kfold_progress_bar.setFormat("%v / %m folds completed (%p%)")
+        for row, model in enumerate(_KFOLD_MODEL_ORDER):
+            result = results.get(model)
+            if result is None:
+                continue
+            self._fill_kfold_result_row(row, model, result)
+            self._set_kfold_status_row(row, "COMPLETE", result.n_successful_runs, result.total_folds)
 
     def select_model(self, model: CameraModelType) -> None:
         idx = self.model_combo.findData(model)

@@ -41,6 +41,13 @@ logger = logging.getLogger(__name__)
 
 _MIN_SUCCESSFUL_SAMPLES = 5
 _STABILITY_EPS = 1e-9
+# Paper Evidence 단계 - "reference(전체 데이터 fit 값)가 0에 가까우면 상대
+# CV가 통계적으로 의미가 약하다"를 판단하는 진단용 heuristic cutoff. 이
+# 값을 바꾼다고 어떤 모델의 stability 점수가 달라지지 않는다 - near-zero
+# diagnostic 플래그를 붙일지 말지에만 쓰인다. distortion 계수(k1~k4 등)는
+# 보통 이 크기 이상이므로("아주 작은 왜곡"이라도 보통 1e-3보다는 크다)
+# 1e-3을 "0에 가깝다"의 기준으로 삼는다 - 특정 계수를 겨냥해 고른 값이 아니다.
+_NEAR_ZERO_REFERENCE_THRESHOLD = 1e-3
 
 
 def _run_bootstrap_sample(args: tuple) -> tuple[float, float, float, float, list[float]] | None:
@@ -94,6 +101,78 @@ def _stability_from_std(mean: float, std: float, reference: float | None = None)
     return float(max(0.0, min(100.0, 100.0 * (1.0 - cv))))
 
 
+def _pure_relative_cv(mean: float | None, std: float | None) -> float | None:
+    """논문 수식 그대로의 CV_p = sigma_p / mu_p (mu_p = bootstrap 표본 평균).
+
+    기존 stability_score가 쓰는 _stability_from_std()는 scale에 reference
+    (전체 데이터 fit 값)도 섞어서(max(|mean|,|reference|,eps)) 안정성 점수
+    자체를 계산하는 데 쓰이므로 그 계산은 그대로 둔다 - 이 함수는 "논문
+    수식과 정확히 같은 CV"를 진단용으로 별도 노출하기 위한 것이다.
+    """
+    if mean is None or std is None:
+        return None
+    denom = max(abs(mean), _STABILITY_EPS)
+    return float(std / denom)
+
+
+def _paper_stability_fields(
+    fx: dict, fy: dict, cx: dict, cy: dict,
+    d_stats: list[DistortionCoeffStat],
+    fx_ref: float | None, fy_ref: float | None, cx_ref: float | None, cy_ref: float | None,
+) -> dict:
+    """paper_intrinsic_stability 등 Paper Evidence 전용 필드를 한 곳에서 계산.
+
+    compute_parameter_bootstrap()(method="bootstrap")과
+    add_normal_approximation_ci()(method="covariance") 둘 다 fx/fy/cx/cy
+    각각의 _distribution() 결과(dict: mean/std/median/... /stability)와
+    distortion_stats를 이미 갖고 있으므로, 이 함수는 그 값들로부터
+    paper_intrinsic_stability/distortion_stability_summary/lowest-stability
+    parameter/근-영 진단 플래그만 추가로 뽑아낸다 - 어떤 기존 값도 다시
+    계산하거나 바꾸지 않는다(순수 파생값).
+    """
+    intrinsic_stabilities = [
+        v for v in (fx["stability"], fy["stability"], cx["stability"], cy["stability"]) if v is not None
+    ]
+    paper_intrinsic_stability = float(np.mean(intrinsic_stabilities)) if intrinsic_stabilities else None
+
+    distortion_stabilities = [s.stability_score for s in d_stats if s.stability_score is not None]
+    distortion_stability_summary = float(np.mean(distortion_stabilities)) if distortion_stabilities else None
+
+    # 각 distortion coefficient에 reference/relative_cv/near-zero 진단을 채운다
+    # (in-place - d_stats는 호출부가 막 만든 리스트라 공유 걱정이 없다).
+    for stat in d_stats:
+        stat.relative_cv = _pure_relative_cv(stat.mean, stat.std)
+        if stat.reference is not None and abs(stat.reference) < _NEAR_ZERO_REFERENCE_THRESHOLD:
+            stat.near_zero_reference = True
+            stat.diagnostic = "near-zero coefficient; relative CV unstable"
+
+    # 전체(intrinsic 4개 + distortion 전부)에서 stability_score가 가장 낮은
+    # 파라미터 하나를 찾는다 - "Fisheye 62%가 어디서 왔는지" UI가 바로
+    # 짚어줄 수 있게.
+    candidates: list[tuple[str, float]] = []
+    for label, value in (("fx", fx["stability"]), ("fy", fy["stability"]), ("cx", cx["stability"]), ("cy", cy["stability"])):
+        if value is not None:
+            candidates.append((label, value))
+    for stat in d_stats:
+        if stat.stability_score is not None:
+            candidates.append((stat.label or f"d{stat.index}", stat.stability_score))
+    lowest_label, lowest_value = (None, None)
+    if candidates:
+        lowest_label, lowest_value = min(candidates, key=lambda item: item[1])
+
+    return {
+        "paper_intrinsic_stability": paper_intrinsic_stability,
+        "distortion_stability_summary": distortion_stability_summary,
+        "fx_reference": fx_ref, "fy_reference": fy_ref, "cx_reference": cx_ref, "cy_reference": cy_ref,
+        "fx_relative_cv": _pure_relative_cv(fx["mean"], fx["std"]),
+        "fy_relative_cv": _pure_relative_cv(fy["mean"], fy["std"]),
+        "cx_relative_cv": _pure_relative_cv(cx["mean"], cx["std"]),
+        "cy_relative_cv": _pure_relative_cv(cy["mean"], cy["std"]),
+        "lowest_stability_parameter": lowest_label,
+        "lowest_stability_value": lowest_value,
+    }
+
+
 def _distribution(samples: list[float], reference: float | None = None) -> dict[str, float | None]:
     if not samples:
         return {
@@ -125,7 +204,8 @@ def _distortion_stats(
     stats: list[DistortionCoeffStat] = []
     for i in range(max_len):
         values = [sample[i] for sample in distortion_samples if i < len(sample)]
-        d = _distribution(values, reference=ref[i] if i < len(ref) else None)
+        ref_i = ref[i] if i < len(ref) else None
+        d = _distribution(values, reference=ref_i)
         stats.append(
             DistortionCoeffStat(
                 index=i,
@@ -138,6 +218,7 @@ def _distortion_stats(
                 ci_low=d["ci_low"],
                 ci_high=d["ci_high"],
                 stability_score=d["stability"],
+                reference=ref_i,
             )
         )
     return stats
@@ -228,6 +309,12 @@ def compute_parameter_bootstrap(
     )
     overall_stability = float(np.mean(stability_values)) if stability_values else None
 
+    paper_fields = _paper_stability_fields(
+        fx, fy, cx, cy, d_stats,
+        fx_ref=float(K_ref[0, 0]), fy_ref=float(K_ref[1, 1]),
+        cx_ref=float(K_ref[0, 2]), cy_ref=float(K_ref[1, 2]),
+    )
+
     logger.info(
         "%s bootstrap 불확실성 추정 완료: %d/%d개 재표본 성공",
         model.value, len(fx_samples), n_bootstrap,
@@ -239,6 +326,7 @@ def compute_parameter_bootstrap(
         cy_std=cy["std"],
         method="bootstrap",
         n_bootstrap_success=len(fx_samples),
+        n_bootstrap_total=n_bootstrap,
         fx_ci_low=fx["ci_low"], fx_ci_high=fx["ci_high"],
         fy_ci_low=fy["ci_low"], fy_ci_high=fy["ci_high"],
         cx_ci_low=cx["ci_low"], cx_ci_high=cx["ci_high"],
@@ -251,6 +339,7 @@ def compute_parameter_bootstrap(
         cx_stability=cx["stability"], cy_stability=cy["stability"],
         overall_stability=overall_stability,
         distortion_stats=d_stats,
+        **paper_fields,
     )
 
 
@@ -296,6 +385,30 @@ def add_normal_approximation_ci(uncertainty: ParameterUncertainty, camera_matrix
         if v is not None
     ]
     uncertainty.overall_stability = float(np.mean(stability_values)) if stability_values else None
+    # method="covariance"는 distortion coefficient 통계가 애초에 없으므로
+    # (cv2.calibrateCameraExtended의 stdDeviationsIntrinsics만 여기서 다룬다)
+    # overall_stability와 paper_intrinsic_stability가 이 경로에서는 항상
+    # 같은 값이 된다 - 그래도 두 메서드(bootstrap/covariance) 모두에서
+    # paper_intrinsic_stability가 존재하도록 명시적으로 채운다.
+    uncertainty.paper_intrinsic_stability = uncertainty.overall_stability
+    uncertainty.distortion_stability_summary = None
+    uncertainty.fx_reference, uncertainty.fy_reference = fx, fy
+    uncertainty.cx_reference, uncertainty.cy_reference = cx, cy
+    uncertainty.fx_relative_cv = _pure_relative_cv(uncertainty.fx_mean, uncertainty.fx_std)
+    uncertainty.fy_relative_cv = _pure_relative_cv(uncertainty.fy_mean, uncertainty.fy_std)
+    uncertainty.cx_relative_cv = _pure_relative_cv(uncertainty.cx_mean, uncertainty.cx_std)
+    uncertainty.cy_relative_cv = _pure_relative_cv(uncertainty.cy_mean, uncertainty.cy_std)
+    candidates = [
+        (label, value) for label, value in (
+            ("fx", uncertainty.fx_stability), ("fy", uncertainty.fy_stability),
+            ("cx", uncertainty.cx_stability), ("cy", uncertainty.cy_stability),
+        )
+        if value is not None
+    ]
+    if candidates:
+        uncertainty.lowest_stability_parameter, uncertainty.lowest_stability_value = min(
+            candidates, key=lambda item: item[1]
+        )
 
     return uncertainty
 
@@ -317,7 +430,15 @@ def format_parameter_uncertainty(uncertainty: ParameterUncertainty | None) -> st
         ci = f"  (95% CI: {lo:.1f} ~ {hi:.1f})" if lo is not None and hi is not None else ""
         return f"{name} std = {std:.3f}{ci}"
 
-    lines = [f"Parameter Uncertainty (method={uncertainty.method})"]
+    # calibration/repeatability.py의 order-shuffle/initial-condition
+    # perturbation("Solver Repeatability")과 절대 혼동되면 안 되므로,
+    # provenance(어떤 실험에서 나온 숫자인지)를 문장으로 명시한다 -
+    # method 필드 자체("bootstrap"/"covariance")는 바꾸지 않는다.
+    provenance = {
+        "bootstrap": "Bootstrap Parameter Stability - frame resampling with replacement",
+        "covariance": "Covariance-based Parameter Uncertainty (cv2 stdDeviationsIntrinsics, normal approximation)",
+    }.get(uncertainty.method, f"method={uncertainty.method}")
+    lines = [f"Parameter Uncertainty ({provenance})"]
     lines.append(fmt_line("fx", uncertainty.fx_std, uncertainty.fx_ci_low, uncertainty.fx_ci_high))
     lines.append(fmt_line("fy", uncertainty.fy_std, uncertainty.fy_ci_low, uncertainty.fy_ci_high))
     lines.append(fmt_line("cx", uncertainty.cx_std, uncertainty.cx_ci_low, uncertainty.cx_ci_high))
@@ -339,7 +460,19 @@ def format_parameter_uncertainty(uncertainty: ParameterUncertainty | None) -> st
         lines.append(fmt_dist("cx", uncertainty.cx_mean, uncertainty.cx_median, uncertainty.cx_ci_low, uncertainty.cx_ci_high, uncertainty.cx_stability))
         lines.append(fmt_dist("cy", uncertainty.cy_mean, uncertainty.cy_median, uncertainty.cy_ci_low, uncertainty.cy_ci_high, uncertainty.cy_stability))
     if uncertainty.overall_stability is not None:
-        lines.append(f"Parameter Stability = {uncertainty.overall_stability:.1f}/100")
+        lines.append(f"All-Parameter Stability (legacy overall_stability) = {uncertainty.overall_stability:.1f}/100")
+    if uncertainty.paper_intrinsic_stability is not None:
+        lines.append(
+            f"Paper Intrinsic Stability (fx/fy/cx/cy only, CV_p=sigma_p/mu_p) = "
+            f"{uncertainty.paper_intrinsic_stability:.1f}/100"
+        )
+    if uncertainty.distortion_stability_summary is not None:
+        lines.append(f"Distortion Stability Summary (diagnostic only) = {uncertainty.distortion_stability_summary:.1f}/100")
+    if uncertainty.lowest_stability_parameter is not None:
+        lines.append(
+            f"Lowest-stability parameter: {uncertainty.lowest_stability_parameter} "
+            f"({uncertainty.lowest_stability_value:.1f}/100)"
+        )
     if uncertainty.distortion_stats:
         lines.append("Distortion coefficient stability:")
         for stat in uncertainty.distortion_stats:
@@ -350,8 +483,11 @@ def format_parameter_uncertainty(uncertainty: ParameterUncertainty | None) -> st
                 f", 95% CI {stat.ci_low:.4g} ~ {stat.ci_high:.4g}"
                 if stat.ci_low is not None and stat.ci_high is not None else ""
             )
+            ref = f", reference={stat.reference:.4g}" if stat.reference is not None else ""
+            rel_cv = f", relative_cv={stat.relative_cv:.3g}" if stat.relative_cv is not None else ""
+            warn = f"  [{stat.diagnostic}]" if stat.diagnostic else ""
             lines.append(
                 f"  {stat.label or f'd{stat.index}'}: std={std} "
-                f"median={median} stability={stability}{ci}"
+                f"median={median}{ref} stability={stability}{ci}{rel_cv}{warn}"
             )
     return "\n".join(lines)

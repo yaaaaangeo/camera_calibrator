@@ -10,8 +10,8 @@ camera_matrix: !!opencv-matrix
    rows: 3
    cols: 3
    dt: d
-   data: [ 6214.1999565182732, 0., 1241.5485289521691, 0.,
-       3736.1637659542394, -668.88555041152222, 0., 0., 1. ]
+   data: [ 6214.1999565829392, 0., 1241.5485289509836, 0.,
+       3736.1637659765174, -668.88555039589085, 0., 0., 1. ]
 distortion_coefficients: !!opencv-matrix
    rows: 1
    cols: 5
@@ -19,7 +19,7 @@ distortion_coefficients: !!opencv-matrix
    data: [ 0., 0., 0., 0., 0. ]
 distortion_coefficient_count: 5
 distortion_coefficient_order: "k1,k2,p1,p2,k3"
-rms_reprojection_error: 5.0634885453752894
+rms_reprojection_error: 5.0634885453779201
 calibration_source: original
 pattern_type: chessboard
 pattern_squares_x: 7

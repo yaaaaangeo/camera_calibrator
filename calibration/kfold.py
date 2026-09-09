@@ -21,7 +21,10 @@ Train/Test leakage 방지 원칙(test로 파라미터를 수정하지 않음)이
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import random
+import threading
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -43,6 +46,54 @@ from calibration.types import (
     PatternConfig,
     RepeatedKFoldResult,
 )
+
+
+# ---------------------------------------------------------------------------
+# 진행률 콜백 - Qt/UI에 의존하지 않는 순수 dataclass + Callable로만 구성한다
+# (ui/kfold_worker.py가 이 dataclass를 그대로 Signal(object)에 실어 보낸다).
+# 75 fold(K=5 x Repeats=5 x 3모델) 같은 오래 걸리는 계산에서 사용자가 "멈춘
+# 건지 계산 중인지" 알 수 있게 하는 것이 유일한 목적이고, fold split/seed/
+# metric 계산 자체에는 관여하지 않는다 - 실제 fold 하나가 끝날 때마다
+# "끝났다"는 신호만 위로 전달한다.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class KFoldProgressEvent:
+    """Repeated K-Fold 진행 상황 하나.
+
+    completed_folds/total_folds: 이 이벤트를 emit한 함수 기준 "가장 바깥
+        스코프"의 진행도. run_repeated_kfold_all_models()를 통해 받은
+        이벤트라면 K=5,Repeats=5,3모델 기준 0~75 전체 진행이고,
+        compute_repeated_kfold()를 단독으로 호출했다면 그 모델 하나의
+        0~(k*n_repeats) 진행과 같다(모델이 하나뿐이라 model_* 값과 동일).
+    model: 이 이벤트가 어느 모델에 대한 것인지 - stage가 "all_completed"면 None.
+    model_completed_folds/model_total_folds: model 하나의 진행(예: 0~25).
+    stage: "model_started" | "fold_completed" | "model_completed" | "all_completed".
+    partial_result: stage=="model_completed"일 때 그 모델의 완성된
+        RepeatedKFoldResult(다른 stage에서는 None) - UI가 모델 하나가 끝나는
+        즉시 그 모델의 표 row를 채울 수 있게 한다.
+    """
+    completed_folds: int
+    total_folds: int
+    model: Optional[CameraModelType]
+    model_completed_folds: int
+    model_total_folds: int
+    stage: str
+    partial_result: Optional[RepeatedKFoldResult] = None
+
+
+KFoldProgressCallback = Callable[[KFoldProgressEvent], None]
+
+
+def _safe_call(callback: Optional[Callable[..., None]], *args) -> None:
+    """progress callback은 UI 쪽 코드(Qt slot 등)일 수 있어, 여기서 예외가
+    나도 calibration 계산 자체가 실패하면 안 된다 - 항상 조용히 삼킨다."""
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception:
+        pass
 
 
 def _fold_cache_key(
@@ -222,10 +273,20 @@ def compute_kfold_validation(
     seed: int = 42,
     n_jobs: int = 1,
     cache: ValidationCache | None = KFOLD_VALIDATION_CACHE,
+    fold_done_callback: Optional[Callable[[], None]] = None,
 ) -> KFoldResult:
     """단일 K-Fold 실행. 각 fold를 정확히 한 번 test로 써서 validate_holdout()으로
     평가하고, fold별 test_rms/test_residual_stats.p95를 모아 mean/std/min/max로
     요약한다.
+
+    fold_done_callback: 실제 fold 하나(validate_holdout 1회 호출, 캐시
+        히트든 아니든)가 끝날 때마다 인자 없이 호출된다 - progress reporting
+        전용이고 fold split/metric 계산에는 전혀 관여하지 않는다. 기본값
+        None이라 기존 호출부는 전혀 영향받지 않는다(backward-compatible).
+        n_jobs>1이면 여러 worker thread에서 동시에 호출될 수 있으므로,
+        호출자가 그 경우 thread-safe하게 처리해야 한다(compute_repeated_kfold
+        가 그렇게 한다) - 이 함수 자체는 카운터를 들고 있지 않고 그냥
+        "fold 하나 끝남" 신호만 그대로 전달한다.
     """
     folds = split_k_folds(dataset, camera_config, k=k, seed=seed)
     tasks = []
@@ -247,17 +308,23 @@ def compute_kfold_validation(
             )
         )
 
+    def _run_fold_and_report(task):
+        result = _validate_fold(task)
+        _safe_call(fold_done_callback)
+        return result
+
     workers = resolve_worker_count(n_jobs, len(tasks))
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            fold_results = list(executor.map(_validate_fold, tasks))
+            fold_results = list(executor.map(_run_fold_and_report, tasks))
     else:
-        fold_results = [_validate_fold(task) for task in tasks]
+        fold_results = [_run_fold_and_report(task) for task in tasks]
 
     metrics = _collect_multi_metrics(fold_results)
 
     return KFoldResult(
         k=k,
+        seed=seed,
         fold_validation_results=fold_results,
         mean_test_rms=metrics["mean_test_rms"], std_test_rms=metrics["std_test_rms"],
         min_test_rms=metrics["min_test_rms"], max_test_rms=metrics["max_test_rms"],
@@ -283,18 +350,53 @@ def compute_repeated_kfold(
     base_seed: int = 42,
     n_jobs: int = 1,
     cache: ValidationCache | None = KFOLD_VALIDATION_CACHE,
+    progress_callback: Optional[KFoldProgressCallback] = None,
 ) -> RepeatedKFoldResult:
     """설계 문서 19번 - K-Fold를 n_repeats번(각기 다른 seed로 다시 분할) 반복.
 
     "5-fold x 5회 반복" = fold 25개의 test_rms를 전부 모아 하나의 분포로 보고
     mean/std/min/max를 낸다 - 개별 KFoldResult(1회 분할 기준 평균)도 참고용으로
     보존한다.
+
+    progress_callback: 기본값 None(기존 호출부는 전혀 영향받지 않는다). 넘기면
+        이 model 하나에 대해 "model_started"(시작 시 1회) -> 실제 fold가
+        끝날 때마다 "fold_completed"(정확히 fold 개수만큼) -> 끝나면
+        "model_completed"(완성된 RepeatedKFoldResult를 partial_result로 담아
+        1회) 순서로 호출된다. n_repeats를 n_jobs>1로 병렬 실행하면 여러
+        repeat가 서로 다른 thread에서 동시에 fold를 끝낼 수 있으므로, 진행
+        카운터는 Lock으로 보호한다(중복/역행 없이 정확히 1개씩 증가).
     """
+    model_total_folds = k * n_repeats
+    progress_lock = threading.Lock()
+    completed = {"n": 0}
+
+    def _emit(stage: str, partial_result: RepeatedKFoldResult | None = None) -> None:
+        if progress_callback is None:
+            return
+        with progress_lock:
+            n = completed["n"]
+        _safe_call(
+            progress_callback,
+            KFoldProgressEvent(
+                completed_folds=n, total_folds=model_total_folds,
+                model=model, model_completed_folds=n, model_total_folds=model_total_folds,
+                stage=stage, partial_result=partial_result,
+            ),
+        )
+
+    def _on_fold_done() -> None:
+        with progress_lock:
+            completed["n"] += 1
+        _emit("fold_completed")
+
+    _emit("model_started")
+
     def _run_repeat(repeat_index: int) -> KFoldResult:
         return compute_kfold_validation(
             dataset, camera_config, pattern_config, model,
             k=k, seed=base_seed + repeat_index,
             n_jobs=1, cache=cache,
+            fold_done_callback=_on_fold_done,
         )
 
     repeat_indices = list(range(n_repeats))
@@ -321,9 +423,10 @@ def compute_repeated_kfold(
     missing_folds = max(0, total_folds - len(all_fold_results))
     failed_folds = executed_failed + missing_folds
 
-    return RepeatedKFoldResult(
+    result = RepeatedKFoldResult(
         k=k,
         n_repeats=n_repeats,
+        base_seed=base_seed,
         kfold_results=kfold_results,
         mean_test_rms=metrics["mean_test_rms"], std_test_rms=metrics["std_test_rms"],
         min_test_rms=metrics["min_test_rms"], max_test_rms=metrics["max_test_rms"],
@@ -341,6 +444,8 @@ def compute_repeated_kfold(
         partial_success_folds=partial_success,
         failed_folds=failed_folds,
     )
+    _emit("model_completed", partial_result=result)
+    return result
 
 
 def format_kfold_result(result: KFoldResult) -> str:
@@ -426,6 +531,7 @@ def run_repeated_kfold_all_models(
     base_seed: int = 42,
     n_jobs: int = 1,
     cache: ValidationCache | None = KFOLD_VALIDATION_CACHE,
+    progress_callback: Optional[KFoldProgressCallback] = None,
 ) -> dict[CameraModelType, RepeatedKFoldResult]:
     """Brown-Conrady/Rational(Extended Pinhole)/Fisheye 세 모델을 정확히 같은
     fold partition으로 비교하기 위한 편의 함수.
@@ -439,19 +545,75 @@ def run_repeated_kfold_all_models(
     split_k_folds의 결정론적 동작으로 구조적으로 보장된다(별도 조율 로직이
     필요 없다) - test_repeated_kfold_all_models_share_fold_partition()이
     이 사실을 회귀 테스트로 고정한다.
+
+    progress_callback: 기본값 None(기존 호출부는 영향 없음). 넘기면 모델
+        순서(Brown-Conrady -> Rational -> Fisheye, 유지됨) 그대로 "이
+        모델의 folds"가 아니라 "3모델 전체 folds"(K=5,Repeats=5면 0~75)
+        기준 completed_folds/total_folds를 담은 KFoldProgressEvent를 준다:
+        모델 시작 시 "model_started" 1회, 그 모델의 fold가 실제로 끝날
+        때마다 "fold_completed"(model_completed_folds/model_total_folds도
+        함께 갱신), 모델 하나가 끝나면 "model_completed"(그 모델의 완성된
+        RepeatedKFoldResult를 partial_result로 담음), 3모델 전체가 끝나면
+        마지막에 "all_completed" 1회. 전역 카운터는 Lock으로 보호되어
+        n_jobs>1이어도 역행/중복 없이 정확히 1씩 증가한다.
     """
     target_models = models or [
         CameraModelType.BROWN_CONRADY,
         CameraModelType.EXTENDED_PINHOLE,
         CameraModelType.FISHEYE,
     ]
-    return {
-        model: compute_repeated_kfold(
+    model_total_folds = k * n_repeats
+    total_folds = model_total_folds * len(target_models)
+    global_lock = threading.Lock()
+    global_completed = {"n": 0}
+
+    def _emit(stage: str, model: CameraModelType | None, model_completed_folds: int,
+              partial_result: RepeatedKFoldResult | None = None) -> None:
+        if progress_callback is None:
+            return
+        with global_lock:
+            n = global_completed["n"]
+        _safe_call(
+            progress_callback,
+            KFoldProgressEvent(
+                completed_folds=n, total_folds=total_folds,
+                model=model, model_completed_folds=model_completed_folds,
+                model_total_folds=model_total_folds, stage=stage, partial_result=partial_result,
+            ),
+        )
+
+    results: dict[CameraModelType, RepeatedKFoldResult] = {}
+    for model in target_models:
+        _emit("model_started", model=model, model_completed_folds=0)
+
+        def _relay(inner_event: KFoldProgressEvent, _model=model) -> None:
+            # compute_repeated_kfold가 이미 "model_started"도 보내지만, 그
+            # 시점의 completed_folds는 이 함수(모델 하나) 관점이라 전역
+            # 진행률과 다르다 - 위에서 이미 올바른 전역 값으로 한 번 보냈으니
+            # 여기서는 무시하고, "fold_completed"/"model_completed"만
+            # 전역 카운터로 다시 계산해서 relay한다.
+            if inner_event.stage == "fold_completed":
+                with global_lock:
+                    global_completed["n"] += 1
+                _emit(
+                    "fold_completed", model=_model,
+                    model_completed_folds=inner_event.model_completed_folds,
+                )
+            elif inner_event.stage == "model_completed":
+                _emit(
+                    "model_completed", model=_model,
+                    model_completed_folds=inner_event.model_completed_folds,
+                    partial_result=inner_event.partial_result,
+                )
+
+        results[model] = compute_repeated_kfold(
             dataset, camera_config, pattern_config, model,
             k=k, n_repeats=n_repeats, base_seed=base_seed, n_jobs=n_jobs, cache=cache,
+            progress_callback=(_relay if progress_callback is not None else None),
         )
-        for model in target_models
-    }
+
+    _emit("all_completed", model=None, model_completed_folds=0)
+    return results
 
 
 _MODEL_COMPARISON_LABELS = {
