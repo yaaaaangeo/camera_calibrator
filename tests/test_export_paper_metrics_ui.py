@@ -317,6 +317,30 @@ class TestSuccessfulExport:
         finally:
             win.close()
 
+    def test_export_accepts_string_model_and_pattern_values(self, qapp, monkeypatch, tmp_path):
+        """PySide Signal/QVariant가 str-Enum을 plain str로 바꿔도 export한다."""
+        from ui.main_window import MainWindow
+
+        win = MainWindow()
+        try:
+            _minimal_state(win)
+            model = CameraModelType.BROWN_CONRADY.value
+            win.pattern_config.type = PatternType.CHESSBOARD.value
+            win.calibration_results = {model: next(iter(win.calibration_results.values()))}
+            win.validation_results = {model: next(iter(win.validation_results.values()))}
+            win.repeated_kfold_results = {model: next(iter(win.repeated_kfold_results.values()))}
+
+            monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(tmp_path)))
+            monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *a, **k: None))
+
+            win._on_export_paper_metrics_requested()
+
+            metrics = (tmp_path / "paper_metrics.json").read_text(encoding="utf-8")
+            assert '"target_type": "chessboard"' in metrics
+            assert '"brown_conrady"' in metrics
+        finally:
+            win.close()
+
 
 # ---------------------------------------------------------------------------
 # 6) backend 예외 시 crash 없이 에러 표시

@@ -59,6 +59,34 @@ from calibration.types import (
 PAPER_FOLD_METRICS = ["test_rms", "test_p95", "test_edge_rms", "test_straightness"]
 
 
+def _enum_value(value: object) -> str:
+    """Qt userData 등을 거치며 str로 바뀐 str-Enum도 같은 값으로 다룬다."""
+    return str(getattr(value, "value", value))
+
+
+def _normalize_model_mapping(mapping: dict, label: str) -> dict[CameraModelType, object]:
+    """Paper export 경계에서 model key를 CameraModelType으로 정규화한다.
+
+    PySide의 ``Signal(dict)``/QVariant 경계를 통과한 ``str, Enum`` key는
+    값은 같아도 ``.value`` 속성이 없다. 계산 결과 객체는 건드리지 않고
+    export에 쓰는 mapping view만 정규화한다.
+    """
+    normalized: dict[CameraModelType, object] = {}
+    for raw_model, result in mapping.items():
+        try:
+            model = (
+                raw_model
+                if isinstance(raw_model, CameraModelType)
+                else CameraModelType(_enum_value(raw_model))
+            )
+        except ValueError as exc:
+            raise ValueError(f"{label}에 알 수 없는 camera model key가 있습니다: {raw_model!r}") from exc
+        if model in normalized:
+            raise ValueError(f"{label}에 중복 camera model key가 있습니다: {model.value}")
+        normalized[model] = result
+    return normalized
+
+
 def _fmt(v: float | None, ndigits: int = 3) -> str:
     return f"{v:.{ndigits}f}" if v is not None else "N/A"
 
@@ -436,14 +464,15 @@ def build_paper_metadata(
     usable = 0
     if dataset is not None:
         usable = sum(1 for f in dataset.enabled_frames if f.detection and f.detection.success)
-    board = f"{pattern_config.type.value} {pattern_config.squares_x}x{pattern_config.squares_y}, square={pattern_config.square_size}m"
+    pattern_type = _enum_value(pattern_config.type)
+    board = f"{pattern_type} {pattern_config.squares_x}x{pattern_config.squares_y}, square={pattern_config.square_size}m"
     if pattern_config.marker_size:
         board += f", marker={pattern_config.marker_size}m"
     roi_dict = (roi or full_image_roi(camera_config.width, camera_config.height)).to_dict()
     return PaperExperimentMetadata(
         resolution=f"{camera_config.width}x{camera_config.height}",
         approximate_fov_deg=camera_config.hfov_deg,
-        target_type=pattern_config.type.value,
+        target_type=pattern_type,
         board_geometry=board,
         num_usable_frames=usable,
         k=k, n_repeats=n_repeats, base_seed=base_seed,
@@ -605,10 +634,20 @@ def export_paper_metrics(
     calibration 결과를 하나도 다시 계산하지 않고 이미 있는 값을 파일로
     옮겨 적을 뿐이다.
     """
+    # Qt의 Signal(dict)/QVariant를 거친 dict key가 str로 바뀌는 경우가
+    # 있으므로 파일을 쓰기 전에 한 번 정규화한다. 이 단계가 없으면 아래
+    # helper의 ``model.value`` 접근에서 export가 중단된다.
+    single_holdout = _normalize_model_mapping(single_holdout, "single_holdout")
+    repeated = _normalize_model_mapping(repeated, "repeated")
+    stability_by_model = _normalize_model_mapping(stability_by_model or {}, "stability_by_model")
+    spatial_rows_by_model = (
+        _normalize_model_mapping(spatial_rows_by_model, "spatial_rows_by_model")
+        if spatial_rows_by_model is not None else None
+    )
+
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     written: dict[str, str] = {}
-    stability_by_model = stability_by_model or {}
 
     rows_by_model = {m: kfold_raw_rows(m, r) for m, r in repeated.items()}
     fold_rows = [row for rows in rows_by_model.values() for row in rows]
