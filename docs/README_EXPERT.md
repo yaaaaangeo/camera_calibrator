@@ -164,6 +164,10 @@ Object-Releasing(4번 섹션)도 동일 원칙을 따르되 범위가 하나 더
 
 ## 6. Windshield Geometry
 
+이 절은 수식·구현·검증 계약을 다루는 전문가용 설명입니다. 실제 GUI 클릭
+순서와 촬영/문제 해결은 [Windshield Refraction 실전 가이드](WINDSHIELD_REFRACTION_GUIDE.md)를
+먼저 보세요.
+
 Camera Intrinsic(2번 섹션) 위에 얹는 **별도 계층**이다. 실제 차량은 카메라
 앞에 windshield(자동차 유리)가 있고, 그 유리가 굴절을 일으켜 순수 K/D
 모델만으로는 설명 안 되는 잔차가 남는다 - 이 계층은 그 잔차를 모델링한다.

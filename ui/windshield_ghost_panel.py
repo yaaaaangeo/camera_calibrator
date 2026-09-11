@@ -28,7 +28,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QGroupBox,
-    QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -42,7 +41,7 @@ from PySide6.QtWidgets import (
 from calibration.windshield.ghost import GhostDatasetResult, GhostEvaluationConfig
 from calibration.windshield.ghost.config import DEFAULT_SPATIAL_COLS, DEFAULT_SPATIAL_ROWS, GHOST_DATASET_IMAGE_EXTENSIONS
 from ui.ghost_evaluation_worker import GhostEvaluationWorker
-from ui.windshield_common import _ScrollTable, _fit_table_to_rows, _fmt
+from ui.windshield_common import ResponsiveRow, _ScrollTable, _fit_table_to_rows, _fmt, make_scrollable_page
 from ui.worker import run_worker_in_thread
 
 
@@ -51,8 +50,11 @@ class GhostPanelMixin:
 
     def _build_ghost_tab(self) -> QWidget:
         outer = QTabWidget()
-        outer.addTab(self._build_ghost_evaluation_subtab(), "Evaluation")
-        outer.addTab(self._build_ghost_suppression_subtab(), "Suppression")
+        outer.tabBar().setUsesScrollButtons(True)
+        outer.tabBar().setExpanding(False)
+        outer.setElideMode(Qt.ElideNone)
+        outer.addTab(make_scrollable_page(self._build_ghost_evaluation_subtab()), "Evaluation")
+        outer.addTab(make_scrollable_page(self._build_ghost_suppression_subtab()), "Suppression")
         return outer
 
     def _build_ghost_evaluation_subtab(self) -> QWidget:
@@ -62,7 +64,7 @@ class GhostPanelMixin:
         group = QGroupBox("GHOST / DOUBLE IMAGE EVALUATION")
         group_layout = QVBoxLayout(group)
 
-        mode_row = QHBoxLayout()
+        mode_row = ResponsiveRow(breakpoint=720)
         self._ghost_mode_button_group = QButtonGroup(self)
         self.ghost_point_source_radio = QRadioButton("Point Source")
         self.ghost_point_source_radio.setChecked(True)
@@ -76,18 +78,18 @@ class GhostPanelMixin:
             self._ghost_mode_button_group.addButton(radio)
             mode_row.addWidget(radio)
         mode_row.addStretch(1)
-        group_layout.addLayout(mode_row)
+        group_layout.addWidget(mode_row)
 
-        edge_axis_row = QHBoxLayout()
+        edge_axis_row = ResponsiveRow(breakpoint=520)
         edge_axis_row.addWidget(QLabel("Edge Axis (Edge Target only):"))
         self.ghost_edge_axis_combo = QComboBox()
         self.ghost_edge_axis_combo.addItems(["Auto", "Vertical", "Horizontal"])
         self.ghost_edge_axis_combo.setCurrentText("Vertical")
         edge_axis_row.addWidget(self.ghost_edge_axis_combo)
         edge_axis_row.addStretch(1)
-        group_layout.addLayout(edge_axis_row)
+        group_layout.addWidget(edge_axis_row)
 
-        image_row = QHBoxLayout()
+        image_row = ResponsiveRow(breakpoint=760)
         self.ghost_image_path_label = QLabel("N/A")
         load_image_btn = QPushButton("Load Image...")
         load_image_btn.clicked.connect(self._on_load_ghost_image)
@@ -96,14 +98,15 @@ class GhostPanelMixin:
         image_row.addWidget(load_image_btn)
         image_row.addWidget(load_dataset_btn)
         image_row.addWidget(self.ghost_image_path_label, stretch=1)
-        group_layout.addLayout(image_row)
+        self.ghost_image_path_label.setWordWrap(True)
+        group_layout.addWidget(image_row)
 
-        action_row = QHBoxLayout()
+        action_row = ResponsiveRow(breakpoint=480)
         self.ghost_run_button = QPushButton("Run Evaluation")
         self.ghost_run_button.clicked.connect(self._on_run_ghost_evaluation)
         action_row.addWidget(self.ghost_run_button)
         action_row.addStretch(1)
-        group_layout.addLayout(action_row)
+        group_layout.addWidget(action_row)
 
         self.ghost_status_label = QLabel(
             "Ghost = same exterior scene shifted/warped by internal windshield multi-reflection. "
@@ -365,4 +368,3 @@ class GhostPanelMixin:
     # ------------------------------------------------------------------
     # STEP 8B - Ghost Suppression handlers
     # ------------------------------------------------------------------
-

@@ -19,6 +19,7 @@ Evaluation과 Suppression을 절대 섞지 않는다(사용자 스펙 원칙).
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
@@ -38,7 +39,14 @@ from PySide6.QtWidgets import (
 from calibration.windshield.reflection import ReflectionDatasetResult, ReflectionEvaluationConfig, ReflectionImagePair
 from export.reflection import export_reflection_yaml
 from ui.reflection_worker import ReflectionEvaluationWorker
-from ui.windshield_common import _ScrollTable, _fit_table_to_rows, _fmt
+from ui.windshield_common import (
+    ResponsiveRow,
+    _ScrollTable,
+    _fit_table_to_rows,
+    _fmt,
+    configure_form_layout,
+    make_scrollable_page,
+)
 from ui.worker import run_worker_in_thread
 
 
@@ -51,8 +59,11 @@ class ReflectionPanelMixin:
         Suppression"). 기존 Evaluation UI는 그대로 `_build_reflection_
         evaluation_subtab()`로 옮겼을 뿐 내용은 손대지 않았다."""
         outer = QTabWidget()
-        outer.addTab(self._build_reflection_evaluation_subtab(), "Evaluation")
-        outer.addTab(self._build_reflection_suppression_subtab(), "Suppression")
+        outer.tabBar().setUsesScrollButtons(True)
+        outer.tabBar().setExpanding(False)
+        outer.setElideMode(Qt.ElideNone)
+        outer.addTab(make_scrollable_page(self._build_reflection_evaluation_subtab()), "Evaluation")
+        outer.addTab(make_scrollable_page(self._build_reflection_suppression_subtab()), "Suppression")
         return outer
 
     def _build_reflection_evaluation_subtab(self) -> QWidget:
@@ -77,10 +88,10 @@ class ReflectionPanelMixin:
         normal_btn.clicked.connect(self._on_load_reflection_normal_image)
         reference_btn = QPushButton("Load Reference Image...")
         reference_btn.clicked.connect(self._on_load_reflection_reference_image)
-        normal_row = QHBoxLayout()
+        normal_row = ResponsiveRow(breakpoint=620)
         normal_row.addWidget(normal_btn)
         normal_row.addWidget(self.reflection_normal_path_label, stretch=1)
-        reference_row = QHBoxLayout()
+        reference_row = ResponsiveRow(breakpoint=620)
         reference_row.addWidget(reference_btn)
         reference_row.addWidget(self.reflection_reference_path_label, stretch=1)
         path_form.addRow("Normal:", normal_row)
@@ -92,9 +103,12 @@ class ReflectionPanelMixin:
         self.reflection_threshold_spin.setSingleStep(0.01)
         self.reflection_threshold_spin.setValue(0.08)
         path_form.addRow("Coverage Threshold:", self.reflection_threshold_spin)
+        self.reflection_normal_path_label.setWordWrap(True)
+        self.reflection_reference_path_label.setWordWrap(True)
+        configure_form_layout(path_form)
         mode_layout.addLayout(path_form)
 
-        action_row = QHBoxLayout()
+        action_row = ResponsiveRow(breakpoint=560)
         self.reflection_run_button = QPushButton("Run Evaluation")
         self.reflection_run_button.clicked.connect(self._on_run_reflection_evaluation)
         self.reflection_export_button = QPushButton("Export YAML...")
@@ -103,8 +117,9 @@ class ReflectionPanelMixin:
         action_row.addWidget(self.reflection_run_button)
         action_row.addWidget(self.reflection_export_button)
         action_row.addStretch(1)
-        mode_layout.addLayout(action_row)
+        mode_layout.addWidget(action_row)
         self.reflection_status_label = QLabel("Raw image-domain photometric evaluation. Geometry calibration is not modified.")
+        self.reflection_status_label.setWordWrap(True)
         mode_layout.addWidget(self.reflection_status_label)
         layout.addWidget(mode_group)
 
@@ -221,4 +236,3 @@ class ReflectionPanelMixin:
             self.reflection_status_label.setText(f"Reflection YAML saved: {path}")
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Reflection Export", str(e))
-

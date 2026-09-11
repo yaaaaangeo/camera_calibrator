@@ -8,7 +8,9 @@ camera_calibrator.ui.help_view
 
 from __future__ import annotations
 
-from PySide6.QtWidgets import QTextBrowser, QVBoxLayout, QWidget
+from pathlib import Path
+
+from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser, QVBoxLayout, QWidget
 
 from ui.theme import Theme
 
@@ -183,3 +185,32 @@ class HelpView(QWidget):
             </tr>
         </table>
         """
+
+
+class WindshieldGuideDialog(QDialog):
+    """Read the repository's canonical Windshield guide inside the existing help UI."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Windshield Refraction Guide")
+        self.resize(900, 700)
+        layout = QVBoxLayout(self)
+        path = Path(__file__).resolve().parents[1] / "docs" / "WINDSHIELD_REFRACTION_GUIDE.md"
+        browser = QTextBrowser()
+        browser.setObjectName("windshieldGuideBrowser")
+        browser.setOpenExternalLinks(True)
+        browser.setStyleSheet(
+            f"QTextBrowser {{ background: {Theme.BG_PRIMARY}; color: {Theme.TEXT_PRIMARY}; "
+            f"border: 1px solid {Theme.BORDER}; padding: 14px; }}"
+        )
+        try:
+            browser.setMarkdown(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            browser.setHtml(
+                f"<h2>Windshield Guide를 열 수 없습니다.</h2>"
+                f"<p>{path}</p><p>{exc}</p>"
+            )
+        layout.addWidget(browser)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)

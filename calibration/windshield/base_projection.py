@@ -14,10 +14,9 @@ calibration.validation.py::_test_reprojection_errors와 동일한 계약을 따�
 
 from __future__ import annotations
 
-import cv2
 import numpy as np
 
-from calibration.models.common import solve_pnp_for_model
+from calibration.models.common import solve_pnp_for_model_robust
 from calibration.types import CameraModelType, Frame
 
 
@@ -49,13 +48,14 @@ def solve_poses_fixed_intrinsics(
             failed_frame_ids.append(frame_id)
             continue
 
-        try:
-            ok, rvec, tvec = solve_pnp_for_model(
-                det.object_points, det.corners, camera_matrix, distortion, model
-            )
-            if not ok:
-                raise cv2.error("solvePnP returned False")
-        except cv2.error:
+        # Fisheye input points must be reshaped to OpenCV's Nx1x{3,2}
+        # convention.  The shared robust path performs that normalization and
+        # retains the fixed-K,D fallback policy already used by intrinsic
+        # Hold-out validation.
+        ok, rvec, tvec, _reason = solve_pnp_for_model_robust(
+            det.object_points, det.corners, camera_matrix, distortion, model
+        )
+        if not ok:
             failed_frame_ids.append(frame_id)
             continue
 

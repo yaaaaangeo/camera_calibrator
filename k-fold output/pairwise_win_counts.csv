@@ -1,0 +1,13 @@
+metric,model_a,model_b,wins_a,wins_b,ties,comparable_folds
+test_rms,brown_conrady,extended_pinhole,6,19,0,25
+test_rms,brown_conrady,fisheye,0,25,0,25
+test_rms,extended_pinhole,fisheye,11,14,0,25
+test_p95,brown_conrady,extended_pinhole,6,19,0,25
+test_p95,brown_conrady,fisheye,0,25,0,25
+test_p95,extended_pinhole,fisheye,8,17,0,25
+test_edge_rms,brown_conrady,extended_pinhole,6,19,0,25
+test_edge_rms,brown_conrady,fisheye,0,25,0,25
+test_edge_rms,extended_pinhole,fisheye,0,25,0,25
+test_straightness,brown_conrady,extended_pinhole,6,19,0,25
+test_straightness,brown_conrady,fisheye,0,25,0,25
+test_straightness,extended_pinhole,fisheye,0,25,0,25

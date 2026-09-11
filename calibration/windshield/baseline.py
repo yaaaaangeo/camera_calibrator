@@ -159,6 +159,21 @@ def calibrate_baseline(
         )
 
     train_outcome = _evaluate_frames(train_frames, K, D, model, image_size)
+    if not train_outcome.ok_frames:
+        return WindshieldCalibrationResult(
+            windshield_model=WindshieldModelType.BASELINE,
+            base_model_name=model,
+            base_camera_matrix=K,
+            base_distortion=D,
+            train_frame_ids=train_ids,
+            test_frame_ids=test_ids,
+            failed_frame_ids=list(train_outcome.failed_frame_ids),
+            success=False,
+            error_message=(
+                "모든 Train 프레임에서 고정 Base K,D를 사용한 pose 추정이 실패했습니다. "
+                "Base Camera 모델과 Dataset 해상도/패턴 설정을 확인하세요."
+            ),
+        )
 
     result = WindshieldCalibrationResult(
         windshield_model=WindshieldModelType.BASELINE,
@@ -191,6 +206,10 @@ def calibrate_baseline(
             result.test_spatial_error_map = test_outcome.spatial_error_map
             result.test_mean_dx = test_outcome.mean_dx
             result.test_mean_dy = test_outcome.mean_dy
+            if not test_outcome.ok_frames:
+                result.warning_message = (
+                    "모든 Test 프레임에서 pose 추정이 실패해 Hold-out 지표를 계산하지 못했습니다."
+                )
             for fid in test_outcome.failed_frame_ids:
                 if fid not in result.failed_frame_ids:
                     result.failed_frame_ids.append(fid)

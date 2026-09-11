@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
     QSpinBox,
     QTableWidget,
@@ -68,6 +70,7 @@ from ui.calibration_home_view import CalibrationHomeView
 from ui.help_view import HelpView
 from ui.intrinsic_workspace import IntrinsicWorkspace
 from ui.live_capture_dialog import LiveCaptureDialog
+from ui.windshield_common import ResponsiveRow, configure_form_layout
 from ui.wheel_guard import WheelChangeGuard
 from ui.worker import (
     PipelineWorker,
@@ -408,19 +411,29 @@ class MainWindow(QMainWindow):
         group.setToolTip("제목의 화살표를 클릭해 Camera Setup 영역을 접거나 펼칩니다.")
         group_layout = QVBoxLayout(group)
         content = QWidget()
-        outer = QHBoxLayout(content)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(20)  # 3등분 섹션(Camera/Pattern/Actions) 사이 가로 간격만 살짝 추가
-        group_layout.addWidget(content)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        outer = ResponsiveRow(breakpoint=1050)
+        outer.box_layout.setSpacing(20)
+        content_layout.addWidget(outer)
+        settings_scroll = QScrollArea()
+        settings_scroll.setObjectName("cameraSettingsScrollArea")
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setFrameShape(QFrame.NoFrame)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        settings_scroll.setMaximumHeight(390)
+        settings_scroll.setWidget(content)
+        self.settings_scroll_area = settings_scroll
+        group_layout.addWidget(settings_scroll)
         self.settings_group = group
         self.settings_content = content
         group.toggled.connect(self._on_settings_panel_toggled)
 
         camera_form = QFormLayout()
-        camera_form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        camera_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         # QFormLayout에 세로 간격을 따로 정해주지 않으면 Qt가 부모 레이아웃인
-        # outer(QHBoxLayout)의 spacing 값을 그대로 물려받는다 - 그래서
-        # outer.setSpacing()으로 가로 간격만 넓혔는데도 이 폼의 행간(세로
+        # 상위 responsive row의 spacing 값을 그대로 물려받는다 - 그래서
+        # 상위 간격으로 열 사이만 넓혀도 이 폼의 행간(세로
         # 간격)까지 같이 넓어지는 부작용이 있었다. 원래 기본값(6px)으로
         # 고정해서 가로/세로 간격을 서로 독립적으로 만든다.
         camera_form.setVerticalSpacing(6)
@@ -476,10 +489,13 @@ class MainWindow(QMainWindow):
         size_row.addWidget(QLabel("Height"))
         size_row.addWidget(self.height_spin)
         camera_form.addRow(size_row)
-        outer.addLayout(camera_form, stretch=1)
+        camera_column = QWidget()
+        camera_column.setLayout(camera_form)
+        configure_form_layout(camera_form)
+        outer.addWidget(camera_column, stretch=1)
 
         pattern_form = QFormLayout()
-        pattern_form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        pattern_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         pattern_form.setVerticalSpacing(6)  # camera_form과 같은 이유(outer 간격 상속 방지)
         self.squares_x_spin = QSpinBox()
         self.squares_x_spin.setRange(3, 30)
@@ -542,7 +558,10 @@ class MainWindow(QMainWindow):
         pattern_form.addRow("AprilGrid variant", self.aprilgrid_variant_combo)
         self._pattern_form = pattern_form  # setRowVisible로 마커/딕셔너리 행을 토글하기 위해 보관
         self._on_pattern_type_changed()
-        outer.addLayout(pattern_form, stretch=1)
+        pattern_column = QWidget()
+        pattern_column.setLayout(pattern_form)
+        configure_form_layout(pattern_form)
+        outer.addWidget(pattern_column, stretch=1)
 
         # 오른쪽 열 순서: 캘리브레이션 실행 -> Export -> 취소. Rational
         # on/off 체크박스는 제거됐다 - Standard 계산은 항상 Ideal Pinhole/
@@ -571,7 +590,9 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(self.export_button)
         action_layout.addWidget(self.cancel_button)
         action_layout.addStretch(1)
-        outer.addLayout(action_layout, stretch=1)
+        action_column = QWidget()
+        action_column.setLayout(action_layout)
+        outer.addWidget(action_column, stretch=1)
 
         return group
 

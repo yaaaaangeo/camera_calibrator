@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QGroupBox,
-    QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -36,7 +35,7 @@ from PySide6.QtWidgets import (
 from calibration.windshield.ghost import GhostEvaluationConfig, fit_ghost_field_from_dataset, load_ghost_model, save_ghost_model
 from calibration.windshield.ghost.config import DEFAULT_SPATIAL_COLS, DEFAULT_SPATIAL_ROWS
 from ui.ghost_suppression_worker import GhostSuppressionWorker
-from ui.windshield_common import _ScrollTable, _fmt
+from ui.windshield_common import ResponsiveRow, _ScrollTable, _fmt, configure_form_layout
 from ui.worker import run_worker_in_thread
 
 
@@ -54,7 +53,7 @@ class GhostSuppressionPanelMixin:
         group = QGroupBox("GHOST SUPPRESSION")
         form = QFormLayout(group)
 
-        model_row = QHBoxLayout()
+        model_row = ResponsiveRow(breakpoint=900)
         self.ghost_suppression_model_path_label = QLabel("N/A")
         load_model_btn = QPushButton("Load Ghost Model...")
         load_model_btn.clicked.connect(self._on_load_ghost_suppression_model)
@@ -79,21 +78,24 @@ class GhostSuppressionPanelMixin:
         model_row.addWidget(self.ghost_suppression_model_path_label, stretch=1)
         form.addRow("Model:", model_row)
 
-        input_row = QHBoxLayout()
+        input_row = ResponsiveRow(breakpoint=620)
         self.ghost_suppression_input_path_label = QLabel("N/A")
         load_input_btn = QPushButton("Load Image...")
         load_input_btn.clicked.connect(self._on_load_ghost_suppression_input_image)
         input_row.addWidget(load_input_btn)
         input_row.addWidget(self.ghost_suppression_input_path_label, stretch=1)
         form.addRow("Input:", input_row)
+        self.ghost_suppression_model_path_label.setWordWrap(True)
+        self.ghost_suppression_input_path_label.setWordWrap(True)
+        configure_form_layout(form)
         layout.addWidget(group)
 
-        action_row = QHBoxLayout()
+        action_row = ResponsiveRow(breakpoint=480)
         self.ghost_suppression_run_button = QPushButton("Run Suppression")
         self.ghost_suppression_run_button.clicked.connect(self._on_run_ghost_suppression)
         action_row.addWidget(self.ghost_suppression_run_button)
         action_row.addStretch(1)
-        layout.addLayout(action_row)
+        layout.addWidget(action_row)
 
         self.ghost_suppression_status_label = QLabel(
             "Deterministic iterative reconstruction: T_(k+1) = clip(I - alpha*W(T_k), 0, 1). "
@@ -103,7 +105,9 @@ class GhostSuppressionPanelMixin:
         layout.addWidget(self.ghost_suppression_status_label)
 
         viz_group = QGroupBox("VISUALIZATION")
-        viz_grid = QHBoxLayout(viz_group)
+        viz_layout = QVBoxLayout(viz_group)
+        viz_grid = ResponsiveRow(breakpoint=900)
+        viz_layout.addWidget(viz_grid)
         self.ghost_suppression_original_image_label = QLabel("Original")
         self.ghost_suppression_predicted_image_label = QLabel("Predicted Ghost")
         self.ghost_suppression_correction_image_label = QLabel("Correction Map")

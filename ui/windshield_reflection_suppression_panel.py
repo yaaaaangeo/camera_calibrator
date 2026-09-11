@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ui.windshield_common import _ScrollTable
+from ui.windshield_common import ResponsiveRow, _ScrollTable, configure_form_layout
 from ui.worker import run_worker_in_thread
 
 
@@ -55,7 +55,7 @@ class ReflectionSuppressionPanelMixin:
         group = QGroupBox("REFLECTION SUPPRESSION")
         form = QFormLayout(group)
 
-        model_row = QHBoxLayout()
+        model_row = ResponsiveRow(breakpoint=620)
         self.suppression_model_path_label = QLabel("N/A")
         load_model_btn = QPushButton("Load Model...")
         load_model_btn.clicked.connect(self._on_load_suppression_model)
@@ -63,7 +63,7 @@ class ReflectionSuppressionPanelMixin:
         model_row.addWidget(self.suppression_model_path_label, stretch=1)
         form.addRow("Model:", model_row)
 
-        input_row = QHBoxLayout()
+        input_row = ResponsiveRow(breakpoint=620)
         self.suppression_input_path_label = QLabel("N/A")
         load_input_btn = QPushButton("Load Image...")
         load_input_btn.clicked.connect(self._on_load_suppression_input_image)
@@ -74,7 +74,7 @@ class ReflectionSuppressionPanelMixin:
         # Reference는 선택 사항이다(사용자 스펙 53번, No-Reference Runtime) -
         # 있으면 STEP 6 evaluator로 Before/After를 Reference Mode로, 없으면
         # No-Reference Mode(Reflection Likelihood)로 평가한다.
-        reference_row = QHBoxLayout()
+        reference_row = ResponsiveRow(breakpoint=620)
         self._suppression_reference_path = ""
         self.suppression_reference_path_label = QLabel("N/A (No-Reference mode)")
         load_reference_btn = QPushButton("Load Reference (optional)...")
@@ -98,14 +98,21 @@ class ReflectionSuppressionPanelMixin:
             mode_row.addWidget(radio)
         mode_row.addStretch(1)
         form.addRow("Mode:", mode_row)
+        for path_label in (
+            self.suppression_model_path_label,
+            self.suppression_input_path_label,
+            self.suppression_reference_path_label,
+        ):
+            path_label.setWordWrap(True)
+        configure_form_layout(form)
         layout.addWidget(group)
 
-        action_row = QHBoxLayout()
+        action_row = ResponsiveRow(breakpoint=480)
         self.suppression_run_button = QPushButton("Run Suppression")
         self.suppression_run_button.clicked.connect(self._on_run_reflection_suppression)
         action_row.addWidget(self.suppression_run_button)
         action_row.addStretch(1)
-        layout.addLayout(action_row)
+        layout.addWidget(action_row)
 
         self.suppression_status_label = QLabel(
             "Learned residual reflection-layer correction. Geometry(K,D/Spherical/Grid/RBF/"
@@ -117,7 +124,9 @@ class ReflectionSuppressionPanelMixin:
         # Visualization: Original / Predicted Reflection / Reflection Mask / Suppressed
         # (사용자 스펙 51번, "단순 시각 효과가 아니라 디버깅에 중요하다").
         viz_group = QGroupBox("VISUALIZATION")
-        viz_grid = QHBoxLayout(viz_group)
+        viz_layout = QVBoxLayout(viz_group)
+        viz_grid = ResponsiveRow(breakpoint=900)
+        viz_layout.addWidget(viz_grid)
         self.suppression_original_image_label = QLabel("Original")
         self.suppression_reflection_image_label = QLabel("Predicted Reflection")
         self.suppression_alpha_image_label = QLabel("Reflection Mask")
@@ -325,4 +334,3 @@ class ReflectionSuppressionPanelMixin:
             label.width() or 160, label.height() or 120, Qt.KeepAspectRatio, Qt.SmoothTransformation,
         )
         label.setPixmap(pixmap)
-

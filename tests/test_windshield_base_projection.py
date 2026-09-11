@@ -9,6 +9,7 @@ calibration.windshield.base_projection::solve_poses_fixed_intrinsics 검증 -
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 
 from calibration.types import CameraModelType
@@ -56,3 +57,24 @@ def test_solve_poses_reports_failed_frame_without_crashing_batch():
     assert bad_frame.image_info.image_id in failed
     assert len(ok_frames) == len(dataset.frames) - 1
     assert len(rvecs) == len(ok_frames) == len(tvecs)
+
+
+def test_solve_poses_accepts_fisheye_charuco_point_shapes():
+    """Windshield detection stores ChArUco points as Nx3/Nx1x2, while
+    cv2.fisheye.solvePnP requires normalized Nx1x3/Nx1x2 arrays."""
+    K, _ = default_camera_matrix_distortion()
+    D = np.array([[-0.08], [0.01], [0.0], [0.0]], dtype=np.float64)
+    dataset = build_synthetic_windshield_dataset(K, np.zeros(5))
+    frame = dataset.frames[0]
+    obj = np.asarray(frame.detection.object_points, dtype=np.float64).reshape(-1, 1, 3)
+    rvec = np.array([[0.08], [-0.04], [0.02]], dtype=np.float64)
+    tvec = np.array([[0.05], [-0.03], [2.5]], dtype=np.float64)
+    corners, _ = cv2.fisheye.projectPoints(obj, rvec, tvec, K, D)
+    frame.detection.corners = corners.astype(np.float32)
+
+    ok_frames, rvecs, tvecs, failed = solve_poses_fixed_intrinsics(
+        [frame], K, D, CameraModelType.FISHEYE
+    )
+
+    assert len(ok_frames) == len(rvecs) == len(tvecs) == 1
+    assert failed == []

@@ -134,39 +134,22 @@ python -m app.main
 
 *(`windshield` 브랜치에만 있는 추가 기능입니다.)*
 
-일반 카메라 캘리브레이션은 "카메라 자체"의 찌그러짐만 계산합니다. 그런데
-자동차에 달린 카메라는 보통 앞유리(windshield) **너머로** 세상을 봅니다 -
-그 유리도 빛을 살짝 굴절시키기 때문에, 카메라만 보정해서는 설명 안 되는
-오차가 남습니다.
+일반 calibration으로 확정한 카메라 K/D는 그대로 고정하고, 앞유리가 추가로
+만드는 기하학적 굴절을 별도 correction 계층으로 계산합니다. Reflection과
+Ghost는 이 Geometry 점수와 섞지 않는 독립적인 광학 평가입니다.
 
 ```
-Camera         카메라 자체의 찌그러짐 (1~6번 섹션에서 계산)
- ↓
-Windshield     앞유리를 통과하며 생기는 추가 굴절/반사
- ↓
-Road           최종적으로 도로/세상이 보이는 모습
+Intrinsic 완료 → ① Base Camera → ② Windshield Dataset
+→ ③ Baseline/Spherical 실행 → ④ Hold-out Comparison
+→ 선택한 결과를 Windshield YAML로 Export
 ```
 
-이 기능은 이 굴절만 따로 추가로 계산합니다 - 카메라 자체의 계산 값(1~6번
-섹션 결과)은 건드리지 않고 그 위에 얹는 방식입니다. 크게 세 가지를
-구분해서 다룹니다.
+- 처음부터 촬영·실행·결과 선택·Export까지: **[Windshield Refraction 실전 가이드](docs/WINDSHIELD_REFRACTION_GUIDE.md)**
+- 모델 수식, runtime exact/LUT, Reflection/Ghost 알고리즘: **[전문가 문서 6~8번](docs/README_EXPERT.md#6-windshield-geometry)**
 
-- **Geometry(형상) 보정** - 유리 때문에 빛이 얼마나 휘는지 계산.
-- **Reflection(반사)** - 유리에 비치는 하늘/조명 등을 평가.
-- **Ghost(유령상)** - 밝은 빛이 유리에 이중으로 반사되어 살짝 어긋난
-  채로 두 번 보이는 현상을 평가.
-
-세 가지는 서로 다른 문제라 점수도 따로 나옵니다 - 반사가 있다고 해서
-형상 보정 결과가 나빠 보이지 않도록 분리되어 있습니다. 원리와 각 모델의
-차이는 [전문가 문서 6~8번 섹션](docs/README_EXPERT.md#6-windshield-geometry)
-에 있습니다.
-
-Spherical 모델에서 유리 굴절률을 공기와 같게 두면 "굴절이 없음"은
-확인할 수 있지만, 그 상태로는 구의 중심/반지름을 식별할 수 없습니다. 또한
-실시간 Camera-LiDAR 투영처럼 포인트가 아주 많을 때는 exact projector와
-빠른 LUT projector가 분리되어 있으며, LUT 정확도는 실제 사용 범위에서
-검증해야 합니다. CAD/STEP 기반 windshield surface prior는 현재 필수 기능이
-아니며, 향후 optional 기능으로만 다룹니다.
+README는 빠른 시작, Windshield 가이드는 실제 작업 절차, 전문가 문서는 수식과
+알고리즘 상세를 담당합니다. 실차 데이터셋이 저장소에 포함되어 있지 않으므로
+최종 결과는 실제 운용 거리/FOV/환경에서 별도로 검증해야 합니다.
 
 ## 8. 설치에서 막히면
 

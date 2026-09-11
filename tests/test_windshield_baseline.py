@@ -123,3 +123,20 @@ def test_baseline_fails_gracefully_with_no_train_frames():
 
     assert result.success is False
     assert result.error_message
+
+
+def test_baseline_does_not_report_success_when_all_train_poses_fail():
+    K, D = default_camera_matrix_distortion()
+    dataset = build_synthetic_windshield_dataset(K, D)
+    for frame in dataset.frames:
+        frame.detection.success = False
+    train_ids = [frame.image_info.image_id for frame in dataset.frames]
+
+    result = calibrate_baseline(
+        dataset, _config(K, D), default_camera_config(), train_ids, []
+    )
+
+    assert result.success is False
+    assert result.residual_stats is None
+    assert len(result.failed_frame_ids) == len(train_ids)
+    assert "pose" in result.error_message

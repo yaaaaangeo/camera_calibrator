@@ -66,6 +66,7 @@ from calibration.windshield.spline import (
 from export.windshield import export_windshield_yaml
 from ui.radial_profile_view import RadialProfileChartWidget
 from ui.windshield_common import (
+    ResponsiveRow,
     _REGIONAL_ROWS,
     _STATS_ROWS,
     _UNSET_SPINBOX_VALUE,
@@ -74,6 +75,7 @@ from ui.windshield_common import (
     _fit_table_to_rows,
     _fmt,
     _fmt_deg,
+    configure_form_layout,
 )
 from ui.windshield_vector_field_view import VectorFieldChartWidget
 from ui.windshield_worker import WindshieldCalibrationWorker
@@ -150,6 +152,11 @@ class GeometryPanelMixin:
         self.standoff_spin.setSpecialValueText("(auto)")
         self.standoff_spin.setValue(_UNSET_SPINBOX_VALUE)
         advanced_form.addRow("Initial standoff distance (m):", self.standoff_spin)
+        configure_form_layout(advanced_form)
+        self.glass_index_spin.setToolTip("AUTO/default 권장. 유리 재질의 굴절률을 알 때만 입력하세요.")
+        self.glass_thickness_spin.setToolTip("AUTO/default 권장. 실제 유리 두께(mm)를 알 때만 입력하세요.")
+        self.sphere_radius_spin.setToolTip("AUTO 권장. 초기 sphere radius(m)입니다.")
+        self.standoff_spin.setToolTip("AUTO 권장. 카메라에서 sphere surface까지의 초기 거리(m)입니다.")
         layout.addWidget(self.spherical_advanced_group)
 
         self.residual_ray_advanced_group = QGroupBox("Advanced (Residual Ray)")
@@ -210,6 +217,7 @@ class GeometryPanelMixin:
         self.lambda_smooth_spin.setSingleStep(0.001)
         self.lambda_smooth_spin.setValue(DEFAULT_LAMBDA_SMOOTH)
         rr_form.addRow("Smoothness λ:", self.lambda_smooth_spin)
+        configure_form_layout(rr_form)
         grid_settings_layout.addLayout(rr_form)
         rr_layout.addWidget(self.residual_grid_settings_group)
 
@@ -242,6 +250,7 @@ class GeometryPanelMixin:
         self.rbf_smoothing_spin.setValue(DEFAULT_RBF_SMOOTHING)
         self.rbf_smoothing_spin.setEnabled(False)
         rbf_form.addRow("Smoothing:", self.rbf_smoothing_spin)
+        configure_form_layout(rbf_form)
         rr_layout.addWidget(self.residual_rbf_settings_group)
 
         # NEURAL SETTINGS - Advanced 항목은 QFormLayout 하나에 전부 넣는다
@@ -296,6 +305,7 @@ class GeometryPanelMixin:
         self.neural_batch_size_spin.setRange(16, 4096)
         self.neural_batch_size_spin.setValue(DEFAULT_NEURAL_BATCH_SIZE)
         neural_form.addRow("Batch Size:", self.neural_batch_size_spin)
+        configure_form_layout(neural_form)
         rr_layout.addWidget(self.residual_neural_settings_group)
 
         self.grid_mode_manual_radio.toggled.connect(self.grid_rows_spin.setEnabled)
@@ -361,13 +371,14 @@ class GeometryPanelMixin:
         self.spline_max_displacement_spin.setSuffix(" mm")
         self.spline_max_displacement_spin.setValue(DEFAULT_MAX_DISPLACEMENT_M * 1000.0)
         spline_form.addRow("Max deformation:", self.spline_max_displacement_spin)
+        configure_form_layout(spline_form)
         spline_layout.addLayout(spline_form)
 
         self.spline_mode_manual_radio.toggled.connect(self.spline_rows_spin.setEnabled)
         self.spline_mode_manual_radio.toggled.connect(self.spline_cols_spin.setEnabled)
         layout.addWidget(self.spline_advanced_group)
 
-        run_row = QHBoxLayout()
+        run_row = ResponsiveRow(breakpoint=560)
         self.run_button = QPushButton("Run")
         self.run_button.clicked.connect(self._on_run_windshield_calibration)
         run_row.addWidget(self.run_button)
@@ -376,7 +387,7 @@ class GeometryPanelMixin:
         self.export_button.setEnabled(False)
         run_row.addWidget(self.export_button)
         run_row.addStretch(1)
-        layout.addLayout(run_row)
+        layout.addWidget(run_row)
 
         self.run_summary_label = QLabel("")
         self.run_summary_label.setWordWrap(True)
@@ -395,12 +406,12 @@ class GeometryPanelMixin:
         self.stats_table.setVerticalHeaderLabels(row_labels)
         result_layout.addWidget(self.stats_table)
 
-        charts_row = QHBoxLayout()
+        charts_row = ResponsiveRow(breakpoint=900)
         self.radial_chart = RadialProfileChartWidget()
         charts_row.addWidget(self.radial_chart, stretch=1)
         self.vector_field_chart = VectorFieldChartWidget()
         charts_row.addWidget(self.vector_field_chart, stretch=1)
-        result_layout.addLayout(charts_row)
+        result_layout.addWidget(charts_row)
 
         layout.addWidget(result_group)
 
@@ -435,6 +446,7 @@ class GeometryPanelMixin:
         diag_form.addRow("Ray Stability:", self.diag_ray_stability_label)
         self.diag_pose_movement_label = QLabel("N/A")
         diag_form.addRow("Pose Movement (STAGE B):", self.diag_pose_movement_label)
+        configure_form_layout(diag_form)
         layout.addWidget(self.residual_ray_diagnostics_group)
 
         self.spline_diagnostics_group = QGroupBox("SPLINE DIAGNOSTICS")
@@ -458,6 +470,7 @@ class GeometryPanelMixin:
         spline_diag_form.addRow("Surface Stability:", self.diag_spline_surface_stability_label)
         self.diag_spline_pose_movement_label = QLabel("N/A")
         spline_diag_form.addRow("Pose Movement (STAGE B):", self.diag_spline_pose_movement_label)
+        configure_form_layout(spline_diag_form)
         layout.addWidget(self.spline_diagnostics_group)
 
         layout.addStretch(1)

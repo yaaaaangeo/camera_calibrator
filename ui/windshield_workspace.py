@@ -64,11 +64,10 @@ WindshieldWorkspace` 임포트는 전혀 바뀌지 않는다 - 파일 경로, �
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog,
     QGroupBox,
-    QHBoxLayout,
     QInputDialog,
     QLabel,
     QMessageBox,
@@ -102,7 +101,7 @@ from export.opencv import (
     load_camera_matrix_and_distortion_from_opencv_yaml,
 )
 from ui.theme import Theme
-from ui.windshield_common import _MODEL_LABELS
+from ui.windshield_common import ResponsiveRow, _MODEL_LABELS, make_scrollable_page
 from ui.windshield_comparison_panel import ComparisonPanelMixin
 from ui.windshield_geometry_panel import GeometryPanelMixin
 from ui.windshield_ghost_panel import GhostPanelMixin
@@ -184,12 +183,16 @@ class WindshieldWorkspace(
         self._session_pattern_config: PatternConfig | None = None
 
         layout = QVBoxLayout(self)
-        header = QHBoxLayout()
-        home_button = QPushButton("← Calibration Home")
-        home_button.clicked.connect(self.back_requested.emit)
-        header.addWidget(home_button)
+        header = ResponsiveRow(breakpoint=520)
+        self.home_button = QPushButton("← Calibration Home")
+        self.home_button.clicked.connect(self.back_requested.emit)
+        header.addWidget(self.home_button)
+        self.windshield_guide_button = QPushButton("? Windshield Guide")
+        self.windshield_guide_button.setToolTip("Windshield Refraction 초보자 작업 매뉴얼을 엽니다.")
+        self.windshield_guide_button.clicked.connect(self._show_windshield_guide)
+        header.addWidget(self.windshield_guide_button)
         header.addStretch(1)
-        layout.addLayout(header)
+        layout.addWidget(header)
 
         title = QLabel("WINDSHIELD REFRACTION CALIBRATION")
         title.setStyleSheet("font-size: 18px; font-weight: 700;")
@@ -203,13 +206,24 @@ class WindshieldWorkspace(
         layout.addWidget(subtitle)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_base_camera_tab(), "① Base Camera")
-        self.tabs.addTab(self._build_dataset_tab(), "② Dataset")
-        self.tabs.addTab(self._build_model_tab(), "③ Windshield Model")
-        self.tabs.addTab(self._build_comparison_tab(), "④ Comparison")
+        self.tabs.tabBar().setUsesScrollButtons(True)
+        self.tabs.tabBar().setExpanding(False)
+        self.tabs.setElideMode(Qt.ElideNone)
+        self.tabs.addTab(make_scrollable_page(self._build_base_camera_tab()), "① Base Camera")
+        self.tabs.addTab(make_scrollable_page(self._build_dataset_tab()), "② Dataset")
+        self.tabs.addTab(make_scrollable_page(self._build_model_tab()), "③ Windshield Model")
+        self.tabs.addTab(make_scrollable_page(self._build_comparison_tab()), "④ Comparison")
         self.tabs.addTab(self._build_reflection_tab(), "⑤ Reflection")
         self.tabs.addTab(self._build_ghost_tab(), "⑥ Ghost")
         layout.addWidget(self.tabs, stretch=1)
+
+    def _show_windshield_guide(self) -> None:
+        # Keep help rendering in ui.help_view instead of creating a second help
+        # system inside the workspace.
+        from ui.help_view import WindshieldGuideDialog
+
+        dialog = WindshieldGuideDialog(self)
+        dialog.exec()
 
     # ------------------------------------------------------------------
     # MainWindow 연동 API
@@ -275,7 +289,8 @@ class WindshieldWorkspace(
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        button_row = QHBoxLayout()
+        button_row = ResponsiveRow(breakpoint=820)
+        self.base_load_buttons = []
         for text, handler in (
             ("Load from current session", self._on_load_from_session),
             ("Load from Library...", self._on_load_from_library),
@@ -285,8 +300,9 @@ class WindshieldWorkspace(
             btn = QPushButton(text)
             btn.clicked.connect(handler)
             button_row.addWidget(btn)
+            self.base_load_buttons.append(btn)
         button_row.addStretch(1)
-        layout.addLayout(button_row)
+        layout.addWidget(button_row)
 
         group = QGroupBox("Base Camera")
         form = QVBoxLayout(group)
@@ -294,6 +310,7 @@ class WindshieldWorkspace(
         self.base_info_label.setWordWrap(True)
         form.addWidget(self.base_info_label)
         self.base_lock_label = QLabel("")
+        self.base_lock_label.setWordWrap(True)
         self.base_lock_label.setStyleSheet(f"color: {Theme.WARNING}; font-weight: 700; font-size: 14px;")
         form.addWidget(self.base_lock_label)
         layout.addWidget(group)
@@ -435,12 +452,12 @@ class WindshieldWorkspace(
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        button_row = QHBoxLayout()
-        load_btn = QPushButton("Load windshield images...")
-        load_btn.clicked.connect(self._on_load_dataset)
-        button_row.addWidget(load_btn)
+        button_row = ResponsiveRow(breakpoint=520)
+        self.load_dataset_button = QPushButton("Load windshield images...")
+        self.load_dataset_button.clicked.connect(self._on_load_dataset)
+        button_row.addWidget(self.load_dataset_button)
         button_row.addStretch(1)
-        layout.addLayout(button_row)
+        layout.addWidget(button_row)
 
         group = QGroupBox("Dataset")
         form = QVBoxLayout(group)
