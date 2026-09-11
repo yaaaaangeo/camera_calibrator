@@ -121,3 +121,4 @@ class IntrinsicWorkspace(QWidget):
         owner.scene_quality_view.recalibrate_requested.connect(owner._on_subset_recalibrate_requested)
         owner.scene_quality_view.model_changed.connect(owner._on_scene_quality_model_changed)
         owner.scene_quality_view.export_subset_requested.connect(owner._on_export_subset_calibration)
+        owner.scene_quality_view.validate_subset_requested.connect(owner._on_validate_best_subset)

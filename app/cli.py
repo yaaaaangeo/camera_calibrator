@@ -46,6 +46,12 @@ from calibration.kfold import compute_kfold_validation, compute_repeated_kfold, 
 from calibration.repeatability import compute_repeatability, format_repeatability
 from calibration.bootstrap import compute_parameter_bootstrap, format_parameter_uncertainty
 from calibration.calibration_io import load_standard_calibration
+from calibration.subset_comparison import (
+    ComparisonTolerance,
+    compare_subset_calibrations,
+    load_split_manifest,
+    write_subset_comparison_outputs,
+)
 from calibration.external_compare import ExternalComparisonResult, compare_reference_candidate_calibrations
 from calibration.json_utils import json_safe
 from calibration.models.pinhole import calibrate_pinhole
@@ -1575,7 +1581,123 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def build_compare_subset_parser() -> argparse.ArgumentParser:
+    """Dedicated parser kept separate from the legacy flat calibration CLI."""
+    p = argparse.ArgumentParser(
+        prog="camera_calibrator compare-subset",
+        description="Baseline과 Best Subset을 동일한 frozen hold-out에서 고정 K/D로 비교합니다.",
+    )
+    p.add_argument("--baseline", required=True, help="Baseline calibration YAML/JSON")
+    p.add_argument("--candidate", required=True, help="Best Subset calibration YAML/JSON")
+    p.add_argument("--holdout-manifest", required=True, help="누수 방지 split manifest JSON/YAML")
+    p.add_argument("--dataset", required=True, nargs="+", help="Hold-out 이미지 디렉터리/파일/glob")
+    p.add_argument("--output", "--output-dir", dest="output", required=True)
+    p.add_argument("--relative-tolerance", type=float, default=0.05)
+    p.add_argument("--absolute-tolerance-px", type=float, default=0.10)
+    p.add_argument("--success-rate-drop", type=float, default=0.05)
+    p.add_argument("--minimum-common-frames", type=int, default=5)
+    p.add_argument("--pattern", choices=sorted(_PATTERN_BY_NAME), default=None)
+    p.add_argument("--squares-x", type=int)
+    p.add_argument("--squares-y", type=int)
+    p.add_argument("--square-size", type=float)
+    p.add_argument("--marker-size", type=float)
+    p.add_argument("--dictionary")
+    p.add_argument("--width", type=int)
+    p.add_argument("--height", type=int)
+    p.add_argument("--jobs", type=int, default=1)
+    p.add_argument("--quiet", action="store_true")
+    return p
+
+
+def _run_compare_subset_cli(argv: list[str]) -> int:
+    parser = build_compare_subset_parser()
+    args = parser.parse_args(argv)
+    baseline = load_standard_calibration(args.baseline)
+    candidate = load_standard_calibration(args.candidate)
+    manifest = load_split_manifest(args.holdout_manifest)
+    metadata = {**baseline.metadata, **candidate.metadata}
+
+    def required(name: str, metadata_name: str | None = None):
+        value = getattr(args, name)
+        if value is None:
+            value = metadata.get(metadata_name or f"pattern_{name}")
+        if value is None:
+            parser.error(
+                f"--{name.replace('_', '-')}가 필요합니다 (calibration YAML에도 값이 없습니다)."
+            )
+        return value
+
+    pattern_name = args.pattern or metadata.get("pattern_type") or "charuco"
+    try:
+        pattern_type = _PATTERN_BY_NAME[str(pattern_name)]
+    except KeyError:
+        parser.error(f"지원하지 않는 pattern type: {pattern_name}")
+    pattern = PatternConfig(
+        type=pattern_type,
+        squares_x=int(required("squares_x")),
+        squares_y=int(required("squares_y")),
+        square_size=float(required("square_size")),
+        marker_size=(float(args.marker_size or metadata.get("pattern_marker_size")) if (args.marker_size or metadata.get("pattern_marker_size")) is not None else None),
+        dictionary=args.dictionary or metadata.get("pattern_dictionary") or "DICT_5X5_100",
+    )
+    image_paths = _resolve_image_path_items(args.dataset)
+    holdout = set(manifest.holdout_scene_ids)
+    # Evaluate only the frozen partition. Unknown manifest IDs remain visible as
+    # explicit failures in the core instead of being silently discarded.
+    def manifest_id_for_path(path: str) -> str | None:
+        candidate_path = Path(path)
+        aliases = {
+            candidate_path.stem, candidate_path.name, str(candidate_path),
+            str(candidate_path.resolve()),
+        }
+        return next((frame_id for frame_id in manifest.holdout_scene_ids if frame_id in aliases), None)
+
+    selected_paths = [path for path in image_paths if manifest_id_for_path(path) is not None]
+    width = args.width or baseline.width or candidate.width
+    height = args.height or baseline.height or candidate.height
+    if width is None or height is None:
+        width, height = _infer_resolution(selected_paths[0] if selected_paths else image_paths[0])
+    camera = CameraConfig(width=int(width), height=int(height))
+    _log(args.quiet, f"Frozen hold-out 검출 중... ({len(selected_paths)}/{len(holdout)}장 발견)")
+    dataset = detect_dataset(
+        selected_paths, pattern, parallel=args.jobs != 1,
+        max_workers=None if args.jobs in (0, 1) else args.jobs,
+    )
+    # detect_dataset uses Path.stem as its default ID. Preserve the manifest's
+    # exact ID (which may be a filename or absolute path) for provenance joins.
+    for frame in dataset.frames:
+        manifest_id = manifest_id_for_path(frame.image_info.path)
+        if manifest_id is not None:
+            frame.image_info.image_id = manifest_id
+            if frame.detection is not None:
+                frame.detection.image_id = manifest_id
+    result = compare_subset_calibrations(
+        dataset, baseline, candidate, manifest, camera, pattern,
+        ComparisonTolerance(
+            relative=args.relative_tolerance,
+            absolute_px=args.absolute_tolerance_px,
+            success_rate_drop=args.success_rate_drop,
+            minimum_common_frames=args.minimum_common_frames,
+        ),
+        progress=None if args.quiet else print,
+    )
+    paths = write_subset_comparison_outputs(result, args.output)
+    _log(args.quiet, f"{result['verdict']} — {' '.join(result['verdict_reasons'])}")
+    for path in paths.values():
+        _log(args.quiet, f"저장: {path}")
+    return 0 if result["verdict"] != "FAIL" else 2
+
+
 def main(argv: list[str] | None = None) -> int:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if effective_argv and effective_argv[0] == "compare-subset":
+        try:
+            return _run_compare_subset_cli(effective_argv[1:])
+        except KeyboardInterrupt:
+            return 130
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            print(f"오류: {exc}", file=sys.stderr)
+            return 1
     parser = build_arg_parser()
 
     # --config는 2단계로 처리한다: 먼저 (다른 옵션은 몰라도 되니) --config 값만

@@ -190,6 +190,47 @@ CLI 옵션 전체 목록, Python API로 직접 호출하는 방법, 프로젝트
 
 ## 결과를 믿기 전에 (Current Validation Status)
 
+### Best Subset을 공정하게 검증하기
+
+Best Subset의 `rms_reprojection_error`(예: 0.4869 px)는 선택된 학습 장면에
+대한 **Train RMS**다. 장면 선택에도 사용된 데이터의 적합도이므로, 이 숫자만
+낮아졌다고 새 모델의 일반화 성능이 좋아졌다고 결론 내릴 수 없다.
+
+먼저 전체 데이터를 `Training pool`과 절대 변경하지 않는 `Frozen Hold-out`으로
+나눈다. Baseline은 Training pool 전체로 학습하고 Best Subset은 그 pool
+안에서만 고르고 학습한다. Hold-out 이미지, 품질 점수, residual은 선택에
+사용하지 않는다. 두 모델은 같은 Hold-out에서 K/D를 고정하고 장면별 board
+pose만 추정한다. 학습/hold-out ID가 하나라도 겹치면 비교는 즉시 중단된다.
+
+GUI의 **Scene Ranking → Validate Best Subset**에서 Baseline YAML, Best Subset
+YAML, split manifest, 출력 폴더와 tolerance를 선택할 수 있다. CLI 예시는 다음과
+같다(패턴 정보가 export YAML에 없으면 패턴 옵션도 함께 지정한다).
+
+```bash
+python -m app.cli compare-subset \
+  --baseline baseline_fisheye.yaml \
+  --candidate camera_subset_fisheye.yaml \
+  --holdout-manifest split_manifest.json \
+  --dataset /path/to/dataset \
+  --output results/subset_comparison \
+  --relative-tolerance 0.05 \
+  --absolute-tolerance-px 0.10
+```
+
+Manifest에는 `baseline_training_scene_ids`, `subset_training_scene_ids`,
+`holdout_scene_ids`, `seed`를 기록한다. 기존 명칭인 `training_pool_scene_ids`,
+`train_ids`, `test_ids`도 읽을 수 있지만 세 집합의 provenance는 모두 필요하다.
+
+Hold-out RMS는 전체 재투영 오차, Edge RMS는 기존 이미지 3등분 regional
+정의의 외곽(left/right/top/bottom/corner) 오차다. 기본 허용치는
+`max(0.10 px, baseline × 5%)`다. Hold-out RMS와 Edge RMS가 개선되거나 허용치
+내로 유지되고 성공률이 유지되면 PASS, tail(P95)·성공률·표본 수에 문제가
+있으면 WARNING, 핵심 지표 회귀·누수·필수 provenance 누락이면 FAIL이다.
+
+결과 폴더에는 원시 정밀도의 `subset_comparison_summary.json`, 표시용 3자리
+반올림의 `subset_comparison_summary.csv`, `subset_comparison_per_frame.csv`,
+`subset_comparison_failures.csv`, 그리고 `subset_comparison_report.md`가 생성된다.
+
 이 프로그램이 "어디까지 실제로 검증됐는지"를 정직하게 밝힙니다 - 전부 통과했다고
 과장하지 않습니다.
 

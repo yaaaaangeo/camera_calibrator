@@ -276,6 +276,23 @@ def load_opencv_calibration(path: str) -> StandardCalibration:
         width = int(fs.getNode("image_width").real()) if not fs.getNode("image_width").empty() else None
         height = int(fs.getNode("image_height").real()) if not fs.getNode("image_height").empty() else None
         rms = fs.getNode("rms_reprojection_error").real() if not fs.getNode("rms_reprojection_error").empty() else None
+        # Keep provenance/target fields needed by leak-safe subset comparison.
+        # Missing fields remain absent so third-party OpenCV YAML stays supported.
+        metadata: dict[str, Any] = {}
+        for key in ("calibration_source", "subset_scene_ids", "pattern_type", "pattern_dictionary"):
+            node = fs.getNode(key)
+            if not node.empty():
+                metadata[key] = node.string()
+        for key in ("subset_scene_count", "pattern_squares_x", "pattern_squares_y", "pattern_square_size", "pattern_marker_size"):
+            node = fs.getNode(key)
+            if not node.empty():
+                metadata[key] = node.real()
+        if "subset_scene_ids" in metadata:
+            metadata["subset_scene_ids"] = [
+                item for item in metadata["subset_scene_ids"].split(",") if item
+            ]
+        if rms is not None:
+            metadata["rms_reprojection_error"] = rms
     finally:
         fs.release()
 
@@ -292,7 +309,7 @@ def load_opencv_calibration(path: str) -> StandardCalibration:
         coefficient_order=None,
         source_format="opencv_yaml",
         source_path=path,
-        metadata={"rms_reprojection_error": rms} if rms is not None else {},
+        metadata=metadata,
     )
 
 

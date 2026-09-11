@@ -54,6 +54,7 @@ class SceneQualityView(QWidget):
     recalibrate_requested = Signal(list, object)  # frame ids, CameraModelType
     model_changed = Signal(object)
     export_subset_requested = Signal()
+    validate_subset_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -64,6 +65,7 @@ class SceneQualityView(QWidget):
         self._best_subset_result: SubsetCalibrationResult | None = None
         self._original_calibration_pixmap: QPixmap | None = None
         self._best_subset_calibration_pixmap: QPixmap | None = None
+        self._frozen_holdout_ids: set[str] = set()
 
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
@@ -115,6 +117,12 @@ class SceneQualityView(QWidget):
         self.export_subset_button.setEnabled(False)
         self.export_subset_button.clicked.connect(self.export_subset_requested.emit)
         action_row.addWidget(self.export_subset_button)
+        self.validate_subset_button = QPushButton("Validate Best Subset")
+        self.validate_subset_button.setToolTip(
+            "두 calibration의 K/D를 고정하고 frozen hold-out에서 누수 없이 비교합니다."
+        )
+        self.validate_subset_button.clicked.connect(self.validate_subset_requested.emit)
+        action_row.addWidget(self.validate_subset_button)
         layout.addLayout(action_row)
 
         # Ranking/재계산 영역의 다음 줄: 같은 scene을 전체 데이터 K/D와 Best
@@ -177,9 +185,11 @@ class SceneQualityView(QWidget):
         calibration_results: dict[CameraModelType, CalibrationResult],
         analysis: SceneQualityAnalysis | None,
         subset_result: SubsetCalibrationResult | None,
+        frozen_holdout_ids: list[str] | None = None,
     ) -> None:
         self._dataset = dataset
         self._camera_config = camera_config
+        self._frozen_holdout_ids = set(frozen_holdout_ids or [])
         current = analysis.model_name if analysis else self.model_combo.currentData()
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
@@ -264,7 +274,12 @@ class SceneQualityView(QWidget):
             for col, item in enumerate(values):
                 self.table.setItem(row, col, item)
             check = QTableWidgetItem("")
-            check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+            frame_id = scene.frame_id
+            if frame_id in self._frozen_holdout_ids:
+                check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                check.setToolTip("Frozen Hold-out: subset 후보에서 제외됨")
+            else:
+                check.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
             check.setCheckState(Qt.Unchecked)
             check.setData(Qt.UserRole, scene.frame_id)
             self.table.setItem(row, 6, check)
@@ -308,6 +323,7 @@ class SceneQualityView(QWidget):
         ]
 
     def _set_checked_ids(self, ids: set[str]) -> None:
+        ids = set(ids) - self._frozen_holdout_ids
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 6)
             item.setCheckState(Qt.Checked if item.data(Qt.UserRole) in ids else Qt.Unchecked)
@@ -317,13 +333,17 @@ class SceneQualityView(QWidget):
         ids = {
             self.table.item(row, 6).data(Qt.UserRole)
             for row in range(self.table.rowCount())
+            if self.table.item(row, 6).data(Qt.UserRole) not in self._frozen_holdout_ids
         } if checked else set()
         self._set_checked_ids(ids)
 
     def _recommend(self, count: int) -> None:
         if not self._dataset or not self._analysis or not self._camera_config:
             return
-        ids = recommend_best_subset(self._dataset, self._analysis, self._camera_config, count)
+        ids = recommend_best_subset(
+            self._dataset, self._analysis, self._camera_config, count,
+            excluded_scene_ids=self._frozen_holdout_ids,
+        )
         self._set_checked_ids(set(ids))
         self.selection_label.setText(
             f"Recommended {len(ids)} scenes using quality + pose diversity + image coverage."

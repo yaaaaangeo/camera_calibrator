@@ -128,11 +128,13 @@ def recommend_best_subset(
     analysis: SceneQualityAnalysis,
     camera_config: CameraConfig,
     count: int,
+    excluded_scene_ids: list[str] | set[str] | None = None,
 ) -> list[str]:
     """Quality + minimum pose distance + new coverage gain을 greedy로 최대화."""
     by_id = {f.image_info.image_id: f for f in dataset.frames}
     quality = {s.frame_id: s.quality_score / 100.0 for s in analysis.scenes if s.frame_id in by_id}
-    candidates = list(quality)
+    excluded = set(excluded_scene_ids or [])
+    candidates = [frame_id for frame_id in quality if frame_id not in excluded]
     target = min(max(0, count), len(candidates))
     if target == 0:
         return []
@@ -177,15 +179,23 @@ def run_subset_calibration(
     model: CameraModelType,
     original_diversity=None,
     original_coverage_pct: float | None = None,
+    frozen_holdout_ids: list[str] | None = None,
 ) -> SubsetCalibrationResult:
     """Deep-copied subset으로 동일 model을 재계산해 Original을 변경하지 않는다."""
     from calibration.compare import run_all_models
-    from calibration.validation import split_train_test, validate_holdout
+    from calibration.validation import _evaluate_on_test, split_train_test, validate_holdout
 
     if model is None:
         raise ValueError("Subset Calibration requires a Camera Model, but none was provided.")
     model = model if isinstance(model, CameraModelType) else CameraModelType(str(model))
     selected = set(selected_frame_ids)
+    frozen_holdout = set(frozen_holdout_ids or [])
+    leaked = sorted(selected & frozen_holdout)
+    if leaked:
+        raise ValueError(
+            "Data leakage: Best Subset selection contains frozen hold-out scenes: "
+            + ", ".join(leaked)
+        )
     subset = Dataset(frames=copy.deepcopy([
         frame for frame in dataset.frames
         if frame.image_info.image_id in selected and frame.enabled
@@ -198,8 +208,21 @@ def run_subset_calibration(
     analyze_dataset_quality(subset, camera_config)
     results = run_all_models(subset, camera_config, models=[model], model_jobs=1)
     result = results[0] if results else None
-    train_ids, test_ids = split_train_test(subset, camera_config, 0.25, 42)
-    validation = validate_holdout(subset, camera_config, pattern_config, model, train_ids, test_ids)
+    if result is None or not result.success:
+        reason = result.error_message if result is not None else "no calibration result"
+        raise ValueError(f"Best Subset calibration failed: {reason}")
+    if frozen_holdout_ids:
+        # result was fitted only on selected training-pool scenes.  Evaluate that
+        # immutable K/D on the outer frozen hold-out from the original dataset.
+        validation = _evaluate_on_test(
+            dataset, camera_config, pattern_config, model,
+            [f.image_info.image_id for f in subset.frames], list(frozen_holdout_ids), result,
+        )
+    else:
+        # Backward compatible path for callers/projects created before frozen
+        # hold-out provenance was available.
+        train_ids, test_ids = split_train_test(subset, camera_config, 0.25, 42)
+        validation = validate_holdout(subset, camera_config, pattern_config, model, train_ids, test_ids)
     subset_coverage = coverage_percentage(subset.coverage_grid)
     warnings = []
     if original_coverage_pct is not None and subset_coverage < original_coverage_pct - 20.0:

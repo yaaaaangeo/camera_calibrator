@@ -37,6 +37,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QStackedWidget,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -75,10 +77,12 @@ from ui.worker import (
     BagExtractionWorker,
     LibrarySaveWorker,
     SceneSubsetCalibrationWorker,
+    SubsetComparisonWorker,
     run_worker_in_thread,
 )
 from ui.kfold_worker import RepeatedKFoldWorker
 from calibration.scene_quality import add_original_comparison_warnings, compute_scene_quality_analysis
+from calibration.subset_comparison import ComparisonTolerance
 from ui.library_view import LibraryView
 from ui.windshield_workspace import WindshieldWorkspace
 
@@ -703,7 +707,10 @@ class MainWindow(QMainWindow):
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
-        progress.canceled.connect(worker.request_cancel)
+        # Lambda executes in the GUI thread and flips the worker's atomic-ish
+        # boolean immediately; a queued slot could not run while worker.run()
+        # owns the QThread event loop.
+        progress.canceled.connect(lambda: worker.request_cancel())
 
         worker.progress.connect(progress.setLabelText)
         worker.progress.connect(self.status_label.setText)
@@ -1332,9 +1339,17 @@ class MainWindow(QMainWindow):
             )
         else:
             self.scene_quality_analysis = None
+        validation = next(
+            (
+                value for key, value in self.validation_results.items()
+                if key == model or str(key) == getattr(model, "value", None)
+            ),
+            None,
+        )
         self.scene_quality_view.set_context(
             self.dataset, self.camera_config, self.calibration_results,
             self.scene_quality_analysis, self.subset_calibration_result,
+            frozen_holdout_ids=(validation.test_frame_ids if validation else []),
         )
 
     def _on_scene_quality_model_changed(self, model: CameraModelType) -> None:
@@ -1367,8 +1382,25 @@ class MainWindow(QMainWindow):
                 f"{model.value} Initial Calibration 결과가 없거나 실패했습니다.",
             )
             return
+        original_validation = next(
+            (
+                value for key, value in self.validation_results.items()
+                if key == model or str(key) == model.value
+            ),
+            None,
+        )
+        frozen_holdout_ids = list(original_validation.test_frame_ids) if original_validation else []
+        leaked = sorted(set(frame_ids) & set(frozen_holdout_ids))
+        if leaked:
+            QMessageBox.critical(
+                self, "Subset Calibration 차단",
+                "선택 장면에 Frozen Hold-out이 포함되어 데이터 누수가 발생합니다:\n"
+                + ", ".join(leaked),
+            )
+            return
         worker = SceneSubsetCalibrationWorker(
-            self.dataset, frame_ids, self.camera_config, self.pattern_config, model
+            self.dataset, frame_ids, self.camera_config, self.pattern_config, model,
+            frozen_holdout_ids=frozen_holdout_ids,
         )
         thread = run_worker_in_thread(worker, self)
         worker.progress.connect(self.status_label.setText)
@@ -1411,6 +1443,7 @@ class MainWindow(QMainWindow):
         self.scene_quality_view.set_context(
             self.dataset, self.camera_config, self.calibration_results,
             self.scene_quality_analysis, self.subset_calibration_result,
+            frozen_holdout_ids=(result.original_validation_result.test_frame_ids if result.original_validation_result else []),
         )
         self._autosave()
 
@@ -1649,6 +1682,106 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Subset Export 실패", str(exc))
+
+    def _on_validate_best_subset(self) -> None:
+        """Collect paths in the GUI, then run the same evaluator used by CLI."""
+        if self.dataset is None or self.camera_config is None or self.pattern_config is None:
+            QMessageBox.warning(self, "Validation 불가", "먼저 hold-out 이미지가 포함된 Dataset을 불러오세요.")
+            return
+        baseline, _ = QFileDialog.getOpenFileName(
+            self, "Baseline calibration YAML", "", "Calibration (*.yaml *.yml *.json)"
+        )
+        if not baseline:
+            return
+        candidate, _ = QFileDialog.getOpenFileName(
+            self, "Best Subset calibration YAML", "", "Calibration (*.yaml *.yml *.json)"
+        )
+        if not candidate:
+            return
+        manifest, _ = QFileDialog.getOpenFileName(
+            self, "Frozen hold-out split manifest", "", "Manifest (*.json *.yaml *.yml)"
+        )
+        if not manifest:
+            return
+        output_dir = QFileDialog.getExistingDirectory(self, "Comparison output directory")
+        if not output_dir:
+            return
+        relative_pct, ok = QInputDialog.getDouble(
+            self, "판정 tolerance", "Relative tolerance (%):", 5.0, 0.0, 100.0, 1
+        )
+        if not ok:
+            return
+        absolute_px, ok = QInputDialog.getDouble(
+            self, "판정 tolerance", "Absolute tolerance (px):", 0.10, 0.0, 100.0, 3
+        )
+        if not ok:
+            return
+        worker = SubsetComparisonWorker(
+            self.dataset, self.camera_config, self.pattern_config,
+            baseline, candidate, manifest, output_dir,
+            ComparisonTolerance(relative=relative_pct / 100.0, absolute_px=absolute_px),
+        )
+        thread = run_worker_in_thread(worker, self)
+        progress = QProgressDialog("Frozen hold-out 비교 준비 중...", "취소", 0, 0, self)
+        progress.setWindowTitle("Validate Best Subset")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.canceled.connect(worker.request_cancel)
+        worker.progress.connect(progress.setLabelText)
+        worker.error.connect(self._on_error)
+        worker.result_ready.connect(self._on_subset_comparison_ready)
+        worker.finished.connect(progress.close)
+        self._subset_comparison_thread = thread
+        self._subset_comparison_worker = worker
+        self._subset_comparison_progress = progress
+        progress.show()
+        thread.start()
+
+    def _on_subset_comparison_ready(self, result, paths) -> None:
+        def metric(name: str) -> str:
+            row = result["comparison"][name]
+            left = "N/A" if row["baseline"] is None else f"{row['baseline']:.3f}"
+            right = "N/A" if row["candidate"] is None else f"{row['candidate']:.3f}"
+            return f"{name}: {left} → {right} ({row['status']})"
+
+        summary = "\n".join([
+            f"{result['verdict']} — {' '.join(result['verdict_reasons'])}",
+            "Data leakage check: PASS",
+            metric("train_rms"), metric("holdout_rms"), metric("p95"),
+            metric("p99"), metric("edge_rms"), metric("straightness"),
+            f"Success: {result['baseline']['success_rate'] * 100:.1f}% → "
+            f"{result['candidate']['success_rate'] * 100:.1f}%",
+            f"Common frames: {result['paired']['common_frame_count']}",
+            f"Report: {paths['report']}",
+        ])
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Best Subset Validation 결과")
+        dialog.resize(900, 620)
+        layout = QVBoxLayout(dialog)
+        summary_label = QLabel(summary)
+        summary_label.setWordWrap(True)
+        layout.addWidget(summary_label)
+        table = QTableWidget(len(result["per_frame"]), 7)
+        table.setHorizontalHeaderLabels([
+            "Frame", "Common", "Baseline RMS", "Subset RMS", "Delta",
+            "Baseline Edge", "Subset Edge",
+        ])
+        for row_index, row in enumerate(result["per_frame"]):
+            values = [
+                row["frame_id"], "Yes" if row["common_success"] else "No",
+                row.get("baseline_rms"), row.get("candidate_rms"), row.get("rms_delta"),
+                row.get("baseline_edge_rms"), row.get("candidate_edge_rms"),
+            ]
+            for column, value in enumerate(values):
+                text = f"{value:.3f}" if isinstance(value, float) else ("N/A" if value is None else str(value))
+                table.setItem(row_index, column, QTableWidgetItem(text))
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.resizeColumnsToContents()
+        layout.addWidget(table, stretch=1)
+        close_button = QPushButton("닫기")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+        dialog.exec()
+        self.status_label.setText(f"Best Subset Validation {result['verdict']}: {paths['report']}")
 
     # ------------------------------------------------------------------
     # 프로젝트 저장/불러오기 (.ccproj)

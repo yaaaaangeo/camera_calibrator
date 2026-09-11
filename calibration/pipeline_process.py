@@ -141,6 +141,7 @@ def run_scene_subset_calibration(
     model: CameraModelType,
     original_diversity,
     original_coverage_pct: float,
+    frozen_holdout_ids: list[str] | None = None,
 ):
     """ProcessPool에 전달할 수 있는 scene subset 재계산 진입점."""
     from calibration.scene_quality import run_subset_calibration
@@ -149,6 +150,7 @@ def run_scene_subset_calibration(
         dataset, selected_frame_ids, camera_config, pattern_config, model,
         original_diversity=original_diversity,
         original_coverage_pct=original_coverage_pct,
+        frozen_holdout_ids=frozen_holdout_ids,
     )
 
 

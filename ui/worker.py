@@ -67,6 +67,11 @@ from calibration.rosbag_reader import (
 from calibration.validation import validate_cross_datasets
 from calibration.external_compare import compare_with_external_params
 from calibration.pipeline_process import run_models_and_validation, run_scene_subset_calibration
+from calibration.subset_comparison import (
+    ComparisonTolerance, compare_subset_calibrations, load_split_manifest,
+    write_subset_comparison_outputs,
+)
+from calibration.calibration_io import load_standard_calibration
 
 # 위 계산(Standard 4모델 + Hold-out 진행 상황)은 자식 프로세스 안에서 일어나므로
 # 세부 진행률 문자열을 실시간으로 받을 수 없다 - future.result()를 이 간격
@@ -371,7 +376,8 @@ class SceneSubsetCalibrationWorker(QObject):
     error = Signal(str)
     finished = Signal()
 
-    def __init__(self, dataset, selected_frame_ids, camera_config, pattern_config, model):
+    def __init__(self, dataset, selected_frame_ids, camera_config, pattern_config, model,
+                 frozen_holdout_ids=None):
         super().__init__()
         self.dataset = dataset
         self.selected_frame_ids = selected_frame_ids
@@ -380,6 +386,7 @@ class SceneSubsetCalibrationWorker(QObject):
         if model is None:
             raise ValueError("Subset Calibration model is missing.")
         self.model = model if isinstance(model, CameraModelType) else CameraModelType(str(model))
+        self.frozen_holdout_ids = list(frozen_holdout_ids or [])
 
     def run(self) -> None:
         try:
@@ -396,6 +403,7 @@ class SceneSubsetCalibrationWorker(QObject):
                     self.model,
                     self.dataset.diversity,
                     coverage_percentage(self.dataset.coverage_grid),
+                    self.frozen_holdout_ids,
                 )
                 result = _wait_with_heartbeat(
                     future, self.progress, "Best Subset Calibration + Hold-out 계산 중..."
@@ -405,6 +413,53 @@ class SceneSubsetCalibrationWorker(QObject):
             self.error.emit(
                 f"Subset Calibration 실패: {exc}\n\nTechnical details:\n{traceback.format_exc()}"
             )
+        finally:
+            self.finished.emit()
+
+
+class SubsetComparisonWorker(QObject):
+    """One shared core for the GUI comparison; this object runs in a QThread."""
+
+    progress = Signal(str)
+    result_ready = Signal(object, object)  # result, output paths
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, dataset, camera_config, pattern_config, baseline_path,
+                 candidate_path, manifest_path, output_dir, tolerance):
+        super().__init__()
+        self.dataset = dataset
+        self.camera_config = camera_config
+        self.pattern_config = pattern_config
+        self.baseline_path = baseline_path
+        self.candidate_path = candidate_path
+        self.manifest_path = manifest_path
+        self.output_dir = output_dir
+        self.tolerance = tolerance
+        self._cancelled = False
+
+    def request_cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            self.progress.emit("Calibration과 split manifest 검사 중...")
+            result = compare_subset_calibrations(
+                self.dataset,
+                load_standard_calibration(self.baseline_path),
+                load_standard_calibration(self.candidate_path),
+                load_split_manifest(self.manifest_path),
+                self.camera_config,
+                self.pattern_config,
+                self.tolerance,
+                progress=self.progress.emit,
+                cancelled=lambda: self._cancelled,
+            )
+            self.progress.emit("비교 보고서 저장 중...")
+            paths = write_subset_comparison_outputs(result, self.output_dir)
+            self.result_ready.emit(result, paths)
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(f"Best Subset Validation 실패: {exc}")
         finally:
             self.finished.emit()
 
