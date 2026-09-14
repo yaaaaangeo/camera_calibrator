@@ -199,10 +199,17 @@ class GhostSuppressionPanelMixin:
         if field is None:
             QMessageBox.warning(self, "Ghost Suppression", "먼저 'Fit From Last Evaluation'으로 model을 만드세요.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save Ghost Model", "ghost_model.yml", "Ghost Model (*.yml *.yaml)")
-        if not path:
-            return
+        manager = getattr(self, "output_manager", None)
+        if manager is not None:
+            manager.ensure_session(getattr(self._camera_config, "sensor_name", ""))
+            path = str(manager.ghost_path("ghost_model.yaml"))
+        else:
+            path, _ = QFileDialog.getSaveFileName(self, "Save Ghost Model", "ghost_model.yml", "Ghost Model (*.yml *.yaml)")
+            if not path:
+                return
         save_ghost_model(field, path)
+        if manager is not None:
+            manager.record_export("windshield.ghost", path)
         self._ghost_suppression_model_path = path
         self.ghost_suppression_model_path_label.setText(path)
 

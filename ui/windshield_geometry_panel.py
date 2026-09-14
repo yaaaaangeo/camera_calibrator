@@ -18,6 +18,8 @@ Windshield Geometry(③ Windshield Model 탭) 전용 UI. `GeometryPanelMixin`은
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtWidgets import (
     QButtonGroup,
     QComboBox,
@@ -904,11 +906,27 @@ class GeometryPanelMixin:
         if result is None or not result.success:
             QMessageBox.warning(self, "Export", "Export할 결과가 없습니다.")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Windshield YAML 저장", "windshield.yml", "YAML (*.yml *.yaml)")
-        if not path:
-            return
+        manager = getattr(self, "output_manager", None)
+        if manager is not None:
+            manager.ensure_session(getattr(self._camera_config, "sensor_name", ""))
+            key = windshield_result_key_for_result(result)
+            if isinstance(key, tuple):
+                variant = f"{key[0].value}_{key[1]}"
+            else:
+                variant = result.windshield_model.value
+            path = str(manager.windshield_geometry_path(result.base_model_name, variant))
+        else:
+            path, _ = QFileDialog.getSaveFileName(self, "Windshield YAML 저장", "windshield.yml", "YAML (*.yml *.yaml)")
+            if not path:
+                return
         try:
             export_windshield_yaml(result, self._camera_config, path)
+            if manager is not None:
+                artifacts = [path]
+                neural = str(Path(path).with_name(Path(path).stem + "_neural.pt"))
+                if Path(neural).exists():
+                    artifacts.append(neural)
+                manager.record_export(f"windshield.geometry.{variant}", artifacts)
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Export", f"저장 실패: {e}")
             return

@@ -113,6 +113,7 @@ from export.ros import export_ros_camera_info
 from export.json_export import export_json
 from export.csv_export import export_csv
 from export.kalibr import build_kalibr_camera_calibration_command, export_kalibr_target_yaml
+from export.output_manager import OutputManager, model_filename
 
 logger = logging.getLogger(__name__)
 
@@ -631,7 +632,11 @@ def _run_benchmark_cli(args) -> int:
         benchmark_bootstrap=n_bootstrap,
     )
 
-    out_dir = Path(args.output_dir)
+    output_manager = getattr(args, "output_manager", None)
+    out_dir = (
+        output_manager.validation_directory()
+        if output_manager is not None else Path(args.output_dir)
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = _benchmark_result_payload(
         result,
@@ -645,11 +650,19 @@ def _run_benchmark_cli(args) -> int:
 
     json_path = out_dir / "benchmark_result.json"
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if output_manager is not None:
+        output_manager.update_context(
+            camera={"name": camera_config.sensor_name, "resolution": [camera_config.width, camera_config.height]},
+            pattern={"type": pattern_config.type.value},
+        )
+        output_manager.record_export("validation.benchmark_json", json_path)
     _log(quiet, f"저장: {json_path}")
 
     if args.benchmark_report:
         report_path = out_dir / "benchmark_report.html"
         report_path.write_text(_benchmark_report_html(payload), encoding="utf-8")
+        if output_manager is not None:
+            output_manager.record_export("validation.benchmark_report", report_path)
         _log(quiet, f"저장: {report_path}")
 
     if args.json_summary:
@@ -1261,45 +1274,88 @@ def _validate_choose_and_export(
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     exported: dict[str, str] = {}
+    output_manager = getattr(args, "output_manager", None)
+    if output_manager is not None:
+        output_manager.update_context(
+            camera={
+                "name": camera_config.sensor_name,
+                "resolution": [camera_config.width, camera_config.height],
+            },
+            pattern={
+                "type": pattern_config.type.value,
+                "squares": [pattern_config.squares_x, pattern_config.squares_y],
+                "square_size_m": pattern_config.square_size,
+                "marker_size_m": pattern_config.marker_size,
+                "dictionary": pattern_config.dictionary,
+            },
+            calibration={
+                "available_models": [model.value for model, result in calibration_results.items() if result.success],
+                "selected_model": chosen_model.value,
+                "recommended_model": next((s.model_name.value for s in scores if s.is_recommended), None),
+            },
+            paper_metrics_available=bool(repeated_kfold_result),
+        )
+
+    def destination(legacy_name: str, session_path) -> Path:
+        return Path(session_path) if output_manager is not None else out_dir / legacy_name
+
+    def record(key: str, path: str | Path) -> None:
+        if output_manager is not None:
+            output_manager.record_export(key, path)
 
     export_targets = set(args.export)
     if "opencv" in export_targets:
-        p = export_opencv_yaml(calibration_results[chosen_model], camera_config, pattern_config, str(out_dir / "camera.yaml"))
+        target = destination("camera.yaml", output_manager.intrinsic_path(chosen_model) if output_manager else "")
+        p = export_opencv_yaml(calibration_results[chosen_model], camera_config, pattern_config, str(target))
         exported["opencv_yaml"] = p
+        record(f"intrinsic.{model_filename(chosen_model)}", p)
         _log(quiet, f"저장: {p}")
     if "ros" in export_targets:
-        p = export_ros_camera_info(calibration_results[chosen_model], camera_config, str(out_dir / "camera_info.yaml"))
+        target = destination("camera_info.yaml", output_manager.ros_path() if output_manager else "")
+        p = export_ros_camera_info(calibration_results[chosen_model], camera_config, str(target))
         exported["ros_yaml"] = p
+        record("intrinsic.ros", p)
         _log(quiet, f"저장: {p}")
     if "report" in export_targets:
+        target = destination("report.html", output_manager.report_path("report.html") if output_manager else "")
         p = export_html_report(
             args.sensor_name or "camera_calibrator", camera_config, pattern_config, dataset,
-            calibration_results, validation_results, final_result, str(out_dir / "report.html"),
+            calibration_results, validation_results, final_result, str(target),
             cross_dataset_results=cross_dataset_results,
             kfold_result=kfold_result, repeated_kfold_result=repeated_kfold_result,
         )
         exported["report_html"] = p
+        record("reports.html", p)
         _log(quiet, f"저장: {p}")
     if "json" in export_targets:
+        target = destination("calibration.json", output_manager.report_path("calibration.json") if output_manager else "")
         p = export_json(
             camera_config, pattern_config, dataset, calibration_results, validation_results,
-            chosen_model, str(out_dir / "calibration.json"),
+            chosen_model, str(target),
             final_result=final_result, model_scores=scores,
             cross_dataset_results=cross_dataset_results,
             kfold_result=kfold_result, repeated_kfold_result=repeated_kfold_result,
         )
         exported["json"] = p
+        record("reports.json", p)
         _log(quiet, f"저장: {p}")
     if "csv" in export_targets:
-        p = export_csv(dataset, str(out_dir / "dataset.csv"))
+        target = destination("dataset.csv", output_manager.report_path("dataset.csv") if output_manager else "")
+        p = export_csv(dataset, str(target))
         exported["csv"] = p
+        record("reports.dataset_csv", p)
 
     if "kalibr" in export_targets:
         try:
-            p = export_kalibr_target_yaml(pattern_config, str(out_dir / "kalibr_aprilgrid.yaml"))
+            target = destination(
+                "kalibr_aprilgrid.yaml",
+                output_manager.kalibr_path("kalibr_aprilgrid.yaml") if output_manager else "",
+            )
+            p = export_kalibr_target_yaml(pattern_config, str(target))
         except ValueError as e:
             raise CliError(str(e)) from e
         exported["kalibr_target_yaml"] = p
+        record("intrinsic.kalibr_target", p)
         if args.bag and args.topic:
             command = build_kalibr_camera_calibration_command(
                 bag_path=args.bag,
@@ -1307,9 +1363,13 @@ def _validate_choose_and_export(
                 target_yaml_path=p,
                 camera_model=args.kalibr_camera_model,
             )
-            command_path = out_dir / "kalibr_camera_calibration_command.txt"
+            command_path = destination(
+                "kalibr_camera_calibration_command.txt",
+                output_manager.kalibr_path("kalibr_camera_calibration_command.txt") if output_manager else "",
+            )
             command_path.write_text(command + "\n", encoding="utf-8")
             exported["kalibr_command"] = str(command_path)
+            record("intrinsic.kalibr_command", command_path)
         _log(quiet, f"저장: {p}")
 
     if args.save_project:
@@ -1325,6 +1385,7 @@ def _validate_choose_and_export(
         )
         saved_path = save_project(project, args.save_project)
         exported["project_ccproj"] = saved_path
+        record("project.save_as", saved_path)
         _log(quiet, f"저장: {saved_path} (나중에 --load-project로 이어서 쓸 수 있음)")
 
     if args.json_summary:
@@ -1532,7 +1593,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     out = p.add_argument_group("출력")
-    out.add_argument("--output-dir", default="./calibration_output", help="결과 저장 폴더, 기본 ./calibration_output")
+    out.add_argument(
+        "--output-dir", default=None,
+        help=("기존 호환용 정확한(flat) 저장 폴더. 생략하면 "
+              "~/CameraCalibratorOutputs 아래에 시간 기반 Output Session을 생성합니다."),
+    )
     out.add_argument(
         "--export", nargs="+", default=None,
         choices=["opencv", "ros", "report", "json", "csv", "kalibr"],
@@ -1741,6 +1806,14 @@ def main(argv: list[str] | None = None) -> int:
         for required in ("squares_x", "squares_y", "square_size"):
             if getattr(args, required) is None:
                 parser.error(f"--{required.replace('_', '-')}는 필수입니다.")
+
+    # --output-dir를 명시한 자동화/기존 스크립트는 종전의 flat 디렉터리
+    # 계약을 유지한다. 생략한 일반 실행만 GUI와 같은 세션 구조를 사용한다.
+    args.output_manager = None
+    if args.output_dir is None:
+        args.output_manager = OutputManager(camera_name=args.sensor_name or "")
+        args.output_dir = str(args.output_manager.ensure_session(args.sensor_name or ""))
+        _log(args.quiet, f"Output Session: {args.output_dir}")
 
     try:
         if args.benchmark_mode:

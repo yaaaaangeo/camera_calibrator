@@ -146,6 +146,7 @@ class WindshieldWorkspace(
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
+        self.output_manager = None
         self._camera_config: CameraConfig | None = None
         self._pattern_config: PatternConfig | None = None
         self._windshield_dataset: Dataset | None = None
@@ -228,6 +229,10 @@ class WindshieldWorkspace(
     # ------------------------------------------------------------------
     # MainWindow 연동 API
     # ------------------------------------------------------------------
+    def set_output_manager(self, manager) -> None:
+        """Share MainWindow's session destination with all export mixins."""
+        self.output_manager = manager
+
     def load_base_from_calibration_results(
         self,
         calibration_results: dict[CameraModelType | str, CalibrationResult],

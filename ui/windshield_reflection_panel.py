@@ -228,11 +228,18 @@ class ReflectionPanelMixin:
     def _on_export_reflection_yaml(self) -> None:
         if self._reflection_result is None:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Reflection YAML 저장", "reflection_evaluation.yml", "YAML (*.yml *.yaml)")
-        if not path:
-            return
+        manager = getattr(self, "output_manager", None)
+        if manager is not None:
+            manager.ensure_session(getattr(self._camera_config, "sensor_name", ""))
+            path = str(manager.reflection_path("reflection_evaluation.yaml"))
+        else:
+            path, _ = QFileDialog.getSaveFileName(self, "Reflection YAML 저장", "reflection_evaluation.yml", "YAML (*.yml *.yaml)")
+            if not path:
+                return
         try:
             export_reflection_yaml(self._reflection_result, path)
+            if manager is not None:
+                manager.record_export("windshield.reflection", path)
             self.reflection_status_label.setText(f"Reflection YAML saved: {path}")
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Reflection Export", str(e))

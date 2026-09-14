@@ -224,6 +224,9 @@ class TestRepeatedKFoldStateReuse:
         win = MainWindow()
         try:
             _minimal_state(win)
+            from export.output_manager import OutputManager
+            win.output_manager = OutputManager(tmp_path)
+            win.windshield_workspace.set_output_manager(win.output_manager)
             stored_repeated = win.repeated_kfold_results
 
             recompute_calls = {"n": 0}
@@ -263,22 +266,33 @@ class TestRepeatedKFoldStateReuse:
 # ---------------------------------------------------------------------------
 
 class TestCancelDoesNothing:
-    def test_cancel_dialog_creates_no_files_and_does_not_call_exporter(self, qapp, monkeypatch, tmp_path):
+    def test_default_export_does_not_open_a_directory_dialog(self, qapp, monkeypatch, tmp_path):
         import ui.main_window as main_window_module
         from ui.main_window import MainWindow
 
         win = MainWindow()
         try:
             _minimal_state(win)
-            monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: ""))
+            from export.output_manager import OutputManager
+            win.output_manager = OutputManager(tmp_path)
+            win.windshield_workspace.set_output_manager(win.output_manager)
+            dialog_calls = {"n": 0}
+            monkeypatch.setattr(
+                QFileDialog, "getExistingDirectory",
+                staticmethod(lambda *a, **k: dialog_calls.__setitem__("n", dialog_calls["n"] + 1)),
+            )
             export_calls = {"n": 0}
             monkeypatch.setattr(
                 main_window_module.paper_evidence, "export_paper_metrics",
-                lambda *a, **k: export_calls.__setitem__("n", export_calls["n"] + 1),
+                lambda output_dir, *a, **k: (
+                    export_calls.__setitem__("n", export_calls["n"] + 1)
+                    or {"paper_summary.csv": str(output_dir) + "/paper_summary.csv"}
+                ),
             )
+            monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *a, **k: None))
             win._on_export_paper_metrics_requested()
-            assert export_calls["n"] == 0
-            assert list(tmp_path.iterdir()) == []
+            assert export_calls["n"] == 1
+            assert dialog_calls["n"] == 0
         finally:
             win.close()
 
@@ -294,7 +308,9 @@ class TestSuccessfulExport:
         win = MainWindow()
         try:
             _minimal_state(win)
-            monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(tmp_path)))
+            from export.output_manager import OutputManager
+            win.output_manager = OutputManager(tmp_path)
+            win.windshield_workspace.set_output_manager(win.output_manager)
             messages = []
             monkeypatch.setattr(
                 QMessageBox, "information",
@@ -312,8 +328,9 @@ class TestSuccessfulExport:
             ]
             for name in expected_files:
                 assert name in message, f"{name}이 성공 메시지에 없음"
-                assert (tmp_path / name).exists(), f"{name} 파일이 실제로 생성되지 않음"
-                assert (tmp_path / name).stat().st_size > 0
+                path = win.output_manager.paper_directory() / name
+                assert path.exists(), f"{name} 파일이 실제로 생성되지 않음"
+                assert path.stat().st_size > 0
         finally:
             win.close()
 
@@ -324,6 +341,9 @@ class TestSuccessfulExport:
         win = MainWindow()
         try:
             _minimal_state(win)
+            from export.output_manager import OutputManager
+            win.output_manager = OutputManager(tmp_path)
+            win.windshield_workspace.set_output_manager(win.output_manager)
             model = CameraModelType.BROWN_CONRADY.value
             win.pattern_config.type = PatternType.CHESSBOARD.value
             win.calibration_results = {model: next(iter(win.calibration_results.values()))}
@@ -335,7 +355,7 @@ class TestSuccessfulExport:
 
             win._on_export_paper_metrics_requested()
 
-            metrics = (tmp_path / "paper_metrics.json").read_text(encoding="utf-8")
+            metrics = (win.output_manager.paper_directory() / "paper_metrics.json").read_text(encoding="utf-8")
             assert '"target_type": "chessboard"' in metrics
             assert '"brown_conrady"' in metrics
         finally:
@@ -354,6 +374,9 @@ class TestExportFailure:
         win = MainWindow()
         try:
             _minimal_state(win)
+            from export.output_manager import OutputManager
+            win.output_manager = OutputManager(tmp_path)
+            win.windshield_workspace.set_output_manager(win.output_manager)
             monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(tmp_path)))
 
             def _raise(*a, **k):
@@ -435,6 +458,9 @@ class TestStabilitySeparationInExport:
         win = MainWindow()
         try:
             _minimal_state(win)
+            from export.output_manager import OutputManager
+            win.output_manager = OutputManager(tmp_path)
+            win.windshield_workspace.set_output_manager(win.output_manager)
             # _fake_calibration_result가 paper=90.0, overall=62.0으로 일부러
             # 다르게 만들어 뒀다 - 두 값이 export에서 섞이면 이 테스트가 잡는다.
             monkeypatch.setattr(QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: str(tmp_path)))
@@ -442,7 +468,7 @@ class TestStabilitySeparationInExport:
 
             win._on_export_paper_metrics_requested()
 
-            content = (tmp_path / "stability_parameters.csv").read_text(encoding="utf-8")
+            content = (win.output_manager.paper_directory() / "stability_parameters.csv").read_text(encoding="utf-8")
             assert "paper_intrinsic_stability" in content
             assert "all_parameter_stability" in content
             assert "90.0" in content

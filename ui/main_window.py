@@ -11,13 +11,12 @@ calibration/*.py에 있고, 여기서는 그 함수들을 worker.py를 통해 �
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from pathlib import Path
 
 import cv2
 
-from PySide6.QtCore import QThread, QTimer, Qt
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QThread, QTimer, Qt, QUrl
+from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -61,10 +60,20 @@ from calibration.types import (
     ValidationResult,
 )
 from calibration.sanity_check import run_sanity_checks
+from calibration.recommender import compute_final_result
 from calibration.ros_live import ROS_LIVE_BACKEND
 from calibration.project_io import load_project, save_project, PROJECT_EXTENSION
 import calibration.paper_evidence as paper_evidence
 from export.opencv import export_opencv_yaml
+from export.output_manager import DEFAULT_OUTPUT_ROOT, OutputManager, model_filename
+from export.csv_export import export_csv
+from export.json_export import export_json
+from export.reflection import export_reflection_yaml
+from export.report import export_html_report
+from export.ros import export_ros_camera_info
+from export.windshield import export_windshield_yaml
+from calibration.windshield.base import windshield_result_key_for_result
+from calibration.windshield.ghost import save_ghost_model
 
 from ui.calibration_home_view import CalibrationHomeView
 from ui.help_view import HelpView
@@ -289,6 +298,10 @@ class MainWindow(QMainWindow):
         self._library_thread: QThread | None = None
         self._library_worker = None
         self._export_dialog: QDialog | None = None  # result_view가 생긴 뒤 지연 생성
+        # 사용자 결과물은 이 관리자 아래 한 세션으로 모인다. 앱 크래시 복구용
+        # ~/.camera_calibrator/autosave.ccproj와 Library 내부 저장은 의도적으로
+        # 별도 수명주기이므로 여기로 합치지 않는다.
+        self.output_manager = OutputManager()
 
         self._build_menu_bar()
 
@@ -304,11 +317,13 @@ class MainWindow(QMainWindow):
         self.intrinsic_workspace.back_requested.connect(self._show_home)
         self.library_view = LibraryView()
         self.windshield_workspace = WindshieldWorkspace()
+        self.windshield_workspace.set_output_manager(self.output_manager)
         self.windshield_workspace.back_requested.connect(self._show_home)
         self.workspace_stack.addWidget(self.home_view)
         self.workspace_stack.addWidget(self.intrinsic_workspace)
         self.workspace_stack.addWidget(self.library_view)
         self.workspace_stack.addWidget(self.windshield_workspace)
+        layout.addWidget(self._build_output_session_bar())
         layout.addWidget(self.workspace_stack, stretch=1)
 
         self.status_label = QLabel("이미지를 불러온 뒤 [캘리브레이션 실행]을 누르세요.")
@@ -366,10 +381,15 @@ class MainWindow(QMainWindow):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("파일")
 
-        save_action = QAction("프로젝트 저장...", self)
+        save_action = QAction("프로젝트 저장", self)
         save_action.setShortcut("Ctrl+S")
-        save_action.triggered.connect(self._on_save_project)
+        save_action.triggered.connect(self._on_save_project_session)
         file_menu.addAction(save_action)
+
+        save_as_action = QAction("프로젝트 다른 이름으로 저장...", self)
+        save_as_action.setShortcut("Ctrl+Shift+S")
+        save_as_action.triggered.connect(self._on_save_project_as)
+        file_menu.addAction(save_as_action)
 
         load_action = QAction("프로젝트 불러오기...", self)
         load_action.setShortcut("Ctrl+O")
@@ -399,6 +419,258 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
         layout.addWidget(HelpView(dialog))
         dialog.exec()
+
+    def _build_output_session_bar(self) -> QWidget:
+        group = QGroupBox("Output Session")
+        row = QHBoxLayout(group)
+        self.output_session_label = QLabel(f"Root: {DEFAULT_OUTPUT_ROOT}  ·  새 세션은 첫 저장 시 생성")
+        self.output_session_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        row.addWidget(self.output_session_label, stretch=1)
+        change_button = QPushButton("폴더 변경…")
+        change_button.clicked.connect(self._on_change_output_root)
+        row.addWidget(change_button)
+        open_button = QPushButton("폴더 열기")
+        open_button.clicked.connect(self._on_open_output_folder)
+        row.addWidget(open_button)
+        export_all_button = QPushButton("Export All")
+        export_all_button.clicked.connect(self._on_export_all)
+        row.addWidget(export_all_button)
+        return group
+
+    def _session_camera_name(self) -> str:
+        config = self.camera_config
+        if config is not None and config.sensor_name:
+            return config.sensor_name
+        edit = getattr(self, "sensor_name_edit", None)
+        return edit.text().strip() if edit is not None else ""
+
+    def _ensure_output_session(self) -> Path:
+        session = self.output_manager.ensure_session(self._session_camera_name())
+        self._update_output_manifest_context()
+        self.output_session_label.setText(f"Session: {session}")
+        return session
+
+    def _update_output_manifest_context(self) -> None:
+        if not self.output_manager.active:
+            return
+        camera = self.camera_config
+        pattern = self.pattern_config
+        successful = [
+            getattr(getattr(result, "model_name", model), "value", str(model))
+            for model, result in self.calibration_results.items()
+            if getattr(result, "success", False)
+        ]
+        recommended = next(
+            (
+                getattr(score.model_name, "value", str(score.model_name))
+                for score in self.scores
+                if getattr(score, "is_recommended", False)
+            ),
+            None,
+        )
+        selected = recommended
+        if hasattr(self, "result_view"):
+            combo = getattr(self.result_view, "export_model_combo", None)
+            if combo is not None:
+                data = combo.currentData()
+                selected = getattr(data, "value", data) or selected
+        self.output_manager.update_context(
+            camera={
+                "name": getattr(camera, "sensor_name", "") if camera else "",
+                "resolution": [getattr(camera, "width", 0), getattr(camera, "height", 0)] if camera else None,
+            },
+            pattern={
+                "type": getattr(getattr(pattern, "type", None), "value", None),
+                "squares": [getattr(pattern, "squares_x", 0), getattr(pattern, "squares_y", 0)] if pattern else None,
+                "square_size_m": getattr(pattern, "square_size", None),
+                "marker_size_m": getattr(pattern, "marker_size", None),
+                "dictionary": getattr(pattern, "dictionary", None),
+            },
+            calibration={
+                "available_models": successful,
+                "selected_model": selected,
+                "recommended_model": recommended,
+            },
+            paper_metrics_available=bool(self.repeated_kfold_results),
+        )
+
+    def _on_change_output_root(self) -> None:
+        root = QFileDialog.getExistingDirectory(
+            self, "Output Root 선택", str(self.output_manager.output_root)
+        )
+        if not root:
+            return
+        self.output_manager = OutputManager(root)
+        self.windshield_workspace.set_output_manager(self.output_manager)
+        session = self._ensure_output_session()
+        self.status_label.setText(f"Output Session 생성: {session}")
+
+    def _on_open_output_folder(self) -> None:
+        folder = self._ensure_output_session()
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+            QMessageBox.warning(self, "폴더 열기 실패", str(folder))
+
+    def _on_export_all(self) -> None:
+        """Export every currently available artifact, isolating each failure."""
+        session = self._ensure_output_session()
+        exported: list[str] = []
+        skipped: list[str] = []
+        failed: list[str] = []
+
+        def attempt(label: str, available: bool, operation) -> None:
+            outcome = self.output_manager.execute_export(label, operation if available else None)
+            if outcome["status"] == "skipped":
+                skipped.append(label)
+                return
+            if outcome["status"] == "exported":
+                exported.append(label)
+                return
+            logger.error("Export All: %s failed: %s", label, outcome["error"])
+            failed.append(f"{label}: {outcome['error']}")
+
+        configs_ready = self.camera_config is not None and self.pattern_config is not None
+        successful = {
+            model: result for model, result in self.calibration_results.items()
+            if getattr(result, "success", False)
+        }
+        for model, result in successful.items():
+            def export_intrinsic(model=model, result=result):
+                path = self.output_manager.intrinsic_path(model)
+                return export_opencv_yaml(result, self.camera_config, self.pattern_config, str(path))
+            attempt(f"intrinsic.{model_filename(model)}", configs_ready, export_intrinsic)
+
+        subset = self.subset_calibration_result
+        subset_result = getattr(subset, "calibration_result", None)
+        def export_subset():
+            path = self.output_manager.intrinsic_path(subset_result.model_name, subset=True)
+            return export_opencv_yaml(
+                subset_result, self.camera_config, self.pattern_config, str(path),
+                calibration_source="best_subset",
+                selected_frame_ids=subset.selected_frame_ids,
+            )
+        attempt(
+            "intrinsic.subset",
+            configs_ready and subset_result is not None and getattr(subset_result, "success", False),
+            export_subset,
+        )
+
+        attempt(
+            "project",
+            self.dataset is not None and configs_ready,
+            lambda: self._save_project_to_path(
+                str(self.output_manager.project_path()), record=False, notify=False
+            ),
+        )
+
+        chosen = next(
+            (score.model_name for score in self.scores if getattr(score, "is_recommended", False)),
+            next(iter(successful), None),
+        )
+        if chosen is not None and self.dataset is not None and configs_ready:
+            final = compute_final_result(
+                CameraModelType(chosen), self.calibration_results, self.validation_results,
+                outlier_result=self.outlier_result, scores=self.scores,
+            )
+            attempt(
+                "reports.html", True,
+                lambda: export_html_report(
+                    self._session_camera_name() or "camera_calibrator",
+                    self.camera_config, self.pattern_config, self.dataset,
+                    self.calibration_results, self.validation_results, final,
+                    str(self.output_manager.report_path("report.html")),
+                    cross_dataset_results=self.cross_dataset_results,
+                ),
+            )
+            attempt(
+                "reports.json", True,
+                lambda: export_json(
+                    self.camera_config, self.pattern_config, self.dataset,
+                    self.calibration_results, self.validation_results, CameraModelType(chosen),
+                    str(self.output_manager.report_path("calibration.json")),
+                    final_result=final, model_scores=self.scores,
+                    cross_dataset_results=self.cross_dataset_results,
+                ),
+            )
+            attempt(
+                "reports.dataset_csv", True,
+                lambda: export_csv(self.dataset, str(self.output_manager.report_path("dataset.csv"))),
+            )
+            attempt(
+                "intrinsic.ros", True,
+                lambda: export_ros_camera_info(
+                    successful[chosen], self.camera_config, str(self.output_manager.ros_path())
+                ),
+            )
+        else:
+            skipped.extend(["reports.html", "reports.json", "reports.dataset_csv", "intrinsic.ros"])
+
+        ws_config, _ws_dataset, ws_results, reflection_results, _ghost_results, ghost_models = (
+            self.windshield_workspace.export_state()
+        )
+        for key, result in ws_results.items():
+            variant_key = windshield_result_key_for_result(result)
+            variant = (
+                f"{variant_key[0].value}_{variant_key[1]}"
+                if isinstance(variant_key, tuple) else result.windshield_model.value
+            )
+            def export_geometry(result=result, variant=variant):
+                path = self.output_manager.windshield_geometry_path(result.base_model_name, variant)
+                export_windshield_yaml(result, self.camera_config, str(path))
+                paths = [path]
+                neural = path.with_name(path.stem + "_neural.pt")
+                if neural.exists():
+                    paths.append(neural)
+                return paths
+            attempt(f"windshield.geometry.{variant}", getattr(result, "success", False) and self.camera_config is not None, export_geometry)
+
+        for key, result in reflection_results.items():
+            safe = model_filename(key)
+            attempt(
+                f"windshield.reflection.{safe}", result is not None,
+                lambda result=result, safe=safe: export_reflection_yaml(
+                    result, str(self.output_manager.reflection_path(f"reflection_{safe}.yaml"))
+                ),
+            )
+        for key, field in ghost_models.items():
+            safe = model_filename(key)
+            attempt(
+                f"windshield.ghost.{safe}", field is not None,
+                lambda field=field, safe=safe: save_ghost_model(
+                    field, str(self.output_manager.ghost_path(f"ghost_{safe}.yaml"))
+                ),
+            )
+
+        if self.validation_results and self.repeated_kfold_results and configs_ready and self.dataset is not None:
+            def export_paper():
+                stability = {
+                    model: (cal.param_uncertainty_bootstrap or cal.param_uncertainty)
+                    for model, cal in self.calibration_results.items()
+                }
+                repeated = next(iter(self.repeated_kfold_results.values()))
+                metadata = paper_evidence.build_paper_metadata(
+                    self.camera_config, self.pattern_config, self.dataset,
+                    k=repeated.k, n_repeats=repeated.n_repeats, base_seed=repeated.base_seed,
+                )
+                written = paper_evidence.export_paper_metrics(
+                    str(self.output_manager.paper_directory()),
+                    single_holdout=self.validation_results,
+                    repeated=self.repeated_kfold_results,
+                    stability_by_model=stability,
+                    metadata=metadata,
+                )
+                return list(written.values())
+            attempt("paper.metrics", True, export_paper)
+        else:
+            skipped.append("paper.metrics")
+
+        details = [
+            f"Session: {session}",
+            f"완료 {len(exported)}개: {', '.join(exported) or '-'}",
+            f"건너뜀 {len(skipped)}개: {', '.join(skipped) or '-'}",
+            f"실패 {len(failed)}개: {', '.join(failed) or '-'}",
+        ]
+        QMessageBox.information(self, "Export All 결과", "\n\n".join(details))
+        self.status_label.setText(f"Export All 완료: {session} (완료 {len(exported)}, 실패 {len(failed)})")
 
     def _build_settings_panel(self) -> QWidget:
         group = QGroupBox("▼ Camera Setup / Pattern")
@@ -1181,38 +1453,25 @@ class MainWindow(QMainWindow):
             logger.exception("자동 저장 실패 (무시하고 계속 진행)")
 
     def _auto_save_calibration_outputs(self) -> None:
-        """Ideal Pinhole/Brown-Conrady/Rational/Fisheye 중 성공한 모델의 파라미터(K/D)를
-        OpenCV YAML로 output/ 폴더에 자동 저장한다.
-
-        위 _autosave()는 앱 크래시 복구용 고정 파일 하나를 계속 덮어쓰는
-        반면, 이건 사용자가 나중에 실제로 꺼내 쓸 결과물이라 실행마다 타임
-        스탬프가 붙은 별개 파일로 남긴다 - 재실행해도 이전 결과가 지워지지
-        않는다.
-        """
+        """성공한 intrinsic 모델을 현재 Output Session에 자동 저장한다."""
         if self.camera_config is None or self.pattern_config is None:
             return
-        output_dir = Path.cwd() / "output"
-        sensor = self.camera_config.sensor_name or "camera"
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         saved: list[str] = []
-        try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            for model, result in self.calibration_results.items():
-                if not result.success:
-                    continue
-                # self.calibration_results는 QThread의 Signal(dict)을 건너온
-                # 딕셔너리라, PySide6가 str-Enum 키를 평범한 str로 낮춰서
-                # 넘길 때가 있다 - .value 접근 전에 다시 enum으로 정규화한다
-                # (calibration/library.py의 같은 문제와 동일한 원인).
-                filename = f"{sensor}_{CameraModelType(model).value}_{timestamp}.yaml"
-                export_opencv_yaml(result, self.camera_config, self.pattern_config, str(output_dir / filename))
-                saved.append(filename)
-        except Exception:  # noqa: BLE001 - 자동 저장 실패로 사용자 작업을 막으면 안 됨
-            logger.exception("파라미터 자동 저장 실패 (무시하고 계속 진행)")
-            return
+        self._ensure_output_session()
+        for model, result in self.calibration_results.items():
+            if not result.success:
+                continue
+            try:
+                path = self.output_manager.intrinsic_path(model)
+                export_opencv_yaml(result, self.camera_config, self.pattern_config, str(path))
+                key = f"intrinsic.{model_filename(model)}"
+                self.output_manager.record_export(key, path, metadata={"automatic": True})
+                saved.append(path.name)
+            except Exception:  # noqa: BLE001 - 모델 하나의 실패가 나머지를 막지 않게 한다.
+                logger.exception("%s 파라미터 자동 저장 실패 (계속 진행)", model)
         if saved:
             self.status_label.setText(
-                self.status_label.text() + f"  ·  output/ 폴더에 저장됨: {', '.join(saved)}"
+                self.status_label.text() + f"  ·  Output Session 저장: {', '.join(saved)}"
             )
 
     def _save_to_library(self) -> None:
@@ -1598,11 +1857,9 @@ class MainWindow(QMainWindow):
             )
             return
 
-        directory = QFileDialog.getExistingDirectory(self, "Export Paper Metrics - 저장 폴더 선택")
-        if not directory:
-            return  # 사용자가 취소함 - 아무 파일도 만들지 않는다.
-
         try:
+            self._ensure_output_session()
+            directory = self.output_manager.paper_directory()
             # Paper Intrinsic Stability(fx/fy/cx/cy)와 All-Parameter
             # Stability(overall_stability, distortion 포함 가능)는
             # ParameterUncertainty 안에 이미 별도 필드로 분리되어 있다 -
@@ -1617,7 +1874,7 @@ class MainWindow(QMainWindow):
                 k=any_repeated.k, n_repeats=any_repeated.n_repeats, base_seed=any_repeated.base_seed,
             )
             written = paper_evidence.export_paper_metrics(
-                directory,
+                str(directory),
                 single_holdout=self.validation_results,
                 repeated=self.repeated_kfold_results,
                 stability_by_model=stability_by_model,
@@ -1627,6 +1884,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export Paper Metrics 실패", f"Paper Metrics export 중 오류가 발생했습니다:\n{e}")
             return
 
+        paths = [directory / name for name in written.keys()]
+        self.output_manager.record_export("paper.metrics", paths)
         file_list = "\n".join(f"- {name}" for name in sorted(written.keys()))
         message = f"Paper Metrics export 완료\n{directory}\n\nGenerated:\n{file_list}"
         QMessageBox.information(self, "Export Paper Metrics", message)
@@ -1663,11 +1922,11 @@ class MainWindow(QMainWindow):
         if not result or not result.success or self.camera_config is None or self.pattern_config is None:
             QMessageBox.warning(self, "Export 불가", f"{CameraModelType(model).value} 모델의 캘리브레이션 결과가 없습니다.")
             return
-        path = self.result_view.prompt_save_path("camera.yaml", "YAML (*.yaml *.yml)")
-        if not path:
-            return
         try:
-            export_opencv_yaml(result, self.camera_config, self.pattern_config, path)
+            self._ensure_output_session()
+            path = self.output_manager.intrinsic_path(model)
+            export_opencv_yaml(result, self.camera_config, self.pattern_config, str(path))
+            self.output_manager.record_export(f"intrinsic.{model_filename(model)}", path)
             self.status_label.setText(f"OpenCV YAML 저장 완료: {path}")
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Export 실패", str(e))
@@ -1684,18 +1943,21 @@ class MainWindow(QMainWindow):
                 "먼저 Scene을 선택해 Re-Calibration을 완료하세요.",
             )
             return
-        default_name = f"camera_subset_{result.model_name.value}.yaml"
-        path = self.result_view.prompt_save_path(default_name, "YAML (*.yaml *.yml)")
-        if not path:
-            return
         try:
+            self._ensure_output_session()
+            path = self.output_manager.intrinsic_path(result.model_name, subset=True)
             export_opencv_yaml(
                 result,
                 self.camera_config,
                 self.pattern_config,
-                path,
+                str(path),
                 calibration_source="best_subset",
                 selected_frame_ids=subset.selected_frame_ids,
+            )
+            self.output_manager.record_export(
+                f"intrinsic.subset.{model_filename(result.model_name)}",
+                path,
+                metadata={"selected_frame_ids": subset.selected_frame_ids},
             )
             self.status_label.setText(
                 f"Subset OpenCV YAML 저장 완료: {path} "
@@ -1724,9 +1986,8 @@ class MainWindow(QMainWindow):
         )
         if not manifest:
             return
-        output_dir = QFileDialog.getExistingDirectory(self, "Comparison output directory")
-        if not output_dir:
-            return
+        self._ensure_output_session()
+        output_dir = str(self.output_manager.validation_directory())
         relative_pct, ok = QInputDialog.getDouble(
             self, "판정 tolerance", "Relative tolerance (%):", 5.0, 0.0, 100.0, 1
         )
@@ -1758,6 +2019,10 @@ class MainWindow(QMainWindow):
         thread.start()
 
     def _on_subset_comparison_ready(self, result, paths) -> None:
+        if getattr(self, "output_manager", None) is not None:
+            self.output_manager.record_export(
+                "validation.subset_comparison", list(paths.values()), metadata={"verdict": result.get("verdict")}
+            )
         def metric(name: str) -> str:
             row = result["comparison"][name]
             left = "N/A" if row["baseline"] is None else f"{row['baseline']:.3f}"
@@ -1809,11 +2074,23 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_save_project(self) -> None:
+        """Backward-compatible Save As entry point used by older integrations."""
+        self._on_save_project_as()
+
+    def _on_save_project_session(self) -> None:
         if self.dataset is None or self.camera_config is None or self.pattern_config is None:
             QMessageBox.warning(self, "저장할 내용 없음", "먼저 이미지를 불러오고 캘리브레이션을 실행하세요.")
             return
         IntrinsicWorkspace.sync_owner_state(self)
+        self._ensure_output_session()
+        path = str(self.output_manager.project_path())
+        self._save_project_to_path(path)
 
+    def _on_save_project_as(self) -> None:
+        if self.dataset is None or self.camera_config is None or self.pattern_config is None:
+            QMessageBox.warning(self, "저장할 내용 없음", "먼저 이미지를 불러오고 캘리브레이션을 실행하세요.")
+            return
+        IntrinsicWorkspace.sync_owner_state(self)
         path, _ = QFileDialog.getSaveFileName(
             self, "프로젝트 저장", f"project{PROJECT_EXTENSION}", f"Camera Calibrator Project (*{PROJECT_EXTENSION})"
         )
@@ -1822,6 +2099,11 @@ class MainWindow(QMainWindow):
         if not path.endswith(PROJECT_EXTENSION):
             path += PROJECT_EXTENSION
 
+        self._save_project_to_path(path, record=False)
+
+    def _save_project_to_path(
+        self, path: str, *, record: bool = True, notify: bool = True
+    ) -> str | None:
         windshield_config, windshield_dataset, windshield_results, reflection_results, ghost_results, ghost_models = self.windshield_workspace.export_state()
         project = CalibrationProject(
             project_name=self.camera_config.sensor_name or Path(path).stem,
@@ -1847,9 +2129,15 @@ class MainWindow(QMainWindow):
         )
         try:
             saved_path = save_project(project, path)
-            self.status_label.setText(f"프로젝트 저장 완료: {saved_path}")
+            if record:
+                self.output_manager.record_export("project", saved_path)
+            if notify:
+                self.status_label.setText(f"프로젝트 저장 완료: {saved_path}")
+            return str(saved_path)
         except Exception as e:  # noqa: BLE001
-            QMessageBox.critical(self, "저장 실패", str(e))
+            if notify:
+                QMessageBox.critical(self, "저장 실패", str(e))
+            return None
 
     def _on_load_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
