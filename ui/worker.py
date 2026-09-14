@@ -58,6 +58,10 @@ from calibration.image_quality import evaluate_dataset_image_quality
 from calibration.quality import coverage_percentage
 from calibration.models.common import infer_image_size
 from calibration.recommender import compute_model_scores, build_recommendation_message
+from calibration.image_selection import (
+    ImageSelectionConfig,
+    select_calibration_images,
+)
 from calibration.self_check import run_all_self_checks
 from calibration.library import save_calibration_run
 from calibration.rosbag_reader import (
@@ -363,6 +367,92 @@ class PipelineWorker(QObject):
             self.cancelled.emit()
         except Exception as e:  # noqa: BLE001 - UI에 원인을 그대로 보여주기 위해 광범위하게 캐치
             self.error.emit(f"파이프라인 실행 중 오류: {e}")
+        finally:
+            self._current_executor = None
+            self.finished.emit()
+
+
+class ImageSelectionWorker(QObject):
+    """Detect loaded images and choose a quality/diversity-balanced subset."""
+
+    progress = Signal(str)
+    progress_value = Signal(int, int)
+    dataset_ready = Signal(object)
+    selection_ready = Signal(object)
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(
+        self,
+        image_paths: list[str],
+        pattern_config: PatternConfig,
+        camera_config: CameraConfig,
+        target_count: int,
+    ):
+        super().__init__()
+        self.image_paths = image_paths
+        self.pattern_config = pattern_config
+        self.camera_config = camera_config
+        self.target_count = target_count
+        self._cancel_requested = False
+        self._current_executor = None
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+        executor = self._current_executor
+        if executor is not None:
+            terminate_executor_processes(executor)
+
+    def _is_cancel_requested(self) -> bool:
+        return self._cancel_requested
+
+    def _register_executor(self, executor) -> None:
+        self._current_executor = executor
+        if self._cancel_requested:
+            terminate_executor_processes(executor)
+
+    def run(self) -> None:
+        try:
+            total = len(self.image_paths)
+            self.progress.emit(f"이미지 자동 선별 준비 중... ({total}장)")
+            self.progress_value.emit(0, total)
+
+            start = time.monotonic()
+
+            def _on_progress(done: int, total_count: int) -> None:
+                elapsed = time.monotonic() - start
+                self.progress.emit(
+                    f"자동 선별용 패턴 검출 중... {done}/{total_count}장 ({elapsed:.0f}초)"
+                )
+                self.progress_value.emit(done, total_count)
+
+            dataset = detect_dataset(
+                self.image_paths,
+                self.pattern_config,
+                parallel=total > 8,
+                progress_callback=_on_progress,
+                cancel_check=self._is_cancel_requested,
+                on_executor_ready=self._register_executor,
+            )
+            self._current_executor = None
+
+            self.progress.emit("자동 선별용 품질/커버리지 분석 중...")
+            analyze_dataset_quality(dataset, self.camera_config)
+            image_size = infer_image_size(dataset, self.camera_config)
+            compute_frame_quality_scores(dataset, self.pattern_config, image_size, use_reprojection=False)
+
+            result = select_calibration_images(
+                dataset,
+                ImageSelectionConfig(target_count=self.target_count),
+            )
+            self.dataset_ready.emit(dataset)
+            self.selection_ready.emit(result)
+            self.progress.emit(result.summary_text())
+            self.progress_value.emit(result.selected_count, max(1, result.requested_count))
+        except PipelineCancelled:
+            self.progress.emit("이미지 자동 선별이 취소되었습니다.")
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(f"이미지 자동 선별 중 오류: {exc}\n\nTechnical details:\n{traceback.format_exc()}")
         finally:
             self._current_executor = None
             self.finished.emit()

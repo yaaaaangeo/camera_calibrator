@@ -52,6 +52,13 @@ _STATUS_COLOR = {
     FrameStatus.DISABLED_MANUAL: Theme.TEXT_DISABLED,
 }
 
+_DISABLED_REASON_LABEL = {
+    "blur_rejected": "Blur 불량",
+    "exposure_rejected": "Exposure 불량",
+    "duplicate_scene": "유사 이미지 제외",
+    "distribution_excluded": "분포 때문에 제외",
+}
+
 # 설계 문서 6번 - Frame Quality Score 등급 표시
 _GRADE_LABEL = {
     QualityGrade.EXCELLENT: "✓ Excellent",
@@ -261,6 +268,7 @@ class DatasetView(QWidget):
                 status_item.setText(f"{_STATUS_LABEL[FrameStatus.DETECTION_FAILED]}: {det.failure_reason}")
                 status_item.setToolTip(det.failure_reason)
             elif frame.status in (FrameStatus.DISABLED_OUTLIER, FrameStatus.DISABLED_MANUAL) and frame.disabled_reason:
+                status_item.setText(_DISABLED_REASON_LABEL.get(frame.disabled_reason, frame.disabled_reason))
                 status_item.setToolTip(frame.disabled_reason)
 
             corners = str(det.num_corners) if det else "-"

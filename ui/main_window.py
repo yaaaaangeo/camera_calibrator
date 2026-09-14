@@ -72,6 +72,7 @@ from export.reflection import export_reflection_yaml
 from export.report import export_html_report
 from export.ros import export_ros_camera_info
 from export.windshield import export_windshield_yaml
+from calibration.image_selection import write_selection_manifest
 from calibration.windshield.base import windshield_result_key_for_result
 from calibration.windshield.ghost import save_ghost_model
 
@@ -83,6 +84,7 @@ from ui.windshield_common import ResponsiveRow, configure_form_layout
 from ui.wheel_guard import WheelChangeGuard
 from ui.worker import (
     PipelineWorker,
+    ImageSelectionWorker,
     CrossDatasetValidationWorker,
     SelfCheckWorker,
     BagTopicDiscoveryWorker,
@@ -288,6 +290,8 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._worker = None  # QThread가 살아있는 동안 GC 방지용 강한 참조
         self._self_check_thread: QThread | None = None
+        self._selection_thread: QThread | None = None
+        self._selection_worker = None
         self._bag_thread: QThread | None = None
         self._bag_worker = None  # QThread가 살아있는 동안 GC 방지용 강한 참조
         self._bag_progress_dialog: QProgressDialog | None = None
@@ -323,7 +327,6 @@ class MainWindow(QMainWindow):
         self.workspace_stack.addWidget(self.intrinsic_workspace)
         self.workspace_stack.addWidget(self.library_view)
         self.workspace_stack.addWidget(self.windshield_workspace)
-        layout.addWidget(self._build_output_session_bar())
         layout.addWidget(self.workspace_stack, stretch=1)
 
         self.status_label = QLabel("이미지를 불러온 뒤 [캘리브레이션 실행]을 누르세요.")
@@ -421,10 +424,11 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _build_output_session_bar(self) -> QWidget:
-        group = QGroupBox("Output Session")
-        row = QHBoxLayout(group)
-        self.output_session_label = QLabel(f"Root: {DEFAULT_OUTPUT_ROOT}  ·  새 세션은 첫 저장 시 생성")
-        self.output_session_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.output_session_label = QLineEdit(f"Output Session: {DEFAULT_OUTPUT_ROOT}")
+        self.output_session_label.setReadOnly(True)
         row.addWidget(self.output_session_label, stretch=1)
         change_button = QPushButton("폴더 변경…")
         change_button.clicked.connect(self._on_change_output_root)
@@ -435,7 +439,7 @@ class MainWindow(QMainWindow):
         export_all_button = QPushButton("Export All")
         export_all_button.clicked.connect(self._on_export_all)
         row.addWidget(export_all_button)
-        return group
+        return bar
 
     def _session_camera_name(self) -> str:
         config = self.camera_config
@@ -447,7 +451,7 @@ class MainWindow(QMainWindow):
     def _ensure_output_session(self) -> Path:
         session = self.output_manager.ensure_session(self._session_camera_name())
         self._update_output_manifest_context()
-        self.output_session_label.setText(f"Session: {session}")
+        self.output_session_label.setText(f"Output Session: {session}")
         return session
 
     def _update_output_manifest_context(self) -> None:
@@ -740,6 +744,23 @@ class MainWindow(QMainWindow):
         self.loaded_label = QLabel("불러온 이미지: 0장")
         camera_form.addRow(self.loaded_label)
 
+        selection_row = QHBoxLayout()
+        self.auto_select_count_spin = QSpinBox()
+        self.auto_select_count_spin.setRange(1, 35)
+        self.auto_select_count_spin.setValue(35)
+        self.auto_select_count_spin.setEnabled(False)
+        self.auto_select_button = QPushButton("이미지 걸러내기")
+        self.auto_select_button.setEnabled(False)
+        self.auto_select_button.clicked.connect(self._on_auto_select_images)
+        selection_row.addWidget(QLabel("최종 선택 장수"))
+        selection_row.addWidget(self.auto_select_count_spin)
+        selection_row.addWidget(self.auto_select_button)
+        camera_form.addRow(selection_row)
+
+        self.auto_select_status_label = QLabel("이미지를 불러오면 자동 선별을 사용할 수 있습니다.")
+        self.auto_select_status_label.setWordWrap(True)
+        camera_form.addRow(self.auto_select_status_label)
+
         self.check_resolution_button = QPushButton("해상도 확인")
         self.check_resolution_button.setToolTip(
             "JPEG/PNG 이미지를 한 장 골라 실제로 디코딩해서 크기를 확인하고,\n"
@@ -859,6 +880,7 @@ class MainWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
         self._on_calibration_method_changed()
         action_layout.addWidget(self.run_button)
+        action_layout.addWidget(self._build_output_session_bar())
         action_layout.addWidget(self.export_button)
         action_layout.addWidget(self.cancel_button)
         action_layout.addStretch(1)
@@ -879,6 +901,17 @@ class MainWindow(QMainWindow):
     # 이미지 로드 / 파이프라인 실행
     # ------------------------------------------------------------------
 
+    def _sync_auto_select_controls(self, *, reset_value: bool = False) -> None:
+        count = len(self.image_paths)
+        enabled = count > 0
+        self.auto_select_count_spin.setEnabled(enabled)
+        self.auto_select_button.setEnabled(enabled)
+        self.auto_select_count_spin.setMaximum(max(1, count))
+        if reset_value or self.auto_select_count_spin.value() > count:
+            self.auto_select_count_spin.setValue(min(35, max(1, count)))
+        if not enabled:
+            self.auto_select_status_label.setText("이미지를 불러오면 자동 선별을 사용할 수 있습니다.")
+
     def _on_load_images(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self, "캘리브레이션 이미지 선택", "", "Images (*.jpg *.jpeg *.png *.bmp)"
@@ -887,7 +920,72 @@ class MainWindow(QMainWindow):
             return
         self.image_paths = paths
         self.loaded_label.setText(f"불러온 이미지: {len(paths)}장")
+        self.auto_select_status_label.setText("자동 선별 전: 전체 이미지가 캘리브레이션 입력입니다.")
+        self._sync_auto_select_controls(reset_value=True)
         self.run_button.setEnabled(True)
+
+    def _on_auto_select_images(self) -> None:
+        if not self.image_paths:
+            QMessageBox.warning(self, "이미지 없음", "먼저 이미지를 불러오세요.")
+            return
+
+        self.pattern_config = self._current_pattern_config()
+        self.camera_config = self._current_camera_config()
+        target_count = min(self.auto_select_count_spin.value(), len(self.image_paths))
+        worker = ImageSelectionWorker(
+            self.image_paths,
+            self.pattern_config,
+            self.camera_config,
+            target_count,
+        )
+        thread = run_worker_in_thread(worker, self)
+
+        worker.progress.connect(self.status_label.setText)
+        worker.progress.connect(self.auto_select_status_label.setText)
+        worker.progress_value.connect(self._on_pipeline_progress_value)
+        worker.dataset_ready.connect(self._on_dataset_ready)
+        worker.selection_ready.connect(self._on_image_selection_ready)
+        worker.error.connect(self._on_error)
+
+        self._selection_thread, self._selection_worker = thread, worker
+        self.auto_select_button.setEnabled(False)
+        self.run_button.setEnabled(False)
+        self.load_button.setEnabled(False)
+        self.pipeline_progress_bar.setRange(0, max(1, len(self.image_paths)))
+        self.pipeline_progress_bar.setValue(0)
+        self.pipeline_progress_bar.show()
+        thread.finished.connect(lambda: self._sync_auto_select_controls())
+        thread.finished.connect(lambda: self.run_button.setEnabled(bool(self.image_paths)))
+        thread.finished.connect(lambda: self.load_button.setEnabled(True))
+        thread.finished.connect(self.pipeline_progress_bar.hide)
+        thread.finished.connect(self._stop_busy_sheep)
+        thread.finished.connect(lambda: setattr(self, "_selection_worker", None))
+        thread.start()
+
+    def _on_image_selection_ready(self, result) -> None:
+        self.image_paths = list(result.selected_paths)
+        self.loaded_label.setText(
+            f"불러온 이미지: {len(self.image_paths)}장 (자동 선별: {result.selected_count}/{result.requested_count})"
+        )
+        parts = [result.summary_text()]
+        if result.warnings:
+            parts.extend(result.warnings[:3])
+        self.auto_select_status_label.setText(" | ".join(parts))
+        self._sync_auto_select_controls()
+
+        manifest_path = write_selection_manifest(
+            result,
+            self.output_manager.report_path("image_selection_manifest.json"),
+        )
+        self.output_manager.record_export(
+            "image_selection.manifest",
+            manifest_path,
+            metadata={
+                "selected_count": result.selected_count,
+                "requested_count": result.requested_count,
+            },
+        )
+        self._ensure_output_session()
 
     def _on_check_resolution(self) -> None:
         """JPEG/PNG 이미지 한 장을 실제로 디코딩해 크기를 확인하고
@@ -1050,6 +1148,8 @@ class MainWindow(QMainWindow):
 
         self.image_paths = extracted
         self.loaded_label.setText(f"불러온 이미지: {len(extracted)}장 (rosbag: {Path(bag_path).name})")
+        self.auto_select_status_label.setText("자동 선별 전: 전체 이미지가 캘리브레이션 입력입니다.")
+        self._sync_auto_select_controls(reset_value=True)
         self.run_button.setEnabled(True)
 
     def _on_load_from_live(self) -> None:
@@ -1086,6 +1186,8 @@ class MainWindow(QMainWindow):
         self.loaded_label.setText(
             f"불러온 이미지: {len(dialog.captured_paths)}장 (실시간 캡처{size_text})"
         )
+        self.auto_select_status_label.setText("자동 선별 전: 전체 이미지가 캘리브레이션 입력입니다.")
+        self._sync_auto_select_controls(reset_value=True)
         self.run_button.setEnabled(True)
 
     def _set_pattern_type_options_for_method(self, method: CalibrationMethod) -> None:
@@ -1294,12 +1396,14 @@ class MainWindow(QMainWindow):
         self._thread, self._worker = thread, worker
         self.run_button.setEnabled(False)
         self.load_button.setEnabled(False)
+        self.auto_select_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.pipeline_progress_bar.setRange(0, max(1, len(self.image_paths)))
         self.pipeline_progress_bar.setValue(0)
         self.pipeline_progress_bar.show()
         thread.finished.connect(lambda: self.run_button.setEnabled(True))
         thread.finished.connect(lambda: self.load_button.setEnabled(True))
+        thread.finished.connect(lambda: self._sync_auto_select_controls())
         thread.finished.connect(lambda: self.cancel_button.setEnabled(False))
         thread.finished.connect(self.pipeline_progress_bar.hide)
         thread.finished.connect(self._stop_busy_sheep)
@@ -2229,6 +2333,8 @@ class MainWindow(QMainWindow):
                 self.preview_view.select_model(recommended)
 
         self.loaded_label.setText(f"불러온 이미지: {len(self.image_paths)}장 (프로젝트: {Path(path).name})")
+        self.auto_select_status_label.setText("프로젝트 데이터셋을 불러왔습니다. 필요하면 다시 자동 선별할 수 있습니다.")
+        self._sync_auto_select_controls(reset_value=True)
         self.run_button.setEnabled(bool(self.image_paths))
 
         msg = f"프로젝트 불러옴: {project.project_name} ({self.dataset.num_total}장, 검출 {self.dataset.num_detected}장)"
