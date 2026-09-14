@@ -1,6 +1,7 @@
 ﻿venv/
 __pycache__/
 *.py[cod]
+ON_error.log
 
 # 대용량 확장자/폴더 예시
 *.mp4
