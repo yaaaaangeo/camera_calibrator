@@ -115,6 +115,7 @@ def load_opencv_yaml(path: str) -> dict:
         "mean_focal_length_px": optional_real("mean_focal_length_px"),
         "normalized_rms_reprojection_error": optional_real("normalized_rms_reprojection_error"),
         "fhd_equivalent_rms_reprojection_error": optional_real("fhd_equivalent_rms_reprojection_error"),
+        "calibration_source": fs.getNode("calibration_source").string(),
     }
     fs.release()
     return data

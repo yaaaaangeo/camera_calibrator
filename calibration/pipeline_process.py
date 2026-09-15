@@ -133,6 +133,23 @@ def run_models_and_validation(
     )
 
 
+def run_calibration_optimizer(
+    dataset: Dataset,
+    camera_config: CameraConfig,
+    pattern_config: PatternConfig,
+    model: CameraModelType,
+    train_ids: list[str],
+    holdout_ids: list[str],
+    settings,
+):
+    """Pickle-safe process entry point for the SciPy refinement backend."""
+    from calibration.optimizer import ScipyCalibrationOptimizer
+
+    return ScipyCalibrationOptimizer().optimize(
+        dataset, camera_config, pattern_config, model, train_ids, holdout_ids, settings
+    )
+
+
 def run_scene_subset_calibration(
     dataset: Dataset,
     selected_frame_ids: list[str],

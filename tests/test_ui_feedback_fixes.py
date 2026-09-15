@@ -381,6 +381,7 @@ def test_main_window_uses_documented_top_level_tabs(qapp):
             "② Preview",
             "③ Model Comparison",
             "④ Scene Ranking",
+            "(5) Optimizer",
         ]
         assert win.result_view.model_comparison_scroll_area.widgetResizable()
         assert (

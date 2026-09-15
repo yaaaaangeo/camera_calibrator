@@ -64,6 +64,7 @@ from calibration.project_codecs.intrinsic import (
     _final_result_from_dict,
     _model_score_from_dict,
     _object_releasing_validation_result_from_dict,
+    _optimizer_result_from_dict,
     _outlier_result_from_dict,
     _pattern_config_from_dict,
     _scene_quality_analysis_from_dict,
@@ -299,6 +300,10 @@ def project_from_dict(payload: dict) -> CalibrationProject:
             d.get("standard_vs_object_releasing_comparison")
         ),
         validation_results=validation_results,
+        optimizer_results={
+            CameraModelType(k): _optimizer_result_from_dict(v)
+            for k, v in d.get("optimizer_results", {}).items()
+        },
         cross_dataset_results=[
             _cross_dataset_result_from_dict(r)
             for r in d.get("cross_dataset_results", [])

@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "session_id": "2026-09-15_161615",
+  "created_at": "2026-09-15T16:16:15+09:00",
+  "application": {
+    "name": "camera-calibrator",
+    "version": "0.2.0"
+  },
+  "camera": {
+    "name": null,
+    "resolution": [
+      3840,
+      2160
+    ]
+  },
+  "pattern": {
+    "type": null,
+    "squares": [
+      10,
+      7
+    ],
+    "square_size_m": 0.08,
+    "marker_size_m": 0.06,
+    "dictionary": "DICT_5X5_100"
+  },
+  "calibration": {
+    "available_models": [
+      "brown_conrady",
+      "extended_pinhole",
+      "fisheye",
+      "pinhole"
+    ],
+    "selected_model": "fisheye",
+    "recommended_model": "fisheye"
+  },
+  "windshield": {
+    "geometry_models": [],
+    "selected_model": null
+  },
+  "paper_metrics_available": false,
+  "exports": {
+    "intrinsic.brown_conrady": {
+      "exported_at": "2026-09-15T16:19:04+09:00",
+      "file": "intrinsic/camera_brown_conrady.yaml",
+      "metadata": {
+        "automatic": true
+      }
+    },
+    "intrinsic.rational": {
+      "exported_at": "2026-09-15T16:19:04+09:00",
+      "file": "intrinsic/camera_rational.yaml",
+      "metadata": {
+        "automatic": true
+      }
+    },
+    "intrinsic.fisheye": {
+      "exported_at": "2026-09-15T16:19:04+09:00",
+      "file": "intrinsic/camera_fisheye.yaml",
+      "metadata": {
+        "automatic": true
+      }
+    },
+    "intrinsic.pinhole": {
+      "exported_at": "2026-09-15T16:19:04+09:00",
+      "file": "intrinsic/camera_pinhole.yaml",
+      "metadata": {
+        "automatic": true
+      }
+    }
+  }
+}

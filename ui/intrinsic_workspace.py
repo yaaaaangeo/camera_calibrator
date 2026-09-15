@@ -21,6 +21,7 @@ from calibration.types import (
     CrossDatasetValidationResult,
     Dataset,
     ModelScore,
+    OptimizerResult,
     ObjectReleasingValidationResult,
     OutlierResult,
     PatternConfig,
@@ -33,6 +34,7 @@ from calibration.types import (
 from ui.dataset_view import DatasetView
 from ui.result_view import ResultView
 from ui.scene_quality_view import SceneQualityView
+from ui.optimizer_view import OptimizerView
 from ui.undistort_straightness_view import UndistortStraightnessView
 
 
@@ -61,6 +63,7 @@ class IntrinsicState:
     # calibration을 실행하면 비워지고(stale 방지), 필요하면 다시 실행해야
     # 한다는 제약을 그대로 둔다.
     repeated_kfold_results: dict[CameraModelType, RepeatedKFoldResult] = field(default_factory=dict)
+    optimizer_results: dict[CameraModelType, OptimizerResult] = field(default_factory=dict)
 
 
 class IntrinsicWorkspace(QWidget):
@@ -99,6 +102,7 @@ class IntrinsicWorkspace(QWidget):
         owner.dataset_view = DatasetView()
         owner.result_view = ResultView(standalone=False)
         owner.scene_quality_view = SceneQualityView()
+        owner.optimizer_view = OptimizerView()
         # Undistort Preview와 Straightness Map을 한 화면으로 합친 뷰
         # (Edge Error Map은 별도 요청으로 제거됨). preview_view라는 이름은
         # main_window.py의 기존 호출부와의 혼란을 줄이기 위해 유지한다.
@@ -108,6 +112,7 @@ class IntrinsicWorkspace(QWidget):
         tabs.addTab(owner.preview_view, "② Preview")
         tabs.addTab(owner.result_view.model_comparison_widget, "③ Model Comparison")
         tabs.addTab(owner.scene_quality_view, "④ Scene Ranking")
+        tabs.addTab(owner.optimizer_view, "(5) Optimizer")
         owner.tabs = tabs
         workspace = cls(settings_panel, tabs)
         workspace.connect_owner_handlers(owner)
@@ -122,3 +127,7 @@ class IntrinsicWorkspace(QWidget):
         owner.scene_quality_view.model_changed.connect(owner._on_scene_quality_model_changed)
         owner.scene_quality_view.export_subset_requested.connect(owner._on_export_subset_calibration)
         owner.scene_quality_view.validate_subset_requested.connect(owner._on_validate_best_subset)
+        owner.optimizer_view.run_requested.connect(owner._on_optimizer_run)
+        owner.optimizer_view.cancel_requested.connect(owner._on_optimizer_cancel)
+        owner.optimizer_view.apply_requested.connect(owner._on_optimizer_apply)
+        owner.optimizer_view.restore_requested.connect(owner._on_optimizer_restore)

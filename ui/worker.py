@@ -44,6 +44,7 @@ from calibration.types import (
     CameraModelType,
     Dataset,
     PatternConfig,
+    OptimizerSettings,
 )
 from calibration.detector import build_detect_fn, detect_dataset, summarize_dataset
 from calibration.process_control import (
@@ -70,7 +71,11 @@ from calibration.rosbag_reader import (
 )
 from calibration.validation import validate_cross_datasets
 from calibration.external_compare import compare_with_external_params
-from calibration.pipeline_process import run_models_and_validation, run_scene_subset_calibration
+from calibration.pipeline_process import (
+    run_calibration_optimizer,
+    run_models_and_validation,
+    run_scene_subset_calibration,
+)
 from calibration.subset_comparison import (
     ComparisonTolerance, compare_subset_calibrations, load_split_manifest,
     write_subset_comparison_outputs,
@@ -367,6 +372,54 @@ class PipelineWorker(QObject):
             self.cancelled.emit()
         except Exception as e:  # noqa: BLE001 - UI에 원인을 그대로 보여주기 위해 광범위하게 캐치
             self.error.emit(f"파이프라인 실행 중 오류: {e}")
+        finally:
+            self._current_executor = None
+            self.finished.emit()
+
+
+class OptimizerWorker(QObject):
+    """Run SciPy bundle adjustment outside the GUI process."""
+
+    progress = Signal(str)
+    result_ready = Signal(object)
+    error = Signal(str)
+    cancelled = Signal()
+    finished = Signal()
+
+    def __init__(self, dataset, camera_config, pattern_config, model,
+                 train_ids, holdout_ids, settings: OptimizerSettings):
+        super().__init__()
+        self.args = (dataset, camera_config, pattern_config, model,
+                     list(train_ids), list(holdout_ids), settings)
+        self._cancel_requested = False
+        self._current_executor = None
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+        if self._current_executor is not None:
+            terminate_executor_processes(self._current_executor)
+
+    def run(self) -> None:
+        try:
+            self.progress.emit("Optimizer: train-only multi-start / robust bundle adjustment...")
+            with ProcessPoolExecutor(max_workers=1, mp_context=safe_process_pool_context()) as executor:
+                self._current_executor = executor
+                future = executor.submit(run_calibration_optimizer, *self.args)
+                result = _wait_with_heartbeat(
+                    future, self.progress, "Optimizer 실행 중",
+                    cancel_check=lambda: self._cancel_requested,
+                )
+            self._current_executor = None
+            if result.cancelled:
+                self.cancelled.emit()
+            elif not result.success:
+                self.error.emit(result.error_message or "Optimizer failed")
+            else:
+                self.result_ready.emit(result)
+        except PipelineCancelled:
+            self.cancelled.emit()
+        except Exception as exc:  # noqa: BLE001
+            self.error.emit(f"Optimizer error: {exc}")
         finally:
             self._current_executor = None
             self.finished.emit()

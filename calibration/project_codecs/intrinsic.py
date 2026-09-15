@@ -43,6 +43,11 @@ from calibration.types import (
     ModelScore,
     ObjectReleasingValidationResult,
     ObservabilityReport,
+    OptimizerMetricSet,
+    OptimizerResult,
+    OptimizerSettings,
+    OptimizerStageResult,
+    OptimizerStartResult,
     OutlierResult,
     ParameterCorrelation,
     ParameterUncertainty,
@@ -387,6 +392,51 @@ def _calibration_result_from_dict(d: dict) -> CalibrationResult:
         success=d.get("success", False),
         error_message=d.get("error_message"),
         warning_message=d.get("warning_message"),
+        input_frame_count=d.get("input_frame_count", 0),
+        used_frame_count=d.get("used_frame_count", 0),
+        excluded_frame_ids=d.get("excluded_frame_ids", []),
+        exclusion_reason=d.get("exclusion_reason"),
+    )
+
+
+def _optimizer_metric_set_from_dict(d) -> OptimizerMetricSet:
+    return OptimizerMetricSet(**(d or {}))
+
+
+def _optimizer_result_from_dict(d: dict) -> OptimizerResult:
+    settings = OptimizerSettings(**d.get("settings", {}))
+    return OptimizerResult(
+        model_name=CameraModelType(d["model_name"]),
+        settings=settings,
+        train_frame_ids=d.get("train_frame_ids", []),
+        holdout_frame_ids=d.get("holdout_frame_ids", []),
+        original_calibration=(
+            _calibration_result_from_dict(d["original_calibration"])
+            if d.get("original_calibration") else None
+        ),
+        optimized_calibration=(
+            _calibration_result_from_dict(d["optimized_calibration"])
+            if d.get("optimized_calibration") else None
+        ),
+        pre_apply_calibration=(
+            _calibration_result_from_dict(d["pre_apply_calibration"])
+            if d.get("pre_apply_calibration") else None
+        ),
+        before_metrics=_optimizer_metric_set_from_dict(d.get("before_metrics")),
+        after_metrics=_optimizer_metric_set_from_dict(d.get("after_metrics")),
+        starts=[OptimizerStartResult(**v) for v in d.get("starts", [])],
+        stages=[OptimizerStageResult(**v) for v in d.get("stages", [])],
+        pipeline_status=d.get("pipeline_status", {}),
+        recommendation=d.get("recommendation", "Neutral / Marginal"),
+        reasons=d.get("reasons", []),
+        applied=d.get("applied", False),
+        success=d.get("success", False),
+        cancelled=d.get("cancelled", False),
+        error_message=d.get("error_message"),
+        input_training_frame_ids=d.get("input_training_frame_ids", []),
+        used_training_frame_ids=d.get("used_training_frame_ids", []),
+        excluded_training_frame_ids=d.get("excluded_training_frame_ids", []),
+        exclusion_reason=d.get("exclusion_reason"),
     )
 
 
@@ -434,7 +484,8 @@ def _validation_result_from_dict(d: dict) -> ValidationResult:
     return ValidationResult(
         train_frame_ids=d.get("train_frame_ids", []),
         test_frame_ids=d.get("test_frame_ids", []),
-        train_rms=d.get("train_rms"), test_rms=d.get("test_rms"), edge_rms=d.get("edge_rms"),
+        train_rms=d.get("train_rms"), test_rms=d.get("test_rms"),
+        test_macro_rms=d.get("test_macro_rms"), edge_rms=d.get("edge_rms"),
         straightness_residual=d.get("straightness_residual"),
         straightness_source=d.get("straightness_source"),
         straightness_breakdown=_straightness_breakdown_from_dict(d.get("straightness_breakdown")),
@@ -642,5 +693,3 @@ def _final_result_from_dict(d) -> FinalResult | None:
         model_scores=[_model_score_from_dict(s) for s in d.get("model_scores", [])],
         diagnosis=_diagnosis_report_from_dict(d.get("diagnosis")),
     )
-
-

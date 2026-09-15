@@ -58,8 +58,10 @@ from calibration.types import (
     PatternConfig,
     PatternType,
     ValidationResult,
+    OptimizerResult,
 )
 from calibration.sanity_check import run_sanity_checks
+from calibration.optimizer import apply_optimized_calibration, restore_original_calibration
 from calibration.recommender import compute_final_result
 from calibration.ros_live import ROS_LIVE_BACKEND
 from calibration.project_io import load_project, save_project, PROJECT_EXTENSION
@@ -92,6 +94,7 @@ from ui.worker import (
     LibrarySaveWorker,
     SceneSubsetCalibrationWorker,
     SubsetComparisonWorker,
+    OptimizerWorker,
     run_worker_in_thread,
 )
 from ui.kfold_worker import RepeatedKFoldWorker
@@ -251,6 +254,14 @@ class MainWindow(QMainWindow):
     def subset_calibration_result(self, value):
         self.intrinsic_state.subset_calibration_result = value
 
+    @property
+    def optimizer_results(self):
+        return self.intrinsic_state.optimizer_results
+
+    @optimizer_results.setter
+    def optimizer_results(self, value):
+        self.intrinsic_state.optimizer_results = value
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Calibration Tool")
@@ -301,6 +312,8 @@ class MainWindow(QMainWindow):
         self._self_check_worker = None  # 위와 동일한 이유로 별도 워커도 강한 참조 보관
         self._library_thread: QThread | None = None
         self._library_worker = None
+        self._optimizer_thread: QThread | None = None
+        self._optimizer_worker = None
         self._export_dialog: QDialog | None = None  # result_view가 생긴 뒤 지연 생성
         # 사용자 결과물은 이 관리자 아래 한 세션으로 모인다. 앱 크래시 복구용
         # ~/.camera_calibrator/autosave.ccproj와 Library 내부 저장은 의도적으로
@@ -540,7 +553,13 @@ class MainWindow(QMainWindow):
         for model, result in successful.items():
             def export_intrinsic(model=model, result=result):
                 path = self.output_manager.intrinsic_path(model)
-                return export_opencv_yaml(result, self.camera_config, self.pattern_config, str(path))
+                source = "optimized" if (
+                    self.optimizer_results.get(model) and self.optimizer_results[model].applied
+                ) else "original_opencv"
+                return export_opencv_yaml(
+                    result, self.camera_config, self.pattern_config, str(path),
+                    calibration_source=source,
+                )
             attempt(f"intrinsic.{model_filename(model)}", configs_ready, export_intrinsic)
 
         subset = self.subset_calibration_result
@@ -1370,6 +1389,7 @@ class MainWindow(QMainWindow):
             return
         self.calibration_results = {}
         self.validation_results = {}
+        self.optimizer_results = {}
         self.cross_dataset_results = []
         self.scores = []
         # 새 calibration 실행은 이전 Repeated K-Fold 결과를 무효화한다 -
@@ -1384,6 +1404,8 @@ class MainWindow(QMainWindow):
             self.scene_quality_view.set_context(
                 self.dataset, self.camera_config, {}, None, None
             )
+        if hasattr(self, "optimizer_view"):
+            self.optimizer_view.set_context({}, {}, {}, self.camera_config)
 
         self.calibration_method = selected_method
         worker = PipelineWorker(
@@ -1506,10 +1528,102 @@ class MainWindow(QMainWindow):
             except Exception:  # noqa: BLE001 - 진단 실패가 결과 UI 전체를 막지 않게 한다.
                 logger.exception("Sanity check failed after calibration; keeping result views available")
         self._refresh_result_view()
+        self.optimizer_view.set_context(
+            self.calibration_results, self.validation_results, self.optimizer_results, self.camera_config
+        )
 
     def _on_validation_ready(self, results: dict[CameraModelType, ValidationResult]) -> None:
         self.validation_results = results
         self._refresh_result_view()
+        self.optimizer_view.set_context(
+            self.calibration_results, self.validation_results, self.optimizer_results, self.camera_config
+        )
+
+    # --- Post-OpenCV optimizer -------------------------------------------------
+
+    def _on_optimizer_run(self, model: CameraModelType, settings) -> None:
+        model = CameraModelType(model)
+        validation = self.validation_results.get(model)
+        calibration = self.calibration_results.get(model)
+        if (
+            self.dataset is None or self.camera_config is None or self.pattern_config is None
+            or validation is None or not validation.train_frame_ids
+            or calibration is None or not calibration.success
+        ):
+            QMessageBox.warning(
+                self, "Optimizer unavailable",
+                "Complete OpenCV calibration and frozen hold-out validation first.",
+            )
+            return
+        worker = OptimizerWorker(
+            self.dataset, self.camera_config, self.pattern_config, model,
+            validation.train_frame_ids, validation.test_frame_ids, settings,
+        )
+        thread = run_worker_in_thread(worker, self)
+        worker.progress.connect(self.status_label.setText)
+        worker.result_ready.connect(self._on_optimizer_result)
+        worker.error.connect(self._on_optimizer_error)
+        worker.cancelled.connect(self._on_optimizer_cancelled)
+        self._optimizer_thread, self._optimizer_worker = thread, worker
+        self.optimizer_view.set_running(True)
+        thread.finished.connect(lambda: self.optimizer_view.set_running(False))
+        thread.start()
+
+    def _on_optimizer_cancel(self) -> None:
+        if self._optimizer_worker is not None:
+            self.status_label.setText("Optimizer cancellation requested...")
+            self._optimizer_worker.request_cancel()
+
+    def _on_optimizer_cancelled(self) -> None:
+        self.status_label.setText("Optimizer cancelled; original calibration was preserved.")
+        self.optimizer_view.set_cancelled()
+
+    def _on_optimizer_error(self, message: str) -> None:
+        self.status_label.setText(message)
+        self.optimizer_view.set_failed(message)
+        QMessageBox.warning(self, "Optimizer failed", message)
+
+    def _on_optimizer_result(self, result: OptimizerResult) -> None:
+        self.optimizer_results[result.model_name] = result
+        self.optimizer_view.set_context(
+            self.calibration_results, self.validation_results, self.optimizer_results, self.camera_config
+        )
+        self.optimizer_view.select_model(result.model_name)
+        self.status_label.setText(f"Optimizer completed: {result.recommendation}")
+        self._autosave()
+
+    def _on_optimizer_apply(self, model: CameraModelType) -> None:
+        model = CameraModelType(model)
+        result = self.optimizer_results.get(model)
+        if not result or not result.success or result.optimized_calibration is None:
+            return
+        self.calibration_results[model] = apply_optimized_calibration(
+            self.calibration_results[model], result
+        )
+        self._refresh_after_optimizer_change(model)
+        self.status_label.setText(f"Applied optimized {model.value} calibration.")
+        self._autosave()
+
+    def _on_optimizer_restore(self, model: CameraModelType) -> None:
+        model = CameraModelType(model)
+        result = self.optimizer_results.get(model)
+        if not result or result.pre_apply_calibration is None:
+            return
+        self.calibration_results[model] = restore_original_calibration(result)
+        self._refresh_after_optimizer_change(model)
+        self.status_label.setText(f"Restored original OpenCV {model.value} calibration.")
+        self._autosave()
+
+    def _refresh_after_optimizer_change(self, model: CameraModelType) -> None:
+        self.optimizer_view.set_context(
+            self.calibration_results, self.validation_results, self.optimizer_results, self.camera_config
+        )
+        self.optimizer_view.select_model(model)
+        self._refresh_result_view()
+        if self.dataset is not None and self.camera_config is not None:
+            self.preview_view.set_context(
+                self.dataset, self.camera_config, self.calibration_results, self.pattern_config
+            )
 
     def _on_recommendation_ready(self, scores: list[ModelScore], message: str) -> None:
         self.scores = scores
@@ -1559,6 +1673,7 @@ class MainWindow(QMainWindow):
                 outlier_result=self.outlier_result,
                 scene_quality_analysis=self.scene_quality_analysis,
                 subset_calibration_result=self.subset_calibration_result,
+                optimizer_results=self.optimizer_results,
             )
             save_project(project, str(_AUTOSAVE_PATH))
             logger.debug("자동 저장 완료: %s", _AUTOSAVE_PATH)
@@ -1576,7 +1691,13 @@ class MainWindow(QMainWindow):
                 continue
             try:
                 path = self.output_manager.intrinsic_path(model)
-                export_opencv_yaml(result, self.camera_config, self.pattern_config, str(path))
+                source = "optimized" if (
+                    self.optimizer_results.get(model) and self.optimizer_results[model].applied
+                ) else "original_opencv"
+                export_opencv_yaml(
+                    result, self.camera_config, self.pattern_config, str(path),
+                    calibration_source=source,
+                )
                 key = f"intrinsic.{model_filename(model)}"
                 self.output_manager.record_export(key, path, metadata={"automatic": True})
                 saved.append(path.name)
@@ -2040,7 +2161,13 @@ class MainWindow(QMainWindow):
         try:
             self._ensure_output_session()
             path = self.output_manager.intrinsic_path(model)
-            export_opencv_yaml(result, self.camera_config, self.pattern_config, str(path))
+            source = "optimized" if (
+                self.optimizer_results.get(model) and self.optimizer_results[model].applied
+            ) else "original_opencv"
+            export_opencv_yaml(
+                result, self.camera_config, self.pattern_config, str(path),
+                calibration_source=source,
+            )
             self.output_manager.record_export(f"intrinsic.{model_filename(model)}", path)
             self.status_label.setText(f"OpenCV YAML 저장 완료: {path}")
         except Exception as e:  # noqa: BLE001
@@ -2235,6 +2362,7 @@ class MainWindow(QMainWindow):
             outlier_result=self.outlier_result,
             scene_quality_analysis=self.scene_quality_analysis,
             subset_calibration_result=self.subset_calibration_result,
+            optimizer_results=self.optimizer_results,
             windshield_config=windshield_config,
             windshield_dataset=windshield_dataset,
             windshield_results=windshield_results,
@@ -2283,6 +2411,7 @@ class MainWindow(QMainWindow):
         self.outlier_result = project.outlier_result
         self.scene_quality_analysis = project.scene_quality_analysis
         self.subset_calibration_result = project.subset_calibration_result
+        self.optimizer_results = project.optimizer_results
         # Repeated K-Fold 결과는 .ccproj에 저장되지 않는다(계산 비용이 크고,
         # 이 프로젝트가 로드된 dataset/calibration과 실제로 짝이 맞는
         # 결과인지 보장할 방법이 없다) - 프로젝트를 불러오면 항상 비우고,
@@ -2334,6 +2463,9 @@ class MainWindow(QMainWindow):
         if self.calibration_results:
             self.preview_view.set_context(self.dataset, self.camera_config, self.calibration_results, self.pattern_config)
         self._refresh_result_view()
+        self.optimizer_view.set_context(
+            self.calibration_results, self.validation_results, self.optimizer_results, self.camera_config
+        )
         self._update_scene_quality_analysis(
             self.scene_quality_analysis.model_name if self.scene_quality_analysis else None
         )

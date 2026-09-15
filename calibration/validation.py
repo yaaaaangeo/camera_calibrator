@@ -41,6 +41,7 @@ from calibration.types import (
 )
 from calibration.models.common import (
     MIN_FRAMES_REQUIRED,
+    active_correspondences,
     classify_regions,
     compute_regional_error,
     project_points_for_model,
@@ -205,8 +206,9 @@ def _test_reprojection_errors(
 
     for frame in test_frames:
         det = frame.detection
-        obj = det.object_points
-        img = det.corners
+        # Hold-out must use the same active correspondence policy as training;
+        # excluded corner indices are never silently reintroduced.
+        obj, img = active_correspondences(det)
         frame_id = frame.image_info.image_id
 
         ok, rvec, tvec, reason = solve_pnp_for_model_robust(obj, img, camera_matrix, distortion, model)

@@ -700,6 +700,83 @@ class CalibrationResult:
     exclusion_reason: Optional[str] = None
 
 
+@dataclass
+class OptimizerSettings:
+    """User-facing optimizer controls.  Defaults are deliberately conservative."""
+    backend: str = "scipy"
+    multi_start: bool = True
+    num_starts: int = 4
+    robust_loss: str = "huber"
+    huber_delta: float = 1.0
+    staged: bool = True
+    max_iterations_per_stage: int = 100
+    final_joint_iterations: int = 200
+    optimize_principal_point: bool = True
+    optimize_focal_length: bool = True
+    optimize_distortion: bool = True
+    optimize_extrinsics: bool = True
+
+
+@dataclass
+class OptimizerMetricSet:
+    train_rms: Optional[float] = None
+    test_rms: Optional[float] = None
+    test_p95: Optional[float] = None
+    test_p99: Optional[float] = None
+    edge_rms: Optional[float] = None
+    stability: Optional[float] = None
+    observability: Optional[float] = None
+
+
+@dataclass
+class OptimizerStartResult:
+    name: str = ""
+    converged: bool = False
+    objective: Optional[float] = None
+    message: str = ""
+    selected: bool = False
+
+
+@dataclass
+class OptimizerStageResult:
+    name: str = ""
+    active_parameters: list[str] = field(default_factory=list)
+    iterations: int = 0
+    rms_before: Optional[float] = None
+    rms_after: Optional[float] = None
+    termination: str = ""
+    success: bool = False
+
+
+@dataclass
+class OptimizerResult:
+    model_name: CameraModelType
+    settings: OptimizerSettings = field(default_factory=OptimizerSettings)
+    train_frame_ids: list[str] = field(default_factory=list)
+    holdout_frame_ids: list[str] = field(default_factory=list)
+    original_calibration: Optional[CalibrationResult] = None
+    optimized_calibration: Optional[CalibrationResult] = None
+    # Snapshot of the UI/deployment result replaced by Apply.  This can be a
+    # full-data OpenCV fit, whereas original_calibration above is deliberately
+    # the leak-safe train-only Before fit.
+    pre_apply_calibration: Optional[CalibrationResult] = None
+    before_metrics: OptimizerMetricSet = field(default_factory=OptimizerMetricSet)
+    after_metrics: OptimizerMetricSet = field(default_factory=OptimizerMetricSet)
+    starts: list[OptimizerStartResult] = field(default_factory=list)
+    stages: list[OptimizerStageResult] = field(default_factory=list)
+    pipeline_status: dict[str, str] = field(default_factory=dict)
+    recommendation: str = "Neutral / Marginal"
+    reasons: list[str] = field(default_factory=list)
+    applied: bool = False
+    success: bool = False
+    cancelled: bool = False
+    error_message: Optional[str] = None
+    input_training_frame_ids: list[str] = field(default_factory=list)
+    used_training_frame_ids: list[str] = field(default_factory=list)
+    excluded_training_frame_ids: list[str] = field(default_factory=list)
+    exclusion_reason: Optional[str] = None
+
+
 # ---------------------------------------------------------------------------
 # Outlier (설계 문서 9번)
 # ---------------------------------------------------------------------------
@@ -1248,6 +1325,7 @@ class CalibrationProject:
     scene_quality_analysis: Optional[SceneQualityAnalysis] = None
     subset_calibration_result: Optional[SubsetCalibrationResult] = None
     final_result: Optional[FinalResult] = None
+    optimizer_results: dict[CameraModelType, OptimizerResult] = field(default_factory=dict)
     # Windshield Refraction Calibration (calibration/windshield/) - Object-Releasing과
     # 같은 패턴으로 별도 필드에 담는다. calibration.types는 calibration.windshield를
     # import하지 않으므로(순환 참조 방지) 타입은 문자열 forward-reference로 둔다 -
