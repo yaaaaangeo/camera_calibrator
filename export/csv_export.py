@@ -17,16 +17,22 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from calibration.types import Dataset
+from calibration.error_normalization import fhd_equivalent_error, normalized_reprojection_error
+from calibration.types import CalibrationResult, Dataset
 
 _FIELDNAMES = [
     "image_id", "path", "status", "num_corners", "sharpness", "brightness",
     "board_area_ratio", "board_tilt_deg", "reprojection_error_px",
+    "normalized_reprojection_error", "fhd_equivalent_reprojection_error_px",
     "quality_detection_score", "quality_geometric_score", "quality_overall_score", "quality_grade",
 ]
 
 
-def dataset_to_rows(dataset: Dataset) -> list[dict]:
+def dataset_to_rows(
+    dataset: Dataset,
+    calibration: CalibrationResult | None = None,
+    image_size: tuple[int, int] | None = None,
+) -> list[dict]:
     """CSV로 쓸 행(dict) 리스트를 만든다. 파일 I/O 없이 이 함수만으로도
     테스트나 다른 용도(예: pandas.DataFrame(dataset_to_rows(...)))에 바로 쓸 수 있다.
     """
@@ -44,6 +50,12 @@ def dataset_to_rows(dataset: Dataset) -> list[dict]:
             "board_area_ratio": det.board_area_ratio if det else None,
             "board_tilt_deg": det.board_tilt_deg if det else None,
             "reprojection_error_px": frame.reprojection_error,
+            "normalized_reprojection_error": normalized_reprojection_error(
+                frame.reprojection_error, calibration.camera_matrix if calibration else None
+            ),
+            "fhd_equivalent_reprojection_error_px": fhd_equivalent_error(
+                frame.reprojection_error, image_size
+            ),
             "quality_detection_score": q.detection_score if q else None,
             "quality_geometric_score": q.geometric_score if q else None,
             "quality_overall_score": q.overall_score if q else None,
@@ -52,8 +64,13 @@ def dataset_to_rows(dataset: Dataset) -> list[dict]:
     return rows
 
 
-def export_csv(dataset: Dataset, path: str) -> str:
-    rows = dataset_to_rows(dataset)
+def export_csv(
+    dataset: Dataset,
+    path: str,
+    calibration: CalibrationResult | None = None,
+    image_size: tuple[int, int] | None = None,
+) -> str:
+    rows = dataset_to_rows(dataset, calibration, image_size)
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as f:

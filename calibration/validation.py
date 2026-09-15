@@ -347,8 +347,18 @@ def _evaluate_on_test(
             failed_test_frame_reasons=failed_reasons,
         )
 
-    test_rms = float(np.sqrt(np.mean(np.array(list(per_frame_error.values())) ** 2)))
+    # 설계 문서 - Train/Test RMS 정의 통일. train_rms(CalibrationResult.rms_error)
+    # 는 OpenCV calibrateCamera*의 반환값 그대로라 이미 pooled(전체 corner
+    # point 기준) RMS다. test_rms는 이 값과 공정하게 비교 가능하도록 동일하게
+    # pooled로 정의한다(point_errors 전체에서 직접 계산 - 이미 몇 줄 아래에서
+    # compute_residual_stats(point_errors)가 만드는 test_residual_stats.rmse와
+    # 정확히 같은 공식이므로 그 필드에서 재사용한다). 이전 정의
+    # (sqrt(mean(per_frame_rms**2)), frame마다 동일 가중치)는 test_macro_rms로
+    # 보존한다 - ChArUco partial detection으로 frame별 코너 수가 크게 다르면
+    # 두 값이 달라질 수 있고, 둘 다 정보 가치가 있다.
+    test_macro_rms = float(np.sqrt(np.mean(np.array(list(per_frame_error.values())) ** 2)))
     test_residual_stats = compute_residual_stats(point_errors)
+    test_rms = test_residual_stats.rmse if test_residual_stats.rmse is not None else test_macro_rms
     image_size = camera_config.width, camera_config.height
     regional = compute_regional_error(point_xs, point_ys, point_errors, image_size)
     edge_rms = regional_edge_average(regional)
@@ -386,6 +396,7 @@ def _evaluate_on_test(
         test_frame_ids=test_ids,
         train_rms=train_result.rms_error,
         test_rms=test_rms,
+        test_macro_rms=test_macro_rms,
         edge_rms=edge_rms,
         straightness_residual=straightness,
         straightness_source=straightness_source,

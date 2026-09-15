@@ -592,6 +592,17 @@ class LiveCaptureDialog(QDialog):
         if current_tilt is not None and previous_tilt is not None:
             if abs(current_tilt - previous_tilt) >= 5.0:
                 return True
+
+        # 진짜 3D 회전(estimate_rough_pose)이 있으면 yaw/pitch 변화도 novelty
+        # 트리거에 추가한다 - board_tilt_deg(2D)만으로는 위/아래로 기울어지는
+        # 움직임을 못 잡는다. 기존 조건들과 OR로 결합되므로 이전에 novel로
+        # 판단되던 경우를 덜 novel하게 만들지는 않는다(추가적인 트리거일 뿐).
+        if detection.yaw_deg is not None and previous.yaw_deg is not None:
+            if abs(detection.yaw_deg - previous.yaw_deg) >= 5.0:
+                return True
+        if detection.pitch_deg is not None and previous.pitch_deg is not None:
+            if abs(detection.pitch_deg - previous.pitch_deg) >= 5.0:
+                return True
         return False
 
     def _on_live_detection_ready(self, detection: DetectionResult) -> None:

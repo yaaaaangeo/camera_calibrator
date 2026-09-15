@@ -116,6 +116,10 @@ def _exposure_score(brightness: float, ideal: float = 127.0) -> float:
 def _pose_diversity_contribution(
     tilt: float | None, area: float | None,
     mean_tilt: float, std_tilt: float, mean_area: float, std_area: float,
+    yaw: float | None = None, pitch: float | None = None, roll: float | None = None,
+    mean_yaw: float = 0.0, std_yaw: float = 0.0,
+    mean_pitch: float = 0.0, std_pitch: float = 0.0,
+    mean_roll: float = 0.0, std_roll: float = 0.0,
 ) -> float | None:
     """설계 문서 4번 예시 표의 "Pose Diversity" 항목 - 프레임 단위 근사치.
 
@@ -124,12 +128,25 @@ def _pose_diversity_contribution(
     평균에서 많이 벗어난(=드문 자세) 프레임일수록 다양성에 기여도가 높다고
     보고 점수를 높게 준다. std가 2만큼 벗어나면 만점(1.0)으로 포화시키는
     V1 근사치 - _normalized_spread류 휴리스틱과 같은 성격이다.
+
+    yaw/pitch/roll(estimate_rough_pose, 진짜 3D 회전)이 있으면 세 축의
+    z-score 평균을 회전 성분으로 쓴다. 계산 불가한 프레임(solvePnP 실패 등)만
+    board_tilt_deg(2D minAreaRect 각도) 단일 축 z-score로 fallback한다 -
+    둘 다 없으면 이전과 동일하게 None(판단 불가)을 반환한다.
     """
-    if tilt is None or area is None:
+    if area is None:
         return None
-    z_tilt = abs(tilt - mean_tilt) / std_tilt if std_tilt > 1e-6 else 0.0
     z_area = abs(area - mean_area) / std_area if std_area > 1e-6 else 0.0
-    return float(min(1.0, ((z_tilt + z_area) / 2.0) / 2.0))
+    if yaw is not None and pitch is not None and roll is not None:
+        z_yaw = abs(yaw - mean_yaw) / std_yaw if std_yaw > 1e-6 else 0.0
+        z_pitch = abs(pitch - mean_pitch) / std_pitch if std_pitch > 1e-6 else 0.0
+        z_roll = abs(roll - mean_roll) / std_roll if std_roll > 1e-6 else 0.0
+        z_rotation = (z_yaw + z_pitch + z_roll) / 3.0
+    elif tilt is not None:
+        z_rotation = abs(tilt - mean_tilt) / std_tilt if std_tilt > 1e-6 else 0.0
+    else:
+        return None
+    return float(min(1.0, ((z_rotation + z_area) / 2.0) / 2.0))
 
 
 # ---------------------------------------------------------------------------
@@ -240,10 +257,19 @@ def compute_frame_quality_scores(
     # 설계 문서 4번 "Pose Diversity" per-frame 기여도 계산용 데이터셋 통계
     tilts = [f.detection.board_tilt_deg for f in frames if f.detection.board_tilt_deg is not None]
     areas = [f.detection.board_area_ratio for f in frames if f.detection.board_area_ratio is not None]
+    yaws = [f.detection.yaw_deg for f in frames if f.detection.yaw_deg is not None]
+    pitches = [f.detection.pitch_deg for f in frames if f.detection.pitch_deg is not None]
+    rolls = [f.detection.roll_deg for f in frames if f.detection.roll_deg is not None]
     mean_tilt = float(np.mean(tilts)) if tilts else 0.0
     std_tilt = float(np.std(tilts)) if tilts else 0.0
     mean_area = float(np.mean(areas)) if areas else 0.0
     std_area = float(np.std(areas)) if areas else 0.0
+    mean_yaw = float(np.mean(yaws)) if yaws else 0.0
+    std_yaw = float(np.std(yaws)) if yaws else 0.0
+    mean_pitch = float(np.mean(pitches)) if pitches else 0.0
+    std_pitch = float(np.std(pitches)) if pitches else 0.0
+    mean_roll = float(np.mean(rolls)) if rolls else 0.0
+    std_roll = float(np.std(rolls)) if rolls else 0.0
 
     for frame in frames:
         fid = frame.image_info.image_id
@@ -280,7 +306,11 @@ def compute_frame_quality_scores(
         geometric_score = contribution if contribution is not None else 0.5
 
         pose_diversity = _pose_diversity_contribution(
-            det.board_tilt_deg, det.board_area_ratio, mean_tilt, std_tilt, mean_area, std_area
+            det.board_tilt_deg, det.board_area_ratio, mean_tilt, std_tilt, mean_area, std_area,
+            yaw=det.yaw_deg, pitch=det.pitch_deg, roll=det.roll_deg,
+            mean_yaw=mean_yaw, std_yaw=std_yaw,
+            mean_pitch=mean_pitch, std_pitch=std_pitch,
+            mean_roll=mean_roll, std_roll=std_roll,
         )
 
         overall = 100.0 * (

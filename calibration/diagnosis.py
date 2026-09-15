@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 
 from calibration.models.common import regional_edge_average
+from calibration.error_normalization import reference_equivalent_error
 from calibration.types import (
     CalibrationResult,
     CaptureRecommendation,
@@ -234,7 +235,15 @@ def _diagnose_edge_residuals(
     train = cal.rms_error
     if edge is None:
         return
-    if edge > 1.0 or (train is not None and edge > max(train * 1.75, train + 0.35)):
+    edge_ref = reference_equivalent_error(edge, cal.camera_matrix)
+    train_ref = reference_equivalent_error(train, cal.camera_matrix)
+    # Invalid/legacy K falls back to the historical raw-pixel behavior.
+    edge_quality = edge if edge_ref is None else edge_ref
+    train_quality = train if train_ref is None else train_ref
+    if edge_quality > 1.0 or (
+        train_quality is not None
+        and edge_quality > max(train_quality * 1.75, train_quality + 0.35)
+    ):
         evidence = [f"Edge RMS is {_fmt(edge)}."]
         if train is not None:
             evidence.append(f"Train RMS is {_fmt(train)}.")
@@ -264,7 +273,11 @@ def _diagnose_radial_residuals(patterns: list[FailurePattern], cal: CalibrationR
     outer = _band_metric(profile, {"outer", "edge", "corner"})
     if center is None or outer is None:
         return
-    if outer > max(center * 1.8, center + 0.35):
+    center_ref = reference_equivalent_error(center, cal.camera_matrix)
+    outer_ref = reference_equivalent_error(outer, cal.camera_matrix)
+    center_quality = center if center_ref is None else center_ref
+    outer_quality = outer if outer_ref is None else outer_ref
+    if outer_quality > max(center_quality * 1.8, center_quality + 0.35):
         _add(
             patterns, "radial_edge_pattern", DiagnosisSeverity.WARNING, "Radial residual grows toward the edge",
             [f"Center/inner residual is {_fmt(center)}.", f"Outer/edge/corner residual is {_fmt(outer)}."],
@@ -281,7 +294,9 @@ def _diagnose_train_test_gap(
         return
     gap = val.test_rms - cal.rms_error
     ratio = val.test_rms / max(cal.rms_error, 1e-12)
-    if gap > 0.30 and ratio > 1.50:
+    gap_ref = reference_equivalent_error(max(gap, 0.0), cal.camera_matrix)
+    gap_quality = gap if gap_ref is None else gap_ref
+    if gap_quality > 0.30 and ratio > 1.50:
         _add(
             patterns, "train_test_gap", DiagnosisSeverity.WARNING, "Hold-out error is much worse than train error",
             [f"Train RMS is {_fmt(cal.rms_error)}.", f"Test RMS is {_fmt(val.test_rms)}.", f"Gap is {_fmt(gap)}."],

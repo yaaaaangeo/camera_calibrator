@@ -100,15 +100,30 @@ def compute_scene_quality_analysis(
 
 
 def _pose_vector(frame, camera_config: CameraConfig) -> np.ndarray:
+    """6D pose-space feature for the greedy min-distance diversity selection
+    below. yaw/pitch/roll(estimate_rough_pose, true 3D rotation) are used when
+    available; frames where solvePnP couldn't run fall back to
+    board_tilt_deg(2D minAreaRect angle) on the yaw slot only, with
+    pitch/roll left at 0 (neutral - no differentiation on those axes rather
+    than a wrong guess) so the vector always stays 6D and comparable.
+    """
     det = frame.detection
     center = det.board_center_px or (camera_config.width / 2, camera_config.height / 2)
     area = det.board_area_ratio if det.board_area_ratio is not None else 0.0
-    tilt = det.board_tilt_deg if det.board_tilt_deg is not None else 0.0
+    if det.yaw_deg is not None:
+        yaw = min(1.0, abs(det.yaw_deg) / 60.0)
+        pitch = min(1.0, abs(det.pitch_deg) / 60.0)
+        roll = min(1.0, abs(det.roll_deg) / 60.0)
+    else:
+        tilt = det.board_tilt_deg if det.board_tilt_deg is not None else 0.0
+        yaw = min(1.0, abs(tilt) / 60.0)
+        pitch = 0.0
+        roll = 0.0
     return np.array([
         center[0] / max(1, camera_config.width),
         center[1] / max(1, camera_config.height),
         min(1.0, area / 0.55),
-        min(1.0, abs(tilt) / 60.0),
+        yaw, pitch, roll,
     ], dtype=float)
 
 

@@ -201,5 +201,5 @@ class PreviewView(QWidget):
         return (
             f"{base}\n"
             f"Line Straightness — 보정 전 {raw_residual:.3f}px → 보정 후 {corrected_residual:.3f}px{improvement_note}. "
-            f"0.5px 이하면 방사 왜곡이 사실상 완전히 제거된 것으로 봅니다."
+            "절대 품질은 해상도와 초점거리를 반영한 정규화 지표와 함께 판단하세요."
         )

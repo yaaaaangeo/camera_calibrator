@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from calibration.types import CalibrationResult, CameraConfig, CameraModelType, Dataset, Frame, PatternConfig
+from calibration.error_normalization import reference_equivalent_error
 from calibration.models.common import undistort_image
 from calibration.straightness import compute_frame_straightness_lines, sort_points_along_line
 
@@ -101,7 +102,10 @@ def render_straightness_overlay(
 
     for line in lines:
         pts = sort_points_along_line(line.points).astype(np.int32)
-        color = _residual_to_color(line.residual)
+        reference_residual = reference_equivalent_error(line.residual, target_K)
+        color = _residual_to_color(
+            line.residual if reference_residual is None else reference_residual
+        )
         cv2.polylines(canvas, [pts.reshape(-1, 1, 2)], isClosed=False, color=color, thickness=4)
         for x, y in pts:
             cv2.circle(canvas, (int(x), int(y)), 3, color, -1)

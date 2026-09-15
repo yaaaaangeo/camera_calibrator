@@ -35,6 +35,7 @@ from calibration.types import (
     ValidationResult,
 )
 from calibration.diagnosis import diagnose_calibration
+from calibration.error_normalization import reference_equivalent_error
 
 # 모델별 distortion 자유도. 실제 CalibrationResult.distortion
 # 배열 길이로 역산하지 않고 여기서 명시하는 이유: Pinhole은 distortion 배열이
@@ -705,6 +706,32 @@ _LABELS = {
 }
 
 
+def _frame_count_fairness_warning(
+    calibration_results: dict[CameraModelType, CalibrationResult],
+) -> str | None:
+    """모델별로 실제 학습(fit)에 쓰인 프레임 수(used_frame_count)가 서로 다르면
+    Train RMS를 모델 간 직접 비교하는 게 공정하지 않다는 경고를 만든다 -
+    Fisheye의 robust fallback(불안정한 프레임 자동 제외)이 전형적인 원인이다.
+    Hold-out Test RMS는 모든 모델이 동일한 test_ids에서 K/D를 고정한 채
+    solvePnP만으로 평가되므로(설계 문서 9번) 이 불공정성의 영향을 받지 않는다 -
+    이 경고는 Train RMS 비교에만 해당한다.
+    """
+    counts = {
+        m: cal.used_frame_count
+        for m, cal in calibration_results.items()
+        if cal and cal.success and cal.used_frame_count > 0
+    }
+    if len(set(counts.values())) <= 1:
+        return None
+    parts = [f"{_LABELS.get(m, m.value)} {n}장" for m, n in counts.items()]
+    return (
+        "⚠ 모델별 Train 프레임 수가 다릅니다 (" + ", ".join(parts) + ") - "
+        "일부 모델이 불안정한 프레임을 자동 제외했을 수 있습니다(Fisheye 흔함). "
+        "Train RMS는 모델 간 직접 비교하지 마세요 - Test/Hold-out RMS는 모든 모델이 "
+        "동일한 프레임에서 평가되므로 영향받지 않습니다."
+    )
+
+
 def build_recommendation_message(
     scores: list[ModelScore],
     calibration_results: dict[CameraModelType, CalibrationResult],
@@ -803,6 +830,9 @@ def build_recommendation_message(
         msg += f"\nReasons:\n✓ {', '.join(reasons)}"
     if recommended.selection_confidence_level == "LOW" and recommended.selection_confidence_reason:
         msg += f"\n⚠ Model selection confidence: LOW - {recommended.selection_confidence_reason}"
+    frame_count_warning = _frame_count_fairness_warning(calibration_results)
+    if frame_count_warning:
+        msg += f"\n{frame_count_warning}"
     msg += "\n※ 이 추천은 근거 제시일 뿐입니다. ROS 파이프라인 호환성 등의 이유로 다른 모델을 선택해도 됩니다."
     return msg
 
@@ -977,9 +1007,12 @@ def compare_model_rankings(
 # 설계 문서 3.1번 RMS 등급표를 "종합 등급" 산정에도 재사용한다. 문서가 반복
 # 경고하듯 이건 절대적 pass/fail 기준이 아니라 안내용 가이드라인이다 - 최종
 # 판단은 여전히 사용자의 몫이며, 이 등급은 리포트에 "참고 지표"로만 나간다.
-def _grade_for_value(v: float | None) -> QualityGrade | None:
+def _grade_for_value(v: float | None, camera_matrix=None) -> QualityGrade | None:
     if v is None:
         return None
+    normalized_value = reference_equivalent_error(v, camera_matrix)
+    if normalized_value is not None:
+        v = normalized_value
     if v < 0.3:
         return QualityGrade.EXCELLENT
     if v < 0.5:
@@ -1068,13 +1101,17 @@ def compute_final_confidence(
         components[name] = round(max(0.0, min(100.0, score)), 1)
         weights[name] = weight
 
-    add("train_rms", _score_lower_better(cal.rms_error, 0.25, 2.0), 0.14)
+    def quality_value(value: float | None) -> float | None:
+        normalized = reference_equivalent_error(value, cal.camera_matrix)
+        return value if normalized is None else normalized
+
+    add("train_rms", _score_lower_better(quality_value(cal.rms_error), 0.25, 2.0), 0.14)
     if val and val.success:
-        add("test_rms", _score_lower_better(val.test_rms, 0.30, 2.0), 0.18)
+        add("test_rms", _score_lower_better(quality_value(val.test_rms), 0.30, 2.0), 0.18)
         p95 = val.test_residual_stats.p95 if val.test_residual_stats else None
-        add("test_p95", _score_lower_better(p95, 0.60, 3.0), 0.14)
-        add("edge_rms", _score_lower_better(val.edge_rms, 0.40, 2.5), 0.12)
-        add("straightness", _score_lower_better(val.straightness_residual, 0.20, 1.5), 0.08)
+        add("test_p95", _score_lower_better(quality_value(p95), 0.60, 3.0), 0.14)
+        add("edge_rms", _score_lower_better(quality_value(val.edge_rms), 0.40, 2.5), 0.12)
+        add("straightness", _score_lower_better(quality_value(val.straightness_residual), 0.20, 1.5), 0.08)
     add("coverage", dataset_coverage_pct, 0.10)
 
     stability = _parameter_stability_score(cal)
@@ -1151,7 +1188,10 @@ def compute_final_result(
         candidate_values = [cal.rms_error]
         if val and val.success:
             candidate_values += [val.test_rms, val.edge_rms, val.straightness_residual]
-        grades = [g for g in (_grade_for_value(v) for v in candidate_values) if g is not None]
+        grades = [
+            g for g in (_grade_for_value(v, cal.camera_matrix) for v in candidate_values)
+            if g is not None
+        ]
         overall_grade = _worst_grade(grades)
 
     diagnosis = (

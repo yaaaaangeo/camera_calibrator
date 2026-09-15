@@ -167,6 +167,17 @@ class DetectionResult:
     board_center_px: Optional[tuple[float, float]] = None
     board_tilt_deg: Optional[float] = None
     failure_reason: Optional[str] = None
+    # 3D pose 근사치(models.common.estimate_rough_pose, solvePnP + rough K).
+    # board_tilt_deg(2D minAreaRect 각도)는 in-plane rotation 근사치일 뿐 진짜
+    # yaw/pitch를 담지 못한다 - 이 4개 필드가 그 대체다. detect_charuco/
+    # detect_chessboard/detect_circle_grid/detect_aprilgrid가 검출 직후 채운다.
+    # 계산 불가(포인트 부족/solvePnP 실패)면 전부 None으로 남는다(추가 필드라
+    # 구버전 프로젝트 로드 시에도 자동으로 None) - 소비처는 반드시 None
+    # fallback 경로를 가져야 한다.
+    yaw_deg: Optional[float] = None
+    pitch_deg: Optional[float] = None
+    roll_deg: Optional[float] = None
+    distance_m: Optional[float] = None
     # 설계 문서 3-2번 - Calibration Target 품질 검사 확장 필드
     corner_confidence: Optional[float] = None   # 검출된 코너 수 / 보드가 이론상 가질 수 있는 최대 코너 수 (0~1)
     min_edge_margin_px: Optional[float] = None  # 코너 중 이미지 경계에 가장 가까운 코너까지의 거리(px)
@@ -675,6 +686,18 @@ class CalibrationResult:
     # error_message와 분리한 이유: error_message는 "실패"를 의미하는 필드라
     # success=True와 함께 쓰면 UI 로직이 헷갈린다.
     warning_message: Optional[str] = None
+    # Fisheye의 robust fallback(_robust_fisheye_calibrate)처럼 fit에 실제로
+    # 쓰인 프레임 집합이 입력보다 작을 수 있는 모델을 위한 구조화된 회계.
+    # Pinhole/Brown-Conrady/Rational은 프레임을 제외하지 않으므로
+    # input_frame_count == used_frame_count, excluded_frame_ids == [].
+    # 이전에는 warning_message 자유 텍스트 하나뿐이라 recommender.py/UI/export가
+    # "이 모델이 몇 장으로 학습됐는지"를 기계적으로 읽을 수 없었다 - 모델 간
+    # Train RMS 비교가 서로 다른 데이터셋 크기 위에서 이뤄질 수 있다는 사실을
+    # 명시하기 위해 추가.
+    input_frame_count: int = 0
+    used_frame_count: int = 0
+    excluded_frame_ids: list[str] = field(default_factory=list)
+    exclusion_reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -792,6 +815,18 @@ class ValidationResult:
     test_frame_ids: list[str] = field(default_factory=list)
     train_rms: Optional[float] = None
     test_rms: Optional[float] = None            # test intrinsic 재최적화 금지 원칙 준수
+    # Pooled(전체 test corner point 기준, sqrt(mean(point_error**2))) 정의로
+    # 통일했다 - train_rms(=CalibrationResult.rms_error, OpenCV
+    # calibrateCamera*의 반환값도 pooled)와 동일한 observation weighting이어야
+    # 공정하게 비교할 수 있다(ChArUco partial detection으로 frame마다 코너
+    # 수가 크게 다르면, frame-equal 평균은 코너가 적은 frame에 과도한 가중치를
+    # 준다). test_residual_stats.rmse와 항상 같은 값이다(그 필드에서 그대로
+    # 가져옴) - 별도 필드로 존재하는 이유는 하위 호환(export/UI가 test_rms
+    # 이름으로 이미 참조 중)과, residual_stats가 없는 예외 경로에서도 이
+    # 필드만은 채워져 있길 기대하는 기존 코드가 있어서다.
+    # 이전 정의(frame-equal, sqrt(mean(per_frame_rms**2)))는
+    # test_macro_rms로 보존했다 - 정보 가치가 있어 버리지 않는다.
+    test_macro_rms: Optional[float] = None
     edge_rms: Optional[float] = None
     straightness_residual: Optional[float] = None  # V2, 없으면 None
     straightness_source: Optional[str] = None  # "test" | "train_fallback" | None
@@ -896,7 +931,8 @@ class ObjectReleasingValidationResult:
     failed_test_frame_ids: list[str] = field(default_factory=list)
     failed_test_reasons: dict[str, str] = field(default_factory=dict)
     train_rms: Optional[float] = None
-    test_rms: Optional[float] = None
+    test_rms: Optional[float] = None  # pooled 정의 - ValidationResult.test_rms와 동일한 원칙
+    test_macro_rms: Optional[float] = None  # 이전 frame-equal 정의 (ValidationResult 참고)
     test_residual_stats: Optional[ResidualStats] = None
     target_geometry_refinement: Optional[dict[str, float]] = None
 

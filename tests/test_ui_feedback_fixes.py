@@ -12,6 +12,7 @@ tests/test_ui_feedback_fixes.py
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 # 정합성 마감 라운드 - 최상위 `PySide6` 패키지 import는 성공해도 실제
@@ -143,14 +144,18 @@ def test_result_view_table_has_no_complexity_row(qapp):
     from ui.result_view import ResultView
 
     view = ResultView()
-    assert view.table.rowCount() == 19
+    assert view.table.rowCount() == 32
     labels = [view.table.verticalHeaderItem(i).text() for i in range(view.table.rowCount())]
     assert "Complexity" not in labels
     assert labels == [
-        "Validation Status", "Train RMS", "Test Frames", "Successful Test Frames",
-        "Failed Test Frames", "Failure Reason", "Test RMS", "Test P95",
-        "Test Edge RMS", "Straightness",
-        "Radial Edge", "AIC", "BIC", "Stability", "Observability",
+        "Validation Status", "Image Resolution", "Train RMS", "Normalized Train RMS",
+        "FHD-equivalent Train RMS", "Train Frames Used", "Test Frames", "Successful Test Frames",
+        "Failed Test Frames", "Failure Reason", "Test RMS", "Test Macro RMS", "Normalized Test RMS",
+        "FHD-equivalent Test RMS", "Test P95", "Normalized Test P95",
+        "FHD-equivalent Test P95", "Test Edge RMS", "Normalized Test Edge RMS",
+        "FHD-equivalent Test Edge RMS", "Straightness", "Radial Edge",
+        "Normalized Radial Edge", "FHD-equivalent Radial Edge",
+        "AIC", "BIC", "Stability", "Observability",
         "Undistortion", "Model Score", "Selection Conf.", "Recommend",
     ]
     view.close()
@@ -483,6 +488,33 @@ def test_result_view_test_p95_does_not_fallback_to_train_residual_p95(qapp):
             for i in range(view.table.rowCount())
         ].index("Test P95")
         assert view.table.item(p95_row, 0).text() == "N/A"
+    finally:
+        view.close()
+
+
+def test_result_view_shows_raw_normalized_and_fhd_metrics(qapp):
+    from ui.result_view import ResultView
+
+    view = ResultView()
+    try:
+        result = CalibrationResult(
+            model_name=CameraModelType.PINHOLE,
+            camera_matrix=np.array([[1900.0, 0, 1920.0], [0, 1900.0, 1080.0], [0, 0, 1]]),
+            rms_error=0.8,
+            success=True,
+        )
+        validation = ValidationResult(test_rms=1.0, edge_rms=1.2, success=True)
+        view.set_comparison(
+            {CameraModelType.PINHOLE: result},
+            {CameraModelType.PINHOLE: validation},
+            [],
+            image_size=(3840, 2160),
+        )
+        labels = [view.table.verticalHeaderItem(i).text() for i in range(view.table.rowCount())]
+        assert view.table.item(labels.index("Train RMS"), 0).text() == "0.800"
+        assert view.table.item(labels.index("Normalized Train RMS"), 0).text() == "0.000421"
+        assert view.table.item(labels.index("FHD-equivalent Train RMS"), 0).text() == "0.400px"
+        assert view.table.item(labels.index("Image Resolution"), 0).text() == "3840x2160"
     finally:
         view.close()
 

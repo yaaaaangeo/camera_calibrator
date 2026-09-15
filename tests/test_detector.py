@@ -103,3 +103,74 @@ def test_summarize_dataset_no_crash(synthetic_dataset):
     text = summarize_dataset(synthetic_dataset)
     assert len(text) > 0
     assert "검출" in text or "%" in text
+
+
+def test_partial_charuco_detection_recovers_true_board_footprint(charuco_board):
+    """Test 2 (계획 문서 11번) - 같은 실제 board pose에서 일부 corner만
+    보이도록 만든 뒤, full detection과 partial detection에서 추정되는
+    board_center_px/board_area_ratio가 크게 뒤집히지 않는지 확인한다.
+
+    검출된 코너만으로 convexHull/mean을 구하는(옛 방식) 대신, solvePnP로
+    구한 pose에 전체 보드 코너를 투영해 footprint를 복원하면(Problem 6)
+    partial detection에서도 full detection과 훨씬 가까운 값이 나와야 한다.
+    """
+    from calibration.detector import _compute_board_geometry, _estimate_full_board_footprint
+    from calibration.models.common import rough_camera_matrix
+
+    img_w, img_h = 1920, 1080
+    full_object_points = charuco_board.getChessboardCorners().astype(np.float64)
+    n = full_object_points.shape[0]
+    squares_x, _squares_y = charuco_board.getChessboardSize()
+    n_cols = squares_x - 1
+
+    # 실제 보드가 화면 오른쪽으로 치우치고 기울어진 pose - 오른쪽 절반만
+    # 보이는 partial detection을 시뮬레이션하기 좋은 조건.
+    rvec = np.radians(np.array([0.0, 25.0, 0.0])).reshape(3, 1)
+    tvec = np.array([[0.15], [0.0], [1.0]])
+    K = rough_camera_matrix((img_w, img_h))
+    full_image_points, _ = cv2.projectPoints(full_object_points, rvec, tvec, K, None)
+    full_image_points = full_image_points.reshape(-1, 2)
+
+    full_area, full_center, _, _ = _compute_board_geometry(
+        full_image_points.reshape(-1, 1, 2).astype(np.float32), (img_h, img_w)
+    )
+
+    # Partial detection: 격자의 왼쪽 절반 칼럼만 "검출된" 코너로 남긴다
+    # (오른쪽 절반이 화면 밖/가려짐으로 검출 실패했다고 가정).
+    keep_mask = np.array([(i % n_cols) < n_cols // 2 for i in range(n)])
+    assert 0 < keep_mask.sum() < n
+
+    partial_object_points = full_object_points[keep_mask].reshape(-1, 1, 3).astype(np.float64)
+    partial_image_points = full_image_points[keep_mask].reshape(-1, 1, 2).astype(np.float32)
+
+    naive_area, naive_center, _, _ = _compute_board_geometry(
+        partial_image_points, (img_h, img_w)
+    )
+
+    footprint = _estimate_full_board_footprint(
+        partial_object_points, partial_image_points, full_object_points, (img_h, img_w)
+    )
+    assert footprint is not None
+    recovered_area, recovered_center = footprint
+
+    naive_center_error = float(np.hypot(naive_center[0] - full_center[0], naive_center[1] - full_center[1]))
+    recovered_center_error = float(
+        np.hypot(recovered_center[0] - full_center[0], recovered_center[1] - full_center[1])
+    )
+    assert recovered_center_error < naive_center_error
+    # The naive convexHull-of-detected-only estimate must actually be biased
+    # (otherwise this test wouldn't be exercising the failure mode at all).
+    assert naive_center_error > 20.0
+    # And the reconstruction must land close to the true full-board center.
+    assert recovered_center_error < 15.0
+
+    assert abs(recovered_area - full_area) < abs(naive_area - full_area)
+
+
+def test_full_board_footprint_falls_back_to_none_on_insufficient_points():
+    from calibration.detector import _estimate_full_board_footprint
+
+    footprint = _estimate_full_board_footprint(
+        np.zeros((2, 1, 3)), np.zeros((2, 1, 2)), np.zeros((10, 3)), (1080, 1920)
+    )
+    assert footprint is None

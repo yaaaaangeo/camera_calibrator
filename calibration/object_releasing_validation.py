@@ -199,8 +199,12 @@ def _run_object_releasing_train_test(
             error_message="모든 test 프레임에서 pose 추정(solvePnP)이 실패했습니다.",
         )
 
-    test_rms = float(np.sqrt(np.mean(np.array(list(per_frame_rms.values())) ** 2)))
+    # validation.py::_evaluate_on_test와 동일한 원칙 - train_rms(pooled)와
+    # 공정하게 비교되도록 test_rms도 pooled로 정의하고, 이전 frame-equal
+    # 정의는 test_macro_rms로 보존한다.
+    test_macro_rms = float(np.sqrt(np.mean(np.array(list(per_frame_rms.values())) ** 2)))
     test_residual_stats = compute_residual_stats(point_errors)
+    test_rms = test_residual_stats.rmse if test_residual_stats.rmse is not None else test_macro_rms
 
     return train_result, ObjectReleasingValidationResult(
         success=True,
@@ -208,6 +212,7 @@ def _run_object_releasing_train_test(
         test_frame_ids=test_ids,
         train_rms=train_result.rms_error,
         test_rms=test_rms,
+        test_macro_rms=test_macro_rms,
         test_residual_stats=test_residual_stats,
         target_geometry_refinement=train_result.target_geometry_refinement,
         failed_test_frame_ids=failed_test_frame_ids,

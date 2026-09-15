@@ -1341,7 +1341,12 @@ def _validate_choose_and_export(
         _log(quiet, f"저장: {p}")
     if "csv" in export_targets:
         target = destination("dataset.csv", output_manager.report_path("dataset.csv") if output_manager else "")
-        p = export_csv(dataset, str(target))
+        p = export_csv(
+            dataset,
+            str(target),
+            calibration_results.get(chosen_model),
+            (camera_config.width, camera_config.height),
+        )
         exported["csv"] = p
         record("reports.dataset_csv", p)
 

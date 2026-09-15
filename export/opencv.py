@@ -16,6 +16,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from calibration.error_normalization import (
+    fhd_equivalent_error,
+    mean_focal_length,
+    normalized_reprojection_error,
+)
 from calibration.types import CalibrationResult, CameraConfig, CameraModelType, PatternConfig
 from calibration.models.common import distortion_coeff_labels
 
@@ -62,6 +67,15 @@ def export_opencv_yaml(
         ",".join(distortion_coeff_labels(result.model_name, int(result.distortion.size))),
     )
     fs.write("rms_reprojection_error", float(result.rms_error))
+    focal_mean = mean_focal_length(result.camera_matrix)
+    normalized_rms = normalized_reprojection_error(result.rms_error, result.camera_matrix)
+    fhd_rms = fhd_equivalent_error(result.rms_error, (camera_config.width, camera_config.height))
+    if focal_mean is not None:
+        fs.write("mean_focal_length_px", float(focal_mean))
+    if normalized_rms is not None:
+        fs.write("normalized_rms_reprojection_error", float(normalized_rms))
+    if fhd_rms is not None:
+        fs.write("fhd_equivalent_rms_reprojection_error", float(fhd_rms))
     fs.write("calibration_source", calibration_source)
     if selected_frame_ids is not None:
         fs.write("subset_scene_count", len(selected_frame_ids))
@@ -87,6 +101,10 @@ def export_opencv_yaml(
 def load_opencv_yaml(path: str) -> dict:
     """저장한 파일을 다시 읽어 dict로 반환 (재현성 검증, 다른 도구 연동용)."""
     fs = cv2.FileStorage(path, cv2.FILE_STORAGE_READ)
+    def optional_real(name: str) -> float | None:
+        node = fs.getNode(name)
+        return None if node.empty() else float(node.real())
+
     data = {
         "calibration_model": fs.getNode("calibration_model").string(),
         "image_width": int(fs.getNode("image_width").real()),
@@ -94,6 +112,9 @@ def load_opencv_yaml(path: str) -> dict:
         "camera_matrix": fs.getNode("camera_matrix").mat(),
         "distortion_coefficients": fs.getNode("distortion_coefficients").mat(),
         "rms_reprojection_error": fs.getNode("rms_reprojection_error").real(),
+        "mean_focal_length_px": optional_real("mean_focal_length_px"),
+        "normalized_rms_reprojection_error": optional_real("normalized_rms_reprojection_error"),
+        "fhd_equivalent_rms_reprojection_error": optional_real("fhd_equivalent_rms_reprojection_error"),
     }
     fs.release()
     return data

@@ -4,9 +4,8 @@ camera_calibrator.calibration.straightness
 
 설계 문서 3.4번 - Line Straightness Residual.
 
-    "보정된 이미지에서 직선이어야 할 요소(격자선, 문틀 등) 위 점을 추출해
-     직선 ax+by+c=0에 피팅. 점과 직선 사이 평균 거리가 0.5px 이하여야
-     방사 왜곡이 완벽히 제거된 것으로 판단."
+    보정된 이미지에서 직선이어야 할 요소(격자선, 문틀 등) 위 점을 추출해
+    직선 ax+by+c=0에 피팅하고 점과 직선 사이 평균 거리를 측정한다.
 
 문서 원문은 "문틀" 같은 이미지 속 임의의 직선 요소를 상정하지만, 이 프로젝트는
 ChArUco 패턴을 쓰고 있어 훨씬 안정적인 소스가 이미 손에 있다: **체스보드 격자
@@ -31,6 +30,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from calibration.error_normalization import reference_equivalent_error
+from calibration.models.common import active_correspondences
 from calibration.types import CameraModelType, Frame, PatternConfig, StraightnessBreakdown
 
 # 한 줄(행 또는 열)을 직선으로 피팅하려면 최소 이 정도 점은 있어야 신뢰할 만하다.
@@ -144,14 +145,24 @@ def compute_frame_straightness_lines(
     if det.num_corners < min_points_per_line:
         return []
 
+    # 설계 문서 16번 - corner-level outlier(excluded_corner_indices)로 제외된
+    # 코너는 calibration/regional/radial/residual_stats/spatial_error_map과
+    # 동일하게 straightness에서도 빠져야 한다(이전에는 이 파일만 det.corners/
+    # det.ids를 필터링 없이 직접 읽어 다른 metric과 다른 observation set을
+    # 쓰는 불일치가 있었다). ids는 corners와 같은 인덱스로 짝지어져 있어야
+    # 행/열 grouping이 어긋나지 않으므로 같은 마스크로 함께 거른다.
+    _, active_corners, active_ids = active_correspondences(det, ids=det.ids)
+    if active_corners.shape[0] < min_points_per_line:
+        return []
+
     try:
-        undistorted = _undistort_points_pixel_space(det.corners, camera_matrix, distortion, model, target_K)
+        undistorted = _undistort_points_pixel_space(active_corners, camera_matrix, distortion, model, target_K)
     except cv2.error:
         # 왜곡 계수가 이 프레임의 극단적인 코너에서 수치적으로 불안정할 수 있음 -
         # 해당 프레임만 건너뛰고 나머지는 계속 진행.
         return []
 
-    return _lines_from_points(det, pattern, undistorted, min_points_per_line)
+    return _lines_from_points(active_ids, pattern, undistorted, min_points_per_line)
 
 
 def compute_frame_raw_straightness_lines(
@@ -180,8 +191,15 @@ def compute_frame_raw_straightness_lines(
     if det.num_corners < min_points_per_line:
         return []
 
-    raw_points = det.corners.reshape(-1, 2).astype(np.float64)
-    return _lines_from_points(det, pattern, raw_points, min_points_per_line)
+    # 위 compute_frame_straightness_lines와 동일한 이유로 corner-level
+    # exclusion을 여기(raw/보정 전 기준선)에도 똑같이 적용한다 - 안 그러면
+    # "보정 전/후" 비교 자체가 서로 다른 코너 집합을 쓰게 된다.
+    _, active_corners, active_ids = active_correspondences(det, ids=det.ids)
+    if active_corners.shape[0] < min_points_per_line:
+        return []
+
+    raw_points = active_corners.reshape(-1, 2).astype(np.float64)
+    return _lines_from_points(active_ids, pattern, raw_points, min_points_per_line)
 
 
 def _classify_position(index: int, total: int) -> str:
@@ -200,9 +218,10 @@ def _classify_position(index: int, total: int) -> str:
 
 
 def _lines_from_points(
-    det, pattern: PatternConfig, points: np.ndarray, min_points_per_line: int,
+    ids: np.ndarray, pattern: PatternConfig, points: np.ndarray, min_points_per_line: int,
 ) -> list[StraightnessLine]:
-    """검출 결과(det)의 board id로 점들을 행/열/대각선으로 묶어 직선을 피팅.
+    """board id(ids, points와 같은 순서로 이미 활성 코너만 필터링된 상태여야 함)로
+    점들을 행/열/대각선으로 묶어 직선을 피팅.
 
     compute_frame_straightness_lines()(보정 후)와
     compute_frame_raw_straightness_lines()(보정 전) 둘 다 이 함수를 공유한다 -
@@ -217,7 +236,7 @@ def _lines_from_points(
     """
     n_cols = pattern.squares_x - 1  # id -> row/col 역산에 필요
     n_rows = pattern.squares_y - 1
-    ids_flat = det.ids.reshape(-1)
+    ids_flat = ids.reshape(-1)
     rows: dict[int, list[np.ndarray]] = {}
     cols: dict[int, list[np.ndarray]] = {}
     diag_main: dict[int, list[np.ndarray]] = {}
@@ -310,13 +329,20 @@ def compute_straightness_residual(
     return float(np.mean(all_residuals)), len(all_residuals)
 
 
-def format_straightness_summary(residual: float | None, num_lines: int) -> str:
+def format_straightness_summary(
+    residual: float | None,
+    num_lines: int,
+    camera_matrix: np.ndarray | None = None,
+) -> str:
     if residual is None:
         return "Line Straightness: 계산할 수 있는 직선(행/열)이 부족합니다."
+    quality_residual = reference_equivalent_error(residual, camera_matrix)
+    if quality_residual is None:
+        quality_residual = residual
     grade = (
-        "Excellent" if residual < 0.3 else
-        "Good" if residual < 0.5 else
-        "Warning" if residual < 1.0 else
+        "Excellent" if quality_residual < 0.3 else
+        "Good" if quality_residual < 0.5 else
+        "Warning" if quality_residual < 1.0 else
         "Poor"
     )
     return f"Line Straightness: {residual:.3f}px ({num_lines}개 라인 기준, {grade})"

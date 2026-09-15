@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 
+import numpy as np
 import pytest
 
 from calibration.holdout_evidence import evaluate_holdout_evidence
@@ -118,6 +119,45 @@ def test_cross_dataset_batch_and_format_table(synthetic_dataset, camera_config, 
 # 건드리면 이 파일의 다른 테스트나 다른 파일의 테스트가 오염된다.
 # ---------------------------------------------------------------------------
 
+
+
+def test_test_rms_is_pooled_not_macro_frame_average(synthetic_dataset, camera_config, pattern_config):
+    """Test 6 (계획 문서 11번) - 공식 Test RMS는 pooled(전체 test corner
+    point 기준) 정의여야 train_rms(OpenCV calibrateCamera*의 pooled 반환값)
+    와 공정하게 비교할 수 있다. corner 수가 서로 다른 test frame들에서
+    pooled 값이 이전 macro(frame-equal) 정의와 실제로 달라지고,
+    test_residual_stats.rmse(pooled 정의)와 정확히 일치하는지 확인한다.
+    """
+    dataset = copy.deepcopy(synthetic_dataset)
+    train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio=0.3, seed=23)
+    result = validate_holdout(
+        dataset, camera_config, pattern_config, CameraModelType.PINHOLE, train_ids, test_ids,
+    )
+    assert result.success
+    assert result.test_macro_rms is not None
+    assert result.test_residual_stats is not None
+
+    # 공식 test_rms는 pooled 정의 - test_residual_stats.rmse와 정확히 같아야 한다.
+    assert result.test_rms == pytest.approx(result.test_residual_stats.rmse, rel=1e-9, abs=1e-9)
+
+    # 이 fixture(ChArUco, 랜덤 perspective warp)는 partial occlusion 때문에
+    # frame마다 실제 코너 수가 다르다 - pooled/macro 구분이 의미가 있으려면
+    # 전제조건으로 이게 사실이어야 한다.
+    test_frames = [f for f in dataset.frames if f.image_info.image_id in test_ids]
+    corner_counts = {
+        f.detection.num_corners for f in test_frames if f.detection and f.detection.success
+    }
+    assert len(corner_counts) > 1, (
+        "이 fixture의 test frame들이 전부 같은 corner 수를 가져 pooled/macro "
+        "구분을 검증할 수 없음 - split seed를 바꿔야 할 수 있음"
+    )
+
+    # pooled(test_rms)와 macro(test_macro_rms)는 코너 수가 다르면 값이 달라야 한다.
+    assert result.test_rms != pytest.approx(result.test_macro_rms, rel=1e-9, abs=1e-9)
+
+    # macro 정의가 정확히 이전 공식(frame-equal 가중치)과 일치하는지도 재확인.
+    manual_macro = float(np.sqrt(np.mean(np.array(list(result.per_frame_error.values())) ** 2)))
+    assert result.test_macro_rms == pytest.approx(manual_macro, rel=1e-9, abs=1e-9)
 
 
 def test_train_rms_reproducible_independently_of_test_evaluation(synthetic_dataset, camera_config, pattern_config):
@@ -305,6 +345,61 @@ def test_fisheye_holdout_validation_recovers_known_k_d(pattern_config):
     # Test RMS 자체도 GT 노이즈 없는 합성 데이터이므로 낮아야 한다 (Test에서
     # K,D를 건드리지 않고 pose만 잘 추정했다면 재투영 오차는 작아야 정상).
     assert result.test_rms is not None and result.test_rms < 5.0
+
+
+def test_fisheye_excluded_frame_accounting_is_recorded(monkeypatch):
+    """Test 8 (계획 문서 11번, Problem 7) - Fisheye가 불안정한 프레임을 N개
+    자동 제외하면 CalibrationResult.input_frame_count/used_frame_count/
+    excluded_frame_ids가 정확히 기록돼야 한다(이전에는 자유 텍스트
+    warning_message 하나뿐이라 recommender.py/UI/export가 이걸 기계적으로
+    읽을 수 없었다).
+    """
+    import cv2
+
+    from calibration.models.common import collect_calibration_inputs
+    from calibration.models.fisheye import calibrate_fisheye
+
+    dataset, camera_config, _true_K, _true_D = _build_synthetic_fisheye_dataset(n_frames=16)
+    frames, _obj, _img = collect_calibration_inputs(dataset)
+    n_frames = len(frames)
+    assert n_frames >= 12
+
+    real_calibrate = cv2.fisheye.calibrate
+    call_count = {"n": 0}
+
+    def flaky_calibrate(obj, img, image_size, K, D, flags=0, criteria=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # _robust_fisheye_calibrate가 이 메시지에서 "input array 2"를
+            # 파싱해 그 프레임을 제외 후보로 삼는다(fisheye.py의
+            # _ILL_COND_INDEX_RE 규약).
+            raise cv2.error("Ill-conditioned matrix for input array 2 in function 'someFunc'")
+        return real_calibrate(obj, img, image_size, K, D, flags=flags, criteria=criteria)
+
+    monkeypatch.setattr(cv2.fisheye, "calibrate", flaky_calibrate)
+
+    result = calibrate_fisheye(dataset, camera_config)
+
+    assert result.success, result.error_message
+    assert result.input_frame_count == n_frames
+    assert result.used_frame_count == n_frames - 1
+    assert len(result.excluded_frame_ids) == 1
+    assert result.exclusion_reason == "fisheye_unstable_initialization"
+    assert result.warning_message is not None and "자동 제외" in result.warning_message
+    # per_frame_error/residual_stats 등은 실제 used_frame_count(kept)만큼만 있어야 한다.
+    assert len(result.per_frame_error) == result.used_frame_count
+
+
+def test_fisheye_frame_accounting_has_no_exclusions_on_clean_data():
+    """대조군 - 문제가 없으면 input==used이고 excluded_frame_ids는 비어야 한다."""
+    from calibration.models.fisheye import calibrate_fisheye
+
+    dataset, camera_config, _true_K, _true_D = _build_synthetic_fisheye_dataset(n_frames=16)
+    result = calibrate_fisheye(dataset, camera_config)
+    assert result.success, result.error_message
+    assert result.input_frame_count == result.used_frame_count
+    assert result.excluded_frame_ids == []
+    assert result.exclusion_reason is None
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +725,47 @@ def test_leak_safe_function_matches_validate_holdout_when_no_outliers_removed(
 
     assert leak_safe_result.test_rms == pytest.approx(plain_result.test_rms, rel=1e-6, abs=1e-6)
     assert leak_safe_result.train_rms == pytest.approx(plain_result.train_rms, rel=1e-9, abs=1e-9)
+
+
+def test_corrupted_frozen_holdout_frame_does_not_change_trained_k_d(
+    synthetic_dataset, camera_config, pattern_config
+):
+    """Test 5 (계획 문서 11번) - frozen hold-out 프레임 하나를 일부러 매우
+    나쁜 residual로 만들어도, outlier threshold/training selection/최종
+    K,D 어디에도 영향을 주면 안 된다. 위 test_leak_safe_outlier_pruning_only_removes_train_frames
+    가 "제거 후보에도 안 오른다"까지는 확인했으니, 여기서는 한 걸음 더 나가
+    실제로 학습된 camera_matrix/distortion 값 자체가 손상 여부와 무관하게
+    완전히 동일한지(참조가 아니라 값 비교) 직접 비교한다.
+    """
+    baseline_dataset = copy.deepcopy(synthetic_dataset)
+    train_ids, test_ids = split_train_test(baseline_dataset, camera_config, test_ratio=0.3, seed=17)
+    assert test_ids
+
+    baseline_result, baseline_outlier, _ = recalibrate_train_with_outlier_pruning(
+        baseline_dataset, camera_config, pattern_config, CameraModelType.PINHOLE,
+        train_ids, test_ids, max_iterations=3,
+    )
+
+    corrupted_dataset = copy.deepcopy(synthetic_dataset)
+    victim_id = test_ids[0]
+    victim_frame = next(f for f in corrupted_dataset.frames if f.image_info.image_id == victim_id)
+    # 물리적으로 불가능한 값(화면 밖 극단)으로 완전히 망가뜨린다 - training
+    # 쪽에 조금이라도 영향이 있다면 K/D가 크게 흔들려야 정상이다.
+    victim_frame.detection.corners = victim_frame.detection.corners * 0.0 + 999999.0
+
+    corrupted_result, corrupted_outlier, _ = recalibrate_train_with_outlier_pruning(
+        corrupted_dataset, camera_config, pattern_config, CameraModelType.PINHOLE,
+        train_ids, test_ids, max_iterations=3,
+    )
+
+    assert corrupted_outlier.removed_frame_ids == baseline_outlier.removed_frame_ids
+    np.testing.assert_allclose(
+        corrupted_result.camera_matrix, baseline_result.camera_matrix, rtol=1e-9, atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        corrupted_result.distortion, baseline_result.distortion, rtol=1e-9, atol=1e-9,
+    )
+    assert corrupted_result.rms_error == pytest.approx(baseline_result.rms_error, rel=1e-9, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------

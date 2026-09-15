@@ -451,6 +451,26 @@ class TestExportPaperMetrics:
         assert metrics["metadata"]["k"] == 3
         assert metrics["metadata"]["n_repeats"] == 2
         assert metrics["metadata"]["evaluation_roi"]["is_full_image"] is True
+        assert "camera_installation" not in metrics["metadata"]
+        assert "target_location" not in metrics["metadata"]
+
+    def test_paper_metadata_exports_installation_only_when_explicit(
+        self, synthetic_dataset, camera_config, pattern_config
+    ):
+        metadata = pe.build_paper_metadata(
+            camera_config,
+            pattern_config,
+            synthetic_dataset,
+            k=3,
+            n_repeats=2,
+            base_seed=1,
+            camera_installation="exterior mount",
+            target_location="in front of camera",
+        )
+
+        exported = metadata.to_dict()
+        assert exported["camera_installation"] == "exterior mount"
+        assert exported["target_location"] == "in front of camera"
 
     def test_paper_summary_report_has_no_auto_generated_verdict(self, synthetic_dataset, camera_config, pattern_config):
         """보고서 텍스트에 "가장 좋다"/"실패" 같은 자동 판정 문구가 없는지

@@ -63,13 +63,22 @@ class HelpView(QWidget):
 
         <h2>Camera Setup 패널</h2>
         <p>
-            화면 위쪽의 Camera Setup은 왼쪽(Camera) / 중앙(Pattern) / 오른쪽(Actions)
+            화면 위쪽의 Camera Setup은 왼쪽(Pattern) / 중앙(Camera) / 오른쪽(Actions)
             3열로 구성됩니다.
         </p>
         <table>
             <tr><th>열</th><th>구성</th></tr>
             <tr>
-                <td><b>왼쪽 (Camera)</b></td>
+                <td><b>왼쪽 (Pattern)</b></td>
+                <td>
+                    <b>Calibration method</b>(Standard 또는 Object-Releasing, 아래
+                    "Advanced Calibration" 참고) → Target-specific fields such as
+                    Columns/Rows, Square Size, Center Spacing, Tag Pitch, Marker Size,
+                    Dictionary/Tag Family, Grid type(Circle Grid), AprilGrid variant.
+                </td>
+            </tr>
+            <tr>
+                <td><b>중앙 (Camera)</b></td>
                 <td>
                     Camera Name(Library 분류용 이름) →
                     <b>INPUT</b>(실시간 / rosbag / 이미지 3버튼 - 실시간은 ROS1/ROS2 이미지
@@ -78,13 +87,6 @@ class HelpView(QWidget):
                     선택) → <b>해상도 확인</b>(JPEG/PNG 이미지 한 장을 실제로 디코딩해 크기를
                     확인하고 Width/Height에 자동 반영) → Width/Height.
                 </td>
-            </tr>
-            <tr>
-                <td><b>중앙 (Pattern)</b></td>
-                <td><b>Calibration method</b>(Standard 또는 Object-Releasing, 아래
-                    "Advanced Calibration" 참고) → Target-specific fields such as
-                    Columns/Rows, Square Size, Center Spacing, Tag Pitch, Marker Size,
-                    Dictionary/Tag Family, Grid type(Circle Grid), AprilGrid variant.</td>
             </tr>
             <tr>
                 <td><b>오른쪽 (Actions)</b></td>
@@ -131,7 +133,7 @@ class HelpView(QWidget):
                     오른쪽 패널의 초록~빨강 선은 보드의 행/열이 보정 후 얼마나 곧아졌는지를 나타내고,
                     이미지 아래에는 보정 전/후 Line Straightness 수치가 함께 표시됩니다.</td>
                 <td>중앙보다 가장자리에서 선이 더 휘는지(빨강에 가까운지), 보정 전/후 수치가
-                    얼마나 개선됐는지 봅니다. 0.5px 이하면 방사 왜곡이 사실상 제거된 것으로 봅니다.</td>
+                    얼마나 개선됐는지 봅니다. 절대 품질은 해상도와 초점거리를 반영한 정규화 지표로 판단합니다.</td>
             </tr>
             <tr>
                 <td><b>③ Model Comparison</b></td>

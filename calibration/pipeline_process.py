@@ -172,6 +172,29 @@ def run_outlier_pruning_and_validation(
     """이상치 반복 재계산 + Coverage 재분석 + Standard 4모델 재계산 + Hold-out
     재검증까지 전부 자식 프로세스 하나에서 실행한다.
 
+    설계 문서 9번 - Train/Test Leakage 완전 제거. 이 함수는 두 갈래로
+    나뉜다(app/cli.py의 `--outlier` 흐름과 동일한 원칙, validation.py 상단
+    주석 참고):
+
+    1. **최종 배포용 계산** - `dataset`(원본) 전체에 outlier pruning을 적용해
+       `ref_result`/`calibration_results`를 만든다. train/test 구분 없이
+       "좋은 데이터를 전부 쓴다"는 의도된 설계다(배포용 K/D는 애초에 평가
+       대상이 아니므로 leakage 개념 자체가 적용되지 않는다).
+    2. **Leak-safe Hold-out Validation** - outlier 판단 이전 상태를
+       deepcopy해둔 `validation_dataset`에서 **먼저 train/test로 분할**하고,
+       그 다음 train 서브셋에만 outlier pruning을 적용한다
+       (`recalibrate_train_with_outlier_pruning`) - test 프레임은 outlier
+       판단에 전혀 관여하지 않는다.
+
+    이전 버전은 (1)에서 만든 outlier-pruned `dataset`을 그대로
+    `run_models_and_validation`(내부에서 `validate_all_models`가 split을
+    수행)에 넘겨 validation까지 만들었다 - outlier 판단이 "분할 전" 전체
+    데이터셋에 적용됐으므로 test가 될 프레임의 정보가 outlier 판단에 이미
+    새어 들어간 뒤였다(전형적인 leakage). 이 함수는 현재 `app/cli.py`/
+    `ui/worker.py` 어디서도 호출되지 않는 dead code이지만(테스트에서만 참조),
+    나중에 UI가 연결하면 그대로 재발할 수 있는 지뢰라 leak-safe 경로로
+    다시 작성한다.
+
     주의 - dataset을 반드시 반환값에 포함시켜야 하는 이유:
     recalibrate_with_outlier_pruning()은 dataset.frames[i].status를
     DISABLED_OUTLIER로 바꾸는 in-place 부수효과가 있다. 같은 프로세스/스레드
@@ -182,11 +205,25 @@ def run_outlier_pruning_and_validation(
     교체해야 한다 - 안 그러면 "이상치 제외"가 반영되지 않는 조용한 버그가
     생긴다.
     """
+    import copy
+
     from calibration.outlier import recalibrate_with_outlier_pruning
     from calibration.quality import analyze_dataset_quality
     from calibration.frame_quality import compute_frame_quality_scores
     from calibration.models.common import infer_image_size
+    from calibration.models.pinhole import calibrate_pinhole
+    from calibration.validation import (
+        _subset_dataset,
+        recalibrate_train_with_outlier_pruning,
+        split_train_test,
+        validate_holdout,
+    )
 
+    # Leak-safe validation이 outlier 판단 이전 상태에서 출발하도록, 아래
+    # 전체 데이터 기준 outlier 제거를 적용하기 전에 복사해둔다.
+    validation_dataset = copy.deepcopy(dataset)
+
+    # --- 1. 최종 배포용 계산: 전체 데이터 기준 outlier 제거 ---
     ref_result, outlier_result = recalibrate_with_outlier_pruning(
         dataset, camera_config, reference_model,
         max_iterations=max_iterations,
@@ -197,12 +234,36 @@ def run_outlier_pruning_and_validation(
     image_size = infer_image_size(dataset, camera_config)
     compute_frame_quality_scores(dataset, pattern_config, image_size, use_reprojection=False)
 
-    calibration_results, validation_results, _object_releasing_result, _object_releasing_validation, _ro_comparison = (
+    calibration_results, _validation_results_leaky, _object_releasing_result, _object_releasing_validation, _ro_comparison = (
         run_models_and_validation(
             dataset, camera_config, pattern_config, test_ratio, model_jobs=2,
         )
     )
+    calibration_results[reference_model] = ref_result
 
     compute_frame_quality_scores(dataset, pattern_config, image_size, use_reprojection=True)
+
+    # --- 2. Leak-safe Hold-out Validation: 복사본에서 먼저 분할, 그 다음
+    #        train 서브셋에만 outlier pruning ---
+    train_ids, test_ids = split_train_test(validation_dataset, camera_config, test_ratio)
+    _, _val_outlier_result, ref_validation = recalibrate_train_with_outlier_pruning(
+        validation_dataset, camera_config, pattern_config, reference_model, train_ids, test_ids,
+        max_iterations=max_iterations,
+    )
+    validation_results = {reference_model: ref_validation}
+
+    # 나머지 모델도 leak-safe하게(같은 train/test 분할, K/D는 각 모델
+    # 자신의 train 서브셋에서만 확정) 평가한다 - app/cli.py의 --outlier
+    # 흐름과 동일한 패턴(fisheye는 pinhole 초기값으로 발산 방지).
+    train_subset = _subset_dataset(validation_dataset, train_ids)
+    pinhole_init = calibrate_pinhole(train_subset, camera_config)
+    for m in calibration_results:
+        if m == reference_model:
+            continue
+        fisheye_guess = pinhole_init if m == CameraModelType.FISHEYE else None
+        validation_results[m] = validate_holdout(
+            validation_dataset, camera_config, pattern_config, m, train_ids, test_ids,
+            fisheye_initial_guess=fisheye_guess,
+        )
 
     return dataset, ref_result, outlier_result, warnings, calibration_results, validation_results

@@ -229,4 +229,6 @@ def _calibrate_extended_pinhole_core(
         residual_stats=residual_stats,
         spatial_error_map=spatial_error_map,
         success=True,
+        input_frame_count=len(frames),
+        used_frame_count=len(frames),
     )

@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
+from calibration.error_normalization import fhd_equivalent_error, normalized_reprojection_error
 from calibration.types import (
     CalibrationResult,
     CameraConfig,
@@ -248,7 +249,8 @@ def _section_model_comparison(
 
     status_vals, train_vals, test_frame_vals, successful_test_frame_vals = [], [], [], []
     failed_test_frame_vals, failure_reason_vals, failure_detail_vals = [], [], []
-    test_vals, edge_vals, straight_vals = [], [], []
+    test_vals, test_macro_vals, edge_vals, straight_vals = [], [], [], []
+    frames_used_vals = []
     aic_vals, bic_vals, score_vals, confidence_vals, chosen_vals = [], [], [], [], []
     for m in _MODEL_ORDER:
         cal = calibration_results.get(m)
@@ -279,7 +281,15 @@ def _section_model_comparison(
         else:
             failure_detail_vals.append("-")
         train_vals.append(_fmt(cal.rms_error) if cal and cal.success else "FAIL")
+        if cal and cal.success and cal.input_frame_count > 0:
+            marker = " *" if cal.used_frame_count < cal.input_frame_count else ""
+            frames_used_vals.append(f"{cal.used_frame_count}/{cal.input_frame_count}{marker}")
+        else:
+            frames_used_vals.append("N/A")
         test_vals.append(_fmt(val.test_rms) if val and val.success else "N/A")
+        test_macro_vals.append(
+            _fmt(val.test_macro_rms) if val and val.success and val.test_macro_rms is not None else "N/A"
+        )
         if val and val.success and val.edge_rms is not None:
             edge_vals.append(_fmt(val.edge_rms))
         else:
@@ -312,12 +322,14 @@ def _section_model_comparison(
         '<table class="compare"><thead><tr><th></th>' + header + "</tr></thead><tbody>"
         + row("Validation Status", status_vals)
         + row("Train RMS", train_vals)
+        + row("Train Frames Used", frames_used_vals)
         + row("Test Frames", test_frame_vals)
         + row("Successful Test Frames", successful_test_frame_vals)
         + row("Failed Test Frames", failed_test_frame_vals)
         + row("Failure Reason", failure_reason_vals)
         + row("Pose Failure Detail (per frame)", failure_detail_vals)
         + row("Test RMS", test_vals)
+        + row("Test Macro RMS", test_macro_vals)
         + row("Test Edge RMS", edge_vals)
         + row("Straightness", straight_vals)
         + row("AIC", aic_vals)
@@ -489,16 +501,46 @@ def _section_bootstrap_stability(calibration_results: dict[CameraModelType, Cali
     )
 
 
-def _section_final_summary(final: FinalResult) -> str:
+def _section_final_summary(final: FinalResult, camera_config: CameraConfig) -> str:
     cal, val, conf = final.calibration, final.validation, final.confidence
+    image_size = (camera_config.width, camera_config.height)
+
+    def normalized(value: float | None) -> str:
+        metric = normalized_reprojection_error(value, cal.camera_matrix if cal else None)
+        return f"{metric:.6f}" if metric is not None else "N/A"
+
+    def fhd(value: float | None) -> str:
+        metric = fhd_equivalent_error(value, image_size)
+        return f"{metric:.3f}px" if metric is not None else "N/A (aspect ratio incompatible)"
+
+    train = cal.rms_error if cal else None
+    test = val.test_rms if val else None
+    p95 = val.test_residual_stats.p95 if val and val.test_residual_stats else None
+    edge = val.edge_rms if val else None
     rows = [
         ("Chosen Model", _MODEL_LABELS.get(final.chosen_model, final.chosen_model.value)),
         ("Overall Grade", final.overall_grade.value.upper()),
         ("Final Calibration Confidence", f"{conf.score:.0f}/100 - {conf.level}" if conf else "N/A"),
-        ("Train RMS", _fmt(cal.rms_error if cal else None)),
-        ("Test RMS", _fmt(val.test_rms if val else None)),
-        ("Test P95", _fmt(val.test_residual_stats.p95 if val and val.test_residual_stats else None)),
-        ("Edge RMS", _fmt(val.edge_rms if val else None)),
+        ("Image Resolution", f"{camera_config.width}x{camera_config.height}"),
+        ("Train RMS", _fmt(train)),
+        ("Normalized Train RMS", normalized(train)),
+        ("FHD-equivalent Train RMS", fhd(train)),
+        (
+            "Train Frames Used",
+            f"{cal.used_frame_count}/{cal.input_frame_count}"
+            + (" (some frames auto-excluded)" if cal.used_frame_count < cal.input_frame_count else "")
+            if cal and cal.input_frame_count > 0 else "N/A",
+        ),
+        ("Test RMS", _fmt(test)),
+        ("Test Macro RMS", _fmt(val.test_macro_rms) if val else "N/A"),
+        ("Normalized Test RMS", normalized(test)),
+        ("FHD-equivalent Test RMS", fhd(test)),
+        ("Test P95", _fmt(p95)),
+        ("Normalized Test P95", normalized(p95)),
+        ("FHD-equivalent Test P95", fhd(p95)),
+        ("Edge RMS", _fmt(edge)),
+        ("Normalized Edge RMS", normalized(edge)),
+        ("FHD-equivalent Edge RMS", fhd(edge)),
         ("Straightness", _fmt(val.straightness_residual if val else None)),
         ("Dataset Coverage", f"{final.dataset_coverage_pct:.1f}%" if final.dataset_coverage_pct is not None else "N/A"),
         (
@@ -1025,7 +1067,7 @@ def generate_html_report(
 {_section_cross_dataset(cross_dataset_results)}
 
 <h2>Final Calibration Summary</h2>
-{_section_final_summary(final_result)}
+{_section_final_summary(final_result, camera_config)}
 
 <h2>Overall Quality</h2>
 <div class="grade-box" style="background:{grade_color};">

@@ -428,14 +428,20 @@ class PaperExperimentMetadata:
     k: int
     n_repeats: int
     base_seed: int
-    camera_installation: str = "behind windshield"
-    target_location: str = "outside windshield"
+    # 설치 위치는 데이터만 보고 추론할 수 없다. 명시적으로 전달된 경우에만
+    # export하고, 기본값으로 특정 실험 조건을 주장하지 않는다.
+    camera_installation: Optional[str] = None
+    target_location: Optional[str] = None
     evaluation_roi: Optional[dict] = None
     opencv_version: str = ""
     git_commit_sha: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        for optional_condition in ("camera_installation", "target_location"):
+            if data[optional_condition] is None:
+                data.pop(optional_condition)
+        return data
 
 
 def _git_commit_sha() -> Optional[str]:
@@ -458,6 +464,9 @@ def build_paper_metadata(
     n_repeats: int,
     base_seed: int,
     roi: EvaluationROI | None = None,
+    *,
+    camera_installation: str | None = None,
+    target_location: str | None = None,
 ) -> PaperExperimentMetadata:
     import cv2
 
@@ -476,6 +485,8 @@ def build_paper_metadata(
         board_geometry=board,
         num_usable_frames=usable,
         k=k, n_repeats=n_repeats, base_seed=base_seed,
+        camera_installation=camera_installation,
+        target_location=target_location,
         evaluation_roi=roi_dict,
         opencv_version=cv2.__version__,
         git_commit_sha=_git_commit_sha(),

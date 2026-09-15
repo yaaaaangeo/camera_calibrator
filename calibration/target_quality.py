@@ -31,9 +31,13 @@ _CORNER_CONFIDENCE_WARN = 0.5    # 이론상 코너의 50% 미만만 검출되�
 _EDGE_MARGIN_WARN_PX = 15.0      # 코너가 이미지 경계에서 이보다 가까우면 경고
 _EDGE_MARGIN_CUTOFF_PX = 3.0     # 이보다 가까우면 "잘렸을 가능성" 격상
 
-_TILT_WARN_DEG = 55.0            # minAreaRect 각도(대략 in-plane 회전) 절대값이 이보다 크면 경고
+_TILT_WARN_DEG = 55.0            # minAreaRect 각도(in-plane 회전) 절대값이 이보다 크면 경고 -
+                                  # yaw_deg/pitch_deg(estimate_rough_pose, 진짜 3D 회전)를 계산할
+                                  # 수 없는 프레임에서만 쓰는 fallback.
                                   # (참고: 이 값은 "완전히 옆으로 누운" 정도의 극단치를 잡기 위함
                                   #  - 일반적인 원근 기울기는 board_area_ratio/hull 형태로 더 잘 보임)
+_YAW_PITCH_WARN_DEG = 55.0        # yaw/pitch(진짜 3D 회전) 절대값 기준 - _TILT_WARN_DEG와 동일한
+                                  # 극단치 철학을 3D 축 각각에 적용.
 
 # board_area_ratio 선호 구간 - frame_quality.py의 _area_preference_score와
 # 정확히 같은 값을 쓴다 (같은 "적정 크기" 기준이 두 모듈에서 다르면 혼란스러움)
@@ -135,10 +139,26 @@ def evaluate_target_quality(
                 f"({AREA_SWEET_LOW:.0%}~{AREA_SWEET_HIGH:.0%}) 밖입니다.",
             ))
 
-    if detection.board_tilt_deg is not None and abs(detection.board_tilt_deg) > _TILT_WARN_DEG:
+    if detection.yaw_deg is not None and detection.pitch_deg is not None:
+        # 진짜 3D 회전(estimate_rough_pose)을 계산할 수 있으면 yaw/pitch를
+        # 각각 판정한다 - 2D board_tilt_deg 하나로는 "옆으로 누운 것"과
+        # "위아래로 기운 것"을 구분할 수 없었다.
+        if abs(detection.yaw_deg) > _YAW_PITCH_WARN_DEG:
+            issues.append(TargetQualityIssue(
+                "board_yaw_extreme", TargetQualitySeverity.WARNING,
+                f"보드 yaw(좌우 회전) 추정치 {detection.yaw_deg:.1f}\u00b0 - 매우 큰 각도로 "
+                "촬영되어 코너 검출/재투영 정밀도가 떨어질 수 있습니다.",
+            ))
+        if abs(detection.pitch_deg) > _YAW_PITCH_WARN_DEG:
+            issues.append(TargetQualityIssue(
+                "board_pitch_extreme", TargetQualitySeverity.WARNING,
+                f"보드 pitch(상하 회전) 추정치 {detection.pitch_deg:.1f}\u00b0 - 매우 큰 각도로 "
+                "촬영되어 코너 검출/재투영 정밀도가 떨어질 수 있습니다.",
+            ))
+    elif detection.board_tilt_deg is not None and abs(detection.board_tilt_deg) > _TILT_WARN_DEG:
         issues.append(TargetQualityIssue(
             "board_tilt_extreme", TargetQualitySeverity.WARNING,
-            f"보드 기울기 추정치 {detection.board_tilt_deg:.1f}\u00b0 - 매우 큰 각도로 "
+            f"보드 in-plane 회전 추정치(2D) {detection.board_tilt_deg:.1f}\u00b0 - 매우 큰 각도로 "
             "촬영되어 코너 검출/재투영 정밀도가 떨어질 수 있습니다.",
         ))
 

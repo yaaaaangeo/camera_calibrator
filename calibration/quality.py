@@ -21,7 +21,15 @@ from calibration.types import (
     CameraConfig, CoverageCell, Dataset, DistributionStat, DiversityScores, Frame,
     PoseDistributionStats,
 )
-from calibration.models.common import infer_image_size
+from calibration.models.common import estimate_rough_pose, infer_image_size
+
+# Re-exported for backward compatibility - the implementation now lives in
+# models/common.py so detector.py/image_selection.py/scene_quality.py/
+# frame_quality.py/target_quality.py can all share it without importing this
+# (higher-level, "judge already-computed data") module. See
+# models.common.estimate_rough_pose for the sign convention every consumer
+# must follow.
+_estimate_rough_pose = estimate_rough_pose
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +200,30 @@ def _distance_diversity_from_area_ratios(area_ratios: list[float]) -> float:
 
 
 def _rotation_diversity_from_tilts(tilts: list[float]) -> float:
-    """자세(기울기) 다양성. 위 함수와 같은 이유로 공용화."""
+    """자세(기울기) 다양성 - 2D 근사치(board_tilt_deg) 기반 fallback.
+    위 함수와 같은 이유로 공용화. yaw/pitch/roll을 계산할 수 없을 때만 쓴다
+    (아래 _rotation_diversity_from_poses 참고).
+    """
     return _normalized_spread(tilts, full_score_spread=30.0)  # 표준편차 30도 이상이면 만점
+
+
+def _rotation_diversity_from_poses(
+    yaws: list[float], pitches: list[float], rolls: list[float]
+) -> float | None:
+    """진짜 3D 회전(yaw/pitch/roll) 기반 자세 다양성 - board_tilt_deg 2D 근사
+    대신 우선 사용한다. compute_pose_distribution_stats의 _stat_absolute가
+    yaw/pitch/roll에 쓰는 것과 동일한 full_spread=20.0(표준편차 20도 이상이면
+    만점) 관례를 그대로 재사용한다. 계산 가능한 프레임이 2장 미만이면
+    (estimate_rough_pose가 전부 실패했거나 데이터셋이 너무 작음) None을
+    반환해 호출부가 2D 근사치로 fallback하게 한다.
+    """
+    if len(yaws) < 2:
+        return None
+    axes_scores = [
+        _normalized_spread(axis, full_score_spread=20.0)
+        for axis in (yaws, pitches, rolls)
+    ]
+    return float(sum(axes_scores) / len(axes_scores))
 
 
 def compute_diversity_scores(
@@ -232,8 +262,15 @@ def compute_diversity_scores(
     area_ratios = [f.detection.board_area_ratio for f in frames if f.detection.board_area_ratio is not None]
     distance_diversity = _distance_diversity_from_area_ratios(area_ratios)
 
-    tilts = [f.detection.board_tilt_deg for f in frames if f.detection.board_tilt_deg is not None]
-    rotation_diversity = _rotation_diversity_from_tilts(tilts)
+    yaws = [f.detection.yaw_deg for f in frames if f.detection.yaw_deg is not None]
+    pitches = [f.detection.pitch_deg for f in frames if f.detection.pitch_deg is not None]
+    rolls = [f.detection.roll_deg for f in frames if f.detection.roll_deg is not None]
+    rotation_diversity = _rotation_diversity_from_poses(yaws, pitches, rolls)
+    if rotation_diversity is None:
+        # Too few frames have a solvable pose (or legacy project without
+        # cached yaw/pitch/roll) - fall back to the 2D minAreaRect proxy.
+        tilts = [f.detection.board_tilt_deg for f in frames if f.detection.board_tilt_deg is not None]
+        rotation_diversity = _rotation_diversity_from_tilts(tilts)
 
     return DiversityScores(
         position_coverage=position_coverage,
@@ -406,54 +443,11 @@ def analyze_dataset_quality(
 # 기존 DiversityScores(0~1 점수 4개)는 "다양한가/아닌가"만 보여줬다. 여기서는
 # X/Y 위치, board 크기, yaw/pitch/roll, 거리를 각각 mean/std/variance +
 # coverage 점수로 분해해서 "정확히 어느 축이 부족한지" 보여준다.
-
-def _estimate_rough_pose(
-    object_points: np.ndarray, image_points: np.ndarray, image_size: tuple[int, int]
-) -> tuple[float, float, float, float] | None:
-    """cv2.solvePnP로 (yaw, pitch, roll, distance)를 거칠게 추정한다.
-
-    아직 실제 카메라 파라미터를 모르는 단계(캘리브레이션 전)이므로 K를
-    "focal length = max(w,h)"라는 흔한 경험적 근사로 가정한다 - 절대값은
-    부정확할 수 있지만, 데이터셋 안에서 "자세가 얼마나 다양했는가"를 상대
-    비교하는 진단 목적에는 이 정도 근사로 충분하다 (실제 캘리브레이션
-    결과와는 무관하고, 오직 이 함수만을 위한 임시 가정).
-
-    회전 각도는 표준 R->Euler(XYZ) 분해를 쓴다: pitch=X축, yaw=Y축, roll=Z축
-    회전. distance는 tvec의 노름(카메라 원점에서 보드 원점까지 거리, object
-    points와 같은 단위=보통 미터)이다.
-    """
-    if object_points is None or image_points is None or len(object_points) < 4:
-        return None
-
-    w, h = image_size
-    f_guess = float(max(w, h))
-    K_guess = np.array(
-        [[f_guess, 0, w / 2.0], [0, f_guess, h / 2.0], [0, 0, 1]], dtype=np.float64
-    )
-    obj = object_points.reshape(-1, 1, 3).astype(np.float64)
-    img = image_points.reshape(-1, 1, 2).astype(np.float64)
-
-    try:
-        ok, rvec, tvec = cv2.solvePnP(obj, img, K_guess, None)
-    except cv2.error:
-        return None
-    if not ok:
-        return None
-
-    R, _ = cv2.Rodrigues(rvec)
-    sy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
-    if sy > 1e-6:
-        pitch = math.atan2(R[2, 1], R[2, 2])
-        yaw = math.atan2(-R[2, 0], sy)
-        roll = math.atan2(R[1, 0], R[0, 0])
-    else:
-        # 짐벌락 근접 - roll을 0으로 두고 pitch만으로 근사 (드문 극단 케이스)
-        pitch = math.atan2(-R[1, 2], R[1, 1])
-        yaw = math.atan2(-R[2, 0], sy)
-        roll = 0.0
-
-    distance = float(np.linalg.norm(tvec))
-    return math.degrees(yaw), math.degrees(pitch), math.degrees(roll), distance
+#
+# _estimate_rough_pose 실제 구현은 models/common.py::estimate_rough_pose로
+# 옮겼다(모듈 상단의 재노출 참고) - detector.py를 포함한 더 많은 소비처가
+# 이 모듈(quality.py, "이미 계산된 데이터를 판단하는" 상위 계층)을 다시
+# import하지 않고도 같은 pose 정의를 쓸 수 있게 하기 위함.
 
 
 def _stat_absolute(values: list[float], full_spread: float) -> DistributionStat:
@@ -510,7 +504,19 @@ def compute_pose_distribution_stats(
 
     yaws, pitches, rolls, distances = [], [], [], []
     for f in frames:
-        pose = _estimate_rough_pose(f.detection.object_points, f.detection.corners, image_size)
+        det = f.detection
+        if det.yaw_deg is not None:
+            # detector.py already computed this at detection time - reuse it
+            # instead of running solvePnP again.
+            yaws.append(det.yaw_deg)
+            pitches.append(det.pitch_deg)
+            rolls.append(det.roll_deg)
+            if det.distance_m is not None:
+                distances.append(det.distance_m)
+            continue
+        # Legacy project loaded from before DetectionResult had cached pose -
+        # compute it now instead of leaving this frame out silently.
+        pose = estimate_rough_pose(det.object_points, det.corners, image_size)
         if pose is None:
             continue
         yaw, pitch, roll, distance = pose

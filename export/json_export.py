@@ -24,6 +24,11 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from calibration.error_normalization import (
+    fhd_equivalent_error,
+    mean_focal_length,
+    normalized_reprojection_error,
+)
 from calibration.json_utils import json_safe
 from calibration.types import (
     CalibrationResult,
@@ -151,24 +156,65 @@ def _bootstrap_stability_summary(calibration_results: dict[CameraModelType, Cali
     return summary
 
 
-def _final_calibration_summary(final_result: FinalResult | None) -> dict | None:
+def _normalized_metrics(
+    values: dict[str, float | None],
+    calibration: CalibrationResult | None,
+    image_size: tuple[int, int] | None,
+) -> dict:
+    matrix = calibration.camera_matrix if calibration else None
+    return {
+        "mean_focal_length_px": mean_focal_length(matrix),
+        "normalized": {
+            name: normalized_reprojection_error(value, matrix) for name, value in values.items()
+        },
+        "fhd_equivalent_px": {
+            name: fhd_equivalent_error(value, image_size) for name, value in values.items()
+        },
+        "fhd_equivalent_available": fhd_equivalent_error(0.0, image_size) is not None,
+        "fhd_equivalent_note": (
+            None if fhd_equivalent_error(0.0, image_size) is not None
+            else "N/A: image size is missing or its aspect ratio is not compatible with 1920x1080."
+        ),
+    }
+
+
+def _final_calibration_summary(
+    final_result: FinalResult | None,
+    image_size: tuple[int, int] | None = None,
+) -> dict | None:
     if final_result is None:
         return None
     cal = final_result.calibration
     val = final_result.validation
+    values = {
+        "train_rms": cal.rms_error if cal else None,
+        "test_rms": val.test_rms if val else None,
+        "test_p95": val.test_residual_stats.p95 if val and val.test_residual_stats else None,
+        "test_p99": val.test_residual_stats.p99 if val and val.test_residual_stats else None,
+        "edge_rms": val.edge_rms if val else None,
+        "straightness_residual": val.straightness_residual if val else None,
+    }
     return {
         "chosen_model": final_result.chosen_model.value,
         "overall_grade": final_result.overall_grade.value,
         "confidence": final_result.confidence,
         "train_rms_px": cal.rms_error if cal else None,
         "test_rms_px": val.test_rms if val else None,
+        "test_macro_rms_px": val.test_macro_rms if val else None,
         "test_p95_px": val.test_residual_stats.p95 if val and val.test_residual_stats else None,
         "edge_rms_px": val.edge_rms if val else None,
         "straightness_residual_px": val.straightness_residual if val else None,
+        "train_frame_accounting": {
+            "input_frame_count": cal.input_frame_count if cal else None,
+            "used_frame_count": cal.used_frame_count if cal else None,
+            "excluded_frame_ids": cal.excluded_frame_ids if cal else [],
+            "exclusion_reason": cal.exclusion_reason if cal else None,
+        },
         "dataset_coverage_pct": final_result.dataset_coverage_pct,
         "observability": cal.observability if cal else None,
         "undistortion_quality": cal.undistortion_quality if cal else None,
         "diagnosis": final_result.diagnosis,
+        "resolution_metrics": _normalized_metrics(values, cal, image_size),
     }
 
 
@@ -225,6 +271,16 @@ def build_export_dict(
             "error_message": cal.error_message,
         }
         if cal.success:
+            metric_values = {
+                "train_rms": cal.rms_error,
+                "train_p95": cal.residual_stats.p95 if cal.residual_stats else None,
+                "train_p99": cal.residual_stats.p99 if cal.residual_stats else None,
+                "test_rms": val.test_rms if val else None,
+                "test_p95": val.test_residual_stats.p95 if val and val.test_residual_stats else None,
+                "test_p99": val.test_residual_stats.p99 if val and val.test_residual_stats else None,
+                "edge_rms": val.edge_rms if val else None,
+                "straightness_residual": val.straightness_residual if val else None,
+            }
             entry.update({
                 "camera_matrix": cal.camera_matrix,
                 "distortion_coefficients": cal.distortion,
@@ -238,12 +294,31 @@ def build_export_dict(
                 "residual_stats": cal.residual_stats,
                 "observability": cal.observability,
                 "undistortion_quality": cal.undistortion_quality,
+                "resolution_metrics": _normalized_metrics(
+                    metric_values, cal, (camera_config.width, camera_config.height)
+                ),
+                # Fisheye의 robust fallback(불안정 프레임 자동 제외)처럼 fit에
+                # 실제로 쓰인 프레임 수가 입력보다 작을 수 있는 모델을 위한
+                # 구조화된 회계 - Train RMS를 모델 간 비교할 때 데이터셋 크기가
+                # 다를 수 있다는 사실을 기계가 읽을 수 있게 남긴다. Pinhole/
+                # Brown-Conrady/Rational은 input==used, excluded_frame_ids=[].
+                "train_frame_accounting": {
+                    "input_frame_count": cal.input_frame_count,
+                    "used_frame_count": cal.used_frame_count,
+                    "excluded_frame_ids": cal.excluded_frame_ids,
+                    "exclusion_reason": cal.exclusion_reason,
+                },
+                "warning_message": cal.warning_message,
             })
         if val is not None:
             entry["validation"] = {
                 "success": val.success,
                 "train_rms_px": val.train_rms,
                 "test_rms_px": val.test_rms,
+                # Pooled(전체 test corner 기준) 정의로 통일 - train_rms와
+                # 동일한 observation weighting. 이전 frame-equal 정의는
+                # test_macro_rms_px로 보존.
+                "test_macro_rms_px": val.test_macro_rms,
                 "edge_rms_px": val.edge_rms,
                 "line_straightness_residual_px": val.straightness_residual,
                 "line_straightness_source": val.straightness_source,
@@ -282,7 +357,9 @@ def build_export_dict(
             "dataset_coverage_pct": final_result.dataset_coverage_pct,
             "diagnosis": final_result.diagnosis,
         }
-        payload["final_calibration_summary"] = _final_calibration_summary(final_result)
+        payload["final_calibration_summary"] = _final_calibration_summary(
+            final_result, (camera_config.width, camera_config.height)
+        )
         if final_result.outlier:
             payload["final_result"]["outlier"] = {
                 "removed_frame_ids": final_result.outlier.removed_frame_ids,

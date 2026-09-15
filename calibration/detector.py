@@ -48,6 +48,7 @@ import cv2
 import numpy as np
 
 from calibration.image_quality import compute_contrast, compute_motion_blur_score, compute_phash, compute_saturation
+from calibration.models.common import estimate_rough_pose, rough_camera_matrix
 from calibration.process_control import (
     PipelineCancelled,
     safe_process_pool_context,
@@ -247,6 +248,55 @@ def _compute_board_geometry(
     return board_area_ratio, (cx, cy), tilt_deg, min_edge_margin_px
 
 
+def _estimate_full_board_footprint(
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    full_board_object_points: np.ndarray,
+    image_shape: tuple[int, int],
+) -> tuple[float, tuple[float, float]] | None:
+    """Partial ChArUco/AprilGrid 검출에서 board_center_px/board_area_ratio를
+    검출된 코너만으로 계산하면(위 _compute_board_geometry) 실제 보드가 화면
+    밖으로 크게 걸쳐 있어도 "안쪽/작게" 보이는 체계적 편향이 생긴다 - 예를
+    들어 실제로는 오른쪽 가장자리에 크게 있는 보드가 일부 코너만 검출되면
+    중심이 안쪽으로, 면적이 실제보다 작게 추정된다.
+
+    검출된 correspondence로 solvePnP한 뒤(estimate_rough_pose와 동일한 rough
+    K 관례 재사용), 전체 보드의 3D 코너를 그 pose로 투영해서 진짜
+    footprint(중심/면적)를 추정한다 - 화면 밖으로 나간 코너까지 포함해서
+    convexHull을 구하므로 부분 검출에도 흔들리지 않는다.
+
+    호출부는 detected_count == 전체 보드 코너 수(=이미 다 보임)일 때는 이
+    함수를 부를 필요가 없다 - 그 경우 기존 convexHull(검출된 코너)과 결과가
+    같다. solvePnP 실패/포인트 부족/투영 실패 시 None을 반환(예외 없음) -
+    호출부는 기존 _compute_board_geometry 결과로 그대로 fallback해야 한다.
+    """
+    if object_points is None or image_points is None or len(object_points) < 4:
+        return None
+    h, w = image_shape
+    K_guess = rough_camera_matrix((w, h))
+    obj = np.asarray(object_points, dtype=np.float64).reshape(-1, 1, 3)
+    img = np.asarray(image_points, dtype=np.float64).reshape(-1, 1, 2)
+    full_obj = np.asarray(full_board_object_points, dtype=np.float64).reshape(-1, 1, 3)
+
+    try:
+        ok, rvec, tvec = cv2.solvePnP(obj, img, K_guess, None)
+        if not ok:
+            return None
+        projected, _ = cv2.projectPoints(full_obj, rvec, tvec, K_guess, None)
+    except cv2.error:
+        return None
+
+    pts = projected.reshape(-1, 2).astype(np.float32)
+    if pts.shape[0] < 3 or not np.all(np.isfinite(pts)):
+        return None
+
+    hull = cv2.convexHull(pts)
+    hull_area = cv2.contourArea(hull)
+    area_ratio = float(hull_area / (w * h)) if (w * h) > 0 else 0.0
+    cx, cy = float(np.mean(pts[:, 0])), float(np.mean(pts[:, 1]))
+    return area_ratio, (cx, cy)
+
+
 def detect_charuco(
     image: np.ndarray,
     board: cv2.aruco.CharucoBoard,
@@ -292,6 +342,16 @@ def detect_charuco(
     max_possible = max(1, (squares_x - 1) * (squares_y - 1))
     corner_confidence = float(min(1.0, num_corners / max_possible))
 
+    if num_corners < max_possible:
+        footprint = _estimate_full_board_footprint(
+            object_points, image_points, board.getChessboardCorners(), gray.shape[:2]
+        )
+        if footprint is not None:
+            area_ratio, center_px = footprint
+
+    pose = estimate_rough_pose(object_points, image_points, gray.shape[:2])
+    yaw_deg, pitch_deg, roll_deg, distance_m = pose if pose else (None, None, None, None)
+
     return DetectionResult(
         image_id=image_id,
         success=True,
@@ -304,6 +364,10 @@ def detect_charuco(
         board_tilt_deg=tilt_deg,
         corner_confidence=corner_confidence,
         min_edge_margin_px=min_edge_margin_px,
+        yaw_deg=yaw_deg,
+        pitch_deg=pitch_deg,
+        roll_deg=roll_deg,
+        distance_m=distance_m,
     )
 
 
@@ -498,6 +562,8 @@ def detect_chessboard(
     object_points = build_chessboard_object_points(pattern)
 
     area_ratio, center_px, tilt_deg, min_edge_margin_px = _compute_board_geometry(corners, gray.shape[:2])
+    pose = estimate_rough_pose(object_points, corners, gray.shape[:2])
+    yaw_deg, pitch_deg, roll_deg, distance_m = pose if pose else (None, None, None, None)
 
     return DetectionResult(
         image_id=image_id,
@@ -513,6 +579,10 @@ def detect_chessboard(
         # (ChArUco처럼 일부만 검출되는 경우가 없음) confidence는 항상 1.0.
         corner_confidence=1.0,
         min_edge_margin_px=min_edge_margin_px,
+        yaw_deg=yaw_deg,
+        pitch_deg=pitch_deg,
+        roll_deg=roll_deg,
+        distance_m=distance_m,
     )
 
 
@@ -607,6 +677,8 @@ def detect_circle_grid(
 
     area_ratio, center_px, tilt_deg, min_edge_margin_px = _compute_board_geometry(centers, gray.shape[:2])
     ids = np.arange(centers.shape[0], dtype=np.int32).reshape(-1, 1)
+    pose = estimate_rough_pose(object_points, centers, gray.shape[:2])
+    yaw_deg, pitch_deg, roll_deg, distance_m = pose if pose else (None, None, None, None)
     return DetectionResult(
         image_id=image_id,
         success=True,
@@ -619,7 +691,38 @@ def detect_circle_grid(
         board_tilt_deg=tilt_deg,
         corner_confidence=1.0,
         min_edge_margin_px=min_edge_margin_px,
+        yaw_deg=yaw_deg,
+        pitch_deg=pitch_deg,
+        roll_deg=roll_deg,
+        distance_m=distance_m,
     )
+
+
+def _full_aprilgrid_object_points(pattern: PatternConfig) -> np.ndarray:
+    """detect_aprilgrid의 per-tag 3D 코너 조립 공식을, 검출 여부와 무관하게
+    전체 격자(0..total_tags-1)에 대해 그대로 반복한다 - Partial 검출 시
+    _estimate_full_board_footprint에 넘길 "전체 보드" 좌표가 필요해서다.
+    """
+    total_tags = pattern.squares_x * pattern.squares_y
+    size = float(pattern.marker_size)
+    corners = []
+    for marker_id in range(total_tags):
+        row = marker_id // pattern.squares_x
+        col = marker_id % pattern.squares_x
+        x0 = col * pattern.square_size
+        y0 = row * pattern.square_size
+        corners.append(
+            np.array(
+                [
+                    [x0, y0, 0.0],
+                    [x0 + size, y0, 0.0],
+                    [x0 + size, y0 + size, 0.0],
+                    [x0, y0 + size, 0.0],
+                ],
+                dtype=np.float32,
+            )
+        )
+    return np.concatenate(corners, axis=0)
 
 
 def detect_aprilgrid(
@@ -707,6 +810,15 @@ def detect_aprilgrid(
     area_ratio, center_px, tilt_deg, min_edge_margin_px = _compute_board_geometry(corners, gray.shape[:2])
     corner_confidence = float(min(1.0, valid_marker_count / max(1, total_tags)))
 
+    if valid_marker_count < total_tags:
+        full_board_obj = _full_aprilgrid_object_points(pattern)
+        footprint = _estimate_full_board_footprint(obj, corners, full_board_obj, gray.shape[:2])
+        if footprint is not None:
+            area_ratio, center_px = footprint
+
+    pose = estimate_rough_pose(obj, corners, gray.shape[:2])
+    yaw_deg, pitch_deg, roll_deg, distance_m = pose if pose else (None, None, None, None)
+
     return DetectionResult(
         image_id=image_id,
         success=True,
@@ -719,6 +831,10 @@ def detect_aprilgrid(
         board_tilt_deg=tilt_deg,
         corner_confidence=corner_confidence,
         min_edge_margin_px=min_edge_margin_px,
+        yaw_deg=yaw_deg,
+        pitch_deg=pitch_deg,
+        roll_deg=roll_deg,
+        distance_m=distance_m,
     )
 
 

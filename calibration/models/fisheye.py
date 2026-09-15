@@ -442,7 +442,8 @@ def calibrate_fisheye(
         warning_message = (
             f"Fisheye 초기 자세 추정이 불안정한 프레임 {len(excluded_ids)}장을 "
             f"자동 제외하고 계산했습니다 ({preview}{more}). Dataset 탭에서 "
-            f"'제외됨(이상치)' 상태로 표시됩니다 - 필요하면 원본 촬영을 다시 검토하세요."
+            f"'제외됨(이상치)' 상태로 표시됩니다 - 필요하면 원본 촬영을 다시 검토하세요. "
+            f"이 모델의 Train RMS는 전체 프레임을 쓴 다른 모델과 직접 비교할 수 없습니다."
         )
 
     return CalibrationResult(
@@ -461,4 +462,10 @@ def calibrate_fisheye(
         spatial_error_map=spatial_error_map,
         success=True,
         warning_message=warning_message,
+        input_frame_count=len(frames) + len(excluded_indices),
+        used_frame_count=len(frames),
+        excluded_frame_ids=excluded_ids if excluded_indices else [],
+        exclusion_reason=(
+            "fisheye_unstable_initialization" if excluded_indices else None
+        ),
     )

@@ -36,6 +36,7 @@ from enum import Enum
 
 import numpy as np
 
+from calibration.error_normalization import reference_equivalent_error
 from calibration.types import CalibrationResult, CameraConfig, CameraModelType
 
 
@@ -99,8 +100,8 @@ _FOCAL_LENGTH_MIN_RATIO = 0.15
 _FOCAL_LENGTH_MAX_RATIO = 8.0
 
 _ASPECT_RATIO_WARN_PCT = 5.0   # fx/fy가 서로 이 % 이상 차이나면 경고
-_RMS_WARNING_PX = 1.0
-_RMS_ERROR_PX = 3.0
+_RMS_WARNING_REFERENCE_PX = 1.0
+_RMS_ERROR_REFERENCE_PX = 3.0
 _DISTORTION_ABS_MIN = 1e-4   # 이보다 작으면 "사실상 왜곡 없음"으로 본다 (parameter가 비정상적으로 작은 경우)
 
 # FOV 스펙(camera_config.hfov_deg/vfov_deg, 문서 38번 "제조사 spec 입력")과
@@ -310,13 +311,16 @@ def _check_fov(
 def _check_rms(result: CalibrationResult, issues: list[SanityIssue]) -> None:
     if result.rms_error is None:
         return
-    if result.rms_error > _RMS_ERROR_PX:
+    rms_quality = reference_equivalent_error(result.rms_error, result.camera_matrix)
+    if rms_quality is None:
+        rms_quality = result.rms_error
+    if rms_quality > _RMS_ERROR_REFERENCE_PX:
         issues.append(SanityIssue(
             "rms_very_high", SanitySeverity.WARNING,
             f"Train RMS={result.rms_error:.3f}px - 매우 높습니다 "
             "(검출 오류/이상치/모델 불일치 가능성이 있습니다).",
         ))
-    elif result.rms_error > _RMS_WARNING_PX:
+    elif rms_quality > _RMS_WARNING_REFERENCE_PX:
         issues.append(SanityIssue(
             "rms_high", SanitySeverity.WARNING,
             f"Train RMS={result.rms_error:.3f}px - 다소 높은 편입니다.",

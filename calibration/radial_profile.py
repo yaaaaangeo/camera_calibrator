@@ -25,7 +25,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from calibration.models.common import project_points_for_model
+from calibration.models.common import active_correspondences, project_points_for_model
 from calibration.types import CameraModelType, Frame, RadialBin, RadialErrorProfile
 
 
@@ -62,6 +62,14 @@ def collect_per_point_vectors(
     "코너마다 projectPoints를 부르고 detected와 비교하는" 투영 로직 자체가
     두 곳에 따로 있으면 언젠가 한쪽만 고치는 사고가 난다.
 
+    설계 문서 16번 - corner-level outlier로 제외된 코너(excluded_corner_indices)
+    는 calibrateCamera 입력(collect_calibration_inputs)뿐 아니라 여기서도
+    active_correspondences로 동일하게 빠진다. 이 함수가 regional/radial/
+    residual_stats/spatial_error_map 전부의 공통 투영 경로이므로, 여기 한
+    곳만 필터링하면 그 네 metric이 전부 같은 active correspondence set을
+    쓰게 된다(제외 전과 후에 metric마다 다른 observation set을 쓰던 불일치
+    수정).
+
     Returns:
         (xs, ys, dxs, dys) - 전부 1차원 배열, 길이가 같다. 계산 가능한
         포인트가 하나도 없으면 빈 배열 네 개를 반환한다(예외를 던지지 않음).
@@ -79,13 +87,17 @@ def collect_per_point_vectors(
         if not det or det.object_points is None or det.corners is None:
             continue
 
+        obj, corners = active_correspondences(det)
+        if obj.shape[0] == 0:
+            continue
+
         try:
-            projected = _project(det.object_points, rvec, tvec, camera_matrix, distortion, model)
+            projected = _project(obj, rvec, tvec, camera_matrix, distortion, model)
         except cv2.error:
             # 한 프레임의 pose/투영이 잘못돼도 전체 계산이 죽지 않게 건너뛴다.
             continue
 
-        detected = det.corners.reshape(-1, 2)
+        detected = corners.reshape(-1, 2)
         if detected.shape[0] != projected.shape[0]:
             continue
 

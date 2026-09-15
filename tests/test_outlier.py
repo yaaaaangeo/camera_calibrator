@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import pytest
 
 from calibration.models.common import collect_calibration_inputs
 from calibration.outlier import (
@@ -190,6 +191,96 @@ def test_brown_conrady_corner_outlier_pruning_succeeds(synthetic_dataset, camera
     assert corner_outlier_result.rms_before is not None
     assert result.distortion is not None
     assert result.distortion.size == 5
+
+
+def test_excluded_corner_indices_consistently_removed_from_every_metric(
+    synthetic_dataset, camera_config,
+):
+    """Test 7 (계획 문서 11번, Problem 4) - excluded_corner_indices로 제외한
+    코너가 calibration RMS뿐 아니라 residual_stats(P95/P99)/regional_error/
+    radial_profile/radial_bands/spatial_error_map에서도 전부 제외돼야 한다.
+
+    검증 방법: 같은 dataset을 세 가지로 준비한다.
+      A. baseline - 아무것도 제외하지 않음
+      B. excluded_corner_indices로 코너 하나를 "제외 표시"만 함(배열 자체는 안 건드림)
+      C. 그 코너를 물리적으로 배열에서 아예 삭제함(object_points/corners/ids)
+    B와 C는 calibrateCamera에 들어가는 유효 correspondence가 동일하므로
+    모든 metric에서 값이 정확히 같아야 한다. A와는(코너 하나 차이니까) 달라야
+    한다 - 그래야 "제외가 실제로 효과가 있었다"는 것도 함께 확인된다.
+    """
+    import copy
+
+    from calibration.models.pinhole import calibrate_pinhole
+
+    victim_index = 3  # 대부분의 ChArUco 프레임이 이보다 많은 코너를 가짐
+
+    baseline = copy.deepcopy(synthetic_dataset)
+
+    excluded = copy.deepcopy(synthetic_dataset)
+    target_frame = next(
+        f for f in excluded.frames
+        if f.detection and f.detection.success and f.detection.num_corners > victim_index + 4
+    )
+    target_id = target_frame.image_info.image_id
+    target_frame.detection.excluded_corner_indices = [victim_index]
+
+    physically_removed = copy.deepcopy(synthetic_dataset)
+    removed_frame = next(f for f in physically_removed.frames if f.image_info.image_id == target_id)
+    det = removed_frame.detection
+    keep_mask = np.ones(det.object_points.shape[0], dtype=bool)
+    keep_mask[victim_index] = False
+    det.object_points = det.object_points[keep_mask]
+    det.corners = det.corners[keep_mask]
+    if det.ids is not None:
+        det.ids = det.ids[keep_mask]
+    det.num_corners = int(det.object_points.shape[0])
+
+    result_baseline = calibrate_pinhole(baseline, camera_config)
+    result_excluded = calibrate_pinhole(excluded, camera_config)
+    result_removed = calibrate_pinhole(physically_removed, camera_config)
+
+    assert result_baseline.success and result_excluded.success and result_removed.success
+
+    # B and C must be identical across every metric - the exclusion mechanism
+    # (index-based) must behave exactly like a physical removal everywhere.
+    assert result_excluded.rms_error == _approx(result_removed.rms_error)
+    assert result_excluded.residual_stats.rmse == _approx(result_removed.residual_stats.rmse)
+    assert result_excluded.residual_stats.p95 == _approx(result_removed.residual_stats.p95)
+    assert result_excluded.residual_stats.p99 == _approx(result_removed.residual_stats.p99)
+    assert result_excluded.residual_stats.n == result_removed.residual_stats.n
+
+    for band_excluded, band_removed in zip(
+        result_excluded.radial_profile.bins, result_removed.radial_profile.bins
+    ):
+        assert band_excluded.num_points == band_removed.num_points
+        assert band_excluded.rms_error == _approx(band_removed.rms_error)
+
+    for band_excluded, band_removed in zip(
+        result_excluded.radial_bands.bins, result_removed.radial_bands.bins
+    ):
+        assert band_excluded.num_points == band_removed.num_points
+        assert band_excluded.rms_error == _approx(band_removed.rms_error)
+
+    re_excluded, re_removed = result_excluded.regional_error, result_removed.regional_error
+    for field in ("center", "left", "right", "top", "bottom", "corner"):
+        assert getattr(re_excluded, field) == _approx(getattr(re_removed, field))
+
+    excluded_cells = {(c.row, c.col): c for c in result_excluded.spatial_error_map.cells}
+    removed_cells = {(c.row, c.col): c for c in result_removed.spatial_error_map.cells}
+    assert excluded_cells.keys() == removed_cells.keys()
+    for key in excluded_cells:
+        assert excluded_cells[key].num_points == removed_cells[key].num_points
+        assert excluded_cells[key].rms == _approx(removed_cells[key].rms)
+
+    # And it must actually have made a difference vs. the untouched baseline -
+    # otherwise this whole test would trivially pass even with the old bug.
+    assert (
+        result_excluded.residual_stats.n == result_baseline.residual_stats.n - 1
+    ), "제외된 코너가 residual_stats의 전체 포인트 수에 반영되지 않음"
+
+
+def _approx(value):
+    return pytest.approx(value, rel=1e-9, abs=1e-9) if value is not None else None
 
 
 def test_rational_outlier_pruning_keeps_8_coefficient_identity(synthetic_dataset, camera_config):

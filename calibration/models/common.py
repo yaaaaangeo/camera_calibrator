@@ -13,6 +13,8 @@ extended_pinhole을 내부적으로 재사용하므로 간접적으로 공유하
 
 from __future__ import annotations
 
+import math
+
 import cv2
 import numpy as np
 
@@ -91,6 +93,44 @@ def validate_finite_calibration_output(
     return None
 
 
+def active_correspondences(
+    detection,
+    *,
+    ids: np.ndarray | None = None,
+    exclude: bool = True,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """한 프레임의 object_points/corners에서 excluded_corner_indices를 뺀
+    "이번 계산에 실제로 쓸" correspondence만 반환.
+
+    설계 문서 16번 - corner-level outlier(excluded_corner_indices)가 있으면
+    calibrateCamera 입력(collect_calibration_inputs)에서는 이미 정확히
+    반영되지만, radial/regional/residual_stats/spatial_error_map 같은 "다시
+    투영해서 오차를 재는" 계산들이 예전에는 각자 det.object_points/det.corners
+    를 필터링 없이 직접 읽어 같은 CalibrationResult 안에서 metric마다 다른
+    observation set을 쓰는 불일치가 있었다 - 이 함수 하나로 그 마스킹 로직을
+    통일한다 (호출부가 전부 이 함수를 거치면 자동으로 같은 active set이 됨).
+
+    ids가 주어지면(straightness.py처럼 corner id로 행/열을 묶어야 하는 경우)
+    같은 마스크로 함께 필터링해 3-튜플로 반환한다 - object_points/corners와
+    별도로 ids만 필터링하면 인덱스가 어긋날 위험이 있어 한 곳에서 같이 처리.
+
+    exclude=False면 원본 배열을 그대로 반환한다(예: object_releasing처럼
+    corner-level exclusion을 의도적으로 무시해야 하는 소수 예외 경로용).
+    """
+    obj, img = detection.object_points, detection.corners
+    excluded = detection.excluded_corner_indices if exclude else []
+    if excluded and obj is not None and img is not None:
+        mask = np.ones(obj.shape[0], dtype=bool)
+        valid_idx = [i for i in excluded if 0 <= i < obj.shape[0]]
+        mask[valid_idx] = False
+        obj, img = obj[mask], img[mask]
+        if ids is not None:
+            ids = ids[mask]
+    if ids is not None:
+        return obj, img, ids
+    return obj, img
+
+
 def collect_calibration_inputs(
     dataset: Dataset,
     *,
@@ -100,9 +140,10 @@ def collect_calibration_inputs(
     calibrateCamera 입력 형태(object_points 리스트, image_points 리스트)로 변환.
 
     설계 문서 16번 - corner-level outlier가 표시해둔 excluded_corner_indices가
-    있으면, 프레임 자체는 살리되 그 인덱스에 해당하는 코너만 입력에서 뺀다.
-    제외하고 남은 코너가 MIN_CORNERS_PER_FRAME 밑으로 떨어지면 그 프레임은
-    통째로 빠진다 (calibrateCamera가 애초에 요구하는 최소 조건).
+    있으면, 프레임 자체는 살리되 그 인덱스에 해당하는 코너만 입력에서 뺀다
+    (active_correspondences로 위임). 제외하고 남은 코너가 MIN_CORNERS_PER_FRAME
+    밑으로 떨어지면 그 프레임은 통째로 빠진다 (calibrateCamera가 애초에
+    요구하는 최소 조건).
     """
     usable_frames: list[Frame] = []
     object_points: list[np.ndarray] = []
@@ -113,21 +154,13 @@ def collect_calibration_inputs(
         if not det or not det.success:
             continue
 
-        obj, img = det.object_points, det.corners
-        if obj is None or img is None:
+        if det.object_points is None or det.corners is None:
             continue
-        expected_count = None
-        if det.object_points is not None:
-            expected_count = det.object_points.shape[0]
-        if require_full_target and expected_count is not None and img.shape[0] != expected_count:
+        expected_count = det.object_points.shape[0]
+        if require_full_target and det.corners.shape[0] != expected_count:
             continue
 
-        excluded = [] if require_full_target else det.excluded_corner_indices
-        if excluded:
-            mask = np.ones(obj.shape[0], dtype=bool)
-            valid_idx = [i for i in excluded if 0 <= i < obj.shape[0]]
-            mask[valid_idx] = False
-            obj, img = obj[mask], img[mask]
+        obj, img = active_correspondences(det, exclude=not require_full_target)
 
         if not _is_valid_calibration_view(obj, img):
             continue
@@ -511,6 +544,78 @@ def project_points_for_model(
     else:
         projected, _ = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, distortion)
     return projected.reshape(-1, 2)
+
+
+def rough_camera_matrix(image_size: tuple[int, int]) -> np.ndarray:
+    """A crude K guess (f=max(w,h), principal point at image center, no
+    distortion) for diagnostics that need *some* camera matrix before real
+    calibration has run. Absolute values are not meaningful - only used for
+    relative "how diverse/where is this board" comparisons within one dataset.
+    """
+    w, h = image_size
+    f_guess = float(max(w, h))
+    return np.array(
+        [[f_guess, 0.0, w / 2.0], [0.0, f_guess, h / 2.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def estimate_rough_pose(
+    object_points: np.ndarray | None,
+    image_points: np.ndarray | None,
+    image_size: tuple[int, int],
+) -> tuple[float, float, float, float] | None:
+    """Rough (yaw, pitch, roll, distance) via solvePnP with rough_camera_matrix().
+
+    Pre-calibration diagnostic only (no real K/D exist yet) - absolute values
+    are not accurate, but relative comparisons within one dataset are useful
+    for pose-diversity judgments (image selection, scene similarity, coverage
+    diagnostics). Lives here (rather than duplicated per-caller) so that
+    detector.py, image_selection.py, scene_quality.py, frame_quality.py and
+    target_quality.py all share one definition instead of each deriving
+    pose-ish signals independently from the 2D board_tilt_deg/board_center_px/
+    board_area_ratio proxies detector.py also computes - those are 2D
+    in-plane proxies and cannot represent true yaw/pitch on their own.
+
+    Sign convention (right-handed camera frame, standard R->Euler XYZ
+    decomposition of cv2.Rodrigues(rvec)) - every consumer must use this
+    convention rather than re-deriving one from board_tilt_deg:
+        pitch = rotation about X  (pitch < 0 = board tilted up,   > 0 = down)
+        yaw   = rotation about Y  (yaw   < 0 = board faces left,  > 0 = right)
+        roll  = rotation about Z  (in-image-plane rotation)
+        distance = ||tvec|| (same unit as object_points, usually meters)
+
+    Returns None (never raises) when there aren't enough points (<4) or
+    solvePnP fails - callers must have a 2D-proxy fallback for that case.
+    """
+    if object_points is None or image_points is None or len(object_points) < 4:
+        return None
+
+    K_guess = rough_camera_matrix(image_size)
+    obj = np.asarray(object_points, dtype=np.float64).reshape(-1, 1, 3)
+    img = np.asarray(image_points, dtype=np.float64).reshape(-1, 1, 2)
+
+    try:
+        ok, rvec, tvec = cv2.solvePnP(obj, img, K_guess, None)
+    except cv2.error:
+        return None
+    if not ok:
+        return None
+
+    R, _ = cv2.Rodrigues(rvec)
+    sy = math.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    if sy > 1e-6:
+        pitch = math.atan2(R[2, 1], R[2, 2])
+        yaw = math.atan2(-R[2, 0], sy)
+        roll = math.atan2(R[1, 0], R[0, 0])
+    else:
+        # Near gimbal lock - approximate with roll=0 (rare extreme case).
+        pitch = math.atan2(-R[1, 2], R[1, 1])
+        yaw = math.atan2(-R[2, 0], sy)
+        roll = 0.0
+
+    distance = float(np.linalg.norm(tvec))
+    return math.degrees(yaw), math.degrees(pitch), math.degrees(roll), distance
 
 
 def regional_edge_average(regional_error: RegionalError) -> float | None:

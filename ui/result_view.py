@@ -30,6 +30,10 @@ from PySide6.QtWidgets import (
 )
 
 from calibration.kfold import KFoldProgressEvent
+from calibration.error_normalization import (
+    fhd_equivalent_error,
+    normalized_reprojection_error,
+)
 from calibration.types import (
     CalibrationResult,
     CameraModelType,
@@ -72,6 +76,16 @@ def _fmt(v: float | None) -> str:
 
 def _fmt_pct(v: float | None) -> str:
     return f"{v:.0f}%" if v is not None else "N/A"
+
+
+def _fmt_normalized(value: float | None, cal: CalibrationResult | None) -> str:
+    normalized = normalized_reprojection_error(value, cal.camera_matrix if cal else None)
+    return f"{normalized:.6f}" if normalized is not None else "N/A"
+
+
+def _fmt_fhd(value: float | None, image_size: tuple[int, int] | None) -> str:
+    equivalent = fhd_equivalent_error(value, image_size)
+    return f"{equivalent:.3f}px" if equivalent is not None else "N/A"
 
 
 def _p95(cal: CalibrationResult | None, val: ValidationResult | None) -> float | None:
@@ -263,10 +277,14 @@ class ResultView(QWidget):
         compare_group = QGroupBox("Model Comparison & Validation & Score")
         compare_layout = QVBoxLayout(compare_group)
         self._row_labels = [
-            "Validation Status", "Train RMS", "Test Frames", "Successful Test Frames",
-            "Failed Test Frames", "Failure Reason", "Test RMS", "Test P95",
-            "Test Edge RMS", "Straightness",
-            "Radial Edge", "AIC", "BIC", "Stability", "Observability",
+            "Validation Status", "Image Resolution", "Train RMS", "Normalized Train RMS",
+            "FHD-equivalent Train RMS", "Train Frames Used", "Test Frames", "Successful Test Frames",
+            "Failed Test Frames", "Failure Reason", "Test RMS", "Test Macro RMS", "Normalized Test RMS",
+            "FHD-equivalent Test RMS", "Test P95", "Normalized Test P95",
+            "FHD-equivalent Test P95", "Test Edge RMS", "Normalized Test Edge RMS",
+            "FHD-equivalent Test Edge RMS", "Straightness", "Radial Edge",
+            "Normalized Radial Edge", "FHD-equivalent Radial Edge",
+            "AIC", "BIC", "Stability", "Observability",
             "Undistortion", "Model Score", "Selection Conf.", "Recommend",
         ]
         self.table = _PageScrollTableWidget(len(self._row_labels), len(_MODEL_ORDER))
@@ -545,6 +563,7 @@ class ResultView(QWidget):
         object_releasing_result: CalibrationResult | None = None,
         object_releasing_validation: ObjectReleasingValidationResult | None = None,
         standard_vs_object_releasing: StandardVsObjectReleasingComparison | None = None,
+        image_size: tuple[int, int] | None = None,
     ) -> None:
         self._calibration_results = calibration_results
         self._object_releasing_result = object_releasing_result
@@ -581,7 +600,23 @@ class ResultView(QWidget):
                 if not failure_reason_text:
                     failure_reason_text = f"{len(val.failed_test_frame_ids)} test frame(s) pose 추정 실패"
             train_rms = _fmt(cal.rms_error) if cal and cal.success else "FAIL"
+            resolution = f"{image_size[0]}x{image_size[1]}" if image_size else "N/A"
+            train_norm = _fmt_normalized(cal.rms_error if cal and cal.success else None, cal)
+            train_fhd = _fmt_fhd(cal.rms_error if cal and cal.success else None, image_size)
+            if cal and cal.success and cal.input_frame_count > 0:
+                frames_used = f"{cal.used_frame_count}/{cal.input_frame_count}"
+                if cal.used_frame_count < cal.input_frame_count:
+                    frames_used += " ⚠"
+            else:
+                frames_used = "N/A"
             test_rms = _fmt(val.test_rms) if val and val.success else "N/A"
+            test_macro_rms = (
+                _fmt(val.test_macro_rms)
+                if val and val.success and val.test_macro_rms is not None else "N/A"
+            )
+            test_value = val.test_rms if val and val.success else None
+            test_norm = _fmt_normalized(test_value, cal)
+            test_fhd = _fmt_fhd(test_value, image_size)
             if val and val.success and val.edge_rms is not None:
                 edge_rms = _fmt(val.edge_rms)
             else:
@@ -591,7 +626,16 @@ class ResultView(QWidget):
                 suffix = "TEST" if val.straightness_source == "test" else "TRAIN fallback"
                 straightness = f"{straightness} ({suffix})"
             p95 = _fmt(_p95(cal, val))
-            radial = _fmt(_radial_edge(cal))
+            p95_value = _p95(cal, val)
+            p95_norm = _fmt_normalized(p95_value, cal)
+            p95_fhd = _fmt_fhd(p95_value, image_size)
+            edge_value = val.edge_rms if val and val.success else None
+            edge_norm = _fmt_normalized(edge_value, cal)
+            edge_fhd = _fmt_fhd(edge_value, image_size)
+            radial_value = _radial_edge(cal)
+            radial = _fmt(radial_value)
+            radial_norm = _fmt_normalized(radial_value, cal)
+            radial_fhd = _fmt_fhd(radial_value, image_size)
             aic = f"{score.aic:.1f}" if score and score.aic is not None else "N/A"
             bic = f"{score.bic:.1f}" if score and score.bic is not None else "N/A"
             stability = _fmt_pct(_stability(cal))
@@ -614,9 +658,12 @@ class ResultView(QWidget):
 
             for row, value in enumerate(
                 [
-                    validation_status, train_rms, test_frame_count, successful_test_frame_count,
-                    failed_test_frame_count, failure_reason_text, test_rms, p95, edge_rms, straightness,
-                    radial, aic, bic, stability, observability,
+                    validation_status, resolution, train_rms, train_norm, train_fhd,
+                    frames_used, test_frame_count, successful_test_frame_count,
+                    failed_test_frame_count, failure_reason_text, test_rms, test_macro_rms,
+                    test_norm, test_fhd,
+                    p95, p95_norm, p95_fhd, edge_rms, edge_norm, edge_fhd, straightness,
+                    radial, radial_norm, radial_fhd, aic, bic, stability, observability,
                     undistortion, score_str, selection_conf, recommend,
                 ]
             ):
@@ -630,6 +677,8 @@ class ResultView(QWidget):
                 # 요약만 두고 detail은 hover로 볼 수 있게 한다.
                 if failed_reason_tooltip and self._row_labels[row] in ("Failed Test Frames", "Failure Reason"):
                     item.setToolTip(failed_reason_tooltip)
+                if self._row_labels[row] == "Train Frames Used" and cal and cal.exclusion_reason:
+                    item.setToolTip(cal.warning_message or cal.exclusion_reason)
                 self.table.setItem(row, col, item)
 
         self._update_model_status()

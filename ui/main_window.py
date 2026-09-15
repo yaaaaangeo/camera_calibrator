@@ -597,7 +597,12 @@ class MainWindow(QMainWindow):
             )
             attempt(
                 "reports.dataset_csv", True,
-                lambda: export_csv(self.dataset, str(self.output_manager.report_path("dataset.csv"))),
+                lambda: export_csv(
+                    self.dataset,
+                    str(self.output_manager.report_path("dataset.csv")),
+                    successful[chosen],
+                    (self.camera_config.width, self.camera_config.height),
+                ),
             )
             attempt(
                 "intrinsic.ros", True,
@@ -722,7 +727,7 @@ class MainWindow(QMainWindow):
         )
         camera_form.addRow("Camera Name", self.sensor_name_edit)
 
-        # 왼쪽 열 순서: Camera Name -> INPUT(실시간|rosbag|이미지 한 줄) ->
+        # 중앙 열 순서: Camera Name -> INPUT(실시간|rosbag|이미지 한 줄) ->
         # 해상도 확인 -> Width/Height(한 줄). 해상도 확인이 Width/Height
         # 바로 위에 있어야 "확인해서 자동으로 채운다"는 흐름이 자연스럽다.
         input_row = QHBoxLayout()
@@ -783,9 +788,9 @@ class MainWindow(QMainWindow):
         size_row.addWidget(self.height_spin)
         camera_form.addRow(size_row)
         camera_column = QWidget()
+        camera_column.setObjectName("cameraSetupColumn")
         camera_column.setLayout(camera_form)
         configure_form_layout(camera_form)
-        outer.addWidget(camera_column, stretch=1)
 
         pattern_form = QFormLayout()
         pattern_form.setRowWrapPolicy(QFormLayout.WrapLongRows)
@@ -852,9 +857,13 @@ class MainWindow(QMainWindow):
         self._pattern_form = pattern_form  # setRowVisible로 마커/딕셔너리 행을 토글하기 위해 보관
         self._on_pattern_type_changed()
         pattern_column = QWidget()
+        pattern_column.setObjectName("calibrationPatternColumn")
         pattern_column.setLayout(pattern_form)
         configure_form_layout(pattern_form)
+        # 넓은 화면에서는 Pattern을 가장 왼쪽, Camera를 중앙에 배치한다.
+        # ResponsiveRow가 세로로 접힐 때도 이 순서가 그대로 유지된다.
         outer.addWidget(pattern_column, stretch=1)
+        outer.addWidget(camera_column, stretch=1)
 
         # 오른쪽 열 순서: 캘리브레이션 실행 -> Export -> 취소. Rational
         # on/off 체크박스는 제거됐다 - Standard 계산은 항상 Ideal Pinhole/
@@ -1692,6 +1701,8 @@ class MainWindow(QMainWindow):
             self.object_releasing_result,
             object_releasing_validation=self.object_releasing_validation_result,
             standard_vs_object_releasing=self.standard_vs_object_releasing_comparison,
+            image_size=(self.camera_config.width, self.camera_config.height)
+            if self.camera_config is not None else None,
         )
         self.result_view.set_cross_dataset_results(self.cross_dataset_results)
 

@@ -172,3 +172,15 @@ def test_main_camera_settings_stack_and_scroll_at_800x600(qapp, monkeypatch):
     _process_layout(qapp)
     assert window.run_button.parentWidget() is not None
     window.close()
+
+
+def test_main_camera_settings_put_pattern_left_and_camera_center(qapp, monkeypatch):
+    monkeypatch.setattr(MainWindow, "_offer_autosave_recovery", lambda self: None)
+    window = MainWindow()
+    try:
+        row = window.settings_content.findChild(ResponsiveRow)
+        assert row is not None
+        assert row.box_layout.itemAt(0).widget().objectName() == "calibrationPatternColumn"
+        assert row.box_layout.itemAt(1).widget().objectName() == "cameraSetupColumn"
+    finally:
+        window.close()
