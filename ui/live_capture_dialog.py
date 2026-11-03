@@ -312,6 +312,10 @@ class LiveCaptureDialog(QDialog):
         layout.addWidget(self.count_label)
 
         button_row = QHBoxLayout()
+        self.automatic_calibration_button = QPushButton("자동 캘리브레이션 (P2)")
+        self.automatic_calibration_button.setEnabled(self._pattern_config is not None)
+        self.automatic_calibration_button.clicked.connect(self._open_automatic_calibration)
+        button_row.addWidget(self.automatic_calibration_button)
         self.done_button = QPushButton("완료 (불러오기)")
         self.done_button.clicked.connect(self._on_done)
         self.cancel_button = QPushButton("취소")
@@ -323,6 +327,14 @@ class LiveCaptureDialog(QDialog):
 
         if ROS_LIVE_BACKEND is not None:
             self._refresh_topics()
+
+    def _open_automatic_calibration(self) -> None:
+        from ui.automatic_calibration_dialog import AutomaticCalibrationDialog
+        topic = self.topic_combo.currentData()
+        self._stop_subscription()
+        dialog = AutomaticCalibrationDialog(str(self._output_dir), self._pattern_config,
+                                             self._camera_config, getattr(topic, 'name', ''), self)
+        dialog.exec()
 
     # ------------------------------------------------------------------
 

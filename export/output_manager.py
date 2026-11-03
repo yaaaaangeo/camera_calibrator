@@ -64,6 +64,34 @@ def _safe_component(value: str) -> str:
     return value.strip("._-")
 
 
+SESSION_CLAIM_FILENAME = ".session_claim"
+
+
+def existing_session_outputs(session_dir: str | Path) -> list[str]:
+    """이미 Output Session 결과가 있는지 (덮어쓰기 방지 판단용).
+
+    manifest.json, 세션 claim 표시, 또는 세션 하위 폴더(intrinsic/, reports/ 등)
+    안의 파일을 기존 결과로 본다. 그 밖의 파일(예: 자동화 계층이 먼저 쓴
+    run_manifest.json)은 결과로 보지 않는다.
+    """
+    root = Path(session_dir)
+    if not root.is_dir():
+        return []
+    found = [name for name in ("manifest.json", SESSION_CLAIM_FILENAME) if (root / name).exists()]
+    for relative in SESSION_DIRECTORIES:
+        folder = root / relative
+        # A link/junction can redirect exports into an existing result or source
+        # directory. A file at a reserved directory path is also a collision.
+        is_reparse = folder.exists() and bool(getattr(folder.lstat(), "st_file_attributes", 0) & 0x400)
+        if folder.is_symlink() or is_reparse or (folder.exists() and not folder.is_dir()):
+            found.append(relative)
+        elif folder.is_dir():
+            found.extend(
+                p.relative_to(root).as_posix() for p in folder.rglob("*") if p.is_file()
+            )
+    return sorted(set(found))
+
+
 def model_filename(model: Any) -> str:
     raw = getattr(model, "value", model)
     key = str(raw).strip().lower().replace(" ", "_")
@@ -120,14 +148,40 @@ class OutputManager:
     def manifest_path(self) -> Path:
         return self.require_session() / "manifest.json"
 
-    def ensure_session(self, camera_name: str = "") -> Path:
-        if self.session_dir is not None:
-            return self.session_dir
-        moment = self._now()
+    @staticmethod
+    def _session_stem(moment: datetime, camera_name: str) -> str:
         stem = moment.strftime("%Y-%m-%d_%H%M%S")
         camera = _safe_component(camera_name)
         if camera:
             stem += f"_{camera}"
+        return stem
+
+    def reserve_session_directory(self, camera_name: str = "") -> Path:
+        """Atomically create a new, empty, uniquely named session directory.
+
+        ``ensure_session`` 과 같은 이름 규칙을 쓰지만 manifest를 만들지 않고
+        이 객체의 session에도 연결하지 않는다. 폴더 생성 자체(mkdir, 이미 있으면
+        실패)로 이름을 선점하므로 동시에 실행된 다른 프로세스와 같은 폴더를
+        나눠 쓰지 않는다. 호출부는 이 경로를 CLI ``--session-dir``로 넘긴다.
+        """
+        moment = self._now()
+        stem = self._session_stem(moment, camera_name)
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        candidate = self.output_root / stem
+        suffix = 2
+        while True:
+            try:
+                candidate.mkdir()
+                return candidate.resolve()
+            except FileExistsError:
+                candidate = self.output_root / f"{stem}_{suffix:02d}"
+                suffix += 1
+
+    def ensure_session(self, camera_name: str = "") -> Path:
+        if self.session_dir is not None:
+            return self.session_dir
+        moment = self._now()
+        stem = self._session_stem(moment, camera_name)
         candidate = self.output_root / stem
         suffix = 2
         while candidate.exists():

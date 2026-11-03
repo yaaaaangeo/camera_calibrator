@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from calibration.image_quality import hamming_distance
+from calibration.image_quality import compute_pattern_exposure_metrics, hamming_distance
 from calibration.types import Dataset, Frame, FrameStatus
 
 
@@ -55,6 +55,14 @@ class ImageSelectionConfig:
     similar_area_delta: float = 0.04
     similar_tilt_delta_deg: float = 8.0
     seed: int = 42
+    # 노출 판정 방식.
+    #   "global"  (기본, 기존 동작): 이미지 전체 평균 밝기 + 전체 clipping 비율
+    #   "pattern" : 보드 영역 평균 밝기 + 코너 주변 패치의 포화 비율 중앙값
+    #               (corner_clip_max). 흰 종이/배경/조명처럼 코너와 무관한
+    #               밝은 영역 때문에 정상 이미지를 버리지 않는다.
+    # 두 방식은 선택 결과가 다를 수 있으므로 manifest에 모드를 기록한다.
+    exposure_mode: str = "global"
+    corner_clip_max: float = 0.45
 
 
 @dataclass
@@ -74,6 +82,11 @@ class ImageSelectionRecord:
     blur: float | None = None
     brightness: float | None = None
     saturation: float | None = None
+    roi_brightness: float | None = None  # exposure_mode="pattern"일 때만
+    corner_clip: float | None = None     # exposure_mode="pattern"일 때만
+
+
+EXPOSURE_MODES = ("global", "pattern")
 
 
 @dataclass
@@ -90,6 +103,7 @@ class ImageSelectionResult:
     tilt_counts: dict[str, int] = field(default_factory=dict)
     position_targets: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    exposure_mode: str = "global"
 
     @property
     def selected_count(self) -> int:
@@ -106,7 +120,7 @@ class ImageSelectionResult:
         )
 
     def to_manifest(self) -> dict[str, Any]:
-        return {
+        manifest = {
             "schema_version": 1,
             "requested_count": self.requested_count,
             "target_count": self.target_count,
@@ -139,6 +153,13 @@ class ImageSelectionResult:
                 for r in self.records
             ],
         }
+        if self.exposure_mode != "global":
+            # 기존 기본 모드의 manifest는 그대로 두고, 다른 모드일 때만 기록한다
+            manifest["exposure_mode"] = self.exposure_mode
+            for entry, record in zip(manifest["images"], self.records):
+                entry["roi_brightness"] = record.roi_brightness
+                entry["corner_clip"] = record.corner_clip
+        return manifest
 
 
 def allocate_position_targets(total: int) -> dict[str, int]:
@@ -175,6 +196,8 @@ def select_calibration_images(
     config: ImageSelectionConfig | None = None,
 ) -> ImageSelectionResult:
     cfg = config or ImageSelectionConfig()
+    if cfg.exposure_mode not in EXPOSURE_MODES:
+        raise ValueError(f"exposure_mode must be one of {EXPOSURE_MODES}: {cfg.exposure_mode!r}")
     requested = max(1, int(cfg.target_count))
     records: dict[str, ImageSelectionRecord] = {}
     candidate_frames: list[Frame] = []
@@ -211,7 +234,7 @@ def select_calibration_images(
             frame.disable(blur_reason, outlier=False)
             continue
 
-        exposure_reason = _exposure_rejection_reason(frame, cfg)
+        exposure_reason = _exposure_rejection_reason(frame, cfg, record)
         if exposure_reason:
             counts["exposure_rejected"] += 1
             record.exclusion_reason = exposure_reason
@@ -269,6 +292,7 @@ def select_calibration_images(
         tilt_counts=tilt_counts,
         position_targets=targets,
         warnings=warnings,
+        exposure_mode=cfg.exposure_mode,
     )
 
 
@@ -331,12 +355,43 @@ def _blur_rejection_reason(frame: Frame, cfg: ImageSelectionConfig) -> str:
     return ""
 
 
-def _exposure_rejection_reason(frame: Frame, cfg: ImageSelectionConfig) -> str:
+def _exposure_rejection_reason(
+    frame: Frame, cfg: ImageSelectionConfig, record: ImageSelectionRecord | None = None,
+) -> str:
+    if cfg.exposure_mode == "pattern":
+        reason = _pattern_exposure_rejection_reason(frame, cfg, record)
+        if reason is not None:
+            return reason
+        # 코너가 4개 미만이거나 이미지를 다시 읽지 못하면 기존 전체 기준으로 판단
     brightness = frame.image_info.brightness
     if brightness is not None and (brightness < cfg.brightness_min or brightness > cfg.brightness_max):
         return "exposure_rejected"
     saturation = frame.image_info.saturation
     if saturation is not None and saturation > cfg.saturation_max:
+        return "exposure_rejected"
+    return ""
+
+
+def _pattern_exposure_rejection_reason(
+    frame: Frame, cfg: ImageSelectionConfig, record: ImageSelectionRecord | None,
+) -> str | None:
+    import cv2
+
+    det = frame.detection
+    if det is None or det.corners is None:
+        return None
+    gray = cv2.imread(frame.image_info.path, cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        return None
+    metrics = compute_pattern_exposure_metrics(gray, det.corners)
+    if metrics is None:
+        return None
+    if record is not None:
+        record.roi_brightness = round(metrics.roi_brightness, 3)
+        record.corner_clip = round(metrics.corner_clip_median, 4)
+    if not cfg.brightness_min <= metrics.roi_brightness <= cfg.brightness_max:
+        return "exposure_rejected"
+    if metrics.corner_clip_median > cfg.corner_clip_max:
         return "exposure_rejected"
     return ""
 
@@ -472,7 +527,8 @@ def _select_frames(
     if len(selected) < target:
         choose(remaining, target - len(selected), allow_used_cluster=True)
 
-    selected_set = set(selected)
+    selected_set = _preserve_coverage(frames, records, set(selected))
+    used_clusters = {records[i].cluster_id for i in selected_set}
     duplicate_skips = {
         records[frame.image_info.image_id].cluster_id
         for frame in frames
@@ -480,6 +536,79 @@ def _select_frames(
         and records[frame.image_info.image_id].cluster_id in used_clusters
     }
     return selected_set, {cluster for cluster in duplicate_skips if cluster is not None}
+
+
+def _preserve_coverage(frames, records, selected):
+    """Repair spatial loss using quality-eligible, same-stratum exchanges.
+
+    Keep distance/tilt histograms and occupied position categories, and never increase duplicate-cluster
+    occupancy. Use the existing fair-share grid and coverage criterion; do not
+    change quality filters, selection scores, or calibration/model weights.
+    This bounded local repair is not a general optimal-subset solver.
+    """
+    from collections import Counter
+    from calibration.quality import coverage_percentage
+    from calibration.types import CoverageCell
+
+    hist = {}
+    for frame in frames:
+        info, det = frame.image_info, frame.detection
+        counts = np.zeros(16, dtype=int)
+        if det is not None and det.corners is not None and info.width > 0 and info.height > 0:
+            pts = det.corners.reshape(-1, 2)
+            for x, y in pts:
+                col, row = min(int(x // (info.width / 4)), 3), min(int(y // (info.height / 4)), 3)
+                if 0 <= row < 4 and 0 <= col < 4:
+                    counts[row * 4 + col] += 1
+        hist[info.image_id] = counts
+
+    threshold = coverage_percentage.__defaults__[0]
+
+    def covered(counts):
+        fair = counts.sum() / 16
+        return {i for i, n in enumerate(counts) if fair > 0 and coverage_percentage(
+            [CoverageCell(i // 4, i % 4, int(n), min(1., n / fair))]) > 0}
+
+    def stratum(i):
+        r = records[i]
+        return r.distance, r.tilt
+
+    total = sum((hist[i] for i in selected), np.zeros(16, dtype=int))
+    def objective(counts):
+        fair = counts.sum() / 16
+        support = float(np.minimum(counts / fair, threshold).sum()) if fair > 0 else 0.
+        return len(covered(counts)), support
+
+    for _ in range(max(1, len(frames) * 16)):
+        current = covered(total)
+        clusters = Counter(records[i].cluster_id for i in selected)
+        positions = Counter(records[i].position for i in selected)
+        duplicates = sum(max(0, n - 1) for n in clusters.values())
+        best = None
+        for incoming in sorted(set(hist) - selected):
+            for outgoing in sorted(selected):
+                if stratum(incoming) != stratum(outgoing):
+                    continue
+                if (records[incoming].position != records[outgoing].position and
+                        positions[records[outgoing].position] == 1):
+                    continue
+                candidate_clusters = clusters.copy()
+                candidate_clusters[records[outgoing].cluster_id] -= 1
+                candidate_clusters[records[incoming].cluster_id] += 1
+                if sum(max(0, n - 1) for n in candidate_clusters.values()) > duplicates:
+                    continue
+                counts = total - hist[outgoing] + hist[incoming]
+                cells = covered(counts)
+                if not current <= cells or objective(counts) <= objective(total):
+                    continue
+                key = (*objective(counts), records[incoming].score - records[outgoing].score)
+                if best is None or key > best[0]:
+                    best = key, incoming, outgoing, counts
+        if best is None:
+            break
+        _, incoming, outgoing, total = best
+        selected = (selected - {outgoing}) | {incoming}
+    return selected
 
 
 def _selection_score(

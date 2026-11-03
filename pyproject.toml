@@ -72,8 +72,13 @@ camera-calibrator = "app.main:main"
 camera-calibrator-cli = "app.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["app*", "calibration*", "export*", "ui*"]
+include = ["app*", "automation*", "calibration*", "export*", "ui*"]
 exclude = ["tests*", "scripts*"]
+
+# 자동화 내장 프로파일(`python -m automation run --profile default`)은 .py가 아니므로
+# 명시해야 non-editable 설치(`pip install .`)에도 포함된다.
+[tool.setuptools.package-data]
+automation = ["profiles/*.yaml", "live/*.yaml"]
 
 # pytest 설정은 기존 pytest.ini를 그대로 유지한다 (pytest.ini가 있으면 pytest는
 # pyproject.toml의 [tool.pytest.ini_options]를 아예 읽지 않으므로, 여기 중복

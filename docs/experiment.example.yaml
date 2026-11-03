@@ -1,0 +1,60 @@
+# Copy/edit this file; relative paths resolve against THIS file's directory.
+# This example deliberately fails identity/input preflight until edited.
+experiment_version: 1
+job_id: rosbag-trial-001
+camera:
+  model: REPLACE_WITH_CAMERA_MODEL
+  serial: REPLACE_WITH_REAL_SERIAL
+input:
+  kind: bag                   # bag | images
+  path: ../data/REPLACE_WITH_RECORDING  # ROS1 .bag or ROS2 recording directory
+  topic: /camera/image_raw    # exact Image/CompressedImage topic
+  extract_fps: 1.0            # max decoded sample FPS using bag record timestamps; omit for all
+  replay_interval: 1.1        # wall-clock pacing; default P2 capture interval is 1s
+live:
+  live_profile_version: 1
+  p1:
+    camera:
+      width: null            # set when the expected capture resolution is known
+      height: null
+    pattern:
+      # EXAMPLE ONLY. Confirm actual printed board before use.
+      type: charuco
+      squares_x: 7
+      squares_y: 5
+      square_size: 0.04       # metres
+      marker_size: 0.03
+      dictionary: DICT_5X5_100
+    calibration:
+      models: [pinhole, brown_conrady, rational, fisheye]
+      test_ratio: 0.25
+      seed: 42
+      jobs: 1
+    image_selection:
+      enabled: true
+      target_count: 35
+    acceptance: {}           # existing defaults: unset operating limits imply WARN
+    output:
+      exports: [opencv, ros, report, json, csv]
+  capture: {}
+  readiness: {}              # existing P2 policy; do not lower limits to force success
+  recovery: {}
+output:
+  root: ../.verification/experiment-runs
+  min_free_gb: 5
+publish:
+  retry_in_process: false    # opt in: retry transient failures using Outbox backoff/max_attempts
+  results_repository: false  # explicitly set true ONLY for a results-only repository
+  full_frame: false          # declare true only after confirming actual coordinates
+  config:
+    enabled: false           # external upload OFF by default
+    remote: ''               # e.g. https://github.com/OWNER/camera-calibration-results.git
+    branch: calibration-results
+    outbox: ../.verification/experiment-runs/outbox
+    timeout_sec: 90
+    max_attempts: 5
+# Optional; leave absent without a verified compatible factory reference.
+# factory:
+#   reference: ../data/factory-reference.json
+#   coordinates: ../data/session-coordinates.json
+#   seeded: true

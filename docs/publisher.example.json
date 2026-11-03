@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "remote": "",
+  "branch": "calibration-results",
+  "outbox": "publish_outbox",
+  "max_attempts": 5,
+  "base_backoff_sec": 5,
+  "max_backoff_sec": 3600,
+  "timeout_sec": 90
+}

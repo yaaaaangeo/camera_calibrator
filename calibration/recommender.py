@@ -1135,6 +1135,7 @@ def compute_final_result(
     scores: list[ModelScore] | None = None,
     coverage_grid: "list[CoverageCell] | None" = None,
     dataset_diversity: "DiversityScores | None" = None,
+    capture_observable_coverage: dict | None = None,
 ) -> FinalResult:
     """사용자가 최종적으로 선택한 모델을 기준으로 FinalResult를 조립한다.
 
@@ -1155,7 +1156,8 @@ def compute_final_result(
         overall_grade = _worst_grade(grades)
 
     diagnosis = (
-        diagnose_calibration(cal, val, dataset_coverage_pct, coverage_grid, dataset_diversity)
+        diagnose_calibration(cal, val, dataset_coverage_pct, coverage_grid, dataset_diversity,
+                             observable_coverage=capture_observable_coverage)
         if cal is not None else None
     )
     confidence = compute_final_confidence(cal, val, overall_grade, dataset_coverage_pct, scores, diagnosis)

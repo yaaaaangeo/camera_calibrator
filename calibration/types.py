@@ -675,11 +675,13 @@ class CalibrationResult:
     # error_message와 분리한 이유: error_message는 "실패"를 의미하는 필드라
     # success=True와 함께 쓰면 UI 로직이 헷갈린다.
     warning_message: Optional[str] = None
+    optimization_audit: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
 # Outlier (설계 문서 9번)
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class OutlierResult:
@@ -831,6 +833,10 @@ class ValidationResult:
     # 않은 경우(예: test 프레임이 아예 없어 애초에 hold-out 자체를
     # 수행하지 못한 경우)다.
     evidence_gate: Optional[HoldoutEvidenceGate] = None
+
+    train_camera_matrix: Optional[np.ndarray] = None
+    train_distortion: Optional[np.ndarray] = None
+    optimization_audit: dict = field(default_factory=dict)
 
 
 @dataclass

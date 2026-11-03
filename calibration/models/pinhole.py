@@ -65,6 +65,7 @@ def calibrate_pinhole(
     n_bootstrap: int = 20,
     bootstrap_seed: int = 42,
     bootstrap_jobs: int = 1,
+    initial_guess: CalibrationResult | None = None,
 ) -> CalibrationResult:
     """Pinhole(왜곡 0 고정) 캘리브레이션 실행.
 
@@ -94,6 +95,13 @@ def calibrate_pinhole(
 
     image_size = infer_image_size(dataset, camera_config)
 
+    initial_k = initial_d = None
+    guess_flags = 0
+    if initial_guess is not None:
+        from calibration.initialization import compatible_seed
+        initial_k, initial_d = compatible_seed(initial_guess, CameraModelType.PINHOLE)
+        guess_flags = cv2.CALIB_USE_INTRINSIC_GUESS
+
     try:
         (
             rms,
@@ -108,9 +116,9 @@ def calibrate_pinhole(
             object_points,
             image_points,
             image_size,
-            None,
-            None,
-            flags=_PINHOLE_FLAGS,
+            initial_k,
+            initial_d,
+            flags=_PINHOLE_FLAGS | guess_flags,
             criteria=DEFAULT_TERM_CRITERIA,
         )
     except cv2.error as e:

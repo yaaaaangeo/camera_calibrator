@@ -296,7 +296,7 @@ def _section_model_comparison(
             else ("Not eligible" if score else "N/A")
         )
         confidence_vals.append(
-            f"{score.selection_confidence_level} {score.selection_confidence:.0f}%"
+            f"{score.selection_confidence_level} {score.selection_confidence:.1f}%"
             if score and score.selection_confidence_level and score.selection_confidence is not None
             else ""
         )
@@ -311,7 +311,7 @@ def _section_model_comparison(
     table = (
         '<table class="compare"><thead><tr><th></th>' + header + "</tr></thead><tbody>"
         + row("Validation Status", status_vals)
-        + row("Train RMS", train_vals)
+        + row("Full-fit RMS", train_vals)
         + row("Test Frames", test_frame_vals)
         + row("Successful Test Frames", successful_test_frame_vals)
         + row("Failed Test Frames", failed_test_frame_vals)
@@ -323,7 +323,7 @@ def _section_model_comparison(
         + row("AIC", aic_vals)
         + row("BIC", bic_vals)
         + row("Model Score", score_vals)
-        + row("Confidence", confidence_vals)
+        + row("Model selection Confidence", confidence_vals)
         + row("", chosen_vals)
         + "</tbody></table>"
     )
@@ -494,8 +494,8 @@ def _section_final_summary(final: FinalResult) -> str:
     rows = [
         ("Chosen Model", _MODEL_LABELS.get(final.chosen_model, final.chosen_model.value)),
         ("Overall Grade", final.overall_grade.value.upper()),
-        ("Final Calibration Confidence", f"{conf.score:.0f}/100 - {conf.level}" if conf else "N/A"),
-        ("Train RMS", _fmt(cal.rms_error if cal else None)),
+        ("Final Calibration Confidence", f"{conf.score:.1f}/100 - {conf.level}" if conf else "N/A"),
+        ("Full-fit RMS", _fmt(cal.rms_error if cal else None)),
         ("Test RMS", _fmt(val.test_rms if val else None)),
         ("Test P95", _fmt(val.test_residual_stats.p95 if val and val.test_residual_stats else None)),
         ("Edge RMS", _fmt(val.edge_rms if val else None)),
@@ -973,14 +973,14 @@ def generate_html_report(
     if final_result.confidence:
         conf = final_result.confidence
         comp_rows = "".join(
-            f"<tr><th>{_esc(name)}</th><td>{value:.1f}/100</td></tr>"
+            f"<tr><th>{_esc('Full-fit RMS score (export K/D)' if name == 'train_rms' else name)}</th><td>{value:.1f}/100</td></tr>"
             for name, value in conf.components.items()
         )
         reason_items = "".join(f"<li>{_esc(r)}</li>" for r in conf.reasons)
         warning_items = "".join(f"<li>{_esc(w)}</li>" for w in conf.warnings)
         confidence_html = (
             f"<h4>Final Calibration Confidence</h4>"
-            f'<div class="grade-box" style="background:{grade_color};">{conf.score:.0f}/100 - {_esc(conf.level)}</div>'
+            f'<div class="grade-box" style="background:{grade_color};">{conf.score:.1f}/100 - {_esc(conf.level)}</div>'
             + (f'<table class="kv"><tbody>{comp_rows}</tbody></table>' if comp_rows else "")
             + (f"<ul>{reason_items}</ul>" if reason_items else "")
             + (f'<ul style="color:#ef6c00;">{warning_items}</ul>' if warning_items else "")
@@ -1041,7 +1041,7 @@ def generate_html_report(
     return (
         "<!DOCTYPE html><html lang='ko'><head><meta charset='utf-8'>"
         f"<title>{_esc(project_name)} - Calibration Report</title>"
-        f"<style>{_CSS}</style></head><body>{body}</body></html>"
+        f"<style>{_CSS}</style></head><body><p>Export K/D: full-fit on enabled data. Hold-out Test RMS: separate Train-only K/D; it does not independently validate the exported full-fit parameters.</p>{body}</body></html>"
     )
 
 

@@ -13,6 +13,7 @@ def calibrate_brown_conrady(
     n_bootstrap: int = 20,
     bootstrap_seed: int = 42,
     bootstrap_jobs: int = 1,
+    initial_guess: CalibrationResult | None = None,
 ) -> CalibrationResult:
     """Standard Brown-Conrady 5-coefficient pinhole calibration.
 
@@ -31,6 +32,7 @@ def calibrate_brown_conrady(
         n_bootstrap=n_bootstrap,
         bootstrap_seed=bootstrap_seed,
         bootstrap_jobs=bootstrap_jobs,
+        initial_guess=initial_guess,
     )
     result.model_name = CameraModelType.BROWN_CONRADY
     result.calibration_method = CalibrationMethod.STANDARD

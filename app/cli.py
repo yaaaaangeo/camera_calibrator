@@ -30,6 +30,7 @@ import glob as globmod
 import html
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -113,7 +114,12 @@ from export.ros import export_ros_camera_info
 from export.json_export import export_json
 from export.csv_export import export_csv
 from export.kalibr import build_kalibr_camera_calibration_command, export_kalibr_target_yaml
-from export.output_manager import OutputManager, model_filename
+from export.output_manager import (
+    SESSION_CLAIM_FILENAME,
+    OutputManager,
+    existing_session_outputs,
+    model_filename,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -762,6 +768,8 @@ def _selected_model_types(args) -> list[CameraModelType]:
 
 def run_pipeline(args) -> int:
     quiet = args.quiet
+    if args.robust_optimization and (args.outlier or args.corner_outlier or args.calibration_method == CalibrationMethod.OBJECT_RELEASING):
+        raise CliError('--robust-optimization currently supports Standard calibration without outlier pruning; use the unchanged default for these modes')
 
     if args.load_project:
         return _run_from_loaded_project(args)
@@ -845,6 +853,7 @@ def run_pipeline(args) -> int:
         bootstrap_jobs=args.jobs, model_jobs=args.jobs,
         persistent_cache_dir=args.cache_dir,
         models=_selected_model_types(args),
+        robust_optimization=args.robust_optimization, test_ratio=args.test_ratio, seed=args.seed,
     )
     calibration_results = {r.model_name: r for r in results}
     object_releasing_result = None
@@ -1002,7 +1011,7 @@ def _validate_choose_and_export(
         _log(quiet, "Hold-out Validation 중...")
         validation_results = validate_all_models(
             dataset, camera_config, pattern_config, test_ratio=args.test_ratio,
-            seed=args.seed,
+            seed=args.seed, robust_optimization=args.robust_optimization,
         )
         selected_models = set(_selected_model_types(args))
         validation_results = {
@@ -1166,12 +1175,30 @@ def _validate_choose_and_export(
 
     # --- 8. Final Result ---
     coverage_pct = coverage_percentage(dataset.coverage_grid) if dataset.coverage_grid else None
+    capture_observable_coverage = None
+    guidance_mask = getattr(args, 'capture_guidance_mask', None)
+    chosen_calibration = calibration_results[chosen_model]
+    if guidance_mask:
+        import yaml
+        from calibration.occlusion import resolve_mask, validate_binding
+        try:
+            guidance_mask = resolve_mask(yaml.safe_load(Path(guidance_mask).read_text(encoding='utf-8')))
+            validate_binding(guidance_mask, camera_config.width, camera_config.height)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            raise CliError(f'Invalid capture guidance mask: {exc}') from exc
+        chosen_calibration.optimization_audit['capture_guidance_mask'] = guidance_mask
+    else:
+        guidance_mask = chosen_calibration.optimization_audit.get('capture_guidance_mask')
+    if guidance_mask is not None:
+        from calibration.occlusion import observable_coverage
+        capture_observable_coverage = observable_coverage(dataset, camera_config, guidance_mask)
     final_result = compute_final_result(
         chosen_model, calibration_results, validation_results,
         dataset_coverage_pct=coverage_pct, outlier_result=outlier_result,
         corner_outlier_result=corner_outlier_result, scores=scores,
         coverage_grid=dataset.coverage_grid,
         dataset_diversity=dataset.diversity,
+        capture_observable_coverage=capture_observable_coverage,
     )
     _log(quiet, f"\n선택된 모델: {chosen_model.value}  종합 등급: {final_result.overall_grade.value}")
 
@@ -1395,6 +1422,12 @@ def _validate_choose_and_export(
             "overall_grade": final_result.overall_grade.value,
             "success": cal.success,
             "rms_error": cal.rms_error,
+            "rms_parameter_scope": "exported_full_fit_with_recorded_exclusions",
+            "test_rms_parameter_scope": "separate_train_only_K_D; not validation of exported K_D",
+            "fit_frame_ids": list(calibration_results[chosen_model].per_frame_error),
+            "num_fit_frames": len(calibration_results[chosen_model].per_frame_error),
+            "holdout_train_camera_matrix": (validation_results[chosen_model].train_camera_matrix.tolist() if chosen_model in validation_results and validation_results[chosen_model].train_camera_matrix is not None else None),
+            "holdout_train_distortion": (validation_results[chosen_model].train_distortion.tolist() if chosen_model in validation_results and validation_results[chosen_model].train_distortion is not None else None),
             "test_rms": (validation_results.get(chosen_model).test_rms if validation_results.get(chosen_model) else None),
             "num_images_total": dataset.num_total,
             "num_images_detected": dataset.num_detected,
@@ -1521,6 +1554,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="종합 진단 preset. 별도 지정이 없으면 --cross-validation 5, --bootstrap 100을 켜고 "
              "report/json/csv export를 포함한다.",
     )
+    pipe.add_argument("--capture-guidance-mask", metavar="PATH", help="Native-pixel occlusion mask for capture guidance only; grading metrics unchanged")
+    pipe.add_argument("--robust-optimization", action="store_true", help="Opt-in nested Train-validation initialization selection; Test never selects seeds")
     pipe.add_argument("--test-ratio", type=float, default=0.25, help="Hold-out validation test 비율, 기본 0.25")
     pipe.add_argument("--seed", type=int, default=42, help="train/test 분할 시드, 기본 42")
     pipe.add_argument(
@@ -1596,7 +1631,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     out.add_argument(
         "--output-dir", default=None,
         help=("기존 호환용 정확한(flat) 저장 폴더. 생략하면 "
-              "~/CameraCalibratorOutputs 아래에 시간 기반 Output Session을 생성합니다."),
+              "~/CameraCalibratorOutputs 아래에 시간 기반 Output을 생성합니다."),
+    )
+    out.add_argument(
+        "--session-dir", default=None, metavar="PATH",
+        help=("Output Session 폴더를 정확히 이 경로로 지정한다 (자동화/배치용). 기본 실행과 같은 "
+              "Session 구조(manifest.json, intrinsic/, reports/ ...)를 쓰며, 이미 결과가 있는 "
+              "폴더는 덮어쓰지 않고 오류로 끝낸다. --output-dir와 함께 쓸 수 없다."),
     )
     out.add_argument(
         "--export", nargs="+", default=None,
@@ -1753,6 +1794,34 @@ def _run_compare_subset_cli(argv: list[str]) -> int:
     return 0 if result["verdict"] != "FAIL" else 2
 
 
+def _open_explicit_session(path_text: str, camera_name: str) -> OutputManager:
+    """--session-dir: 지정한 폴더를 그대로 Output Session으로 쓴다.
+
+    덮어쓰기 방지: 이미 Session 결과(manifest.json, intrinsic/·reports/ 등의
+    파일)가 있으면 거부한다. 같은 폴더를 동시에 쓰는 두 실행을 막기 위해
+    claim 파일을 배타적으로(이미 있으면 실패) 만든 뒤에만 Session을 연다.
+    """
+    try:
+        session = Path(path_text).expanduser()
+        if session.exists() and not session.is_dir():
+            raise CliError(f"--session-dir가 폴더가 아닙니다: {session}")
+        existing = existing_session_outputs(session)
+        if existing:
+            shown = ", ".join(existing[:5]) + (" ..." if len(existing) > 5 else "")
+            raise CliError(f"--session-dir에 이미 결과가 있어 덮어쓰지 않습니다: {session} ({shown})")
+        session.mkdir(parents=True, exist_ok=True)
+        with open(session / SESSION_CLAIM_FILENAME, "x", encoding="utf-8") as claim:
+            claim.write(f"pid={os.getpid()}\n")
+    except FileExistsError:
+        raise CliError(f"--session-dir를 다른 실행이 이미 사용 중입니다: {session}") from None
+    except OSError as e:
+        raise CliError(f"--session-dir를 만들 수 없습니다: {session} ({e})") from e
+    try:
+        return OutputManager(session.parent, camera_name=camera_name, session_dir=session)
+    except OSError as e:
+        raise CliError(f"--session-dir에 Session을 만들 수 없습니다: {session} ({e})") from e
+
+
 def main(argv: list[str] | None = None) -> int:
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     if effective_argv and effective_argv[0] == "compare-subset":
@@ -1810,10 +1879,24 @@ def main(argv: list[str] | None = None) -> int:
     # --output-dir를 명시한 자동화/기존 스크립트는 종전의 flat 디렉터리
     # 계약을 유지한다. 생략한 일반 실행만 GUI와 같은 세션 구조를 사용한다.
     args.output_manager = None
-    if args.output_dir is None:
-        args.output_manager = OutputManager(camera_name=args.sensor_name or "")
-        args.output_dir = str(args.output_manager.ensure_session(args.sensor_name or ""))
-        _log(args.quiet, f"Output Session: {args.output_dir}")
+    if args.session_dir is not None:
+        if args.output_dir is not None:
+            parser.error("--session-dir와 --output-dir는 함께 쓸 수 없습니다.")
+        try:
+            args.output_manager = _open_explicit_session(args.session_dir, args.sensor_name or "")
+        except CliError as e:
+            print(f"오류: {e}", file=sys.stderr)
+            return 1
+        args.output_dir = str(args.output_manager.session_dir)
+        _log(args.quiet, f"Output: {args.output_dir}")
+    elif args.output_dir is None:
+        try:
+            args.output_manager = OutputManager(camera_name=args.sensor_name or "")
+            args.output_dir = str(args.output_manager.ensure_session(args.sensor_name or ""))
+        except OSError as e:
+            print(f"오류: Output Session을 만들 수 없습니다: {e}", file=sys.stderr)
+            return 1
+        _log(args.quiet, f"Output: {args.output_dir}")
 
     try:
         if args.benchmark_mode:

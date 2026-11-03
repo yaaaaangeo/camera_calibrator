@@ -241,6 +241,58 @@ def evaluate_image_quality(info: ImageInfo) -> ImageQualityReport:
 
 
 # ---------------------------------------------------------------------------
+# 패턴 기준 노출 지표 (image_selection exposure_mode="pattern" 전용)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PatternExposureMetrics:
+    """검출된 코너 주변만 보고 계산한 노출 지표.
+
+    이미지 전체 clipping 비율(compute_saturation)은 흰 종이·배경·조명 같은 장면
+    내용에 좌우되어, 코너가 정상인 이미지를 버리거나 코너가 실제로 밀린
+    이미지를 통과시킬 수 있다. 여기서는 코너 위치를 결정하는 픽셀만 본다:
+
+      corner_clip_median: 각 코너 주변 정사각 패치에서 >= 250 인 픽셀 비율의
+                          중앙값. 흰 칸이 포화되어 코너 쪽으로 번지면 커진다.
+      roi_brightness:     코너 convex hull(보드 영역) 내부 평균 밝기.
+    """
+    num_corners: int
+    patch_radius_px: int
+    corner_clip_median: float
+    roi_brightness: float
+
+
+def compute_pattern_exposure_metrics(gray: np.ndarray, corners: np.ndarray) -> PatternExposureMetrics | None:
+    """코너가 4개 미만이면 None (보드 영역/코너 간격을 정의할 수 없음)."""
+    points = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
+    if len(points) < 4:
+        return None
+    distances = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
+    np.fill_diagonal(distances, np.inf)
+    spacing = float(np.median(distances.min(axis=1)))
+    # 코너 간격의 1/4: 이웃 코너를 침범하지 않으면서 네 칸의 경계를 모두 포함
+    radius = int(np.clip(round(0.25 * spacing), 3, 25))
+    h, w = gray.shape[:2]
+    clip_ratios = []
+    for x, y in points:
+        x0, x1 = int(max(0, x - radius)), int(min(w, x + radius + 1))
+        y0, y1 = int(max(0, y - radius)), int(min(h, y + radius + 1))
+        patch = gray[y0:y1, x0:x1]
+        if patch.size:
+            clip_ratios.append(float(np.count_nonzero(patch >= _CLIP_HIGH_THRESHOLD) / patch.size))
+    hull = cv2.convexHull(points).astype(np.int32)
+    mask = np.zeros(gray.shape[:2], dtype=np.uint8)
+    cv2.fillConvexPoly(mask, hull, 255)
+    roi = gray[mask > 0]
+    return PatternExposureMetrics(
+        num_corners=len(points),
+        patch_radius_px=radius,
+        corner_clip_median=float(np.median(clip_ratios)) if clip_ratios else 0.0,
+        roi_brightness=float(roi.mean()) if roi.size else float(gray.mean()),
+    )
+
+
+# ---------------------------------------------------------------------------
 # 중복 / 거의 동일 이미지 검사 (설계 문서 3-1번 마지막 두 항목)
 # ---------------------------------------------------------------------------
 

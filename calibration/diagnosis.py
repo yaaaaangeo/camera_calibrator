@@ -152,11 +152,23 @@ def _add_capture_recommendation(
 def _next_capture_recommendations(
     coverage_grid: list[CoverageCell] | None,
     diversity: DiversityScores | None,
+    observable_coverage: dict | None = None,
 ) -> list[CaptureRecommendation]:
     recommendations: list[CaptureRecommendation] = []
     seen: set[str] = set()
 
-    if coverage_grid:
+    if observable_coverage is not None:
+        for cell in observable_coverage['grid']:
+            if cell['visible_pixels'] <= 0 or cell['sufficient']:
+                continue
+            row, col = cell['row'], cell['col']
+            _add_capture_recommendation(
+                recommendations, seen, f'capture_observable_r{row}_c{col}', 'medium',
+                f'Add visible grid ({row + 1}, {col + 1}) board views',
+                f'Capture sharp board views in the unmasked part of grid row {row + 1}, column {col + 1}; keep the target outside the occlusion polygon.',
+                f"Observable cell coverage score {cell['coverage_score'] * 100:.0f}%; {cell['corner_count']} detected corners, visible fraction {cell['visible_fraction']:.3f}.",
+            )
+    elif coverage_grid:
         for label, score, corners in _coverage_location_gaps(coverage_grid)[:5]:
             capture_label = _capture_region_name(label)
             priority = "high" if score < 0.10 else "medium"
@@ -354,6 +366,8 @@ def diagnose_calibration(
     dataset_coverage_pct: float | None = None,
     coverage_grid: list[CoverageCell] | None = None,
     diversity: DiversityScores | None = None,
+    *,
+    observable_coverage: dict | None = None,
 ) -> DiagnosisReport:
     patterns: list[FailurePattern] = []
     if not calibration.success:
@@ -378,7 +392,14 @@ def diagnose_calibration(
             ["Coverage, residuals, stability, and observability did not cross warning thresholds."],
             "Proceed with export, while keeping application-specific tolerance requirements in mind.",
         )
-    capture_recommendations = _next_capture_recommendations(coverage_grid, diversity)
+    capture_recommendations = _next_capture_recommendations(coverage_grid, diversity, observable_coverage)
+    if observable_coverage is not None:
+        for pattern in patterns:
+            if pattern.code in ('poor_coverage', 'limited_coverage', 'coverage_location_gaps'):
+                pattern.recommendation = 'Full-frame coverage is retained for grading. Follow observable-area capture guidance; do not capture inside the occlusion mask.'
+        for rec in capture_recommendations:
+            if not rec.code.startswith('capture_observable_'):
+                rec.action += ' Use only the unmasked observable area; occluded regions are not capture targets.'
     return DiagnosisReport(
         model_name=calibration.model_name,
         patterns=patterns,

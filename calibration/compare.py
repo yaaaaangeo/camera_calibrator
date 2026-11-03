@@ -52,6 +52,9 @@ def run_all_models(
     model_jobs: int = 1,
     persistent_cache_dir: str | Path | None = None,
     models: list[CameraModelType] | tuple[CameraModelType, ...] | None = None,
+    robust_optimization: bool = False,
+    test_ratio: float = 0.25,
+    seed: int = 42,
 ) -> list[CalibrationResult]:
     """Standard 4모델(Ideal Pinhole/Brown-Conrady/Rational/Fisheye)을 정해진
     순서로 계산.
@@ -78,6 +81,18 @@ def run_all_models(
     ))
     if any(model is None for model in requested_models):
         raise ValueError("Calibration model list contains None; select a valid Camera Model.")
+    if robust_optimization:
+        from calibration.robust_optimization import robust_fit
+        from calibration.validation import split_train_test, _subset_dataset
+        train_ids, _ = split_train_test(dataset, camera_config, test_ratio, seed)
+        development = _subset_dataset(dataset, train_ids)
+        results = [robust_fit(dataset, camera_config, model, development, seed,
+                              estimate_uncertainty=estimate_fisheye_uncertainty if model == CameraModelType.FISHEYE else False,
+                              bootstrap_jobs=bootstrap_jobs) for model in requested_models]
+        for result in results:
+            attach_observability_report(result, dataset)
+            attach_undistortion_quality_report(result, dataset, camera_config)
+        return results  # Deliberately bypass legacy result cache.
     requested_set = set(requested_models)
     needs_pinhole = CameraModelType.PINHOLE in requested_set or CameraModelType.FISHEYE in requested_set
     needs_brown = CameraModelType.BROWN_CONRADY in requested_set
@@ -205,7 +220,7 @@ def format_comparison_table(results: list[CalibrationResult]) -> str:
 
     lines = [
         header,
-        row("Train RMS", [train_rms(r) for r in results]),
+        row("Full-fit RMS", [train_rms(r) for r in results]),
         row("Mean Error", [mean_error(r) for r in results]),
         row("Edge Error", [edge_error(r) for r in results]),
         row("Max Error", [max_error(r) for r in results]),

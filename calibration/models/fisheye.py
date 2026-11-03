@@ -441,8 +441,8 @@ def calibrate_fisheye(
         more = f" 외 {len(excluded_ids) - 5}장" if len(excluded_ids) > 5 else ""
         warning_message = (
             f"Fisheye 초기 자세 추정이 불안정한 프레임 {len(excluded_ids)}장을 "
-            f"자동 제외하고 계산했습니다 ({preview}{more}). Dataset 탭에서 "
-            f"'제외됨(이상치)' 상태로 표시됩니다 - 필요하면 원본 촬영을 다시 검토하세요."
+            f"이 계산에서만 제외했습니다 ({preview}{more}). 원본 Dataset 상태는 변경하지 않았습니다. "
+            f"제외 사유와 원본 촬영을 검토하세요."
         )
 
     return CalibrationResult(

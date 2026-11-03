@@ -321,6 +321,9 @@ def _evaluate_on_test(
             train_frame_ids=train_ids,
             test_frame_ids=[],
             train_rms=train_result.rms_error,
+            train_camera_matrix=train_result.camera_matrix.copy(),
+            train_distortion=train_result.distortion.copy(),
+            optimization_audit=train_result.optimization_audit,
             train_residual_stats=train_result.residual_stats,
             straightness_residual=straightness,
             straightness_source="train_fallback" if straightness is not None else None,
@@ -340,6 +343,9 @@ def _evaluate_on_test(
             train_frame_ids=train_ids,
             test_frame_ids=test_ids,
             train_rms=train_result.rms_error,
+            train_camera_matrix=train_result.camera_matrix.copy(),
+            train_distortion=train_result.distortion.copy(),
+            optimization_audit=train_result.optimization_audit,
             train_residual_stats=train_result.residual_stats,
             success=False,
             error_message="모든 test 프레임에서 pose 추정(solvePnP)이 실패했습니다.",
@@ -385,6 +391,9 @@ def _evaluate_on_test(
         train_frame_ids=train_ids,
         test_frame_ids=test_ids,
         train_rms=train_result.rms_error,
+            train_camera_matrix=train_result.camera_matrix.copy(),
+            train_distortion=train_result.distortion.copy(),
+            optimization_audit=train_result.optimization_audit,
         test_rms=test_rms,
         edge_rms=edge_rms,
         straightness_residual=straightness,
@@ -451,6 +460,7 @@ def validate_all_models(
     pattern_config: PatternConfig,
     test_ratio: float = 0.25,
     seed: int = 42,
+    robust_optimization: bool = False,
 ) -> dict[CameraModelType, ValidationResult]:
     """Standard 4모델(Ideal Pinhole/Brown-Conrady/Rational/Fisheye)을 '동일한
     train/test 분할'로 검증. 분할을 여기서 한 번만 하고 네 모델 모두에
@@ -464,6 +474,24 @@ def validate_all_models(
     쓴다.
     """
     train_ids, test_ids = split_train_test(dataset, camera_config, test_ratio, seed)
+
+    if robust_optimization:
+        from calibration.robust_optimization import robust_fit
+        development = _subset_dataset(dataset, train_ids)
+        results = {}
+        for model in CameraModelType:
+            if model not in (CameraModelType.PINHOLE, CameraModelType.BROWN_CONRADY,
+                             CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE):
+                continue
+            result = robust_fit(development, camera_config, model, development, seed)
+            if result.success:
+                results[model] = _evaluate_on_test(dataset, camera_config, pattern_config,
+                                                  model, train_ids, test_ids, result)
+            else:
+                results[model] = ValidationResult(train_frame_ids=train_ids, test_frame_ids=test_ids,
+                                                  success=False, error_message=result.error_message,
+                                                  optimization_audit=result.optimization_audit)
+        return results
 
     # Fisheye 발산 방지용 초기값은 "같은 train 분할"로 학습한 Pinhole 결과를 써야
     # 일관성이 있다. 전체 데이터로 학습한 Pinhole을 쓰면 Fisheye가 test 정보를
@@ -807,7 +835,9 @@ def format_validation_table(results: dict[CameraModelType, ValidationResult]) ->
         Edge RMS(test)   0.51      0.45      0.40      0.44
         Gap(Test-Train)  0.07      0.06      0.04      0.08
     """
-    order = [CameraModelType.PINHOLE, CameraModelType.BROWN_CONRADY, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE]
+    # --models로 일부 모델만 계산한 경우에도 표를 만들 수 있게, 결과에 있는 모델만 고정 순서로 표시한다
+    order = [m for m in (CameraModelType.PINHOLE, CameraModelType.BROWN_CONRADY,
+                         CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE) if m in results]
     labels = {"pinhole": "Ideal", "brown_conrady": "Brown", "extended_pinhole": "Rational", "fisheye": "Fisheye"}
     cols = [labels[m.value] for m in order]
     col_w = max(10, max(len(c) for c in cols) + 2)
@@ -869,7 +899,9 @@ def format_train_test_residual_comparison(results: dict[CameraModelType, Validat
     P99               0.770   0.890      0.700   0.810      0.648   0.760      0.652   0.755
     Max               0.923   1.050      0.910   1.010      0.898   0.990      0.901   0.985
     """
-    order = [CameraModelType.PINHOLE, CameraModelType.BROWN_CONRADY, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE]
+    # --models로 일부 모델만 계산한 경우에도 표를 만들 수 있게, 결과에 있는 모델만 고정 순서로 표시한다
+    order = [m for m in (CameraModelType.PINHOLE, CameraModelType.BROWN_CONRADY,
+                         CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE) if m in results]
     labels = {"pinhole": "Ideal", "brown_conrady": "Brown", "extended_pinhole": "Rational", "fisheye": "Fisheye"}
 
     sub_w = 9
@@ -917,7 +949,9 @@ def format_straightness_comparison(results: dict[CameraModelType, ValidationResu
     Corner line       0.298     0.255     0.221     0.230
     Overall           0.256     0.220     0.196     0.201
     """
-    order = [CameraModelType.PINHOLE, CameraModelType.BROWN_CONRADY, CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE]
+    # --models로 일부 모델만 계산한 경우에도 표를 만들 수 있게, 결과에 있는 모델만 고정 순서로 표시한다
+    order = [m for m in (CameraModelType.PINHOLE, CameraModelType.BROWN_CONRADY,
+                         CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE) if m in results]
     labels = {"pinhole": "Ideal", "brown_conrady": "Brown", "extended_pinhole": "Rational", "fisheye": "Fisheye"}
     col_w = 10
 

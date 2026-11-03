@@ -1,0 +1,84 @@
+# Camera Calibrator 자동화 프로파일 (python -m automation run --profile ...)
+#
+# 우선순위: 명령행 인자 > 이 파일 > 기존 app.cli 기본값
+# pattern / calibration 섹션의 키는 기존 app.cli 옵션 이름(argparse dest)과 같다.
+# 생략한 항목은 기존 CLI 기본값을 그대로 쓴다.
+profile_version: 1
+
+camera:
+  model: null        # 카메라 하드웨어 모델명. 보통 --camera-model로 준다 (예: SG3S-ISX031C)
+  width: null        # 지정하면 실제 이미지 해상도와 다를 때 실행 전에 중단한다
+  height: null
+
+# !!! 실제 사용하는 보드와 반드시 일치시킬 것 !!!
+# 아래 값은 저장소 CLI 예제/테스트가 쓰는 7x5 ChArUco 보드다.
+# 치수(m 단위)나 dictionary가 틀리면 검출이 실패하거나 K가 틀어진다.
+pattern:
+  type: charuco            # charuco | chessboard | circle_grid | aprilgrid
+  squares_x: 7
+  squares_y: 5
+  square_size: 0.04        # m
+  marker_size: 0.03        # m (ChArUco/AprilGrid 필수, square_size보다 작아야 함)
+  dictionary: DICT_5X5_100
+
+calibration:
+  models: [pinhole, brown_conrady, rational, fisheye]   # 기존 Standard 4모델
+  test_ratio: 0.25         # Hold-out 비율 (기존 CLI 기본값)
+  seed: 42                 # Train/Hold-out 분할 seed (기존 CLI 기본값)
+  jobs: 1                  # 1 = 순차 처리 (재현성 기준)
+  # model: brown_conrady   # 지정하면 추천 대신 이 모델을 최종 선택 (기존 CLI --model)
+  # outlier: false         # 기존 CLI --outlier
+  # diagnostic: false      # 기존 CLI --diagnostic (k-fold 5, bootstrap 100 추가, 시간 소요 큼)
+
+image_selection:
+  enabled: true            # 기존 calibration.image_selection 자동 선별 사용
+  target_count: 35         # 기존 ImageSelectionConfig 기본값
+  # 노출 판정: pattern = 보드 영역 밝기 + 코너 주변 포화 비율 (자동화 기본값)
+  #            global  = 이미지 전체 밝기 + 전체 clipping 비율 (GUI 자동 선별과 같은 기존 방식)
+  # pattern은 흰 배경/조명 때문에 정상 이미지를 버리지 않는다. 두 방식은 선택되는
+  # 이미지가 다를 수 있으며 run_manifest와 image_selection_manifest에 모드가 기록된다.
+  # corner_clip_max 0.45의 근거와 한계: docs/AUTOMATION.md "이미지 노출 판정".
+  exposure_mode: pattern
+  corner_clip_max: 0.45
+  # 그 밖의 키: blur_min_laplacian_var, brightness_min, brightness_max, saturation_max(global 전용),
+  #            duplicate_phash_distance, similar_center_distance, similar_area_delta,
+  #            similar_tilt_delta_deg, seed
+
+acceptance:
+  # 운영 품질 기준. null = 아직 정해지지 않음.
+  # required: true 인 지표의 기준이 null이면 판정은 PASS가 될 수 없고 WARN으로 남는다.
+  # required: true 인 지표가 계산되지 않으면 FAIL이다 (누락을 좋은 값으로 간주하지 않음).
+  # on_violation: fail(기본) | warn
+  thresholds:
+    train_rms_px:        {max: null, required: true}
+    test_rms_px:         {max: null, required: true}
+    test_p95_px:         {max: null, required: true}
+    test_p99_px:         {max: null, required: false}
+    edge_rms_px:         {max: null, required: true}
+    train_test_gap_px:   {max: null, required: false}
+    stability_pct:       {min: null, required: false}
+    observability_score: {min: null, required: false}
+    coverage_pct:        {min: null, required: true}
+    num_images_used:     {min: null, required: true}
+    num_test_frames:     {min: null, required: false}
+  # 기존 코드가 이미 내리는 판단을 판정에 어떻게 반영할지 (fail | warn | info)
+  existing_checks:
+    sanity_error: fail                    # NaN, 비정상 초점거리 등 물리적으로 불가능한 값
+    sanity_warning: warn
+    diagnosis_error: warn                 # 기존 diagnosis ERROR 패턴 (예: coverage < 50%)
+    diagnosis_warning: info
+    holdout_evidence_insufficient: warn   # 기존 Hold-out evidence gate
+    grade_warning_or_poor: warn           # 기존 종합 등급 WARNING/POOR
+    confidence_low_or_reject: warn        # 기존 신뢰도 LOW/REJECT
+
+output:
+  root: null               # null = ~/CameraCalibratorOutputs (기존 OutputManager 기본값)
+  exports: [opencv, ros, report, json, csv]
+
+execution:
+  timeout_sec: null        # 계산 단계 제한 시간 (초). null = 제한 없음
+  # OpenCV 스레드 수. 1 = 같은 입력이면 비트 단위로 같은 결과 (자동화 기본값).
+  # null = 기존 CLI/GUI와 같은 기본 스레드 수. 이 경우 실행마다 결과가 흔들린다:
+  #   합성 데이터 K 7e-8 수준, 실제 4K 데이터의 Rational 모델은 fx 최대 92.7 px 차이 (실측).
+  # 실행 시간 영향: docs/AUTOMATION.md "성능" 절 참고.
+  opencv_threads: 1

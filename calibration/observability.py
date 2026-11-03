@@ -84,8 +84,16 @@ def _collect_observations(
     result: CalibrationResult, dataset: Dataset
 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     frames, object_points, image_points = collect_calibration_inputs(dataset)
+    # Robust model fitting may retain only some views (notably Fisheye).
+    # Its poses follow the retained dataset order, not the original prefix.
+    views = list(zip(frames, object_points, image_points))
+    if result.per_frame_error:
+        views = [view for view in views if view[0].image_info.image_id in result.per_frame_error]
+    if len(views) != len(result.rvecs) or len(views) != len(result.tvecs):
+        # A legacy subset without frame identities cannot be aligned safely.
+        return []
     observations = []
-    for obj, img, rvec, tvec in zip(object_points, image_points, result.rvecs, result.tvecs):
+    for (_frame, obj, img), rvec, tvec in zip(views, result.rvecs, result.tvecs):
         observations.append((
             np.asarray(obj, dtype=np.float64),
             np.asarray(img, dtype=np.float64).reshape(-1, 2),

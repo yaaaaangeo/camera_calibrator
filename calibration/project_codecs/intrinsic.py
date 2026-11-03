@@ -366,6 +366,7 @@ def _calibration_result_from_dict(d: dict) -> CalibrationResult:
     return CalibrationResult(
         model_name=CameraModelType(model_value),
         camera_matrix=_arr(d.get("camera_matrix"), np.float64),
+        optimization_audit=d.get("optimization_audit", {}),
         distortion=_arr(d.get("distortion"), np.float64),
         rvecs=[_arr(r, np.float64) for r in d.get("rvecs", [])],
         tvecs=[_arr(t, np.float64) for t in d.get("tvecs", [])],
@@ -432,6 +433,9 @@ def _holdout_evidence_gate_from_dict(d) -> HoldoutEvidenceGate | None:
 
 def _validation_result_from_dict(d: dict) -> ValidationResult:
     return ValidationResult(
+        train_camera_matrix=_arr(d.get("train_camera_matrix"), np.float64),
+        train_distortion=_arr(d.get("train_distortion"), np.float64),
+        optimization_audit=d.get("optimization_audit", {}),
         train_frame_ids=d.get("train_frame_ids", []),
         test_frame_ids=d.get("test_frame_ids", []),
         train_rms=d.get("train_rms"), test_rms=d.get("test_rms"), edge_rms=d.get("edge_rms"),

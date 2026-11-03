@@ -1,0 +1,76 @@
+camera:
+  model: UNKNOWN
+  serial: DIAG-video0
+coordinate_system: native_distorted_pixel_edges
+height: 2160
+polygons:
+- - - 0
+    - 1580
+  - - 480
+    - 1560
+  - - 480
+    - 2160
+  - - 0
+    - 2160
+- - - 480
+    - 1560
+  - - 960
+    - 1550
+  - - 960
+    - 2160
+  - - 480
+    - 2160
+- - - 960
+    - 1550
+  - - 1440
+    - 1555
+  - - 1440
+    - 2160
+  - - 960
+    - 2160
+- - - 1440
+    - 1555
+  - - 1920
+    - 1555
+  - - 1920
+    - 2160
+  - - 1440
+    - 2160
+- - - 1920
+    - 1555
+  - - 2400
+    - 1555
+  - - 2400
+    - 2160
+  - - 1920
+    - 2160
+- - - 2400
+    - 1555
+  - - 2880
+    - 1550
+  - - 2880
+    - 2160
+  - - 2400
+    - 2160
+- - - 2880
+    - 1550
+  - - 3360
+    - 1550
+  - - 3360
+    - 2160
+  - - 2880
+    - 2160
+- - - 3360
+    - 1550
+  - - 3840
+    - 1570
+  - - 3840
+    - 2160
+  - - 3360
+    - 2160
+schema_version: 1
+source: 'Manual conservative annotation of fixed hood/dashboard silhouette on ROSbag
+  video0 samples 0,30,60,90,113 seconds; evidence: .verification/occlusion/boundary-evidence.json;
+  diagnostic camera binding, hardware SN unverified'
+version: rosbag1023-front-visual-v1
+width: 3840

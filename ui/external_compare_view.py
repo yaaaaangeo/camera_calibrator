@@ -20,6 +20,8 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QImage, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
+    QDialog,
+    QPlainTextEdit,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -217,6 +219,9 @@ class ExternalCompareView(QWidget):
         self.load_yaml_button = QPushButton("Calibration 파일 불러오기...")
         self.load_yaml_button.clicked.connect(self._on_load_yaml)
         yaml_row.addWidget(self.load_yaml_button)
+        self.factory_report_button = QPushButton("P4 Factory 비교 보고서 보기...")
+        self.factory_report_button.clicked.connect(self._on_factory_report)
+        yaml_row.addWidget(self.factory_report_button)
         self.yaml_status_label = QLabel(
             "불러온 파일 없음 - 아래 수동 입력을 쓰거나 OpenCV/ROS/Kalibr/JSON calibration 파일을 불러오세요."
         )
@@ -931,6 +936,32 @@ class ExternalCompareView(QWidget):
     # ------------------------------------------------------------------
     # 외부 YAML 불러오기
     # ------------------------------------------------------------------
+
+    def _on_factory_report(self) -> None:
+        """Read-only P4 artifact viewer; never loads K/D into manual controls."""
+        import json
+        from pathlib import Path
+        path, _ = QFileDialog.getOpenFileName(self, "P4 Factory 비교 보고서", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            if Path(path).stat().st_size > 10 * 1024 * 1024:
+                raise ValueError("보고서가 10 MiB를 초과합니다.")
+            report = json.loads(Path(path).read_text(encoding="utf-8"))
+            if report.get("schema_version") != 1 or "candidates" not in report or "conclusion" not in report:
+                raise ValueError("P4 Factory 비교 보고서가 아닙니다.")
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Factory 보고서", str(exc))
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Factory 비교 — 검토용, 승인·적용 아님")
+        layout = QVBoxLayout(dialog)
+        viewer = QPlainTextEdit()
+        viewer.setReadOnly(True)
+        viewer.setPlainText(json.dumps(report, ensure_ascii=False, indent=2))
+        layout.addWidget(viewer)
+        dialog.resize(900, 650)
+        dialog.exec()
 
     def _on_load_yaml(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

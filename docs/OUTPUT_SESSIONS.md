@@ -1,4 +1,4 @@
-# Output Sessions
+# Output
 
 사용자 결과물은 기본적으로 소스 저장소 밖의
 `~/CameraCalibratorOutputs/<session>/`에 저장됩니다. Session 이름은
@@ -25,13 +25,18 @@
     └── dataset.csv
 ```
 
-GUI 상단의 **Output Session**에서 Root 변경, 현재 Session 열기, **Export
+GUI 상단의 **Output**에서 Root 변경, 현재 Session 열기, **Export
 All**을 사용할 수 있습니다. 개별 Export 버튼도 같은 Session을 사용하며
 Project의 **다른 이름으로 저장**만 명시적 외부 경로를 선택합니다.
 
 CLI에서 `--output-dir`를 생략하면 같은 Session 구조를 사용합니다. 기존 CI나
 스크립트가 `--output-dir ./out`을 명시하면 하위 구조를 강제하지 않고 종전의
 flat 파일명 계약을 유지합니다.
+
+자동화/배치처럼 Session 위치를 미리 정해야 하면 `--session-dir PATH`를 씁니다.
+같은 Session 구조를 정확히 그 폴더에 만들며, 이미 결과(`manifest.json` 또는
+Session 하위 폴더의 파일)가 있거나 다른 실행이 사용 중(`.session_claim`)인 폴더는
+덮어쓰지 않고 종료 코드 1로 끝납니다. `--output-dir`와 함께 쓸 수 없습니다.
 
 저장소의 `calibration_output/`은 과거 CLI 기본 실행이 만든 tracked 결과
 snapshot입니다. 새 실행의 기본 목적지가 아니며, serializer 회귀 확인을 위한

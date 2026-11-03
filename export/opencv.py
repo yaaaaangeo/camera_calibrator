@@ -63,6 +63,8 @@ def export_opencv_yaml(
     )
     fs.write("rms_reprojection_error", float(result.rms_error))
     fs.write("calibration_source", calibration_source)
+    fs.write("parameter_scope", "fit_frame_ids; holdout uses separate train-only K/D")
+    fs.write("fit_frame_ids", ",".join(result.per_frame_error))
     if selected_frame_ids is not None:
         fs.write("subset_scene_count", len(selected_frame_ids))
         fs.write("subset_scene_ids", ",".join(selected_frame_ids))

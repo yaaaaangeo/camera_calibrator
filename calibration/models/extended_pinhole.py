@@ -63,6 +63,7 @@ def calibrate_extended_pinhole(
     n_bootstrap: int = 20,
     bootstrap_seed: int = 42,
     bootstrap_jobs: int = 1,
+    initial_guess: CalibrationResult | None = None,
 ) -> CalibrationResult:
     """Extended Pinhole (Rational, 항상 k1~k6+p1,p2 8계수) 캘리브레이션 실행.
 
@@ -78,6 +79,7 @@ def calibrate_extended_pinhole(
         n_bootstrap=n_bootstrap,
         bootstrap_seed=bootstrap_seed,
         bootstrap_jobs=bootstrap_jobs,
+        initial_guess=initial_guess,
     )
 
 
@@ -91,6 +93,7 @@ def _calibrate_extended_pinhole_core(
     n_bootstrap: int = 20,
     bootstrap_seed: int = 42,
     bootstrap_jobs: int = 1,
+    initial_guess: CalibrationResult | None = None,
 ) -> CalibrationResult:
     """실제 계산 로직 - private, 모듈 밖에서 직접 호출하지 않는다.
 
@@ -127,6 +130,13 @@ def _calibrate_extended_pinhole_core(
     if fix_tangent_dist:
         flags |= cv2.CALIB_ZERO_TANGENT_DIST
 
+    initial_k = initial_d = None
+    guess_flags = 0
+    if initial_guess is not None:
+        from calibration.initialization import compatible_seed
+        initial_k, initial_d = compatible_seed(initial_guess, (CameraModelType.EXTENDED_PINHOLE if calibration_flags & cv2.CALIB_RATIONAL_MODEL else CameraModelType.BROWN_CONRADY))
+        guess_flags = cv2.CALIB_USE_INTRINSIC_GUESS
+
     try:
         (
             rms,
@@ -141,9 +151,9 @@ def _calibrate_extended_pinhole_core(
             object_points,
             image_points,
             image_size,
-            None,
-            None,
-            flags=flags,
+            initial_k,
+            initial_d,
+            flags=flags | guess_flags,
             criteria=DEFAULT_TERM_CRITERIA,
         )
     except cv2.error as e:

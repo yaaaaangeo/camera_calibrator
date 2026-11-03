@@ -19,3 +19,11 @@ CameraCalibratorOutputs/
 data/
 calib_data/
 library/
+
+# Local verification fixtures, publication queues and machine-specific settings.
+.verification/
+publish_outbox/
+.publish-outbox/
+publisher.local.json
+.env
+.env.*
