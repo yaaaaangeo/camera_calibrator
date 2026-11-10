@@ -42,6 +42,9 @@ from calibration.radial_profile import _project
 
 
 # ---------------------------------------------------------------------------
+# 누적 제거 상한: 처음 프레임 수의 이 비율까지만 지운다(안전장치).
+MAX_OUTLIER_REMOVAL_FRACTION = 0.2
+
 # Threshold 계산 (설계 문서 9번: threshold = median(error) + 3*MAD)
 # ---------------------------------------------------------------------------
 # compute_mad_threshold()의 실제 정의는 models/common.py로 옮겨졌다 (순환 참조
@@ -180,11 +183,26 @@ def recalibrate_with_outlier_pruning(
     removed_all: list[str] = []
     last_threshold = 0.0
     iterations = 0
+    first_threshold: float | None = None
+    initial_count = len(result.per_frame_error)
+    max_total_removal = max(1, int(np.floor(initial_count * MAX_OUTLIER_REMOVAL_FRACTION)))
 
     for _ in range(max_iterations):
         candidates, threshold = recommend_outliers(
             last_good_result.per_frame_error, k=k, mad_scale=mad_scale, user_threshold=user_threshold
         )
+        if first_threshold is None:
+            first_threshold = threshold
+        elif threshold < first_threshold:
+            # 기준 고정: 제거 후 분포가 좁아지면 median+k*MAD가 계속 내려가 정상
+            # 프레임을 깎아낸다(실측: 0.518 -> 0.362 -> 0.300px, 0.31~0.5px 정상
+            # 프레임 12장 추가 제거, fx 14px 이동). 첫 기준보다 낮추지 않는다.
+            candidates, threshold = recommend_outliers(
+                last_good_result.per_frame_error, k=k, mad_scale=mad_scale,
+                user_threshold=first_threshold,
+            )
+        # 누적 제거 상한(오차 큰 순으로 자른다).
+        candidates = candidates[:max(0, max_total_removal - len(removed_all))]
         if not candidates:
             break
         last_threshold = threshold

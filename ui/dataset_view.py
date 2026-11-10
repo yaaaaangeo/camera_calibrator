@@ -53,6 +53,8 @@ _STATUS_COLOR = {
 }
 
 _DISABLED_REASON_LABEL = {
+    "too_few_corners": "코너 부족",
+    "motion_blur_rejected": "모션 블러",
     "blur_rejected": "Blur 불량",
     "exposure_rejected": "Exposure 불량",
     "duplicate_scene": "유사 이미지 제외",

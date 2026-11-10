@@ -67,8 +67,11 @@ def test_synthetic_default_unchanged(synthetic_dataset,camera_config):
  cv2.setNumThreads(1)
  a=calibrate_extended_pinhole(copy.deepcopy(synthetic_dataset),camera_config)
  b=calibrate_extended_pinhole(copy.deepcopy(synthetic_dataset),camera_config,initial_guess=None)
- assert a.success and b.success and a.rms_error==b.rms_error
+ # P6: identical native numbers and identical physical verdict (this narrow
+ # synthetic Rational folds inside the sensor ROI, so both are rejected).
+ assert a.success==b.success and a.rms_error==b.rms_error and a.error_message==b.error_message
  np.testing.assert_array_equal(a.camera_matrix,b.camera_matrix)
+ np.testing.assert_array_equal(a.distortion,b.distortion)
 
 @pytest.mark.parametrize('model',[M.BROWN_CONRADY,M.FISHEYE])
 def test_known_intrinsics_control(model):
@@ -106,12 +109,15 @@ def test_validation_selects_instead_of_minimum_fit_rms(monkeypatch,synthetic_dat
  opt._DEVELOPMENT_CACHE.clear()
  train_ids,_=split_train_test(synthetic_dataset,camera_config);dev=_subset_dataset(synthetic_dataset,train_ids)
  def fake(data,camera,model,strategy,seed_data):
+  # P6: physically valid fake (principal point near the sensor centre); the
+  # validation error is the principal point offset from that centre.
   r=result(M.FISHEYE,[0]*4)
-  r.camera_matrix[0,2]=1 if strategy=='cold' else 2
+  r.camera_matrix[0,2]=camera.width/2+(1 if strategy=='cold' else 2)
+  r.camera_matrix[1,2]=camera.height/2
   r.rms_error=100 if strategy=='cold' else .01
   return r
  def errors(frames,k,*args):
-  return {f.image_info.image_id:float(k[0,2]) for f in frames},[],[],[],[],{}
+  return {f.image_info.image_id:float(k[0,2]-camera_config.width/2) for f in frames},[],[],[],[],{}
  monkeypatch.setattr(opt,'fit_strategy',fake);monkeypatch.setattr(validation,'_test_reprojection_errors',errors)
  r=robust_fit(dev,camera_config,M.FISHEYE,dev)
  assert r.optimization_audit['selected_strategy']=='cold'

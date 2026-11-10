@@ -107,7 +107,8 @@ def run_all_models(
         cached = cache.get(cache_key)
         if cached is not None:
             logger.info("모델 결과 persistent cache hit: %s", cache_key[:12])
-            return cached
+            from calibration.physical_validity import enforce_distortion_validity
+            return [enforce_distortion_validity(r, camera_config, dataset) for r in cached]
 
     pinhole_result = None
     brown_result = None

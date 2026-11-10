@@ -68,11 +68,18 @@ def fit_strategy(data, camera, model, strategy, seed_data):
         result = fn(data, camera, initial_guess=guess)
     else:
         result = fn(data, camera, initial_guess=guess)
-    result.optimization_audit = {'initialization': init}
+    result.optimization_audit['initialization'] = init
     return result
 
 
 def admissible(result, camera=None, data=None):
+    """Necessary physical checks, not a reprojection-quality/pose-certainty gate.
+
+    OpenCV extrinsics map board points into the camera: Xc = R Xb + t.
+    With correspondences, cheirality belongs to the observed points, not the
+    arbitrary board origin (which may be outside a visible partial board).
+    Without points, retain the conservative origin-depth check.
+    """
     if not result.success or result.camera_matrix is None or result.distortion is None:
         return False
     k, d = result.camera_matrix, result.distortion
@@ -80,7 +87,9 @@ def admissible(result, camera=None, data=None):
         return False
     if not np.isfinite(k).all() or not np.isfinite(d).all() or min(k[0, 0], k[1, 1]) <= 0:
         return False
-    if any(not np.isfinite(t).all() or np.asarray(t).reshape(-1)[2] <= 0 for t in result.tvecs):
+    if any(not np.isfinite(t).all() or
+           (data is None and np.asarray(t).reshape(-1)[2] <= 0)
+           for t in result.tvecs):
         return False
     if data is not None:
         from calibration.models.common import collect_calibration_inputs
@@ -92,22 +101,12 @@ def admissible(result, camera=None, data=None):
             points = np.asarray(obj).reshape(-1,3) @ cv2.Rodrigues(rv)[0].T + np.asarray(tv).reshape(1,3)
             if not np.isfinite(points).all() or np.any(points[:,2] <= 0):
                 return False
-    if result.model_name == M.FISHEYE:
-        dv = np.asarray(d).reshape(-1)
-        roots = np.roots([9*dv[3], 7*dv[2], 5*dv[1], 3*dv[0], 1.0])
-        if any(abs(x.imag) < 1e-9 and 0 <= x.real <= (np.pi/2)**2 for x in roots):
-            return False  # Angular radial mapping folds in the front hemisphere.
-    if result.model_name == M.EXTENDED_PINHOLE:
-        # Reject a rational denominator pole anywhere between axis and fitted points.
-        dv = np.asarray(d).reshape(-1)
-        if len(dv) >= 8:
-            roots = np.roots([dv[7], dv[6], dv[5], 1.0])
-            # Conservative full image domain is checked by the caller below.
-            poles = [float(x.real) for x in roots if abs(x.imag) < 1e-9 and x.real >= 0]
-            if camera is not None:
-                radius2 = max(((x-k[0,2])/k[0,0])**2+((y-k[1,2])/k[1,1])**2
-                              for x in (0,camera.width) for y in (0,camera.height))
-                if any(p <= radius2 for p in poles): return False
+    if result.model_name in (M.FISHEYE, M.EXTENDED_PINHOLE):
+        from calibration.physical_validity import distortion_diagnostic
+        diagnostic = distortion_diagnostic(result, camera, data)
+        result.optimization_audit['physical_validity'] = diagnostic
+        if diagnostic['status'] != 'PASS':
+            return False
     return True
 
 
@@ -212,6 +211,7 @@ def robust_fit(data, camera, model, development_data, seed=42, *, estimate_uncer
         else:
             result = fit_strategy(data, camera, model, 'legacy', data)
     audit['final_physical_check'] = 'PASS' if admissible(result, camera, data) else 'FAIL'
+    audit['physical_validity'] = result.optimization_audit.get('physical_validity', {})
     if result.success and audit['final_physical_check'] == 'FAIL':
         result.success = False
         result.error_message = 'Robust optimization: no physically admissible final result, including legacy fallback'

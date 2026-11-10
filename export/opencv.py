@@ -20,6 +20,36 @@ from calibration.types import CalibrationResult, CameraConfig, CameraModelType, 
 from calibration.models.common import distortion_coeff_labels
 
 
+# cv2.FileStorage YAML은 문자열 하나가 약 4KB(CV_FS_MAX_LEN=4096)를 넘으면
+# "The written string is too long"으로 실패한다. 실측: rosbag 프레임 ID
+# ("bag_0001_t1793943447.673", 24자) 160여 개를 쉼표로 이으면 넘는다.
+_FS_MAX_STRING_LEN = 4000
+
+
+def write_id_list(fs: cv2.FileStorage, key: str, ids) -> None:
+    """ID 목록 저장. 짧으면 기존 형식(쉼표로 이은 문자열)을 그대로 쓰고,
+    한도를 넘으면 문자열 시퀀스로 쓴다. 읽을 때는 read_id_list()가 둘 다 받는다.
+    """
+    ids = [str(item) for item in ids]
+    joined = ",".join(ids)
+    if len(joined) <= _FS_MAX_STRING_LEN:
+        fs.write(key, joined)
+        return
+    fs.startWriteStruct(key, cv2.FileNode_SEQ)
+    for item in ids:
+        fs.write("", item)
+    fs.endWriteStruct()
+
+
+def read_id_list(node: cv2.FileNode) -> list[str]:
+    """write_id_list()의 두 형식(쉼표 문자열 / 문자열 시퀀스)을 모두 읽는다."""
+    if node.empty():
+        return []
+    if node.isSeq():
+        return [node.at(i).string() for i in range(node.size()) if node.at(i).string()]
+    return [item for item in node.string().split(",") if item]
+
+
 def export_opencv_yaml(
     result: CalibrationResult,
     camera_config: CameraConfig,
@@ -64,10 +94,10 @@ def export_opencv_yaml(
     fs.write("rms_reprojection_error", float(result.rms_error))
     fs.write("calibration_source", calibration_source)
     fs.write("parameter_scope", "fit_frame_ids; holdout uses separate train-only K/D")
-    fs.write("fit_frame_ids", ",".join(result.per_frame_error))
+    write_id_list(fs, "fit_frame_ids", result.per_frame_error)
     if selected_frame_ids is not None:
         fs.write("subset_scene_count", len(selected_frame_ids))
-        fs.write("subset_scene_ids", ",".join(selected_frame_ids))
+        write_id_list(fs, "subset_scene_ids", selected_frame_ids)
 
     # 패턴 메타정보 (설계 문서 10번)
     fs.write(

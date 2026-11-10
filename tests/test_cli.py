@@ -130,14 +130,16 @@ def test_cli_full_pipeline_succeeds(synthetic_distorted_dataset_dir, tmp_path):
     assert summary["num_images_detected"] >= 10
 
 
-def test_cli_model_override_is_respected(synthetic_distorted_dataset_dir, tmp_path):
+@pytest.mark.parametrize("model", ["pinhole", "brown_conrady"])
+def test_cli_model_override_is_respected(synthetic_distorted_dataset_dir, tmp_path, model):
+    # 두 모델 중 최소 하나는 추천 모델과 다르므로 override가 실제로 검증된다.
     out_dir = tmp_path / "out"
     summary_path = tmp_path / "summary.json"
 
     exit_code = main([
         "--images", synthetic_distorted_dataset_dir,
         *_base_pattern_args(),
-        "--model", "extended_pinhole",
+        "--model", model,
         "--output-dir", str(out_dir),
         "--json-summary", str(summary_path),
         "--quiet",
@@ -145,7 +147,22 @@ def test_cli_model_override_is_respected(synthetic_distorted_dataset_dir, tmp_pa
 
     assert exit_code == 0
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    assert summary["chosen_model"] == "extended_pinhole"
+    assert summary["chosen_model"] == model
+
+
+def test_cli_physically_invalid_model_override_is_not_exported(synthetic_distorted_dataset_dir, tmp_path):
+    """P6: 이 합성 데이터의 Rational 해는 센서 영역 안에서 접혀 물리 검사에서
+    거부된다. --model로 강제해도 성공/Export 경로로 넘어가지 않는다."""
+    out_dir = tmp_path / "out"
+    exit_code = main([
+        "--images", synthetic_distorted_dataset_dir,
+        *_base_pattern_args(),
+        "--model", "extended_pinhole",
+        "--output-dir", str(out_dir),
+        "--quiet",
+    ])
+    assert exit_code == 2
+    assert not (out_dir / "camera.yaml").exists()
 
 
 def test_cli_outlier_flag_runs_without_crashing(synthetic_distorted_dataset_dir, tmp_path):

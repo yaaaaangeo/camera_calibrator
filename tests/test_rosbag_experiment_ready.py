@@ -165,8 +165,15 @@ def test_synthetic_mcap_to_four_models_yaml_outbox_without_factory_or_push(tmp_p
     assert chosen==next(v.model_name for v in project.model_scores if v.is_recommended)
     partitions={(tuple(v.train_frame_ids),tuple(v.test_frame_ids)) for v in project.validation_results.values()}
     assert len(partitions)==1
-    for v in project.validation_results.values():
-        assert v.test_rms is not None and not set(v.train_frame_ids)&set(v.test_frame_ids)
+    for model,v in project.validation_results.items():
+        assert not set(v.train_frame_ids)&set(v.test_frame_ids)
+        # P6: a Train-only Rational/Fisheye refit may be physically invalid
+        # (e.g. denominator pole inside the sensor ROI) and is then recorded as
+        # a failed hold-out, never as a successful Test RMS.
+        physically_rejected=(model.value in ('extended_pinhole','fisheye') and not v.success
+                             and 'Physical distortion validity' in (v.error_message or ''))
+        assert v.test_rms is not None or physically_rejected,(model,v.error_message)
+    assert project.validation_results[chosen].test_rms is not None
     stem='rational' if chosen.value=='extended_pinhole' else chosen.value
     for file in [session/f'intrinsic/camera_{stem}.yaml',session/'intrinsic/camera_info.yaml']:
         exported=load_standard_calibration(str(file));result=project.calibration_results[chosen]

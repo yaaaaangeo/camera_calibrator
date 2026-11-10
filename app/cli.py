@@ -766,6 +766,78 @@ def _selected_model_types(args) -> list[CameraModelType]:
     return [_MODEL_BY_NAME[name] for name in names]
 
 
+# rosbag 입력의 기본 자동 선별 장수. 근거(실측, 960x540, 단일 스레드):
+# Perspective 적합(cv2.calibrateCameraExtended)은 반복 1회 비용이 프레임 수의
+# 세제곱이다 - 20장 3.5ms, 40장 24ms, 80장 146ms, 146장 894ms. bag을 0.5~1초
+# 간격으로 뽑으면 150~300장이 되어 3모델 CLI가 15분~2시간 이상 걸렸다. 연속
+# 프레임은 거의 중복이라 장수를 늘려도 정보는 크게 늘지 않는다.
+# 80장 근거(2026-11-06 rosbag 4개, 3모델+--outlier): 80장은 4개 모두 전체 프레임과
+# 같은 품질(고정 K/D 정지 프레임 검증 차이 0.01px 이내). 50장은 후방에서 이상치
+# 제거 후 32장만 남아 fx가 14px 틀어졌다.
+DEFAULT_BAG_AUTO_SELECT_COUNT = 80
+# 자동 선별 후보의 최소 코너 수. 코너 4~5개 검출은 pose가 결정되지 않아
+# hold-out Test RMS를 망친다(실측 27px). 장수가 줄면 한 프레임의 영향이 커진다.
+AUTO_SELECT_MIN_CORNERS = 12
+# 자동 선별의 모션 블러 제외 기준(보드 경계 선명도 / 중앙값). 근거는
+# calibration.image_selection.ImageSelectionConfig.min_relative_board_sharpness.
+AUTO_SELECT_MIN_RELATIVE_BOARD_SHARPNESS = 0.7
+
+
+def _effective_auto_select_count(args) -> int:
+    """--auto-select N이 있으면 N(0이면 끔). 없으면 --bag 입력에만 기본값을 쓴다."""
+    requested = getattr(args, "auto_select", None)
+    if requested is not None:
+        return max(0, int(requested))
+    return DEFAULT_BAG_AUTO_SELECT_COUNT if getattr(args, "bag", None) else 0
+
+
+def _apply_auto_selection(dataset, pattern_config, camera_config, target_count: int, quiet: bool):
+    """automation(P1)/GUI와 같은 순서로 기존 선별 기능을 실행하고 선택된 프레임만 남긴다.
+
+    선택되지 않은 프레임은 이후 단계(품질 분석, 모델 계산, 검증)에 넘기지 않는다 -
+    automation 경로가 선택된 경로만 CLI에 넘기는 것과 같은 결과다. 원본 파일은 건드리지 않는다.
+    """
+    from calibration.image_selection import ImageSelectionConfig, select_calibration_images
+
+    num_input = len(dataset.frames)
+    if dataset.num_detected <= target_count:
+        _log(quiet, f"자동 선별 생략: 검출 성공 {dataset.num_detected}장 <= 목표 {target_count}장")
+        return {"enabled": True, "applied": False, "requested_count": target_count,
+                "num_input": num_input, "num_detected": dataset.num_detected,
+                "selected_count": dataset.num_detected}
+
+    analyze_dataset_quality(dataset, camera_config)
+    image_size = infer_image_size(dataset, camera_config)
+    compute_frame_quality_scores(dataset, pattern_config, image_size, use_reprojection=False)
+    result = select_calibration_images(
+        dataset, ImageSelectionConfig(
+            target_count=target_count, min_corners=AUTO_SELECT_MIN_CORNERS,
+            min_relative_board_sharpness=AUTO_SELECT_MIN_RELATIVE_BOARD_SHARPNESS,
+        ),
+    )
+    if result.selected_count == 0:
+        return None
+    selected = set(result.selected_image_ids)
+    dataset.frames = [frame for frame in dataset.frames if frame.image_info.image_id in selected]
+    _log(quiet, result.summary_text())
+    for warning in result.warnings:
+        _log(quiet, f"  ⚠ {warning}")
+    return {
+        "enabled": True,
+        "applied": True,
+        "requested_count": result.requested_count,
+        "num_input": num_input,
+        "num_detected": result.counts.get("total", num_input) - result.counts.get("detection_failed", 0),
+        "selected_count": result.selected_count,
+        "selected_image_ids": list(result.selected_image_ids),
+        "counts": result.counts,
+        "position_counts": result.position_counts,
+        "distance_counts": result.distance_counts,
+        "tilt_counts": result.tilt_counts,
+        "warnings": result.warnings,
+    }
+
+
 def run_pipeline(args) -> int:
     quiet = args.quiet
     if args.robust_optimization and (args.outlier or args.corner_outlier or args.calibration_method == CalibrationMethod.OBJECT_RELEASING):
@@ -818,6 +890,16 @@ def run_pipeline(args) -> int:
     if dataset.num_detected == 0:
         print("오류: 어떤 이미지에서도 ChArUco 패턴이 검출되지 않았습니다.", file=sys.stderr)
         return 1
+
+    # --- 2-1. 프레임 자동 선별 (--auto-select, --bag 기본 ON) ---
+    auto_selection_summary = None
+    auto_select_count = _effective_auto_select_count(args)
+    if auto_select_count:
+        auto_selection_summary = _apply_auto_selection(dataset, pattern_config, camera_config,
+                                                       auto_select_count, quiet)
+        if auto_selection_summary is None:
+            print("오류: 자동 선별 후 남은 프레임이 없습니다.", file=sys.stderr)
+            return 1
 
     # --- 3. Quality Gate (이미지 품질 / Target 품질 / Coverage / Diversity) ---
     # 설계 문서 3-1/3-2번 - 캘리브레이션 계산 전에 데이터 자체가 괜찮은지 먼저 본다.
@@ -936,6 +1018,7 @@ def run_pipeline(args) -> int:
         object_releasing_result=object_releasing_result,
         object_releasing_validation_result=object_releasing_validation_result,
         standard_vs_object_releasing_comparison=standard_vs_object_releasing_comparison,
+        auto_selection_summary=auto_selection_summary,
     )
 
 
@@ -986,6 +1069,7 @@ def _validate_choose_and_export(
     precomputed_validation=None,
     precomputed_scores=None,
     precomputed_cross_dataset_results=None,
+    auto_selection_summary=None,
 ) -> int:
     """설계 문서 15번 파이프라인의 5~9단계(Validation -> 추천 -> Outlier ->
     Final Result -> Export -> [옵션] 프로젝트 저장). 새로 계산한 경우와
@@ -1432,6 +1516,7 @@ def _validate_choose_and_export(
             "num_images_total": dataset.num_total,
             "num_images_detected": dataset.num_detected,
             "num_images_used": dataset.num_enabled,
+            "auto_selection": auto_selection_summary,
             "coverage_pct": coverage_pct,
             "diagnostic": bool(args.diagnostic),
             "cross_validation_k": args.kfold,
@@ -1490,6 +1575,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     src.add_argument("--bag", help="ROS1(.bag)/ROS2(.db3, .mcap) 파일 경로 (--images 대신 사용)")
     src.add_argument("--topic", help="--bag 사용 시 추출할 이미지 토픽")
     src.add_argument("--bag-interval", type=float, default=0.5, help="bag 프레임 샘플링 최소 간격(초), 기본 0.5")
+    src.add_argument(
+        "--auto-select", type=int, default=None, metavar="N",
+        help=f"검출 후 기존 자동 선별(위치/거리/기울기 분포, 블러·노출·중복 제외)로 N장만 계산에 사용. "
+             f"0이면 끔. 생략 시 --bag 입력은 {DEFAULT_BAG_AUTO_SELECT_COUNT}장, 이미지 입력은 끔 "
+             f"(Perspective 적합 비용이 프레임 수의 세제곱이라 bag 전체 프레임은 매우 느리다).",
+    )
     src.add_argument("--list-topics", metavar="BAG_PATH", help="이 bag의 이미지 토픽 목록만 출력하고 종료")
     src.add_argument(
         "--load-project", metavar="CCPROJ_PATH",

@@ -263,8 +263,22 @@ def _robust_fisheye_calibrate(
         cv2.error: 제외를 다 시도해도 안정화되지 않으면 마지막 에러를 그대로 던진다
             (호출부가 사용자에게 보여줄 메시지로 감싼다).
     """
-    working = list(range(len(object_points)))
-    excluded: list[int] = []
+    from calibration.models.common import is_pose_well_posed
+
+    # 사전 제외: pose가 기하적으로 정해지지 않는 프레임(코너가 적거나 거의 일직선)은
+    # InitExtrinsics/CALIB_CHECK_COND 실패의 주원인이다. 하나씩 이진 탐색으로 찾으면
+    # 느리고, 문제 프레임이 많으면 제외 상한에 걸려 Fisheye 전체가 실패했다(실측:
+    # 2026-11-06 전방 rosbag 80장 -> Fisheye 실패 -> Rational이 자동 선택). 남는
+    # 프레임이 min_frames보다 적어지면 사전 제외를 하지 않는다.
+    well_posed = [i for i in range(len(object_points)) if is_pose_well_posed(object_points[i])]
+    if len(well_posed) >= min_frames:
+        working = well_posed
+        well_posed_set = set(well_posed)
+        excluded: list[int] = [i for i in range(len(object_points)) if i not in well_posed_set]
+    else:
+        working = list(range(len(object_points)))
+        excluded = []
+    max_exclusions = len(excluded) + max(_MAX_FISHEYE_EXCLUSIONS, int(0.2 * len(working)))
 
     def _calibrate(indices: list[int], calib_criteria):
         cur_obj = [object_points[i] for i in indices]
@@ -276,7 +290,7 @@ def _robust_fisheye_calibrate(
         )
 
     last_err: cv2.error | None = None
-    for _ in range(_MAX_FISHEYE_ATTEMPTS):
+    for _ in range(max(_MAX_FISHEYE_ATTEMPTS, max_exclusions - len(excluded) + 1)):
         try:
             rms, K, D, rvecs, tvecs = _calibrate(working, criteria)
             return rms, K, D, rvecs, tvecs, working, excluded
@@ -296,7 +310,7 @@ def _robust_fisheye_calibrate(
             if (
                 bad_global is None
                 or len(working) - 1 < min_frames
-                or len(excluded) >= _MAX_FISHEYE_EXCLUSIONS
+                or len(excluded) >= max_exclusions
             ):
                 raise last_err
             working.remove(bad_global)
@@ -357,10 +371,25 @@ def calibrate_fisheye(
         flags |= _fisheye_flag("CALIB_USE_INTRINSIC_GUESS")
 
     try:
-        rms, K, D, rvecs, tvecs, kept_indices, excluded_indices = _robust_fisheye_calibrate(
-            object_points, image_points, image_size, K_init, D_init, flags,
-            DEFAULT_TERM_CRITERIA, MIN_FRAMES_REQUIRED,
-        )
+        try:
+            rms, K, D, rvecs, tvecs, kept_indices, excluded_indices = _robust_fisheye_calibrate(
+                object_points, image_points, image_size, K_init, D_init, flags,
+                DEFAULT_TERM_CRITERIA, MIN_FRAMES_REQUIRED,
+            )
+        except cv2.error:
+            if K_init is None:
+                raise
+            # Pinhole 초기값이 광각 렌즈에서는 크게 틀린다(실측 960x540 ~150도:
+            # Pinhole fx 881 vs 실제 ~434, RMS 3.6px). 그 K로 시작하면 InitExtrinsics가
+            # 실패해 Fisheye 전체가 후보에서 빠지고 Rational이 자동 선택됐다. 초기값을
+            # 쓴 계산이 실패할 때만 OpenCV 기본 초기화로 다시 시도한다(성공하던 경로는
+            # 그대로).
+            logger.warning("Fisheye: Pinhole 초기값으로 실패해 초기값 없이 다시 계산합니다.")
+            rms, K, D, rvecs, tvecs, kept_indices, excluded_indices = _robust_fisheye_calibrate(
+                object_points, image_points, image_size, None, None,
+                flags & ~_fisheye_flag("CALIB_USE_INTRINSIC_GUESS"),
+                DEFAULT_TERM_CRITERIA, MIN_FRAMES_REQUIRED,
+            )
     except cv2.error as e:
         return CalibrationResult(
             model_name=CameraModelType.FISHEYE,
@@ -445,7 +474,7 @@ def calibrate_fisheye(
             f"제외 사유와 원본 촬영을 검토하세요."
         )
 
-    return CalibrationResult(
+    result = CalibrationResult(
         model_name=CameraModelType.FISHEYE,
         camera_matrix=K,
         distortion=D,
@@ -462,3 +491,6 @@ def calibrate_fisheye(
         success=True,
         warning_message=warning_message,
     )
+
+    from calibration.physical_validity import enforce_distortion_validity
+    return enforce_distortion_validity(result, camera_config, dataset)

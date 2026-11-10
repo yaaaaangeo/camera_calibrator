@@ -42,6 +42,139 @@ DEFAULT_TERM_CRITERIA = (
     cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6
 )
 
+# Perspective(calibrateCameraExtended) 수렴 확인. 실측(P7): 100회/1e-6 해가
+# 같은 데이터·같은 시작점에서 목적함수 최소가 아닌 경우가 있었고(예: Train28
+# Rational 3.0008 -> 1.6422px), CALIB_USE_INTRINSIC_GUESS 시작은 반복 수와
+# 무관하게 멈췄다가 결과에서 다시 시작하면 최소로 갔다(2.3641 -> 1.4336px).
+# 같은 fit 집합의 목적함수(RMS)만 비교하며 Test/검증 지표는 보지 않는다.
+# 아래 종료 조건은 희소 LM이 지원하지 않는 플래그일 때의 OpenCV 대체 경로에만 쓴다.
+CONVERGENCE_CHECK_CRITERIA = (
+    cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 5000, 1e-14
+)
+# 수치 잡음으로 수렴 해를 바꾸지 않기 위한 상대 허용치(품질 임계값이 아님).
+CONVERGENCE_RELATIVE_TOLERANCE = 1e-4
+
+
+def _sparse_candidates(object_points, image_points, flags, native):
+    """희소 LM 후보(빠름). 반복 1회 비용이 프레임 수에 선형이다(sparse_refine 참고).
+
+    continue_sparse: native 상태(K, D, 프레임별 자세)에서 이어서 최소화한다.
+        OpenCV LM이 큰 damping에서 작은 스텝으로 1e-6에 걸려 멈춘 경우를 끝낸다
+        (실측: 기존 same_start_long이 찾던 해와 같다. Train28 Brown 2.7139px,
+        rosbag_image Full Rational 2.0242px).
+    restart_sparse: native K/D로 프레임별 자세만 새로 구한 뒤 최소화한다
+        (기존 restart_long과 같은 역할. 실측: Train28 Rational 1.6391px 재현).
+    """
+    from calibration.models.sparse_refine import refine_perspective, reinitialize_extrinsics
+
+    def continue_native():
+        return refine_perspective(object_points, image_points, flags, native[1], native[2],
+                                  native[3], native[4])
+
+    def restart_from_native():
+        rvecs, tvecs = reinitialize_extrinsics(object_points, image_points, native[1], native[2])
+        return refine_perspective(object_points, image_points, flags, native[1], native[2], rvecs, tvecs)
+
+    return [('continue_sparse', continue_native), ('restart_sparse', restart_from_native)]
+
+
+def _dense_candidates(object_points, image_points, image_size, flags, initial_k, initial_d, native):
+    """기존 P7 후보(OpenCV, 긴 종료 조건). 희소 LM이 지원하지 않는 플래그일 때만 쓴다."""
+    def solve(candidate_flags, k, d):
+        return lambda: cv2.calibrateCameraExtended(object_points, image_points, image_size, k, d,
+                                                   flags=candidate_flags, criteria=CONVERGENCE_CHECK_CRITERIA)
+
+    return [
+        ('same_start_long', solve(flags, None if initial_k is None else initial_k.copy(),
+                                  None if initial_d is None else initial_d.copy())),
+        ('restart_long', solve(flags | cv2.CALIB_USE_INTRINSIC_GUESS, native[1].copy(), native[2].copy())),
+    ]
+
+
+# 이 장수 이하는 기존 OpenCV 후보(P7 그대로)를 쓴다. 근거: OpenCV 후보 비용은
+# 프레임 수의 세제곱(실측 960x540: 40장 24ms/반복, 80장 146ms, 146장 894ms)이지만
+# 40장 이하에서는 P7 실측 +0.8~16.6초/적합으로 감당할 수 있고, P7에서 검증한
+# 해를 그대로 재현한다. 희소 LM도 수렴은 하지만 Rational처럼 비식별인 경우 다른
+# 극소에 닿을 수 있다(합성 self-check seed 3: OpenCV 0.262171 vs 희소 0.262331px,
+# 둘 다 기울기 0인 극소). 그보다 많으면 OpenCV 후보가 적합 1회에 수십 분~수 시간
+# 걸리므로 희소 LM을 쓴다.
+DENSE_CONVERGENCE_MAX_VIEWS = 40
+
+
+# 희소 LM 수렴 완료를 쓰는 경우(> DENSE_CONVERGENCE_MAX_VIEWS) OpenCV native 적합의
+# 반복 상한. 큰 데이터에서는 OpenCV가 1e-6에 거의 걸리지 않고 상한까지 가는데,
+# 반복 1회가 프레임 수의 세제곱 비용이다. 이어서 희소 LM이 최소까지 마무리하므로
+# 결과는 같다. 실측(2026-11-06 rosbag 80장 x 3대, Brown/Rational): 상한 30회와
+# 100회의 최종 K 차이 0.07px 이내, RMS 같거나 낮음, 적합 1.5~2.7배 빠름.
+LARGE_NATIVE_MAX_ITERATIONS = 30
+
+
+def native_perspective_criteria(n_views: int, flags: int):
+    """Brown/Rational native 적합의 종료 조건. 40장 이하는 기존 그대로."""
+    from calibration.models.sparse_refine import free_intrinsic_mask
+
+    # 14 = OpenCV가 돌려줄 수 있는 최대 distortion 길이(플래그 지원 여부만 본다).
+    if n_views > DENSE_CONVERGENCE_MAX_VIEWS and free_intrinsic_mask(int(flags), 14) is not None:
+        return (DEFAULT_TERM_CRITERIA[0], LARGE_NATIVE_MAX_ITERATIONS, DEFAULT_TERM_CRITERIA[2])
+    return DEFAULT_TERM_CRITERIA
+
+
+def _convergence_candidates(object_points, image_points, image_size, flags, initial_k, initial_d, native):
+    from calibration.models.sparse_refine import free_intrinsic_mask
+
+    n_dist = int(np.asarray(native[2]).size)
+    if (len(object_points) > DENSE_CONVERGENCE_MAX_VIEWS
+            and free_intrinsic_mask(int(flags), n_dist) is not None):
+        return 'sparse_lm', _sparse_candidates(object_points, image_points, flags, native)
+    return 'opencv_long', _dense_candidates(object_points, image_points, image_size, flags,
+                                            initial_k, initial_d, native)
+
+
+def complete_perspective_convergence(object_points, image_points, image_size,
+                                     flags, initial_k, initial_d, native):
+    """calibrateCameraExtended 결과가 목적함수 최소인지 확인하고 필요할 때만 교체.
+
+    native: calibrateCameraExtended 반환 튜플(rms, K, D, rvecs, tvecs, ...).
+    프레임이 DENSE_CONVERGENCE_MAX_VIEWS장 이하이거나 희소 LM이 지원하지 않는
+    플래그면 기존 OpenCV 후보((a) 같은 시작점 + 긴 종료 조건, (b) native K/D에서
+    재시작 + 긴 종료 조건)를 쓰고, 그보다 많으면 희소 LM 후보 두 가지(native에서
+    이어가기, native K/D에서 재시작)를 쓴다. 같은 관측 집합에서
+    RMS가 상대 허용치보다 낮아질 때만 가장 낮은 후보를 채택하고, 아니면 native
+    튜플을 그대로 돌려준다(이미 수렴한 결과는 비트 단위 동일). 재시작이 다른
+    극소로 가는 경우(실측 28->47px)는 RMS가 커지므로 채택되지 않는다.
+
+    희소 LM으로 바꾼 이유: OpenCV 후보는 반복마다 모든 프레임 자세를 포함한 dense
+    행렬을 풀어 프레임 수의 세제곱으로 느려진다. 실측 146프레임 광각에서 적합
+    1회 15~25분(5000회 x 2후보). 희소 LM은 같은 데이터에서 수 초다.
+    """
+    native_rms = float(native[0])
+    method, candidates = _convergence_candidates(object_points, image_points, image_size, flags,
+                                                 initial_k, initial_d, native)
+    audit = {'native_rms': native_rms, 'method': method,
+             'relative_tolerance': CONVERGENCE_RELATIVE_TOLERANCE, 'candidates': [], 'adopted': 'native'}
+    if method == 'opencv_long':
+        audit['check_criteria'] = list(CONVERGENCE_CHECK_CRITERIA)
+    best = None
+    for name, solve in candidates:
+        try:
+            out = solve()
+        except (cv2.error, np.linalg.LinAlgError) as exc:
+            audit['candidates'].append({'name': name, 'error': str(exc)[:200]})
+            continue
+        if out is None:
+            audit['candidates'].append({'name': name, 'error': 'unsupported'})
+            continue
+        rms = float(out[0])
+        finite = bool(np.isfinite(rms) and np.isfinite(out[1]).all() and np.isfinite(out[2]).all())
+        audit['candidates'].append({'name': name, 'rms': rms, 'finite': finite})
+        if finite and (best is None or rms < best[1]):
+            best = (name, rms, out)
+    if best is not None and best[1] < native_rms * (1 - CONVERGENCE_RELATIVE_TOLERANCE):
+        audit['adopted'] = best[0]
+        audit['adopted_rms'] = best[1]
+        return best[2], audit
+    return native, audit
+
 
 def expected_free_param_count(
     model_name: CameraModelType,
@@ -333,6 +466,33 @@ def solve_pnp_for_model(
     return bool(ok), rvec, tvec
 
 
+# 자세(pose)가 기하적으로 정해지는 관측인지 판단하는 조건(모델과 무관).
+# 실측(2026-11-06 rosbag): 코너 4개 프레임, 코너가 보드 한 줄에 몰린 프레임(거의
+# 일직선)은 고정 K/D에서도 pose가 결정되지 않아 Test 오차가 200~660px였고,
+# cv2.fisheye.calibrate의 InitExtrinsics/CALIB_CHECK_COND 실패 원인이었다.
+# - WELL_POSED_MIN_CORNERS: 6점(12식)으로 6자유도 pose에 중복도를 둔다.
+# - WELL_POSED_MIN_SPREAD_RATIO: 보드 좌표 코너의 2번째/1번째 특이값 비(1이면
+#   고르게 퍼짐, 0이면 일직선). 저장된 P7 데이터 A/B/C의 최솟값이 0.168, 코너 수
+#   최솟값이 7이라 기존 데이터의 판정은 바뀌지 않는다.
+WELL_POSED_MIN_CORNERS = 6
+WELL_POSED_MIN_SPREAD_RATIO = 0.15
+
+
+def corner_spread_ratio(object_points) -> float:
+    pts = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)[:, :2]
+    if len(pts) < 2:
+        return 0.0
+    singular = np.linalg.svd(pts - pts.mean(axis=0), compute_uv=False)
+    return float(singular[1] / singular[0]) if len(singular) > 1 and singular[0] > 0 else 0.0
+
+
+def is_pose_well_posed(object_points) -> bool:
+    if object_points is None:
+        return False
+    n = int(np.asarray(object_points).reshape(-1, 3).shape[0])
+    return n >= WELL_POSED_MIN_CORNERS and corner_spread_ratio(object_points) >= WELL_POSED_MIN_SPREAD_RATIO
+
+
 def _finite_pose(rvec, tvec) -> bool:
     return (
         rvec is not None and tvec is not None
@@ -462,24 +622,16 @@ def _solve_pnp_fisheye_robust(
     return True, best_pose[0], best_pose[1], "IPPE"
 
 
-def solve_pnp_for_model_robust(
-    object_points: np.ndarray,
-    image_points: np.ndarray,
-    camera_matrix: np.ndarray,
-    distortion: np.ndarray,
-    model: CameraModelType,
-) -> tuple[bool, np.ndarray, np.ndarray, str]:
-    """solve_pnp_for_model()과 같은 문제(Test pose 추정, K/D는 고정하고 절대
-    바꾸지 않음)를 풀지만, 실패 진단 문자열을 함께 반환하고 Fisheye에는
-    3단계 fallback chain(_solve_pnp_fisheye_robust 참고)을 적용한다.
+# Test pose 후보 교체 기준. 1차 pose보다 재투영 RMS가 이 비율 이상 낮은 후보만
+# 채택한다(수치 잡음으로 기존 pose를 바꾸지 않기 위한 값, 품질 임계값 아님).
+POSE_CANDIDATE_RELATIVE_TOLERANCE = 1e-4
+# 오차가 0에 가까운 경우(무잡음 합성 데이터 등) 상대 기준만으로는 1e-10px -> 1e-13px
+# 같은 의미 없는 교체가 일어나므로 절대 개선량도 요구한다.
+POSE_CANDIDATE_ABSOLUTE_TOLERANCE_PX = 1e-3
 
-    solve_pnp_for_model()은 다른 모듈(calibration/windshield 등)에서 이미
-    쓰고 있어 기존 동작(단발성 호출, 3-튜플 반환)을 그대로 유지해야 하므로
-    건드리지 않는다 - 이 함수는 그 위에 추가된 새 진입점이다. Fisheye가
-    아닌 모델은 fallback 없이 solve_pnp_for_model()과 동일하게 1회만
-    시도한다 (이번 변경의 목적은 Fisheye Hold-out 0/12 실패 문제이지,
-    다른 모델의 동작을 바꾸는 게 아니다).
-    """
+
+def _first_pass_pose(object_points, image_points, camera_matrix, distortion, model):
+    """기존 동작 그대로의 1차 pose(Fisheye 3단계 fallback / 그 외 solvePnP 1회)."""
     if model == CameraModelType.FISHEYE:
         return _solve_pnp_fisheye_robust(object_points, image_points, camera_matrix, distortion)
     try:
@@ -489,6 +641,95 @@ def solve_pnp_for_model_robust(
     if ok and _finite_pose(rvec, tvec):
         return True, rvec, tvec, "solvePnP"
     return False, rvec, tvec, ("solvePnP: returned False" if not ok else "solvePnP: non-finite result")
+
+
+def _pose_rms_and_depth_ok(obj, img, rvec, tvec, camera_matrix, distortion, model):
+    try:
+        R, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+        depth = (R @ obj.T + np.asarray(tvec, dtype=np.float64).reshape(3, 1)).T[:, 2]
+        proj = project_points_for_model(obj, rvec, tvec, camera_matrix, distortion, model).reshape(-1, 2)
+    except cv2.error:
+        return float("inf"), False
+    if not np.all(np.isfinite(proj)):
+        return float("inf"), False
+    return float(np.sqrt(np.mean(np.sum((proj - img) ** 2, axis=1)))), bool(np.all(depth > 0))
+
+
+def _alternative_pose_candidates(obj, img, camera_matrix, distortion, model):
+    """평면 IPPE 후보(왜곡 제거 좌표) + 모델 도메인 LM 정제. K/D는 고정값으로만 쓴다."""
+    K = np.asarray(camera_matrix, dtype=np.float64)
+    pts = img.reshape(-1, 1, 2)
+    try:
+        if model == CameraModelType.FISHEYE:
+            und = cv2.fisheye.undistortPoints(pts, K, np.asarray(distortion, dtype=np.float64).reshape(-1, 1), P=K)
+        else:
+            und = cv2.undistortPoints(pts, K, np.asarray(distortion, dtype=np.float64).reshape(-1), P=K)
+        und = np.asarray(und, dtype=np.float64).reshape(-1, 1, 2)
+        if not np.all(np.isfinite(und)):
+            return []
+        _, rvecs, tvecs, _ = cv2.solvePnPGeneric(obj.reshape(-1, 1, 3), und, K, None, flags=cv2.SOLVEPNP_IPPE)
+    except cv2.error:
+        return []
+    out = []
+    for rvec, tvec in zip(rvecs or [], tvecs or []):
+        rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+        tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+        try:
+            if model == CameraModelType.FISHEYE:
+                rvec, tvec = cv2.solvePnPRefineLM(obj.reshape(-1, 1, 3), und, K, None, rvec, tvec)
+            else:
+                rvec, tvec = cv2.solvePnPRefineLM(obj.reshape(-1, 1, 3), pts, K,
+                                                  np.asarray(distortion, dtype=np.float64).reshape(-1), rvec, tvec)
+        except cv2.error:
+            pass
+        if _finite_pose(rvec, tvec):
+            out.append((rvec, tvec))
+    return out
+
+
+def solve_pnp_for_model_robust(
+    object_points: np.ndarray,
+    image_points: np.ndarray,
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray,
+    model: CameraModelType,
+) -> tuple[bool, np.ndarray, np.ndarray, str]:
+    """Test pose 추정(K/D는 고정하고 절대 바꾸지 않음). 실패 진단 문자열을 함께 반환.
+
+    1차 pose는 기존과 같다(Fisheye 3단계 fallback, 그 외 solvePnP 1회). 그다음
+    모든 모델에 같은 규칙으로 평면 IPPE 후보(+LM 정제)를 만들어, 1차 pose보다
+    같은 목적함수(재투영 오차 제곱합)가 상대 1e-4 이상 낮거나 1차 pose가 카메라
+    뒤(음의 depth)에 있을 때만 바꾼다. pose는 원래 이 목적함수의 최소화로 정의되므로
+    더 낮은 극소를 고르는 것은 같은 문제를 더 잘 푸는 것이다(K/D, 픽셀, 학습은
+    건드리지 않는다).
+
+    실측 이유: 코너 4개짜리 rosbag 프레임에서 fisheye.solvePnP가 성공을 반환했지만
+    RMS 181px(최대 299px)의 잘못된 극소였고, 이 한 프레임이 Hold-out Test RMS를
+    27px로 만들어 등급이 poor가 됐다.
+
+    solve_pnp_for_model()은 다른 모듈(calibration/windshield 등)에서 쓰므로
+    건드리지 않는다.
+    """
+    ok, rvec, tvec, reason = _first_pass_pose(object_points, image_points, camera_matrix, distortion, model)
+    obj = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)
+    img = np.asarray(image_points, dtype=np.float64).reshape(-1, 2)
+    if ok:
+        base_rms, base_depth_ok = _pose_rms_and_depth_ok(obj, img, rvec, tvec, camera_matrix, distortion, model)
+    else:
+        base_rms, base_depth_ok = float("inf"), False
+    best = None
+    for cand_r, cand_t in _alternative_pose_candidates(obj, img, camera_matrix, distortion, model):
+        rms, depth_ok = _pose_rms_and_depth_ok(obj, img, cand_r, cand_t, camera_matrix, distortion, model)
+        if depth_ok and np.isfinite(rms) and (best is None or rms < best[0]):
+            best = (rms, cand_r, cand_t)
+    if best is not None:
+        improves = (base_rms - best[0]) > max(base_rms * POSE_CANDIDATE_RELATIVE_TOLERANCE,
+                                              POSE_CANDIDATE_ABSOLUTE_TOLERANCE_PX)
+        if not ok or (ok and not base_depth_ok) or improves:
+            why = "first pass failed" if not ok else ("negative depth" if not base_depth_ok else
+                                                      f"{base_rms:.3g}px -> {best[0]:.3g}px")
+            return True, best[1], best[2], f"{reason} | IPPE+LM ({why})"
+    return ok, rvec, tvec, reason
 
 
 def project_points_for_model(

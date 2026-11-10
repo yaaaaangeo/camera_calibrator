@@ -111,7 +111,12 @@ def test_calibration_still_succeeds_with_missing_flags(fisheye_missing_flags):
     camera_config = CameraConfig(width=1280, height=720)
 
     result = fm.calibrate_fisheye(dataset, camera_config)
-    assert result.success, f"플래그 일부가 없어도 캘리브레이션은 성공해야 함: {result.error_message}"
+    # 플래그 일부가 없어도 native 계산은 끝까지 수행돼야 한다. P6: 이 합성 해는
+    # 55.4°에서 접혀 1280x720 센서 모서리에 대응하는 광선이 없으므로 물리 검사가
+    # 거부한다 - 계산된 K/D는 진단 근거로 보존된다.
+    assert np.isfinite(result.camera_matrix).all() and np.isfinite(result.distortion).all()
+    assert result.success or result.error_message.startswith("Physical distortion validity"), result.error_message
+    assert result.optimization_audit["physical_validity"]["fisheye_domain"] == "usage"
 
 
 def test_fisheye_base_flags_only_includes_available_attrs():

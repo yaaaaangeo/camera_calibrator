@@ -39,6 +39,8 @@ from calibration.types import (
 from calibration.models.common import (
     MIN_FRAMES_REQUIRED,
     DEFAULT_TERM_CRITERIA,
+    complete_perspective_convergence,
+    native_perspective_criteria,
     collect_calibration_inputs,
     infer_image_size,
     compute_regional_error,
@@ -71,7 +73,7 @@ def calibrate_extended_pinhole(
     Rational이다 (모듈 docstring 참고). 5계수만 필요하면
     calibration.models.brown_conrady.calibrate_brown_conrady()를 쓴다.
     """
-    return _calibrate_extended_pinhole_core(
+    result = _calibrate_extended_pinhole_core(
         dataset, camera_config,
         calibration_flags=cv2.CALIB_RATIONAL_MODEL,
         fix_tangent_dist=fix_tangent_dist,
@@ -81,6 +83,8 @@ def calibrate_extended_pinhole(
         bootstrap_jobs=bootstrap_jobs,
         initial_guess=initial_guess,
     )
+    from calibration.physical_validity import enforce_distortion_validity
+    return enforce_distortion_validity(result, camera_config, dataset)
 
 
 def _calibrate_extended_pinhole_core(
@@ -138,6 +142,18 @@ def _calibrate_extended_pinhole_core(
         guess_flags = cv2.CALIB_USE_INTRINSIC_GUESS
 
     try:
+        native = cv2.calibrateCameraExtended(
+            object_points,
+            image_points,
+            image_size,
+            initial_k,
+            initial_d,
+            flags=flags | guess_flags,
+            criteria=native_perspective_criteria(len(object_points), flags | guess_flags),
+        )
+        native, convergence_audit = complete_perspective_convergence(
+            object_points, image_points, image_size, flags | guess_flags, initial_k, initial_d, native,
+        )
         (
             rms,
             camera_matrix,
@@ -147,15 +163,7 @@ def _calibrate_extended_pinhole_core(
             std_intrinsics,
             std_extrinsics,
             per_view_errors,
-        ) = cv2.calibrateCameraExtended(
-            object_points,
-            image_points,
-            image_size,
-            initial_k,
-            initial_d,
-            flags=flags | guess_flags,
-            criteria=DEFAULT_TERM_CRITERIA,
-        )
+        ) = native
     except cv2.error as e:
         return CalibrationResult(
             model_name=CameraModelType.EXTENDED_PINHOLE,
@@ -239,4 +247,5 @@ def _calibrate_extended_pinhole_core(
         residual_stats=residual_stats,
         spatial_error_map=spatial_error_map,
         success=True,
+        optimization_audit={'convergence': convergence_audit},
     )

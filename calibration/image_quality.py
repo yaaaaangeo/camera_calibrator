@@ -292,6 +292,44 @@ def compute_pattern_exposure_metrics(gray: np.ndarray, corners: np.ndarray) -> P
     )
 
 
+def compute_board_edge_sharpness(gray: np.ndarray, corners: np.ndarray) -> float | None:
+    """보드 코너 주변 경계의 선명도(모션 블러 지표). 이미지 전체 Laplacian과 달리
+    배경(사람, 차량)의 영향을 받지 않는다.
+
+    각 코너 패치에서 x/y 방향 기울기 상위값(97백분위)을 패치 대비(95-5백분위)로
+    나누고 둘 중 작은 값을 취한 뒤, 코너들의 중앙값을 반환한다. 대비로 나누므로
+    밝기와 무관하고, 한 방향이라도 흐려지면(모션 블러) 값이 내려간다.
+    실측(2026-11-06 rosbag, 풀레이트 프레임 간 코너 이동량과의 Spearman 상관):
+    후방 -0.45, 우측 -0.57, 전방 -0.31 (이미지 전체 Laplacian은 -0.33/-0.47/-0.27).
+    코너가 4개 미만이거나 대비가 있는 패치가 없으면 None.
+    """
+    points = np.asarray(corners, dtype=np.float32).reshape(-1, 2)
+    if len(points) < 4:
+        return None
+    distances = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
+    np.fill_diagonal(distances, np.inf)
+    spacing = float(np.median(distances.min(axis=1)))
+    radius = int(np.clip(round(0.35 * spacing), 4, 30))
+    img = gray.astype(np.float32)
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+    h, w = img.shape[:2]
+    values = []
+    for x, y in points:
+        x0, x1 = int(max(0, x - radius)), int(min(w, x + radius + 1))
+        y0, y1 = int(max(0, y - radius)), int(min(h, y + radius + 1))
+        patch = img[y0:y1, x0:x1]
+        if patch.size < 16:
+            continue
+        contrast = float(np.percentile(patch, 95) - np.percentile(patch, 5))
+        if contrast < 20.0:
+            continue
+        sx = float(np.percentile(np.abs(gx[y0:y1, x0:x1]), 97)) / contrast
+        sy = float(np.percentile(np.abs(gy[y0:y1, x0:x1]), 97)) / contrast
+        values.append(min(sx, sy))
+    return float(np.median(values)) if values else None
+
+
 # ---------------------------------------------------------------------------
 # 중복 / 거의 동일 이미지 검사 (설계 문서 3-1번 마지막 두 항목)
 # ---------------------------------------------------------------------------

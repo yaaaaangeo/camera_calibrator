@@ -89,6 +89,21 @@ def _stratum_key(frame: Frame, image_size: tuple[int, int], median_ratio: float)
     return f"{_position_label(cx, cy, w, h)}_{_distance_label(area_ratio, median_ratio)}"
 
 
+# Test 프레임 자격: pose가 기하적으로 정해지는 프레임만 Test에 둔다(모델과 무관).
+# 기준과 실측 근거는 models.common.is_pose_well_posed 참고.
+from calibration.models.common import (  # noqa: E402
+    WELL_POSED_MIN_CORNERS as MIN_TEST_CORNERS,
+    WELL_POSED_MIN_SPREAD_RATIO as MIN_TEST_SPREAD_RATIO,
+    corner_spread_ratio,
+    is_pose_well_posed,
+)
+
+
+def is_test_eligible(frame: Frame) -> bool:
+    det = frame.detection
+    return bool(det and det.success and is_pose_well_posed(det.object_points))
+
+
 def split_train_test(
     dataset: Dataset,
     camera_config: CameraConfig,
@@ -100,6 +115,9 @@ def split_train_test(
     각 stratum(예: "center_near") 안에서 test_ratio 비율만큼 test로 빼고
     나머지는 train으로 둔다. stratum 크기가 1이면 test로 빼지 않고 무조건
     train에 남긴다 (test에만 있고 train에는 대표 사례가 전혀 없는 극단은 피함).
+
+    is_test_eligible()을 만족하지 않는 프레임(코너가 적거나 거의 일직선)은 Test에
+    넣지 않고 Train에만 둔다.
 
     분할 후 train이 MIN_FRAMES_REQUIRED보다 적으면, test에서 프레임을
     다시 train으로 옮겨서라도 최소 요구치를 맞춘다 (validation 자체가
@@ -124,12 +142,16 @@ def split_train_test(
     median_ratio = float(np.median(area_ratios)) if area_ratios else 0.0
 
     strata: dict[str, list[Frame]] = {}
+    train_only: list[str] = []
     for f in usable:
+        if not is_test_eligible(f):
+            train_only.append(f.image_info.image_id)
+            continue
         key = _stratum_key(f, image_size, median_ratio)
         strata.setdefault(key, []).append(f)
 
     rng = random.Random(seed)
-    train_ids: list[str] = []
+    train_ids: list[str] = list(train_only)
     test_ids: list[str] = []
 
     for key, frames in strata.items():
@@ -539,7 +561,7 @@ def _usable_test_frame_ids(dataset: Dataset) -> list[str]:
     return [
         f.image_info.image_id
         for f in dataset.enabled_frames
-        if f.detection and f.detection.success and f.detection.num_corners >= 4
+        if f.detection and f.detection.success and is_test_eligible(f)
     ]
 
 

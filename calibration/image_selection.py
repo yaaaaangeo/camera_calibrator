@@ -63,6 +63,15 @@ class ImageSelectionConfig:
     # 두 방식은 선택 결과가 다를 수 있으므로 manifest에 모드를 기록한다.
     exposure_mode: str = "global"
     corner_clip_max: float = 0.45
+    # 검출 코너가 이보다 적은 프레임은 후보에서 뺀다. 0이면 끔(기존 동작).
+    # 실측: 코너 4개짜리 ChArUco 검출은 고정 K/D에서도 pose가 결정되지 않아
+    # hold-out Test에서 최대 299px 오차를 내고 Test RMS를 27px로 만들었다.
+    min_corners: int = 0
+    # 보드 경계 선명도(compute_board_edge_sharpness)가 검출 성공 프레임 중앙값의 이
+    # 비율보다 낮으면 모션 블러로 제외한다. 0이면 끔(기존 동작). 실측(rosbag 3대):
+    # 0.7이면 프레임 간 ~30px 움직인 프레임 1~4%만 빠지고 정지 프레임은 거의 안 빠진다
+    # (후방 정지 239장 중 3장, 우측/전방 0장).
+    min_relative_board_sharpness: float = 0.0
 
 
 @dataclass
@@ -113,7 +122,9 @@ class ImageSelectionResult:
         return (
             f"Auto selection: input {self.counts.get('total', 0)}, "
             f"detection failed {self.counts.get('detection_failed', 0)}, "
-            f"blur rejected {self.counts.get('blur_rejected', 0)}, "
+            + (f"too few corners {self.counts['too_few_corners']}, " if self.counts.get('too_few_corners') else "")
+            + (f"motion blur rejected {self.counts['motion_blur_rejected']}, " if self.counts.get('motion_blur_rejected') else "")
+            + f"blur rejected {self.counts.get('blur_rejected', 0)}, "
             f"exposure rejected {self.counts.get('exposure_rejected', 0)}, "
             f"duplicate/scene skipped {self.counts.get('duplicate_scene', 0)}, "
             f"selected {self.selected_count}/{self.requested_count}"
@@ -205,6 +216,8 @@ def select_calibration_images(
     counts = {
         "total": len(dataset.frames),
         "detection_failed": 0,
+        "too_few_corners": 0,
+        "motion_blur_rejected": 0,
         "blur_rejected": 0,
         "exposure_rejected": 0,
         "valid": 0,
@@ -212,6 +225,10 @@ def select_calibration_images(
         "distribution_excluded": 0,
         "selected": 0,
     }
+
+    board_sharpness = _board_sharpness_by_id(dataset, cfg) if cfg.min_relative_board_sharpness > 0 else {}
+    measured = [v for v in board_sharpness.values() if v is not None]
+    sharpness_floor = (cfg.min_relative_board_sharpness * float(np.median(measured))) if measured else None
 
     for frame in dataset.frames:
         record = _base_record(frame)
@@ -226,6 +243,19 @@ def select_calibration_images(
         record.position = classify_position(frame)
         record.distance = classify_distance(frame)
         record.tilt = classify_tilt(frame)
+
+        if cfg.min_corners and record.num_corners < cfg.min_corners:
+            counts["too_few_corners"] += 1
+            record.exclusion_reason = "too_few_corners"
+            frame.disable("too_few_corners", outlier=False)
+            continue
+
+        board_value = board_sharpness.get(frame.image_info.image_id)
+        if sharpness_floor is not None and board_value is not None and board_value < sharpness_floor:
+            counts["motion_blur_rejected"] += 1
+            record.exclusion_reason = "motion_blur_rejected"
+            frame.disable("motion_blur_rejected", outlier=False)
+            continue
 
         blur_reason = _blur_rejection_reason(frame, cfg)
         if blur_reason:
@@ -333,6 +363,25 @@ def classify_tilt(frame: Frame) -> str:
     if tilt >= 12:
         return "right_tilt"
     return "front"
+
+
+def _board_sharpness_by_id(dataset: Dataset, cfg: ImageSelectionConfig) -> dict[str, float | None]:
+    import cv2
+
+    from calibration.image_quality import compute_board_edge_sharpness
+
+    values: dict[str, float | None] = {}
+    for frame in dataset.frames:
+        det = frame.detection
+        if det is None or not det.success or det.corners is None:
+            continue
+        if cfg.min_corners and det.num_corners < cfg.min_corners:
+            continue
+        gray = cv2.imread(frame.image_info.path, cv2.IMREAD_GRAYSCALE)
+        values[frame.image_info.image_id] = (
+            compute_board_edge_sharpness(gray, det.corners) if gray is not None else None
+        )
+    return values
 
 
 def _base_record(frame: Frame) -> ImageSelectionRecord:

@@ -31,6 +31,7 @@ import numpy as np
 
 from calibration.models.common import (
     DEFAULT_TERM_CRITERIA,
+    complete_perspective_convergence,
     collect_calibration_inputs,
     infer_image_size,
     validate_finite_calibration_output,
@@ -151,10 +152,22 @@ def _run_initial_condition_sample(args: tuple) -> tuple[float, float, float, flo
             elif model == CameraModelType.EXTENDED_PINHOLE:
                 flags |= cv2.CALIB_RATIONAL_MODEL
             try:
-                rms, K, D, _, _ = cv2.calibrateCamera(
-                    object_points, image_points, image_size,
-                    K_init.copy(), D_init.copy(), flags=flags, criteria=DEFAULT_TERM_CRITERIA,
-                )
+                if model == CameraModelType.PINHOLE:
+                    rms, K, D, _, _ = cv2.calibrateCamera(
+                        object_points, image_points, image_size,
+                        K_init.copy(), D_init.copy(), flags=flags, criteria=DEFAULT_TERM_CRITERIA,
+                    )
+                else:
+                    # Seeded calibrateCameraExtended can stop before the minimum
+                    # (P7); measure real initial-condition sensitivity, not that.
+                    native = cv2.calibrateCameraExtended(
+                        object_points, image_points, image_size,
+                        K_init.copy(), D_init.copy(), flags=flags, criteria=DEFAULT_TERM_CRITERIA,
+                    )
+                    native, _ = complete_perspective_convergence(
+                        object_points, image_points, image_size, flags, K_init, D_init, native,
+                    )
+                    rms, K, D = native[:3]
             except cv2.error:
                 if model != CameraModelType.PINHOLE:
                     raise

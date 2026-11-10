@@ -7,6 +7,7 @@ tests/test_repeatability.py
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from calibration.repeatability import compute_repeatability, format_repeatability
@@ -83,10 +84,12 @@ class TestComputeRepeatability:
         assert result.initial_condition_runs == 0
 
     def test_initial_condition_perturbation_is_recorded(self, synthetic_dataset, camera_config):
+        # P6: 이 합성 데이터의 Rational 레퍼런스는 센서 영역 안에서 접혀 물리적으로
+        # 무효하므로, 섭동 기록 자체는 유효한 Brown-Conrady 레퍼런스로 검증한다.
         result = compute_repeatability(
             synthetic_dataset,
             camera_config,
-            CameraModelType.EXTENDED_PINHOLE,
+            CameraModelType.BROWN_CONRADY,
             n_runs=3,
             seed=8,
             initial_condition_perturbation=0.03,
@@ -96,6 +99,33 @@ class TestComputeRepeatability:
         assert result.initial_condition_successful > 0
         assert result.initial_condition_perturbation == pytest.approx(0.03)
         assert result.repeatability_pct is not None
+
+    def test_physically_invalid_reference_is_not_perturbed(self, synthetic_dataset, camera_config, monkeypatch):
+        """P6: 물리 검사에서 거부된 Rational 레퍼런스로 초기값 섭동을 시작하지 않는다.
+
+        세션 공용 synthetic_dataset은 앞선 테스트의 제자리 Outlier 제거로 프레임
+        구성이 바뀔 수 있으므로, 거부된 레퍼런스를 직접 주입해 순서와 무관하게 검증한다.
+        """
+        import calibration.repeatability as rep
+        from calibration.types import CalibrationResult
+
+        def rejected(*args, **kwargs):
+            return CalibrationResult(
+                model_name=CameraModelType.EXTENDED_PINHOLE, camera_matrix=np.eye(3), distortion=np.zeros(8),
+                success=False, error_message="Physical distortion validity: rational_denominator_zero_near_zero_or_uncertified",
+            )
+
+        monkeypatch.setattr(rep, "_calibrate_reference", rejected)
+        result = compute_repeatability(
+            synthetic_dataset,
+            camera_config,
+            CameraModelType.EXTENDED_PINHOLE,
+            n_runs=3,
+            seed=8,
+            initial_condition_perturbation=0.03,
+        )
+        assert result.order_runs == 3
+        assert result.initial_condition_runs == 0
 
 
 class TestFormatRepeatability:

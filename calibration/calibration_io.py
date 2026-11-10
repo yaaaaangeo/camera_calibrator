@@ -281,7 +281,12 @@ def load_opencv_calibration(path: str) -> StandardCalibration:
         metadata: dict[str, Any] = {}
         for key in ("calibration_source", "subset_scene_ids", "pattern_type", "pattern_dictionary"):
             node = fs.getNode(key)
-            if not node.empty():
+            if node.empty():
+                continue
+            if key == "subset_scene_ids" and node.isSeq():
+                # export.opencv.write_id_list: 문자열 한도를 넘는 목록은 시퀀스로 저장된다.
+                metadata[key] = ",".join(node.at(i).string() for i in range(node.size()))
+            else:
                 metadata[key] = node.string()
         for key in ("subset_scene_count", "pattern_squares_x", "pattern_squares_y", "pattern_square_size", "pattern_marker_size"):
             node = fs.getNode(key)

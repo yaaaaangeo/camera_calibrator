@@ -23,7 +23,11 @@ from __future__ import annotations
 
 import pytest
 
+import numpy as np
+
 from calibration.self_check import (
+    DEFAULT_N_IMAGES,
+    _generate_synthetic_dataset,
     run_pinhole_accuracy_check,
     run_brown_conrady_accuracy_check,
     run_rational_accuracy_check,
@@ -37,6 +41,19 @@ pytestmark = pytest.mark.slow
 # 여러 시드에서 안정적으로 통과하는지 확인 (특정 시드에서만 우연히 통과하는
 # 걸 방지) - 대화 중 7개 시드로 실측 검증한 값 중 대표로 3개를 골랐다.
 SEEDS = [3, 7, 42]
+
+
+def _rational_native_fit(seed):
+    """P6: 물리 검사로 거부돼도 native K/D는 보존되므로 계수 개수는 그대로 검증한다."""
+    from calibration.models.extended_pinhole import calibrate_extended_pinhole
+    dataset, camera_config, _ = _generate_synthetic_dataset(DEFAULT_N_IMAGES, seed)
+    result = calibrate_extended_pinhole(dataset, camera_config)
+    if not result.success:
+        # 합성 관측 반경 밖이지만 센서 영역 안의 Rational 극점(seed 3/7) -
+        # 물리적으로 무효한 K/D를 성공으로 기대하지 않는다.
+        assert result.error_message.startswith("Physical distortion validity"), result.error_message
+        assert result.optimization_audit["physical_validity"]["status"] == "FAIL"
+    return result
 
 
 class TestGroundTruthAccuracy:
@@ -110,17 +127,29 @@ class TestModelDistortionCoefficientCounts:
         8인지를 확인한다. 배열 길이는 8 또는 14 중 하나(현재 확인된 버전
         범위)여야 한다는 정도만 느슨하게 체크한다.
         """
-        result = run_rational_accuracy_check(seed=seed)
-        assert result.success, result.message
-        assert result.free_param_count == 8, (
+        result = _rational_native_fit(seed)
+        distortion = np.asarray(result.distortion).reshape(-1)
+        free_param_count = int(np.count_nonzero(distortion))
+        assert free_param_count == 8, (
             f"Rational에서 실제 추정된(0이 아닌) 계수는 8개(k1~k6,p1,p2)여야 "
-            f"하는데 {result.free_param_count}. distortion={result.distortion_array_length}칸"
+            f"하는데 {free_param_count}. distortion={distortion.size}칸"
         )
-        assert result.distortion_array_length in (8, 14), (
+        assert distortion.size in (8, 14), (
             "Rational의 distortion 배열 길이가 예상 범위(8 또는 14)를 벗어났습니다 - "
             "OpenCV 버전이 바뀌면서 s1~s4/taux,tauy 처리 방식이 또 달라졌을 수 있습니다: "
-            f"{result.distortion_array_length}"
+            f"{distortion.size}"
         )
+
+    def test_rational_physically_valid_fits_still_succeed(self):
+        """P6 오검출 방지: 물리 검사로 거부되지 않은 합성 Rational은 성공해야 하며
+        최소 한 seed는 성공해야 한다. 어느 seed가 유효한지는 고정하지 않는다 -
+        관측 반경(~0.4)밖의 Rational 형태는 데이터로 정해지지 않아 수렴 정도에
+        따라 극점이 생기거나 사라진다(P7 실측: seed 3/42 판정 반전)."""
+        results = [run_rational_accuracy_check(seed=seed) for seed in SEEDS]
+        for result in results:
+            assert result.success or "Physical distortion validity" in result.message, result.message
+        valid = [r for r in results if r.success]
+        assert valid and all(r.free_param_count == 8 for r in valid)
 
     @pytest.mark.parametrize("seed", SEEDS)
     def test_rational_has_more_free_params_than_brown_conrady(self, seed):
@@ -129,9 +158,9 @@ class TestModelDistortionCoefficientCounts:
         비교. 두 함수는 서로 다른 CameraModelType이며 runtime toggle로 서로의
         결과가 바뀔 수 없다(P0-1)."""
         brown_result = run_brown_conrady_accuracy_check(seed=seed)
-        rational_result = run_rational_accuracy_check(seed=seed)
-        assert brown_result.success and rational_result.success
-        assert rational_result.free_param_count > brown_result.free_param_count, (
+        rational_free = int(np.count_nonzero(_rational_native_fit(seed).distortion))
+        assert brown_result.success
+        assert rational_free > brown_result.free_param_count, (
             f"Rational의 자유도가 Brown-Conrady보다 많아야 합니다: "
-            f"brown={brown_result.free_param_count}, rational={rational_result.free_param_count}"
+            f"brown={brown_result.free_param_count}, rational={rational_free}"
         )

@@ -122,6 +122,16 @@ class ComparisonSide:
     failed_frame_ids: list[str] = field(default_factory=list)
     success: bool = False
     error_message: str | None = None
+    evaluation_status: str = "not_run"
+    num_evaluation_frames: int = 0
+    num_evaluated_frames: int = 0
+    num_detected_frames: int = 0
+    num_unevaluable_frames: int = 0
+    num_pose_failed_frames: int = 0
+    detected_frame_success_rate: float | None = None
+    evaluation_success_rate: float | None = None
+    failed_frame_reasons: dict[str, str] = field(default_factory=dict)
+    pose_diagnostics: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -1996,6 +2006,7 @@ def _test_reprojection_errors_with_points(
     camera_matrix: np.ndarray,
     distortion: np.ndarray,
     model: CameraModelType,
+    *, pose_audit: dict | None = None,
 ) -> tuple[
     dict[str, float],
     list[str],
@@ -2011,34 +2022,25 @@ def _test_reprojection_errors_with_points(
     point_errors: list[float] = []
     point_errors_xy: list[tuple[float, float, float]] = []
     point_error_details: list[PointErrorDetail] = []
-    is_fisheye = model == CameraModelType.FISHEYE
+    from calibration.fixed_intrinsic_pose import evaluate_fixed_pose
 
     for frame in test_frames:
         det = frame.detection
-        obj = det.object_points
-        img = det.corners
         frame_id = frame.image_info.image_id
-
-        try:
-            if is_fisheye:
-                obj64 = obj.astype(np.float64)
-                img64 = img.astype(np.float64)
-                ok, rvec, tvec = cv2.fisheye.solvePnP(obj64, img64, camera_matrix, distortion)
-                if not ok:
-                    raise cv2.error("fisheye.solvePnP returned False")
-                projected, _ = cv2.fisheye.projectPoints(obj64, rvec, tvec, camera_matrix, distortion)
-                detected = img64.reshape(-1, 2)
-            else:
-                ok, rvec, tvec = cv2.solvePnP(obj, img, camera_matrix, distortion)
-                if not ok:
-                    raise cv2.error("solvePnP returned False")
-                projected, _ = cv2.projectPoints(obj, rvec, tvec, camera_matrix, distortion)
-                detected = img.reshape(-1, 2)
-        except cv2.error:
+        if det is None or not det.success or not frame.enabled:
+            if pose_audit is not None:
+                pose_audit[frame_id] = {'status': 'unevaluable',
+                                        'reason': 'detection_failed' if det is None or not det.success else 'frame_disabled',
+                                        'disabled_reason': frame.disabled_reason}
             failed.append(frame_id)
             continue
-
-        projected = projected.reshape(-1, 2)
+        audit, projected = evaluate_fixed_pose(det.object_points, det.corners, camera_matrix, distortion, model)
+        if pose_audit is not None:
+            pose_audit[frame_id] = audit
+        if projected is None:
+            failed.append(frame_id)
+            continue
+        detected = det.corners.reshape(-1, 2)
         diff = detected - projected
         per_point = np.hypot(diff[:, 0], diff[:, 1])
         rms = float(np.sqrt(np.mean(per_point ** 2)))
@@ -2074,15 +2076,29 @@ def _evaluate_side(
     label: str,
 ) -> ComparisonSide:
     subset = _subset_dataset(dataset, test_ids)
-    frames = subset.enabled_frames
+    # Explicit evaluation IDs define the denominator, including disabled/non-detected views.
+    frames = subset.frames
     if not frames:
         return ComparisonSide(
             label=label, model_name=model, camera_matrix=camera_matrix, distortion=distortion,
             success=False, error_message="비교할 프레임이 없습니다.",
         )
 
+    pose_audit = {}
     per_frame_error, failed, point_errors, point_errors_xy, point_error_details = _test_reprojection_errors_with_points(
-        frames, camera_matrix, distortion, model
+        frames, camera_matrix, distortion, model, pose_audit=pose_audit
+    )
+    evaluation = dict(
+        evaluation_status=("complete" if not failed else "partial") if per_frame_error else "failed",
+        num_evaluation_frames=len(frames), num_evaluated_frames=len(per_frame_error),
+        num_detected_frames=sum(bool(f.detection and f.detection.success) for f in frames),
+        num_unevaluable_frames=sum(a['status'] == 'unevaluable' for a in pose_audit.values()),
+        num_pose_failed_frames=sum(a['status'] == 'failed' for a in pose_audit.values()),
+        detected_frame_success_rate=(len(per_frame_error) / sum(bool(f.detection and f.detection.success) for f in frames)
+                                     if any(f.detection and f.detection.success for f in frames) else None),
+        evaluation_success_rate=len(per_frame_error) / len(frames),
+        failed_frame_reasons={fid: pose_audit[fid]['reason'] for fid in failed},
+        pose_diagnostics=pose_audit,
     )
     if not per_frame_error:
         return ComparisonSide(
@@ -2093,7 +2109,7 @@ def _evaluate_side(
                 "카메라 모델 종류(Pinhole/Extended/Fisheye)나 파라미터가 "
                 "이 촬영과 맞는지 다시 확인해 주세요."
             ),
-            failed_frame_ids=failed,
+            failed_frame_ids=failed, **evaluation,
         )
 
     test_rms = float(np.sqrt(np.mean(np.array(list(per_frame_error.values())) ** 2)))
@@ -2120,7 +2136,7 @@ def _evaluate_side(
         test_rms=test_rms, residual_stats=residual_stats, edge_rms=edge_rms, straightness_residual=straightness,
         per_frame_error=per_frame_error, point_errors_xy=point_errors_xy,
         point_error_details=point_error_details,
-        failed_frame_ids=failed, success=True,
+        failed_frame_ids=failed, success=True, **evaluation,
     )
 
 
@@ -2407,7 +2423,7 @@ def _select_evaluation_dataset(
             )
             return (
                 independent_benchmark_dataset,
-                benchmark_ids,
+                [f.image_info.image_id for f in independent_benchmark_dataset.frames],
                 "independent_benchmark",
                 "high",
                 "ok",
@@ -2519,6 +2535,10 @@ def compare_reference_candidate_calibrations(
         evaluation_dataset, camera_config, pattern_config, evaluation_frame_ids,
         candidate.camera_matrix, candidate.distortion, candidate.model_name, candidate.label,
     )
+
+    if reference_side.failed_frame_ids or candidate_side.failed_frame_ids:
+        confidence = "limited"
+        caveats.append("Pose evaluation is partial: report success rates separately from conditional valid-frame RMS; not an accuracy certificate.")
 
     candidate_win = reference_win = tie = 0
     common_ids = set(candidate_side.per_frame_error) & set(reference_side.per_frame_error)

@@ -202,7 +202,9 @@ def test_rational_outlier_pruning_keeps_8_coefficient_identity(synthetic_dataset
     result, outlier_result = recalibrate_with_outlier_pruning(
         dataset, camera_config, CameraModelType.EXTENDED_PINHOLE, max_iterations=2,
     )
-    assert result.success, result.error_message
+    # P6: 이 합성 데이터의 Rational 해는 센서 영역 안에서 접히므로 물리 검사에서
+    # 거부된다. 거부돼도 native K/D는 보존되므로 8계수 정체성은 계속 검증한다.
+    assert result.success or result.error_message.startswith("Physical distortion validity"), result.error_message
     assert result.model_name == CameraModelType.EXTENDED_PINHOLE
     assert result.distortion is not None
     assert result.distortion.size == 8, (
@@ -224,7 +226,12 @@ def test_all_standard_models_recalibrate_without_error(synthetic_dataset, camera
         result, _outlier_result = recalibrate_with_outlier_pruning(
             dataset, camera_config, model, max_iterations=1,
         )
-        assert result.success, f"{model.value}: {result.error_message}"
+        # P6: 이 좁은 합성 데이터의 Rational/Fisheye 해는 센서 영역 안에서 접혀
+        # 물리적으로 무효하다 - ValueError 없이 FAIL로 기록돼야 한다.
+        physically_rejected = (not result.success
+                               and model in (CameraModelType.EXTENDED_PINHOLE, CameraModelType.FISHEYE)
+                               and result.error_message.startswith("Physical distortion validity"))
+        assert result.success or physically_rejected, f"{model.value}: {result.error_message}"
         assert result.model_name == model
 
 
