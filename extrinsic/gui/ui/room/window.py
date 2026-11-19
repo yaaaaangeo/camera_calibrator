@@ -103,7 +103,7 @@ class RoomWindow(QtWidgets.QMainWindow):
         if s.session_id:
             self.session_label.setText(f"세션 <b>{session.session_label(s.session_id)}</b> · {s.session_dir}")
         else:
-            self.session_label.setText("<i>캡처 전 — 세션은 캡처 시각으로 정해집니다</i>")
+            self.session_label.setText("")
 
     # ------------------------------------------------------------- cameras
 

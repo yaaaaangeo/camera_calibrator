@@ -1016,6 +1016,15 @@ AMBIGUOUS_TURN_DEG = 1.0
 # this many metres per board, whichever is looser.
 AMBIGUOUS_RESIDUAL_RATIO = 2.0
 AMBIGUOUS_FLOOR_M = 0.08
+# The beam test (Plausible) is there to tell apart explanations the boards
+# cannot -- one board fits every LiDAR board. It is not a veto over the boards
+# themselves: a rear camera here sat where 42 beams pass close by (more than
+# BLOCKED_RAYS), its true pairing lined up all 10 boards at 4 cm and was thrown
+# out, and the 7-board wrong pairings left over tied as "ambiguous". So a
+# pairing dropped only for beams is taken back when it lines up at least this
+# many boards more than anything that passed, at most AMBIGUOUS_FLOOR_M per
+# board, and still faces the way the camera does.
+BEAM_OVERRIDE_BOARDS = 2
 
 
 def _refine_pairs(pairs, lidar, cams, gate, gate_frac):
@@ -1061,6 +1070,28 @@ def board_evidence(sol, cams, matched: set, cloud, radius: float = 0.45, slab: f
         if near.any():
             total += float((np.abs((xyz[near] - c) @ n) < slab).sum())
     return total
+
+
+def _rescue_beam_dropped(dropped, cands, check):
+    """Pairings dropped only by the beam test that the boards clearly favour, best first.
+
+    `dropped` and `cands` as in `match_boards`: (boards, summed distance,
+    solution, pairs[, reason]). See BEAM_OVERRIDE_BOARDS.
+    """
+    top = max((c[0] for c in cands), default=0)
+    facing = getattr(check, "facing", None)
+    out = []
+    for d in dropped:
+        n, total, sol, _, why = d
+        if not why.startswith("빔통과"):
+            continue
+        if n < max(WEAK_BOARDS, top + BEAM_OVERRIDE_BOARDS) or total / n > AMBIGUOUS_FLOOR_M:
+            continue
+        if facing is not None and facing(sol):
+            continue
+        out.append(d)
+    out.sort(key=lambda d: (-d[0], d[1]))
+    return out
 
 
 def match_boards(lidar: list[LidarBoard], cams: list[CameraBoard],
@@ -1127,13 +1158,21 @@ def match_boards(lidar: list[LidarBoard], cams: list[CameraBoard],
         if len(cands) >= 6:
             break
     check_note = ""
+    rescued = _rescue_beam_dropped(dropped, cands, check)
+    if rescued:
+        r = rescued[0]
+        dropped = [d for d in dropped if d is not r]
+        cands.append(r[:4])
+        top = max((c[0] for c in cands[:-1]), default=0)
+        check_note = (f"빔통과 검사에 걸린 대응을 되살렸습니다: 보드 {r[0]}개를 보드당 {100 * r[1] / r[0]:.1f} cm 로 "
+                      f"맞춥니다 (통과한 후보는 최대 {top}개) — {r[4]}")
     if dropped and not cands:
         cands = [d[:4] for d in dropped[:6]]
         check_note = (f"⚠ 대응 후보 {len(dropped)}개가 모두 위치·방향 검사에 걸렸습니다 ({dropped[0][4]}). "
                       f"검사 없이 골랐으니 결과를 확인하세요")
     elif dropped:
         why = sorted({d[4].split(":")[0] for d in dropped})
-        check_note = f"대응 후보 {len(dropped)}개를 제외했습니다 ({', '.join(why)})"
+        check_note = " · ".join(n for n in (check_note, f"대응 후보 {len(dropped)}개를 제외했습니다 ({', '.join(why)})") if n)
     if not cands:
         return None, []
     cands.sort(key=lambda c: (-c[0], c[1]))
@@ -1411,6 +1450,10 @@ class Plausible:
             n = self.rays.blocked(camera_centre(sol))
             if n > BLOCKED_RAYS:
                 return f"빔통과: 카메라 자리를 LiDAR 빔 {n}개가 지나감"
+        return self.facing(sol)
+
+    def facing(self, sol) -> str:
+        """The direction half of the check alone: why `sol` faces the wrong way, or ''."""
         if self.forward is not None and self.direction in DIRECTIONS:
             rel = _wrap(optical_heading(sol) - self.forward)
             want = DIRECTIONS[self.direction]
