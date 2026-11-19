@@ -1,0 +1,23 @@
+# Calibration Tool 실행 의존성 (내부파라미터 + 카메라·LiDAR 룸 공통)
+# 설치: ./install.sh   (또는 venv 안에서 pip install -r requirements.txt)
+
+PySide6>=6.5.3
+numpy>=1.24
+scipy>=1.11
+PyYAML>=6.0
+
+# cv2.aruco(ChArUco/AprilGrid)가 필요해서 contrib 빌드, GUI 는 PySide6 가 맡으므로 headless.
+# opencv-python / opencv-contrib-python 등 다른 opencv-* 와 같이 설치하지 마세요 (같은 cv2 를 덮어씀).
+# 4.10 미만에는 cv2.fisheye.solvePnP 가 없고, 5.x 에서는 Rational 모델 검증이 실패합니다.
+opencv-contrib-python-headless>=4.10,<5
+
+# ROS 설치 없이 .bag / .db3 / .mcap 읽기
+rosbags>=0.9
+
+# 카메라·LiDAR 룸의 3D 포인트클라우드 뷰
+pyqtgraph>=0.13
+PyOpenGL>=3.1
+
+# 카메라·LiDAR 룸 실시간 캡처: ROS 2 가 설치되지 않은 PC 에서 ROS 2 토픽을 직접 받기 (DDS)
+# (ROS 1 은 별도 패키지 없이 직접 접속, ROS 2 가 source 돼 있으면 rclpy 를 먼저 씀)
+cyclonedds>=0.10

@@ -1,0 +1,701 @@
+"""Automatic image subset selection for calibration inputs.
+
+This module intentionally stays independent from Qt.  It consumes the same
+``Dataset`` produced by ``detect_dataset`` and marks frames as selected or
+excluded without deleting or modifying source image files.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from calibration.image_quality import compute_pattern_exposure_metrics, hamming_distance
+from calibration.types import Dataset, Frame, FrameStatus
+
+
+POSITION_ORDER = [
+    "center",
+    "left",
+    "right",
+    "top",
+    "bottom",
+    "top-left",
+    "top-right",
+    "bottom-left",
+    "bottom-right",
+]
+
+DEFAULT_POSITION_WEIGHTS = {
+    "center": 5,
+    "left": 5,
+    "right": 5,
+    "top": 4,
+    "bottom": 4,
+    "top-left": 3,
+    "top-right": 3,
+    "bottom-left": 3,
+    "bottom-right": 3,
+}
+
+
+@dataclass(frozen=True)
+class ImageSelectionConfig:
+    target_count: int = 35
+    blur_min_laplacian_var: float = 15.0
+    brightness_min: float = 25.0
+    brightness_max: float = 230.0
+    saturation_max: float = 0.15
+    duplicate_phash_distance: int = 14
+    similar_center_distance: float = 0.08
+    similar_area_delta: float = 0.04
+    similar_tilt_delta_deg: float = 8.0
+    seed: int = 42
+    # 노출 판정 방식.
+    #   "global"  (기본, 기존 동작): 이미지 전체 평균 밝기 + 전체 clipping 비율
+    #   "pattern" : 보드 영역 평균 밝기 + 코너 주변 패치의 포화 비율 중앙값
+    #               (corner_clip_max). 흰 종이/배경/조명처럼 코너와 무관한
+    #               밝은 영역 때문에 정상 이미지를 버리지 않는다.
+    # 두 방식은 선택 결과가 다를 수 있으므로 manifest에 모드를 기록한다.
+    exposure_mode: str = "global"
+    corner_clip_max: float = 0.45
+    # 검출 코너가 이보다 적은 프레임은 후보에서 뺀다. 0이면 끔(기존 동작).
+    # 실측: 코너 4개짜리 ChArUco 검출은 고정 K/D에서도 pose가 결정되지 않아
+    # hold-out Test에서 최대 299px 오차를 내고 Test RMS를 27px로 만들었다.
+    min_corners: int = 0
+    # 보드 경계 선명도(compute_board_edge_sharpness)가 검출 성공 프레임 중앙값의 이
+    # 비율보다 낮으면 모션 블러로 제외한다. 0이면 끔(기존 동작). 실측(rosbag 3대):
+    # 0.7이면 프레임 간 ~30px 움직인 프레임 1~4%만 빠지고 정지 프레임은 거의 안 빠진다
+    # (후방 정지 239장 중 3장, 우측/전방 0장).
+    min_relative_board_sharpness: float = 0.0
+
+
+@dataclass
+class ImageSelectionRecord:
+    image_id: str
+    path: str
+    selected: bool = False
+    exclusion_reason: str = ""
+    score: float = 0.0
+    position: str = "unknown"
+    distance: str = "unknown"
+    tilt: str = "unknown"
+    cluster_id: int | None = None
+    train_holdout_assignment: str = "excluded"
+    detection_success: bool = False
+    num_corners: int = 0
+    blur: float | None = None
+    brightness: float | None = None
+    saturation: float | None = None
+    roi_brightness: float | None = None  # exposure_mode="pattern"일 때만
+    corner_clip: float | None = None     # exposure_mode="pattern"일 때만
+
+
+EXPOSURE_MODES = ("global", "pattern")
+
+
+@dataclass
+class ImageSelectionResult:
+    selected_paths: list[str]
+    selected_image_ids: list[str]
+    records: list[ImageSelectionRecord]
+    target_count: int
+    requested_count: int
+    valid_count: int
+    counts: dict[str, int] = field(default_factory=dict)
+    position_counts: dict[str, int] = field(default_factory=dict)
+    distance_counts: dict[str, int] = field(default_factory=dict)
+    tilt_counts: dict[str, int] = field(default_factory=dict)
+    position_targets: dict[str, int] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+    exposure_mode: str = "global"
+
+    @property
+    def selected_count(self) -> int:
+        return len(self.selected_paths)
+
+    def summary_text(self) -> str:
+        return (
+            f"Auto selection: input {self.counts.get('total', 0)}, "
+            f"detection failed {self.counts.get('detection_failed', 0)}, "
+            + (f"too few corners {self.counts['too_few_corners']}, " if self.counts.get('too_few_corners') else "")
+            + (f"motion blur rejected {self.counts['motion_blur_rejected']}, " if self.counts.get('motion_blur_rejected') else "")
+            + f"blur rejected {self.counts.get('blur_rejected', 0)}, "
+            f"exposure rejected {self.counts.get('exposure_rejected', 0)}, "
+            f"duplicate/scene skipped {self.counts.get('duplicate_scene', 0)}, "
+            f"selected {self.selected_count}/{self.requested_count}"
+        )
+
+    def to_manifest(self) -> dict[str, Any]:
+        manifest = {
+            "schema_version": 1,
+            "requested_count": self.requested_count,
+            "target_count": self.target_count,
+            "valid_count": self.valid_count,
+            "selected_count": self.selected_count,
+            "counts": self.counts,
+            "position_targets": self.position_targets,
+            "position_counts": self.position_counts,
+            "distance_counts": self.distance_counts,
+            "tilt_counts": self.tilt_counts,
+            "warnings": self.warnings,
+            "images": [
+                {
+                    "image_id": r.image_id,
+                    "path": r.path,
+                    "selected": r.selected,
+                    "exclusion_reason": r.exclusion_reason,
+                    "score": round(r.score, 6),
+                    "position": r.position,
+                    "distance": r.distance,
+                    "tilt": r.tilt,
+                    "cluster_id": r.cluster_id,
+                    "train_holdout_assignment": r.train_holdout_assignment,
+                    "detection_success": r.detection_success,
+                    "num_corners": r.num_corners,
+                    "blur": r.blur,
+                    "brightness": r.brightness,
+                    "saturation": r.saturation,
+                }
+                for r in self.records
+            ],
+        }
+        if self.exposure_mode != "global":
+            # 기존 기본 모드의 manifest는 그대로 두고, 다른 모드일 때만 기록한다
+            manifest["exposure_mode"] = self.exposure_mode
+            for entry, record in zip(manifest["images"], self.records):
+                entry["roi_brightness"] = record.roi_brightness
+                entry["corner_clip"] = record.corner_clip
+        return manifest
+
+
+def allocate_position_targets(total: int) -> dict[str, int]:
+    """Allocate the 35-image default profile to any target count."""
+    total = max(0, int(total))
+    if total == 0:
+        return {key: 0 for key in POSITION_ORDER}
+    weight_sum = sum(DEFAULT_POSITION_WEIGHTS.values())
+    raw = {key: total * DEFAULT_POSITION_WEIGHTS[key] / weight_sum for key in POSITION_ORDER}
+    targets = {key: int(np.floor(value)) for key, value in raw.items()}
+    remaining = total - sum(targets.values())
+    remainders = sorted(
+        POSITION_ORDER,
+        key=lambda key: (raw[key] - targets[key], DEFAULT_POSITION_WEIGHTS[key]),
+        reverse=True,
+    )
+    for key in remainders[:remaining]:
+        targets[key] += 1
+    return targets
+
+
+def write_selection_manifest(result: ImageSelectionResult, path: str | Path) -> Path:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(result.to_manifest(), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return destination
+
+
+def select_calibration_images(
+    dataset: Dataset,
+    config: ImageSelectionConfig | None = None,
+) -> ImageSelectionResult:
+    cfg = config or ImageSelectionConfig()
+    if cfg.exposure_mode not in EXPOSURE_MODES:
+        raise ValueError(f"exposure_mode must be one of {EXPOSURE_MODES}: {cfg.exposure_mode!r}")
+    requested = max(1, int(cfg.target_count))
+    records: dict[str, ImageSelectionRecord] = {}
+    candidate_frames: list[Frame] = []
+
+    counts = {
+        "total": len(dataset.frames),
+        "detection_failed": 0,
+        "too_few_corners": 0,
+        "motion_blur_rejected": 0,
+        "blur_rejected": 0,
+        "exposure_rejected": 0,
+        "valid": 0,
+        "duplicate_scene": 0,
+        "distribution_excluded": 0,
+        "selected": 0,
+    }
+
+    board_sharpness = _board_sharpness_by_id(dataset, cfg) if cfg.min_relative_board_sharpness > 0 else {}
+    measured = [v for v in board_sharpness.values() if v is not None]
+    sharpness_floor = (cfg.min_relative_board_sharpness * float(np.median(measured))) if measured else None
+
+    for frame in dataset.frames:
+        record = _base_record(frame)
+        records[frame.image_info.image_id] = record
+
+        det = frame.detection
+        if det is None or not det.success:
+            counts["detection_failed"] += 1
+            record.exclusion_reason = "detection_failed"
+            continue
+        record.detection_success = True
+        record.position = classify_position(frame)
+        record.distance = classify_distance(frame)
+        record.tilt = classify_tilt(frame)
+
+        if cfg.min_corners and record.num_corners < cfg.min_corners:
+            counts["too_few_corners"] += 1
+            record.exclusion_reason = "too_few_corners"
+            frame.disable("too_few_corners", outlier=False)
+            continue
+
+        board_value = board_sharpness.get(frame.image_info.image_id)
+        if sharpness_floor is not None and board_value is not None and board_value < sharpness_floor:
+            counts["motion_blur_rejected"] += 1
+            record.exclusion_reason = "motion_blur_rejected"
+            frame.disable("motion_blur_rejected", outlier=False)
+            continue
+
+        blur_reason = _blur_rejection_reason(frame, cfg)
+        if blur_reason:
+            counts["blur_rejected"] += 1
+            record.exclusion_reason = blur_reason
+            frame.disable(blur_reason, outlier=False)
+            continue
+
+        exposure_reason = _exposure_rejection_reason(frame, cfg, record)
+        if exposure_reason:
+            counts["exposure_rejected"] += 1
+            record.exclusion_reason = exposure_reason
+            frame.disable(exposure_reason, outlier=False)
+            continue
+
+        candidate_frames.append(frame)
+
+    valid_count = len(candidate_frames)
+    counts["valid"] = valid_count
+    target = min(requested, valid_count)
+    targets = allocate_position_targets(target)
+    _score_candidates(candidate_frames, records)
+    clusters = _assign_clusters(candidate_frames, records, cfg)
+    selected_ids, duplicate_skips = _select_frames(candidate_frames, records, targets, target)
+
+    for frame in candidate_frames:
+        image_id = frame.image_info.image_id
+        record = records[image_id]
+        if image_id in selected_ids:
+            record.selected = True
+            record.exclusion_reason = ""
+            record.train_holdout_assignment = "pending_split"
+            frame.status = FrameStatus.DETECTED
+            frame.disabled_reason = None
+        else:
+            reason = "duplicate_scene" if record.cluster_id in duplicate_skips else "distribution_excluded"
+            record.exclusion_reason = reason
+            record.train_holdout_assignment = "excluded"
+            frame.disable(reason, outlier=False)
+            counts[reason] += 1
+
+    counts["duplicate_scene"] = max(counts["duplicate_scene"], len(duplicate_skips))
+    counts["selected"] = len(selected_ids)
+
+    selected_frames = [frame for frame in dataset.frames if frame.image_info.image_id in selected_ids]
+    selected_paths = [frame.image_info.path for frame in selected_frames]
+    selected_image_ids = [frame.image_info.image_id for frame in selected_frames]
+
+    position_counts = _count(records[i].position for i in selected_ids)
+    distance_counts = _count(records[i].distance for i in selected_ids)
+    tilt_counts = _count(records[i].tilt for i in selected_ids)
+    warnings = _build_warnings(requested, target, valid_count, targets, position_counts)
+
+    return ImageSelectionResult(
+        selected_paths=selected_paths,
+        selected_image_ids=selected_image_ids,
+        records=[records[f.image_info.image_id] for f in dataset.frames],
+        target_count=target,
+        requested_count=requested,
+        valid_count=valid_count,
+        counts=counts,
+        position_counts=position_counts,
+        distance_counts=distance_counts,
+        tilt_counts=tilt_counts,
+        position_targets=targets,
+        warnings=warnings,
+        exposure_mode=cfg.exposure_mode,
+    )
+
+
+def classify_position(frame: Frame) -> str:
+    det = frame.detection
+    if not det or not det.board_center_px or frame.image_info.width <= 0 or frame.image_info.height <= 0:
+        return "unknown"
+    x = det.board_center_px[0] / frame.image_info.width
+    y = det.board_center_px[1] / frame.image_info.height
+    horizontal = "left" if x < 1 / 3 else ("right" if x > 2 / 3 else "center")
+    vertical = "top" if y < 1 / 3 else ("bottom" if y > 2 / 3 else "center")
+    if horizontal == "center" and vertical == "center":
+        return "center"
+    if vertical == "center":
+        return horizontal
+    if horizontal == "center":
+        return vertical
+    return f"{vertical}-{horizontal}"
+
+
+def classify_distance(frame: Frame) -> str:
+    area = frame.detection.board_area_ratio if frame.detection else None
+    if area is None:
+        return "unknown"
+    if area >= 0.30:
+        return "close"
+    if area >= 0.12:
+        return "middle"
+    return "far"
+
+
+def classify_tilt(frame: Frame) -> str:
+    tilt = frame.detection.board_tilt_deg if frame.detection else None
+    if tilt is None:
+        return "unknown"
+    if tilt <= -12:
+        return "left_tilt"
+    if tilt >= 12:
+        return "right_tilt"
+    return "front"
+
+
+def _board_sharpness_by_id(dataset: Dataset, cfg: ImageSelectionConfig) -> dict[str, float | None]:
+    import cv2
+
+    from calibration.image_quality import compute_board_edge_sharpness
+
+    values: dict[str, float | None] = {}
+    for frame in dataset.frames:
+        det = frame.detection
+        if det is None or not det.success or det.corners is None:
+            continue
+        if cfg.min_corners and det.num_corners < cfg.min_corners:
+            continue
+        gray = cv2.imread(frame.image_info.path, cv2.IMREAD_GRAYSCALE)
+        values[frame.image_info.image_id] = (
+            compute_board_edge_sharpness(gray, det.corners) if gray is not None else None
+        )
+    return values
+
+
+def _base_record(frame: Frame) -> ImageSelectionRecord:
+    det = frame.detection
+    return ImageSelectionRecord(
+        image_id=frame.image_info.image_id,
+        path=frame.image_info.path,
+        detection_success=bool(det and det.success),
+        num_corners=det.num_corners if det else 0,
+        blur=frame.image_info.sharpness,
+        brightness=frame.image_info.brightness,
+        saturation=frame.image_info.saturation,
+    )
+
+
+def _blur_rejection_reason(frame: Frame, cfg: ImageSelectionConfig) -> str:
+    sharpness = frame.image_info.sharpness
+    if sharpness is not None and sharpness < cfg.blur_min_laplacian_var:
+        return "blur_rejected"
+    return ""
+
+
+def _exposure_rejection_reason(
+    frame: Frame, cfg: ImageSelectionConfig, record: ImageSelectionRecord | None = None,
+) -> str:
+    if cfg.exposure_mode == "pattern":
+        reason = _pattern_exposure_rejection_reason(frame, cfg, record)
+        if reason is not None:
+            return reason
+        # 코너가 4개 미만이거나 이미지를 다시 읽지 못하면 기존 전체 기준으로 판단
+    brightness = frame.image_info.brightness
+    if brightness is not None and (brightness < cfg.brightness_min or brightness > cfg.brightness_max):
+        return "exposure_rejected"
+    saturation = frame.image_info.saturation
+    if saturation is not None and saturation > cfg.saturation_max:
+        return "exposure_rejected"
+    return ""
+
+
+def _pattern_exposure_rejection_reason(
+    frame: Frame, cfg: ImageSelectionConfig, record: ImageSelectionRecord | None,
+) -> str | None:
+    import cv2
+
+    det = frame.detection
+    if det is None or det.corners is None:
+        return None
+    gray = cv2.imread(frame.image_info.path, cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        return None
+    metrics = compute_pattern_exposure_metrics(gray, det.corners)
+    if metrics is None:
+        return None
+    if record is not None:
+        record.roi_brightness = round(metrics.roi_brightness, 3)
+        record.corner_clip = round(metrics.corner_clip_median, 4)
+    if not cfg.brightness_min <= metrics.roi_brightness <= cfg.brightness_max:
+        return "exposure_rejected"
+    if metrics.corner_clip_median > cfg.corner_clip_max:
+        return "exposure_rejected"
+    return ""
+
+
+def _score_candidates(frames: list[Frame], records: dict[str, ImageSelectionRecord]) -> None:
+    sharpness_values = [f.image_info.sharpness for f in frames if f.image_info.sharpness is not None]
+    max_sharpness = max(sharpness_values) if sharpness_values else 1.0
+    max_corners = max((f.detection.num_corners for f in frames if f.detection), default=1)
+    for frame in frames:
+        det = frame.detection
+        info = frame.image_info
+        corner_score = min(1.0, (det.num_corners if det else 0) / max(1, max_corners))
+        confidence = det.corner_confidence if det and det.corner_confidence is not None else corner_score
+        sharpness = min(1.0, (info.sharpness or 0.0) / max(1.0, max_sharpness))
+        exposure = 0.5 if info.brightness is None else max(0.0, 1.0 - abs(info.brightness - 127.0) / 127.0)
+        area = det.board_area_ratio if det and det.board_area_ratio is not None else 0.0
+        area_score = 1.0 if 0.10 <= area <= 0.55 else max(0.0, 1.0 - min(abs(area - 0.10), abs(area - 0.55)) / 0.45)
+        score = 0.35 * confidence + 0.25 * sharpness + 0.20 * corner_score + 0.10 * exposure + 0.10 * area_score
+        records[frame.image_info.image_id].score = float(score)
+
+
+def _assign_clusters(
+    frames: list[Frame],
+    records: dict[str, ImageSelectionRecord],
+    cfg: ImageSelectionConfig,
+) -> dict[int, list[str]]:
+    n = len(frames)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _is_similar_scene(frames[i], frames[j], records, cfg):
+                union(i, j)
+
+    roots: dict[int, int] = {}
+    clusters: dict[int, list[str]] = {}
+    for idx, frame in enumerate(frames):
+        root = find(idx)
+        cluster_id = roots.setdefault(root, len(roots))
+        image_id = frame.image_info.image_id
+        records[image_id].cluster_id = cluster_id
+        clusters.setdefault(cluster_id, []).append(image_id)
+    return clusters
+
+
+def _is_similar_scene(
+    a: Frame,
+    b: Frame,
+    records: dict[str, ImageSelectionRecord],
+    cfg: ImageSelectionConfig,
+) -> bool:
+    phash_a = a.image_info.phash
+    phash_b = b.image_info.phash
+    if phash_a and phash_b and hamming_distance(phash_a, phash_b) <= cfg.duplicate_phash_distance:
+        return True
+
+    rec_a = records[a.image_info.image_id]
+    rec_b = records[b.image_info.image_id]
+    if rec_a.position != rec_b.position or rec_a.distance != rec_b.distance or rec_a.tilt != rec_b.tilt:
+        return False
+    det_a = a.detection
+    det_b = b.detection
+    if not det_a or not det_b or not det_a.board_center_px or not det_b.board_center_px:
+        return False
+    center_a = (det_a.board_center_px[0] / a.image_info.width, det_a.board_center_px[1] / a.image_info.height)
+    center_b = (det_b.board_center_px[0] / b.image_info.width, det_b.board_center_px[1] / b.image_info.height)
+    center_dist = float(np.hypot(center_a[0] - center_b[0], center_a[1] - center_b[1]))
+    area_delta = abs((det_a.board_area_ratio or 0.0) - (det_b.board_area_ratio or 0.0))
+    tilt_delta = abs((det_a.board_tilt_deg or 0.0) - (det_b.board_tilt_deg or 0.0))
+    return (
+        center_dist <= cfg.similar_center_distance
+        and area_delta <= cfg.similar_area_delta
+        and tilt_delta <= cfg.similar_tilt_delta_deg
+    )
+
+
+def _select_frames(
+    frames: list[Frame],
+    records: dict[str, ImageSelectionRecord],
+    targets: dict[str, int],
+    target: int,
+) -> tuple[set[str], set[int]]:
+    by_position: dict[str, list[Frame]] = {key: [] for key in POSITION_ORDER}
+    for frame in frames:
+        by_position.setdefault(records[frame.image_info.image_id].position, []).append(frame)
+
+    selected: list[str] = []
+    used_clusters: set[int] = set()
+    selected_distances: set[str] = set()
+    selected_tilts: set[str] = set()
+
+    def order(items: list[Frame]) -> list[Frame]:
+        return sorted(
+            items,
+            key=lambda frame: _selection_score(frame, records, selected_distances, selected_tilts),
+            reverse=True,
+        )
+
+    def choose(items: list[Frame], limit: int, *, allow_used_cluster: bool = False) -> None:
+        nonlocal selected
+        for frame in order(items):
+            if len(selected) >= target or limit <= 0:
+                return
+            image_id = frame.image_info.image_id
+            if image_id in selected:
+                continue
+            cluster_id = records[image_id].cluster_id
+            if not allow_used_cluster and cluster_id in used_clusters:
+                continue
+            selected.append(image_id)
+            if cluster_id is not None:
+                used_clusters.add(cluster_id)
+            selected_distances.add(records[image_id].distance)
+            selected_tilts.add(records[image_id].tilt)
+            limit -= 1
+
+    for position in POSITION_ORDER:
+        choose(by_position.get(position, []), targets.get(position, 0))
+
+    remaining = [frame for frame in frames if frame.image_info.image_id not in selected]
+    choose(remaining, target - len(selected))
+    if len(selected) < target:
+        choose(remaining, target - len(selected), allow_used_cluster=True)
+
+    selected_set = _preserve_coverage(frames, records, set(selected))
+    used_clusters = {records[i].cluster_id for i in selected_set}
+    duplicate_skips = {
+        records[frame.image_info.image_id].cluster_id
+        for frame in frames
+        if frame.image_info.image_id not in selected_set
+        and records[frame.image_info.image_id].cluster_id in used_clusters
+    }
+    return selected_set, {cluster for cluster in duplicate_skips if cluster is not None}
+
+
+def _preserve_coverage(frames, records, selected):
+    """Repair spatial loss using quality-eligible, same-stratum exchanges.
+
+    Keep distance/tilt histograms and occupied position categories, and never increase duplicate-cluster
+    occupancy. Use the existing fair-share grid and coverage criterion; do not
+    change quality filters, selection scores, or calibration/model weights.
+    This bounded local repair is not a general optimal-subset solver.
+    """
+    from collections import Counter
+    from calibration.quality import coverage_percentage
+    from calibration.types import CoverageCell
+
+    hist = {}
+    for frame in frames:
+        info, det = frame.image_info, frame.detection
+        counts = np.zeros(16, dtype=int)
+        if det is not None and det.corners is not None and info.width > 0 and info.height > 0:
+            pts = det.corners.reshape(-1, 2)
+            for x, y in pts:
+                col, row = min(int(x // (info.width / 4)), 3), min(int(y // (info.height / 4)), 3)
+                if 0 <= row < 4 and 0 <= col < 4:
+                    counts[row * 4 + col] += 1
+        hist[info.image_id] = counts
+
+    threshold = coverage_percentage.__defaults__[0]
+
+    def covered(counts):
+        fair = counts.sum() / 16
+        return {i for i, n in enumerate(counts) if fair > 0 and coverage_percentage(
+            [CoverageCell(i // 4, i % 4, int(n), min(1., n / fair))]) > 0}
+
+    def stratum(i):
+        r = records[i]
+        return r.distance, r.tilt
+
+    total = sum((hist[i] for i in selected), np.zeros(16, dtype=int))
+    def objective(counts):
+        fair = counts.sum() / 16
+        support = float(np.minimum(counts / fair, threshold).sum()) if fair > 0 else 0.
+        return len(covered(counts)), support
+
+    for _ in range(max(1, len(frames) * 16)):
+        current = covered(total)
+        clusters = Counter(records[i].cluster_id for i in selected)
+        positions = Counter(records[i].position for i in selected)
+        duplicates = sum(max(0, n - 1) for n in clusters.values())
+        best = None
+        for incoming in sorted(set(hist) - selected):
+            for outgoing in sorted(selected):
+                if stratum(incoming) != stratum(outgoing):
+                    continue
+                if (records[incoming].position != records[outgoing].position and
+                        positions[records[outgoing].position] == 1):
+                    continue
+                candidate_clusters = clusters.copy()
+                candidate_clusters[records[outgoing].cluster_id] -= 1
+                candidate_clusters[records[incoming].cluster_id] += 1
+                if sum(max(0, n - 1) for n in candidate_clusters.values()) > duplicates:
+                    continue
+                counts = total - hist[outgoing] + hist[incoming]
+                cells = covered(counts)
+                if not current <= cells or objective(counts) <= objective(total):
+                    continue
+                key = (*objective(counts), records[incoming].score - records[outgoing].score)
+                if best is None or key > best[0]:
+                    best = key, incoming, outgoing, counts
+        if best is None:
+            break
+        _, incoming, outgoing, total = best
+        selected = (selected - {outgoing}) | {incoming}
+    return selected
+
+
+def _selection_score(
+    frame: Frame,
+    records: dict[str, ImageSelectionRecord],
+    selected_distances: set[str],
+    selected_tilts: set[str],
+) -> float:
+    record = records[frame.image_info.image_id]
+    diversity_bonus = 0.0
+    if record.distance not in selected_distances:
+        diversity_bonus += 0.05
+    if record.tilt not in selected_tilts:
+        diversity_bonus += 0.05
+    return record.score + diversity_bonus
+
+
+def _count(values) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for value in values:
+        result[value] = result.get(value, 0) + 1
+    return result
+
+
+def _build_warnings(
+    requested: int,
+    target: int,
+    valid_count: int,
+    targets: dict[str, int],
+    position_counts: dict[str, int],
+) -> list[str]:
+    warnings: list[str] = []
+    if valid_count < requested:
+        warnings.append(f"Only {valid_count} valid images were available for requested count {requested}.")
+    if target < requested:
+        warnings.append(f"Selected {target} images because the valid image pool was smaller than requested.")
+    for position, quota in targets.items():
+        chosen = position_counts.get(position, 0)
+        if chosen < quota:
+            warnings.append(f"{position}: selected {chosen}/{quota}; remaining slots were redistributed.")
+    return warnings

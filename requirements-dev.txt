@@ -1,0 +1,3 @@
+# 테스트 실행용 (./install.sh --dev 가 함께 설치)
+-r requirements.txt
+pytest>=7.4

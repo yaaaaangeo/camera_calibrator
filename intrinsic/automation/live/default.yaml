@@ -1,0 +1,14 @@
+# Experimental capture/readiness defaults, NOT validated operating acceptance limits.
+# Pattern dimensions must match the physical board. P1 acceptance limits remain null.
+live_profile_version: 1
+p1: {}
+# Capture interval/novelty thresholds reuse LiveCaptureDialog.
+# Motion ratio 3 reuses image_quality's warning threshold as a P2 capture gate.
+capture: {}
+# Count 35: P1 target. Hold-out 5/60/40%/0.25: holdout_evidence defaults.
+# Observability 50: post-fit review boundary, NOT a score-based pre-fit hard block.
+# Full rank and an evaluable Jacobian remain feasibility requirements.
+# Other diversity/coverage
+# readiness targets are provisional coaching settings, not production approval.
+readiness: {}
+recovery: {}

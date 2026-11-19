@@ -1,0 +1,23 @@
+# 패키징 메타데이터만 둔다. 의존성은 저장소 루트의 requirements.txt 하나로 관리한다
+# (Jetson 은 requirements-jetson*.txt). Jetson 설치 스크립트가 `pip install --no-deps -e .`
+# 로 이 파일을 쓴다.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "calibration-tool"
+version = "1.0.0"
+description = "카메라 내부파라미터 + 카메라·LiDAR 외부파라미터(캘리브레이션 룸) 통합 도구"
+requires-python = ">=3.10"
+
+[project.scripts]
+calibration-tool = "app.main:main"
+calibration-tool-cli = "app.tool:main"
+
+[tool.setuptools.packages.find]
+include = ["app*", "automation*", "calibration*", "export*", "shared*", "ui*"]
+exclude = ["tests*", "scripts*"]
+
+[tool.setuptools.package-data]
+automation = ["profiles/*.yaml", "live/*.yaml"]

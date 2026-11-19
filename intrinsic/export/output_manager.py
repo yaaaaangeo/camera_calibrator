@@ -1,0 +1,328 @@
+"""Session-oriented output paths and manifest bookkeeping.
+
+Serializers deliberately do not live here.  This module only decides *where* an
+existing exporter writes and records the resulting artifact, so export formats
+and calibration numerics remain unchanged.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+from shared.naming import safe_name
+
+
+APPLICATION_NAME = "camera-calibrator"
+APPLICATION_VERSION = "0.2.0"
+DEFAULT_OUTPUT_ROOT = Path.home() / "CameraCalibratorOutputs"
+
+SESSION_DIRECTORIES: tuple[str, ...] = (
+    "project",
+    "intrinsic",
+    "intrinsic/subset",
+    "intrinsic/kalibr",
+    "validation/subset_comparison",
+    "paper",
+    "reports",
+)
+
+_MODEL_FILENAMES = {
+    "pinhole": "pinhole",
+    "brown_conrady": "brown_conrady",
+    "brown-conrady": "brown_conrady",
+    "brown": "brown_conrady",
+    "extended_pinhole": "rational",
+    "rational": "rational",
+    "fisheye": "fisheye",
+}
+
+
+def _plain(value: Any) -> Any:
+    """Convert common project values to JSON-safe, stable primitives."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_plain(v) for v in value]
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, (str, int, float, bool)):
+        return enum_value
+    return str(value)
+
+
+def _safe_component(value: str) -> str:
+    return safe_name(value, fallback="", ascii_only=True, keep_dot=True, strip="._-")
+
+
+SESSION_CLAIM_FILENAME = ".session_claim"
+
+
+def existing_session_outputs(session_dir: str | Path) -> list[str]:
+    """이미 Output Session 결과가 있는지 (덮어쓰기 방지 판단용).
+
+    manifest.json, 세션 claim 표시, 또는 세션 하위 폴더(intrinsic/, reports/ 등)
+    안의 파일을 기존 결과로 본다. 그 밖의 파일(예: 자동화 계층이 먼저 쓴
+    run_manifest.json)은 결과로 보지 않는다.
+    """
+    root = Path(session_dir)
+    if not root.is_dir():
+        return []
+    found = [name for name in ("manifest.json", SESSION_CLAIM_FILENAME) if (root / name).exists()]
+    for relative in SESSION_DIRECTORIES:
+        folder = root / relative
+        # A link/junction can redirect exports into an existing result or source
+        # directory. A file at a reserved directory path is also a collision.
+        is_reparse = folder.exists() and bool(getattr(folder.lstat(), "st_file_attributes", 0) & 0x400)
+        if folder.is_symlink() or is_reparse or (folder.exists() and not folder.is_dir()):
+            found.append(relative)
+        elif folder.is_dir():
+            found.extend(
+                p.relative_to(root).as_posix() for p in folder.rglob("*") if p.is_file()
+            )
+    return sorted(set(found))
+
+
+def model_filename(model: Any) -> str:
+    raw = getattr(model, "value", model)
+    key = str(raw).strip().lower().replace(" ", "_")
+    return _MODEL_FILENAMES.get(key, _safe_component(key) or "model")
+
+
+class OutputManager:
+    """Own one output root and, lazily, one collision-safe export session."""
+
+    def __init__(
+        self,
+        output_root: str | Path | None = None,
+        *,
+        camera_name: str = "",
+        now: Callable[[], datetime] | None = None,
+        session_dir: str | Path | None = None,
+    ) -> None:
+        self.output_root = Path(output_root or DEFAULT_OUTPUT_ROOT).expanduser()
+        self._now = now or datetime.now
+        self.session_dir: Path | None = None
+        self.manifest: dict[str, Any] = {}
+        if session_dir is not None:
+            self._initialize(Path(session_dir).expanduser(), camera_name)
+
+    @property
+    def active(self) -> bool:
+        return self.session_dir is not None
+
+    @property
+    def session_id(self) -> str | None:
+        return self.session_dir.name if self.session_dir is not None else None
+
+    @property
+    def intrinsic_dir(self) -> Path:
+        return self.directory("intrinsic")
+
+    @property
+    def validation_dir(self) -> Path:
+        return self.directory("validation")
+
+    @property
+    def paper_dir(self) -> Path:
+        return self.directory("paper")
+
+    @property
+    def report_dir(self) -> Path:
+        return self.directory("reports")
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.require_session() / "manifest.json"
+
+    @staticmethod
+    def _session_stem(moment: datetime, camera_name: str) -> str:
+        stem = moment.strftime("%Y-%m-%d_%H%M%S")
+        camera = _safe_component(camera_name)
+        if camera:
+            stem += f"_{camera}"
+        return stem
+
+    def reserve_session_directory(self, camera_name: str = "") -> Path:
+        """Atomically create a new, empty, uniquely named session directory.
+
+        ``ensure_session`` 과 같은 이름 규칙을 쓰지만 manifest를 만들지 않고
+        이 객체의 session에도 연결하지 않는다. 폴더 생성 자체(mkdir, 이미 있으면
+        실패)로 이름을 선점하므로 동시에 실행된 다른 프로세스와 같은 폴더를
+        나눠 쓰지 않는다. 호출부는 이 경로를 CLI ``--session-dir``로 넘긴다.
+        """
+        moment = self._now()
+        stem = self._session_stem(moment, camera_name)
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        candidate = self.output_root / stem
+        suffix = 2
+        while True:
+            try:
+                candidate.mkdir()
+                return candidate.resolve()
+            except FileExistsError:
+                candidate = self.output_root / f"{stem}_{suffix:02d}"
+                suffix += 1
+
+    def ensure_session(self, camera_name: str = "") -> Path:
+        if self.session_dir is not None:
+            return self.session_dir
+        moment = self._now()
+        stem = self._session_stem(moment, camera_name)
+        candidate = self.output_root / stem
+        suffix = 2
+        while candidate.exists():
+            candidate = self.output_root / f"{stem}_{suffix:02d}"
+            suffix += 1
+        self._initialize(candidate, camera_name, created_at=moment)
+        return candidate
+
+    def require_session(self) -> Path:
+        if self.session_dir is None:
+            return self.ensure_session()
+        return self.session_dir
+
+    def ensure_directories(self) -> Path:
+        session = self.require_session()
+        for relative in SESSION_DIRECTORIES:
+            (session / relative).mkdir(parents=True, exist_ok=True)
+        return session
+
+    def _initialize(
+        self,
+        session_dir: Path,
+        camera_name: str,
+        *,
+        created_at: datetime | None = None,
+    ) -> None:
+        session_dir.mkdir(parents=True, exist_ok=True)
+        for relative in SESSION_DIRECTORIES:
+            (session_dir / relative).mkdir(parents=True, exist_ok=True)
+        self.session_dir = session_dir.resolve()
+        created = created_at or self._now()
+        self.manifest = {
+            "schema_version": 1,
+            "session_id": self.session_dir.name,
+            "created_at": created.astimezone().isoformat(timespec="seconds"),
+            "application": {
+                "name": APPLICATION_NAME,
+                "version": APPLICATION_VERSION,
+            },
+            "camera": {"name": camera_name},
+            "pattern": {},
+            "calibration": {
+                "available_models": [],
+                "selected_model": None,
+                "recommended_model": None,
+            },
+            "paper_metrics_available": False,
+            "exports": {},
+        }
+        self.write_manifest()
+
+    def directory(self, relative: str) -> Path:
+        target = self.require_session() / relative
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    def get_path(self, relative: str, filename: str) -> Path:
+        """Generic extension point for exporters without a dedicated helper."""
+        return self.directory(relative) / filename
+
+    def project_path(self, filename: str = "calibration.ccproj") -> Path:
+        return self.directory("project") / filename
+
+    def intrinsic_path(self, model: Any, *, subset: bool = False) -> Path:
+        folder = "intrinsic/subset" if subset else "intrinsic"
+        prefix = "camera_subset" if subset else "camera"
+        return self.directory(folder) / f"{prefix}_{model_filename(model)}.yaml"
+
+    def ros_path(self) -> Path:
+        return self.directory("intrinsic") / "camera_info.yaml"
+
+    def kalibr_path(self, filename: str) -> Path:
+        return self.directory("intrinsic/kalibr") / filename
+
+    def report_path(self, filename: str) -> Path:
+        return self.directory("reports") / filename
+
+    def paper_directory(self) -> Path:
+        return self.directory("paper")
+
+    def validation_directory(self) -> Path:
+        return self.directory("validation/subset_comparison")
+
+    def update_context(self, **values: Any) -> None:
+        """Merge top-level session facts and persist them immediately."""
+        for key, value in values.items():
+            plain = _plain(value)
+            if isinstance(plain, dict) and isinstance(self.manifest.get(key), dict):
+                self.manifest[key].update(plain)
+            else:
+                self.manifest[key] = plain
+        self.write_manifest()
+
+    def record_export(
+        self,
+        key: str,
+        path: str | Path | list[str | Path] | tuple[str | Path, ...],
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        paths = list(path) if isinstance(path, (list, tuple)) else [path]
+        relative_paths = [self._relative(Path(item)) for item in paths]
+        entry: dict[str, Any] = {
+            "exported_at": self._now().astimezone().isoformat(timespec="seconds"),
+        }
+        if len(relative_paths) == 1:
+            entry["file"] = relative_paths[0]
+        else:
+            entry["files"] = relative_paths
+        if metadata:
+            entry["metadata"] = _plain(metadata)
+        self.manifest.setdefault("exports", {})[key] = entry
+        if key == "paper.metrics":
+            self.manifest["paper_metrics_available"] = True
+        self.write_manifest()
+
+    def execute_export(self, key: str, operation: Callable[[], Any] | None) -> dict[str, Any]:
+        """Run one isolated export; ``None`` means unavailable/skipped."""
+        if operation is None:
+            return {"key": key, "status": "skipped", "paths": [], "error": None}
+        try:
+            result = operation()
+            if result is None:
+                raise RuntimeError("exporter returned no output path")
+            paths = list(result) if isinstance(result, (list, tuple)) else [result]
+            self.record_export(key, paths)
+            return {
+                "key": key,
+                "status": "exported",
+                "paths": [str(path) for path in paths],
+                "error": None,
+            }
+        except Exception as exc:  # noqa: BLE001 - deliberate export isolation boundary.
+            return {"key": key, "status": "failed", "paths": [], "error": str(exc)}
+
+    def _relative(self, path: Path) -> str:
+        absolute = path.expanduser().resolve()
+        session = self.require_session()
+        try:
+            return absolute.relative_to(session).as_posix()
+        except ValueError:
+            return os.fspath(absolute)
+
+    def write_manifest(self) -> None:
+        destination = self.require_session() / "manifest.json"
+        temporary = destination.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(self.manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(destination)
