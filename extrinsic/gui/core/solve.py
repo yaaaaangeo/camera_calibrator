@@ -172,6 +172,15 @@ def cv2_rodrigues(w: np.ndarray) -> np.ndarray:
     return np.eye(3) + np.sin(theta) * k + (1 - np.cos(theta)) * (k @ k)
 
 
+# A scene's face is flipped only when that at least halves the joint residual
+# and takes off this much -- a wrong face costs hundreds of millimetres.
+MIRROR_GAIN = 0.5
+MIRROR_MIN_M = 0.02
+MIRROR_MAX_SCENES = 8  # every combination is tried
+# ...and only when the fit is already poor; a right one sits at 2-8 cm.
+MIRROR_SUSPECT_M = 0.10
+
+
 def solve(scenes: list[tuple[str, np.ndarray, np.ndarray]],
           noise: dict[str, np.ndarray] | None = None) -> Solution:
     """Fit one extrinsic to every scene at once.
@@ -262,6 +271,33 @@ def solve(scenes: list[tuple[str, np.ndarray, np.ndarray]],
                 assignment, best_rmse, changed = trial, err, True
         if not changed:
             break
+
+    # Which face each LiDAR board was seen from comes out of sort_centers, which
+    # judges it from the origin. A merged cloud in the vehicle frame has its
+    # origin on the ground, not at the sensor, and a steeply tilted board can
+    # then read as seen from behind: its holes come out mirrored against the
+    # camera's, and no turn lines them up (385 mm where the true fit is 33 mm,
+    # boards on a stack beside a bus). One board cannot say which face -- a
+    # rectangle is its own mirror image -- but two or more can, so each scene
+    # may flip if the joint fit then gets clearly better.
+    if 2 <= len(L_sets) <= MIRROR_MAX_SCENES and best_rmse > MIRROR_SUSPECT_M:
+        base_sets, base_assign = list(L_sets), list(assignment)
+        flipped = []
+        for s_, c_ in zip(base_sets, C_sets):
+            m_ = s_[::-1].copy()  # reversed cycle, still long edge first
+            up = [sh for sh in (0, 2) if is_upright(solve_rigid(np.roll(m_, sh, axis=0), c_)[0])]
+            flipped.append((m_, up[0] if len(up) == 1 else 0))
+        best = (best_rmse, base_sets, base_assign)
+        for mask in range(1, 1 << len(base_sets)):
+            L_sets[:] = [flipped[i][0] if mask >> i & 1 else base_sets[i] for i in range(len(base_sets))]
+            trial = [flipped[i][1] if mask >> i & 1 else base_assign[i] for i in range(len(base_sets))]
+            err = rmse_of(trial)
+            if err < best[0]:
+                best = (err, list(L_sets), trial)
+        if best[0] < MIRROR_GAIN * best_rmse and best_rmse - best[0] > MIRROR_MIN_M:
+            best_rmse, L_sets[:], assignment = best[0], best[1], best[2]
+        else:
+            L_sets[:] = base_sets
 
     L, C, R, t = fit(assignment)
     weighted = False

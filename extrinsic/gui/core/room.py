@@ -935,7 +935,13 @@ def find_lidar_boards(cloud: np.ndarray, single: np.ndarray | None, target: Targ
                 continue
             stack = True
             _add_board(boards, det, box, (w, h))
-        if windowed and template and stack:
+        # The model fit is let loose on a stack's windows only once one of them
+        # proves a board by its holes -- unless the search is held to an ROI.
+        # Inside one, the stack is a board stand someone pointed at, and on a
+        # sensor whose holes never close (fantaG Eleccity side LiDARs) waiting
+        # for that proof found none of three boards. Over the whole room it
+        # would add false boards (5 across 13 recordings here), so not there.
+        if windowed and template and (stack or roi):
             for box in later:
                 if _on_board(boards, np.asarray(box.center()), target):
                     continue
