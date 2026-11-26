@@ -19,6 +19,7 @@ GUI에 넘긴다.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QVBoxLayout,
@@ -219,6 +221,18 @@ class LiveCaptureDialog(QDialog):
         backend_label.setWordWrap(True)
         layout.addWidget(backend_label)
 
+        # ROS 1 은 master 주소를 알아야 찾을 수 있다. 다른 PC(로봇)의 master 면
+        # 여기에 적는다 - 예: http://192.168.0.10:11311. ROS 2 는 주소가 필요 없다.
+        master_row = QHBoxLayout()
+        master_row.addWidget(QLabel("ROS 1 master"))
+        self.master_edit = QLineEdit(os.environ.get("ROS_MASTER_URI", "http://localhost:11311"))
+        self.master_edit.setPlaceholderText("http://<로봇 IP>:11311")
+        self.master_edit.setToolTip("ROS 1 master 주소. 다른 PC 의 master 면 그 PC 의 IP 를 적고 '토픽 새로고침'.\n"
+                                    "ROS 2 만 쓰면 그대로 두어도 됩니다.")
+        self.master_edit.returnPressed.connect(self._refresh_topics)
+        master_row.addWidget(self.master_edit, stretch=1)
+        layout.addLayout(master_row)
+
         layout.addWidget(self._build_pattern_summary())
 
         topic_row = QHBoxLayout()
@@ -376,7 +390,9 @@ class LiveCaptureDialog(QDialog):
         if self._subscriber is not None and self.subscribe_button.text() == "구독 중지":
             return
         if self._subscriber is None:
-            self._subscriber = LiveTopicSubscriber()
+            self._subscriber = LiveTopicSubscriber(ros1_uri=self.master_edit.text().strip() or None)
+        else:
+            self._subscriber.ros1_uri = self.master_edit.text()
         subscriber = self._subscriber
         self.topic_combo.clear()
         self.topic_combo.addItem("(토픽 탐색 중…)")
@@ -416,7 +432,7 @@ class LiveCaptureDialog(QDialog):
 
         try:
             if self._subscriber is None:
-                self._subscriber = LiveTopicSubscriber()
+                self._subscriber = LiveTopicSubscriber(ros1_uri=self.master_edit.text().strip() or None)
             self._frame_buffer.clear(reset_stats=True)
             self._latest_live_detection = None
             self._start_detection_worker()

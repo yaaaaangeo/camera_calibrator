@@ -150,8 +150,10 @@ class LivePanel(QtWidgets.QWidget):
         self.stats = table(["토픽", "버퍼", "Hz", "도착 지연 ms", "마지막 수신"])
 
         # ---- capture
-        self.sweeps = QtWidgets.QSpinBox(minimum=1, maximum=20, value=1)
-        self.sweeps.setToolTip("기본 1. 정지 상태라 늘리면 거리 노이즈가 평균되지만, 회전식 LiDAR 는 점 밀도는 늘지 않습니다")
+        self.sweeps = QtWidgets.QSpinBox(minimum=0, maximum=20, value=0)
+        self.sweeps.setSpecialValueText("자동")
+        self.sweeps.setToolTip("자동: 보통 1개, 다운샘플된 점군(표본 간격 6 cm 이상)이면 10개.\n"
+                               "회전식 LiDAR 는 늘려도 점 밀도는 늘지 않고 거리 노이즈만 평균됩니다")
         self.frames = QtWidgets.QSpinBox(minimum=1, maximum=10, value=1)
         self.frames.setToolTip("카메라마다 LiDAR 시각에 가장 가까운 프레임 수. 여러 장이면 보드 검출을 평균합니다")
         self.snap_btn = QtWidgets.QPushButton("📸  캡처 → 캘리브레이션에 사용")
@@ -465,6 +467,14 @@ class LivePanel(QtWidgets.QWidget):
                                          else f"{v.stamp_lag_ms / 3.6e6:+.1f} h (녹화 재생?)"),
                                      "—" if not np.isfinite(v.age_s) else f"{v.age_s:.1f}s 전"]):
                 self.stats.setItem(r, k, cell(val, color=Theme.BAD if stale and k == 4 else None))
+        # A topic that is listed but silent: say why, if the backend knows
+        # (ROS 1: the robot's hostname does not resolve here, a firewall, ...).
+        age = {k.split(":", 1)[1]: v.age_s for k, v in st.items()}
+        problems = {t: p for t, p in s.problems().items() if age.get(t, float("inf")) > 2.0}
+        text = "\n".join(f"⚠ {t}: {p}" for t, p in problems.items())
+        if text != getattr(self, "_problem_text", ""):
+            self._problem_text = text
+            self.notes.setText(text)
         # One thumbnail per tick: decoding and marker detection on every camera
         # at once would stall the UI with eight cameras.
         keys = list(self.tiles)
@@ -683,6 +693,7 @@ class LivePanel(QtWidgets.QWidget):
         self.snap_info.setText(
             f"<b>캡처</b> {len(snap.cloud):,}점 (스윕 {snap.n_sweeps}) · 카메라 {len(slots)}대 · "
             f"시각차 ms: {sync} · 스윕 정합 {snap.stillness:.0%}"
+            + (f"<br>{snap.note}" if snap.note else "")
             + (f"<br><span style='color:{Theme.BAD}'>" + " · ".join(warn) + "</span>" if warn else "") + saved)
         self.captured.emit()
 

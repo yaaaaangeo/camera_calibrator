@@ -124,9 +124,18 @@ class Backend:
     def discover(self, timeout: float) -> list[LiveTopic]:
         raise NotImplementedError
 
-    def subscribe(self, topic: LiveTopic, callback) -> None:
-        """`callback(Received)` from a background thread."""
+    def subscribe(self, topic: LiveTopic, callback, on_error=None) -> None:
+        """`callback(Received)` from a background thread.
+
+        `on_error(text)`, if given, hears why a subscribed topic is not
+        delivering (a publisher that cannot be reached, say) -- otherwise that
+        looks the same as a topic nobody publishes on.
+        """
         raise NotImplementedError
+
+    def problems(self) -> dict[str, str]:
+        """Topic name -> why it is not delivering right now. Empty when all is well."""
+        return {}
 
     def close(self) -> None:
         pass
@@ -184,7 +193,7 @@ class Ros2Rclpy(Backend):
                     out.append(LiveTopic(name, ros2_name(t), self.name, "ROS 2", len(infos), rel))
         return out
 
-    def subscribe(self, topic: LiveTopic, callback) -> None:
+    def subscribe(self, topic: LiveTopic, callback, on_error=None) -> None:
         from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
         from rosidl_runtime_py.utilities import get_message
 
@@ -258,7 +267,7 @@ class Ros2Dds(Backend):
             out.append(LiveTopic(name, mt, self.name, flavor, len(samples), rel))
         return out
 
-    def subscribe(self, topic: LiveTopic, callback) -> None:
+    def subscribe(self, topic: LiveTopic, callback, on_error=None) -> None:
         from cyclonedds.core import Qos, Policy
         from cyclonedds.sub import DataReader
         from cyclonedds.topic import Topic
@@ -425,28 +434,78 @@ def ros1_master_uri() -> str:
     return os.environ.get("ROS_MASTER_URI", "http://localhost:11311")
 
 
+def _callback_host(master_uri: str) -> str:
+    """The address a ROS 1 master and publishers can reach this machine at.
+
+    ROS_IP / ROS_HOSTNAME win, as in rospy. Otherwise rospy would use the
+    hostname, which another machine often cannot resolve (no DNS on a vehicle
+    network, no /etc/hosts entry); then publisherUpdate never arrives and a
+    publisher that starts after the subscription is never heard. The address
+    of the interface that routes to the master is reachable by construction.
+    """
+    host = os.environ.get("ROS_IP") or os.environ.get("ROS_HOSTNAME")
+    if host:
+        return host
+    from urllib.parse import urlparse
+
+    master_host = urlparse(master_uri).hostname or "localhost"
+    if master_host in ("localhost", "127.0.0.1", "::1"):
+        return "localhost" if master_host == "localhost" else master_host
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((master_host, 11311))  # UDP: no packet sent, only routing
+            return s.getsockname()[0]
+    except OSError:
+        return socket.gethostname()
+
+
+def _explain(exc: Exception, pub_uri: str) -> str:
+    """One line on why a ROS 1 publisher could not be read, with the usual cause."""
+    from urllib.parse import urlparse
+
+    host = getattr(exc, "ros_host", None) or urlparse(pub_uri).hostname or pub_uri
+    if isinstance(exc, socket.gaierror):
+        return (f"퍼블리셔 주소 {host} 를 이 PC 가 찾지 못합니다 — 로봇 PC 에서 ROS_IP 를 설정하거나 "
+                f"이 PC 의 /etc/hosts 에 '{host}' 를 추가하세요")
+    if isinstance(exc, (ConnectionRefusedError, TimeoutError, socket.timeout)) or (
+            isinstance(exc, OSError) and exc.errno in (101, 110, 111, 113)):
+        return f"퍼블리셔 {host} 에 접속하지 못했습니다 ({type(exc).__name__}) — 방화벽·네트워크·ROS_IP 확인"
+    return f"퍼블리셔 {pub_uri}: {type(exc).__name__}: {exc}"
+
+
 class Ros1Tcpros(Backend):
     """A ROS 1 subscriber written against the protocol, so no rospy is needed.
 
     Subscribes with md5sum `*`, which a publisher accepts from any subscriber,
     and takes the message definition from the publisher's own connection
     header -- so a type this machine has never seen still decodes.
+
+    Checked against rospy/rosmaster 1.15 (Noetic): discovery, Image,
+    CompressedImage and PointCloud2, publishers starting late, and recording.
     """
 
     name = "ros1"
+    RETRY_S = 2.0
 
     def __init__(self, master_uri: str | None = None):
         self.master_uri = master_uri or ros1_master_uri()
-        self.caller_id = f"/room_calib_live_{os.getpid()}"
+        self.caller_id = f"/room_calib_live_{os.getpid()}_{id(self) & 0xFFFF:x}"
         self._server = SimpleXMLRPCServer(("0.0.0.0", 0), logRequests=False, allow_none=True)
         self._server.register_function(self._publisher_update, "publisherUpdate")
         self._server.register_function(lambda caller: [1, "", os.getpid()], "getPid")
         self._server.register_function(lambda caller, msg="": [1, "", 0], "shutdown")
-        host = os.environ.get("ROS_HOSTNAME") or os.environ.get("ROS_IP") or socket.gethostname()
-        self.uri = f"http://{host}:{self._server.server_address[1]}/"
+        self._server.register_function(lambda caller: [1, "", self.master_uri], "getMasterUri")
+        self._server.register_function(lambda caller: [1, "", [[n, ros1_name(t[0].msgtype)]
+                                                               for n, t in self._subs.items()]],
+                                       "getSubscriptions")
+        self._server.register_function(lambda caller: [1, "", []], "getPublications")
+        self.uri = f"http://{_callback_host(self.master_uri)}:{self._server.server_address[1]}/"
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
-        self._subs: dict[str, tuple[LiveTopic, object]] = {}
+        self._lock = threading.Lock()
+        self._subs: dict[str, tuple[LiveTopic, object, object]] = {}
+        self._pubs: dict[str, set[str]] = {}  # topic -> publisher URIs the master lists now
         self._connected: set[tuple[str, str]] = set()
+        self._problems: dict[str, str] = {}
         self._socks = []
         self._run = True
 
@@ -455,59 +514,133 @@ class Ros1Tcpros(Backend):
 
     def discover(self, timeout: float) -> list[LiveTopic]:
         m = self.master(max(timeout, 0.5))
-        code, _, state = m.getSystemState(self.caller_id)
+        code, msg, state = m.getSystemState(self.caller_id)
+        if code != 1:
+            raise RuntimeError(f"master getSystemState: {msg}")
         _, _, types = m.getTopicTypes(self.caller_id)
         tmap = dict(types)
         pubs = {t: len(nodes) for t, nodes in state[0]}
         return [LiveTopic(t, ros2_name(tmap.get(t, "")), self.name, "ROS 1", n)
                 for t, n in pubs.items() if n and t in tmap]
 
-    def subscribe(self, topic: LiveTopic, callback) -> None:
+    def subscribe(self, topic: LiveTopic, callback, on_error=None) -> None:
         code, msg, pubs = self.master().registerSubscriber(
             self.caller_id, topic.name, ros1_name(topic.msgtype), self.uri)
         if code != 1:
             raise RuntimeError(f"master 가 구독을 거부했습니다: {msg}")
-        self._subs[topic.name] = (topic, callback)
-        for p in pubs:
-            self._connect(topic.name, p)
+        with self._lock:
+            self._subs[topic.name] = (topic, callback, on_error)
+        self._set_publishers(topic.name, pubs)
+
+    def problems(self) -> dict[str, str]:
+        with self._lock:
+            return dict(self._problems)
 
     def _publisher_update(self, caller_id, topic, publishers):
-        for p in publishers:
-            self._connect(topic, p)
+        self._set_publishers(topic, publishers)
         return [1, "", 0]
+
+    def _set_publishers(self, topic_name: str, publishers):
+        with self._lock:
+            if topic_name not in self._subs:
+                return
+            self._pubs[topic_name] = set(publishers)
+            if not publishers:
+                self._problems[topic_name] = "퍼블리셔가 없습니다 (노드가 종료됨?)"
+        for p in publishers:
+            self._connect(topic_name, p)
 
     def _connect(self, topic_name: str, pub_uri: str):
         key = (topic_name, pub_uri)
-        if key in self._connected or topic_name not in self._subs:
-            return
-        self._connected.add(key)
+        with self._lock:
+            if key in self._connected or topic_name not in self._subs:
+                return
+            self._connected.add(key)
         threading.Thread(target=self._stream, args=(topic_name, pub_uri), daemon=True).start()
 
+    def _report(self, topic_name: str, text: str):
+        with self._lock:
+            self._problems[topic_name] = text
+            on_error = self._subs.get(topic_name, (None, None, None))[2]
+        if on_error is not None:
+            try:
+                on_error(text)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _stream(self, topic_name: str, pub_uri: str):
-        topic, callback = self._subs[topic_name]
+        """Read one publisher until it goes away; while the master still lists it, retry."""
+        topic, callback, _ = self._subs[topic_name]
         try:
-            code, _, proto = _proxy(pub_uri).requestTopic(self.caller_id, topic_name, [["TCPROS"]])
-            if code != 1 or not proto:
-                return
-            _, host, port = proto[:3]
-            sock = socket.create_connection((host, int(port)), timeout=5)
-            sock.settimeout(None)
-            self._socks.append(sock)
-            sock.sendall(_ros1_header({
-                "callerid": self.caller_id, "topic": topic_name, "type": ros1_name(topic.msgtype),
-                "md5sum": "*", "message_definition": "", "tcp_nodelay": "1",
-            }))
-            hdr = _read_header(sock)
-            if "error" in hdr:
-                raise RuntimeError(hdr["error"])
-            ts, mt = _ros1_typestore(hdr, topic.msgtype)
             while self._run:
-                (n,) = struct.unpack("<I", _read_exact(sock, 4))
-                raw = _read_exact(sock, n)
-                msg = ts.deserialize_ros1(raw, mt)
-                callback(Received(_stamp_ns(msg), time.time_ns(), msg, raw, "ros1"))
-        except Exception:  # noqa: BLE001 - one publisher dropping must not end the others
-            self._connected.discard((topic_name, pub_uri))
+                sock = None
+                try:
+                    sock = self._open(topic, pub_uri)
+                    hdr = _read_header(sock)
+                    if "error" in hdr:
+                        raise RuntimeError(f"퍼블리셔가 거부: {hdr['error']}")
+                    ts, mt = _ros1_typestore(hdr, topic.msgtype)
+                    first = True
+                    while self._run:
+                        (n,) = struct.unpack("<I", _read_exact(sock, 4))
+                        raw = _read_exact(sock, n)
+                        msg = ts.deserialize_ros1(raw, mt)
+                        if first:
+                            first = False
+                            with self._lock:
+                                self._problems.pop(topic_name, None)
+                        callback(Received(_stamp_ns(msg), time.time_ns(), msg, raw, "ros1"))
+                except Exception as e:  # noqa: BLE001 - one publisher dropping must not end the others
+                    if not self._run:
+                        return
+                    if not (isinstance(e, ConnectionError) and "closed" in str(e)):
+                        self._report(topic_name, _explain(e, pub_uri))
+                finally:
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                        with self._lock:
+                            if sock in self._socks:
+                                self._socks.remove(sock)
+                # Publisher gone for good (master no longer lists it): stop.
+                # Otherwise it restarted, or was not reachable yet: try again.
+                deadline = time.monotonic() + self.RETRY_S
+                while self._run and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                with self._lock:
+                    if pub_uri not in self._pubs.get(topic_name, ()):
+                        return
+        finally:
+            with self._lock:
+                self._connected.discard((topic_name, pub_uri))
+
+    def _open(self, topic: LiveTopic, pub_uri: str):
+        code, msg, proto = _proxy(pub_uri).requestTopic(self.caller_id, topic.name, [["TCPROS"]])
+        if code != 1 or not proto:
+            raise RuntimeError(f"requestTopic 실패: {msg}")
+        _, host, port = proto[:3]
+        try:
+            sock = socket.create_connection((host, int(port)), timeout=5)
+        except OSError as e:
+            e.ros_host = host  # the data address can differ from the XML-RPC one
+            raise
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            # A multi-megabyte sweep arrives in one go; a larger buffer keeps the
+            # publisher from blocking on us while the previous one is decoded.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 << 20)
+        except OSError:
+            pass
+        with self._lock:
+            self._socks.append(sock)
+        sock.sendall(_ros1_header({
+            "callerid": self.caller_id, "topic": topic.name, "type": ros1_name(topic.msgtype),
+            "md5sum": "*", "message_definition": "", "tcp_nodelay": "1",
+        }))
+        sock.settimeout(None)
+        return sock
 
     def close(self) -> None:
         self._run = False
@@ -516,12 +649,19 @@ class Ros1Tcpros(Backend):
                 self.master(1.0).unregisterSubscriber(self.caller_id, name, self.uri)
             except Exception:  # noqa: BLE001
                 pass
-        for s in self._socks:
+        with self._lock:
+            socks = list(self._socks)
+        for s in socks:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 s.close()
             except OSError:
                 pass
         self._server.shutdown()
+        self._server.server_close()
 
 
 def _ros1_typestore(header: dict[str, str], msgtype: str):
@@ -559,14 +699,17 @@ def probe(timeout: float = 2.0, ros1_uri: str | None = None, domain_id: int | No
     lock = threading.Lock()
 
     def ros1():
+        b = None
         try:
             b = Ros1Tcpros(ros1_uri)
             topics = b.discover(timeout)
             with lock:
                 out.backends["ros1"] = b
                 out.topics += topics
-                out.notes.append(f"ROS 1 master 응답: {b.master_uri} (토픽 {len(topics)}개)")
-        except (OSError, xmlrpc.client.Error) as e:
+                out.notes.append(f"ROS 1 master 응답: {b.master_uri} (토픽 {len(topics)}개, 이 PC 주소 {b.uri})")
+        except (OSError, xmlrpc.client.Error, RuntimeError) as e:
+            if b is not None:
+                b.close()
             with lock:
                 out.notes.append(f"ROS 1 없음 ({ros1_uri or ros1_master_uri()}: {type(e).__name__})")
 

@@ -79,7 +79,9 @@ class DataStep(RoomStep):
         self.cam_table = table(["포함", "카메라 토픽", "이름", "방향"])
         self.cam_table.setEditTriggers(QtWidgets.QAbstractItemView.AllEditTriggers)
         self.at_spin = QtWidgets.QDoubleSpinBox(minimum=0.0, maximum=1.0, singleStep=0.05, value=0.5)
-        self.sweeps_spin = QtWidgets.QSpinBox(minimum=1, maximum=500, value=1)
+        self.sweeps_spin = QtWidgets.QSpinBox(minimum=0, maximum=500, value=0)
+        self.sweeps_spin.setSpecialValueText("자동")
+        self.sweeps_spin.setToolTip("자동: 보통 1개, 다운샘플된 점군(표본 간격 6 cm 이상)이면 10개")
         self.frames_spin = QtWidgets.QSpinBox(minimum=1, maximum=100, value=1)
         self.load_btn = QtWidgets.QPushButton("▶  불러오기")
         self.load_btn.setMinimumHeight(34)
@@ -282,7 +284,8 @@ class DataStep(RoomStep):
             per = " · ".join(f"{c.name} {len(c.images)}장" for c in s.cams)
             self.summary.setText(
                 f"LiDAR: 스윕 {s.n_sweeps}개 · {len(s.cloud):,}점 · z {np.percentile(z, 1):.1f}~{np.percentile(z, 99):.1f} m"
-                f" · intensity {'있음' if s.intensity is not None else '없음'}\n카메라: {per}")
+                f" · intensity {'있음' if s.intensity is not None else '없음'}\n카메라: {per}"
+                + (f"\n{cap.note}" if cap.note else ""))
             self.preview.set_image(mosaic([c.image() for c in s.cams], [c.name for c in s.cams]))
             self.changed.emit()
 

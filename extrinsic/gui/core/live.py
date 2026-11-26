@@ -102,6 +102,13 @@ class LiveSession:
         for b in self.probe.backends.values():
             b.close()
 
+    def problems(self) -> dict[str, str]:
+        """Subscribed topic -> why it is not delivering (only backends that can tell)."""
+        out = {}
+        for b in self.probe.backends.values():
+            out.update(b.problems())
+        return out
+
     # ------------------------------------------------------------- reading
 
     def stats(self) -> dict[str, TopicStats]:
@@ -170,6 +177,13 @@ class LiveSession:
         """
         from gui.core.decode import image_to_bgr
 
+        note = ""
+        if sweeps <= 0:  # automatic: one sweep, or more of a downsampled cloud
+            from gui.core.room import auto_sweeps
+
+            with self._lock:
+                newest = next((self._buf[t.key][-1][1] for t in self.lidar if self._buf[t.key]), None)
+            sweeps, note = auto_sweeps(newest) if newest is not None else (1, "")
         keys = [self._camera_key(c) for c in cameras] if cameras is not None else [t.key for t in self.cameras]
         keys = [k for k in keys if k]
         with self._lock:
@@ -228,7 +242,7 @@ class LiveSession:
                         # one sweep there is nothing to compare, but the room
                         # still has to have stood still for the picture to match.
                         stillness=_stillness({k: v[-10:] for k, v in per_all.items()}), stamp_ns=ref,
-                        clock=clock)
+                        clock=clock, note=note)
 
 
 def _common_clock(buffers: list) -> str:
@@ -256,8 +270,14 @@ def _stillness(per: dict) -> float:
 
     The room has to stand still while the snapshot accumulates. A board nudged,
     or the vehicle rocking as someone gets in, shows up as this dropping.
+
+    A downsampled cloud gets a wider tolerance: each of its points is a voxel's
+    mean and wanders by a few centimetres between sweeps on its own -- at 5 cm
+    a parked vehicle with 10 cm voxels read 0.84, under the 0.85 warning.
     """
     from scipy.spatial import cKDTree
+
+    from gui.core.detect_lidar import point_spacing
 
     vals = []
     for items in per.values():
@@ -270,7 +290,7 @@ def _stillness(per: dict) -> float:
             continue
         pick = np.random.default_rng(0).choice(len(b), min(len(b), 5000), replace=False)
         d, _ = cKDTree(a).query(b[pick], k=1)
-        vals.append(float(np.mean(d < 0.05)))
+        vals.append(float(np.mean(d < max(0.05, 0.75 * point_spacing(b)))))
     return float(np.mean(vals)) if vals else float("nan")
 
 
@@ -287,6 +307,7 @@ class Snapshot:
     stillness: float = float("nan")
     stamp_ns: int = 0  # the moment the snapshot was taken at (LiDAR stamp, in `clock`)
     clock: str = "header"  # "header" stamps, or "arrival" times when the sensors' clocks disagree
+    note: str = ""  # e.g. how many sweeps the automatic count chose
 
 
 def to_ros2(msg, msgtype: str, ts=TS2):

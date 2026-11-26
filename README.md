@@ -97,7 +97,8 @@ cd calibration
 |---|---|
 | `venv 가 없습니다` | `./install.sh` 를 먼저 실행 |
 | Qt / 화면 관련 오류, 아이콘이 □ 로 보임 | `./install.sh` 를 다시 실행 |
-| 실시간 탐색에 토픽이 안 보임 | 같은 네트워크인지, ROS 2 는 `ROS_DOMAIN_ID` 가 같은지 확인 |
+| 실시간 탐색에 토픽이 안 보임 | 같은 네트워크인지, ROS 2 는 `ROS_DOMAIN_ID` 가 같은지 확인. ROS 1 은 **ROS 1 master** 칸에 `http://<로봇 IP>:11311` |
+| ROS 1 토픽은 보이는데 영상·점군이 안 옴 | 화면의 ⚠ 사유 확인. 대개 로봇 PC 에서 `export ROS_IP=<로봇 IP>` 후 노드를 다시 띄우면 해결 |
 | CAMERA–LiDAR 3D 뷰가 검게 나옴 | 그래픽 드라이버 확인 (원격 접속에서는 3D 뷰가 안 될 수 있음) |
 
 더 많은 증상은 [docs/REFERENCE.md](docs/REFERENCE.md#문제-해결) 에 있습니다.

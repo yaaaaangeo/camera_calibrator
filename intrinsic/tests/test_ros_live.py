@@ -22,7 +22,7 @@ class _FakeBackend:
     def __init__(self):
         self.subscribed, self.closed = [], False
 
-    def subscribe(self, topic, callback):
+    def subscribe(self, topic, callback, on_error=None):
         self.subscribed.append((topic, callback))
 
     def close(self):

@@ -45,7 +45,7 @@ def backend_status_text() -> str:
     ros2 = available_ros2()
     ros2_text = {"rclpy": "ROS 2: rclpy (source 된 ROS 2 사용)",
                  "dds": "ROS 2: DDS 직접 수신 (ROS 설치 불필요)"}.get(ros2, "ROS 2: 받을 수단 없음 (cyclonedds 미설치)")
-    return f"ROS 1: 마스터 직접 접속 ({shared_live.ros1_master_uri()}) · {ros2_text}"
+    return f"ROS 1: master 에 직접 접속 (rospy 불필요) · {ros2_text}"
 
 
 def _require_backend() -> None:
@@ -148,7 +148,7 @@ class LiveTopicSubscriber:
         self._on_frame, self._on_error = on_frame, on_error
         self._running = True
         logger.info("토픽 구독 시작: %s (%s, %s)", topic, chosen.msgtype, chosen.backend)
-        probe.backends[chosen.backend].subscribe(chosen, self._received)
+        probe.backends[chosen.backend].subscribe(chosen, self._received, on_error=self._report_receive_error)
 
     def _received(self, r: shared_live.Received) -> None:
         if not self._running:
@@ -161,6 +161,27 @@ class LiveTopicSubscriber:
         callback = self._on_frame
         if callback is not None:
             callback(img, r.stamp_ns / 1e9)
+
+    def _report_receive_error(self, detail: str) -> None:
+        """토픽은 보이는데 받지 못할 때 (예: ROS 1 퍼블리셔 주소를 이 PC 가 못 찾음)."""
+        logger.warning("토픽 수신 실패: %s", detail)
+        if self._on_error is not None:
+            self._last_error_report_t = time.monotonic()
+            self._on_error(detail)
+
+    @property
+    def ros1_uri(self) -> str | None:
+        return self._ros1_uri
+
+    @ros1_uri.setter
+    def ros1_uri(self, uri: str | None) -> None:
+        """ROS 1 master 주소를 바꾼다 - 다음 탐색부터 쓴다."""
+        if self._running:
+            raise RuntimeError("구독 중에는 master 주소를 바꿀 수 없습니다.")
+        uri = (uri or "").strip() or None
+        if uri != self._ros1_uri:
+            self._ros1_uri = uri
+            self._close_probe()
 
     def _report_decode_error(self, detail: str) -> None:
         # 프레임마다(예: 30fps) 불릴 수 있어 DEBUG 로 남기고, 화면에 알리는 것만 WARNING.

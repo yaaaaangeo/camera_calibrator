@@ -197,9 +197,22 @@ class FilterBox:
         """Which points fall inside, taking the rotation into account."""
         import numpy as np
 
-        pts = np.asarray(xyz, np.float64)
         if self.rotated:
-            pts = (pts - self.center()) @ self.rotation() + self.center()
+            # The cheap axis-aligned bound of the rotated box first: a box is a
+            # board's worth of a room-sized cloud, and the rotation per point is
+            # most of the cost (4.7 s of a 10-sweep board search).
+            raw = np.asarray(xyz)
+            c = self.corners()
+            lo, hi = c.min(axis=0), c.max(axis=0)
+            cand = np.flatnonzero(np.all((raw >= lo) & (raw <= hi), axis=1))
+            out = np.zeros(len(raw), bool)
+            if len(cand):
+                pts = (np.asarray(raw[cand], np.float64) - self.center()) @ self.rotation() + self.center()
+                out[cand] = ((pts[:, 0] >= self.x_min) & (pts[:, 0] <= self.x_max)
+                             & (pts[:, 1] >= self.y_min) & (pts[:, 1] <= self.y_max)
+                             & (pts[:, 2] >= self.z_min) & (pts[:, 2] <= self.z_max))
+            return out
+        pts = np.asarray(xyz, np.float64)
         return (
             (pts[:, 0] >= self.x_min) & (pts[:, 0] <= self.x_max)
             & (pts[:, 1] >= self.y_min) & (pts[:, 1] <= self.y_max)

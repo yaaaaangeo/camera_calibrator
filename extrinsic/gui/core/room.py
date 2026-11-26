@@ -34,6 +34,7 @@ extrinsic, the way `roi_auto.sweep` places scenes from a seed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -422,16 +423,47 @@ TEMPLATE_BRACKET = 0.30
 # the checks: three such "boards" at 23-24 m on the recordings here, while every
 # real board stood within 16 m.
 TEMPLATE_MAX_RANGE = 20.0
+# One sweep sampling a board coarser than this is "sparse": a cloud voxel-
+# downsampled before it was recorded (10-12 cm leaves on the PV5 rig here), or a
+# board far out. A hole 240 mm across is then one or two missing samples, and
+# the checks below are judged on that scale instead of on the dense-cloud one.
+SPARSE_SPACING = 0.06
+# On a sparse board one hole holds only a couple of samples' worth of area, so
+# one stray point is half of "full". A hole is rejected when it holds more than
+# SPARSE_HOLE_FILL of the points solid panel would put there, and the board
+# when all four together hold more than SPARSE_POOLED_FILL.
+SPARSE_HOLE_FILL = 0.5
+SPARSE_POOLED_FILL = 0.25
+# A side of the panel is open when the band just past it holds less than this
+# share of the panel's own fill; a free-standing board needs SPARSE_OPEN_SIDES.
+SPARSE_SIDE_FILL = 0.35
+SPARSE_OPEN_SIDES = 1
+# Sweeps stacked when the count is left to `auto_sweeps` and the cloud is
+# sparse. Each sweep's voxel means land a little differently, so stacking does
+# add samples here, unlike on a spinning sensor's own rings. On the PV5 short
+# recording the narrow camera's answer moved by 5 cm and 0.8 degrees between
+# three moments with one sweep, 2 cm and 0.2 degrees with ten.
+SPARSE_SWEEPS = 10
 
 
-def _plane_points(cloud, box: FilterBox, voxel: float = 0.005, threshold: float = 0.02):
+def auto_sweeps(single) -> tuple[int, str]:
+    """How many sweeps to stack for this cloud, given one sweep of it, and a note."""
+    spacing = sweep_spacing(single)
+    if spacing >= SPARSE_SPACING:
+        return SPARSE_SWEEPS, (f"점군이 다운샘플돼 있어(표본 간격 {spacing * 100:.0f} cm) "
+                               f"스윕 {SPARSE_SWEEPS}개를 쌓았습니다")
+    return 1, ""
+
+
+def _plane_points(cloud, box: FilterBox, voxel: float = 0.005, threshold: float = 0.02,
+                  min_points: int = 50):
     """Board-plane points in the box, and the 2D frame they are expressed in."""
     xyz = np.asarray(cloud, np.float64)[box.mask(cloud)]
     xyz = dl.voxel_down(xyz, voxel)
-    if len(xyz) < 50:
+    if len(xyz) < min_points:
         return None
     normal, d, inliers = dl.fit_plane(xyz, threshold)
-    if normal is None or inliers.sum() < 50:
+    if normal is None or inliers.sum() < min_points:
         return None
     plane = xyz[inliers]
     centre, rot, _, _ = _patch_frame(plane)
@@ -523,6 +555,141 @@ def _hole_offsets(target: Target) -> np.ndarray:
     return np.array([[-w, h], [w, h], [w, -h], [-w, -h]])
 
 
+@lru_cache(maxsize=32)
+def _template_kernels(pw: float, ph: float, holes: tuple, r: float, r_empty: float, cell: float):
+    """[(angle, flipped kernel)] for the coarse search -- see `fit_board_template`.
+
+    Depends only on the target and the raster, so it is built once per board
+    size rather than once per candidate box (11 s of a 10-sweep search).
+    """
+    holes = np.asarray(holes)
+    half = int(np.ceil(max(np.hypot(pw, ph) / 2, np.abs(holes).max() + TEMPLATE_RING_OUT * r) / cell)) + 1
+    g = (np.arange(-half, half + 1)) * cell
+    gx, gy = np.meshgrid(g, g)
+    out = []
+    for ang in np.radians(np.arange(-15.0, 15.01, 1.0)):
+        c, s_ = np.cos(ang), np.sin(ang)
+        k = np.zeros_like(gx)
+        lx, ly = c * gx + s_ * gy, -s_ * gx + c * gy  # kernel grid in the board's own axes
+        panel = (np.abs(lx) < pw / 2 - 0.03) & (np.abs(ly) < ph / 2 - 0.03)
+        for hx, hy in holes:
+            panel &= np.hypot(lx - hx, ly - hy) > TEMPLATE_RING_IN * r
+        k[panel] += TEMPLATE_PANEL_WEIGHT / max(panel.sum(), 1)
+        for hx, hy in holes:
+            px, py = c * hx - s_ * hy, s_ * hx + c * hy
+            d = np.hypot(gx - px, gy - py)
+            ring = (d > TEMPLATE_RING_IN * r) & (d < TEMPLATE_RING_OUT * r)
+            k[ring] += 1.0 / ring.sum()
+            # Normalised like the rewards. As a flat -0.5 per cell it came to
+            # about -100 for four slightly filled holes against at most +6 of
+            # reward, and the best score was wherever there was nothing at all
+            # -- below the board.
+            disc = d < r_empty
+            k[disc] -= TEMPLATE_HOLE_WEIGHT / max(disc.sum(), 1)
+        kf = np.ascontiguousarray(k[::-1, ::-1])
+        kf.setflags(write=False)
+        out.append((float(ang), kf))
+    return tuple(out)
+
+
+def _best_shift(img: np.ndarray, kernels, lo: np.ndarray, cell: float):
+    """(score, angle, shift) of the best kernel placement -- `fftconvolve(img, k, "same")`
+    for every angle, with the image transformed once instead of once per angle."""
+    from scipy import fft as sfft
+
+    kshape = np.array(kernels[0][1].shape)
+    full = np.array(img.shape) + kshape - 1
+    fs = tuple(sfft.next_fast_len(int(n), real=True) for n in full)
+    fimg = sfft.rfft2(img, fs)
+    start = (full - np.array(img.shape)) // 2
+    best = None
+    for ang, kf in kernels:
+        score = sfft.irfft2(fimg * sfft.rfft2(kf, fs), fs)
+        score = score[start[0]:start[0] + img.shape[0], start[1]:start[1] + img.shape[1]]
+        j = np.unravel_index(np.argmax(score), score.shape)
+        if best is None or score[j] > best[0]:
+            best = (score[j], ang, np.array([j[1], j[0]]) * cell + lo)
+    return best
+
+
+def _open_sides(uv: np.ndarray, angle: float, centre: np.ndarray, target: Target, spacing: float):
+    """(how many of the panel's four sides are open, each side's fill vs the panel's).
+
+    A board is a panel standing on its own: past its edges, on its plane, there
+    is nothing -- or, for a board in a stack, the next board above or below,
+    which still leaves the sides open. A board-like spot on a wall has wall
+    all round. Fill is the share of `spacing`-sized cells holding a point, in a
+    band just outside each edge, against the same share on the panel itself.
+    """
+    c, s_ = np.cos(angle), np.sin(angle)
+    loc = (uv - centre) @ np.array([[c, -s_], [s_, c]])
+    pw, ph = panel_size(target, margin=0.0)
+    cell = max(spacing, 0.04)
+
+    def fill(m):
+        if not m.any():
+            return 0.0, 0
+        return float(len(np.unique(np.floor(loc[m] / cell).astype(int), axis=0))), 1
+
+    def cells(w, h):
+        return max((w / cell) * (h / cell), 1.0)
+
+    lo_b, hi_b = 0.06, 0.06 + max(2 * cell, 0.15)
+    ix, iy = np.abs(loc[:, 0]) < pw / 2 - 0.05, np.abs(loc[:, 1]) < ph / 2 - 0.05
+    panel = (np.abs(loc[:, 0]) < pw / 2) & (np.abs(loc[:, 1]) < ph / 2)
+    ref = fill(panel)[0] / cells(pw, ph)
+    sides = []
+    for axis, sign, along in ((0, -1, iy), (0, 1, iy), (1, 1, ix), (1, -1, ix)):  # left, right, top, bottom
+        edge = (pw if axis == 0 else ph) / 2
+        d = sign * loc[:, axis] - edge
+        m = along & (d > lo_b) & (d < hi_b)
+        length = (ph if axis == 0 else pw) - 0.1
+        sides.append(fill(m)[0] / cells(length, hi_b - lo_b) / max(ref, 1e-9))
+    return sum(f < SPARSE_SIDE_FILL for f in sides), [round(f, 2) for f in sides]
+
+
+def _outline_shift(uv: np.ndarray, angle: float, centre: np.ndarray, target: Target, spacing: float,
+                   side_fill: list) -> np.ndarray:
+    """How far to move a sparse board's centre (in `uv`) so it sits midway between its edges.
+
+    Only along an axis whose two sides are both open (`_open_sides`), and only
+    when the edges found are a panel's width apart: past a closed side the
+    "edge" is the next board or the stand. Each row of samples gives its first
+    and last point; the medians are the edges. Both are pulled inwards by the
+    same sampling, so their midpoint is unbiased even though the width is not.
+
+    On the PV5 recording (10 cm voxels, ten sweeps) this took the median lateral
+    miss of the boards against the narrow camera from 24 to 19 mm, and the image
+    error from 9.2 to 8.0 px (narrow) and 4.2 to 3.8 px (wide).
+    """
+    c, s_ = np.cos(angle), np.sin(angle)
+    M = np.array([[c, -s_], [s_, c]])  # columns: the board's x and y axes in uv
+    loc = (uv - centre) @ M
+    pw, ph = panel_size(target, margin=0.0)
+    step = max(spacing, 0.04)
+    shift = np.zeros(2)
+    for ax, ext, other, (a, b) in ((0, pw, ph, (0, 1)), (1, ph, pw, (2, 3))):
+        if side_fill[a] >= SPARSE_SIDE_FILL or side_fill[b] >= SPARSE_SIDE_FILL:
+            continue
+        o = 1 - ax
+        q = loc[(np.abs(loc[:, o]) < other / 2 - 0.08) & (np.abs(loc[:, ax]) < ext / 2 + 0.15)]
+        if len(q) < 20:
+            continue
+        rows = np.floor(q[:, o] / step).astype(int)
+        lo, hi = [], []
+        for k in np.unique(rows):
+            v = q[rows == k, ax]
+            if len(v) >= 2:
+                lo.append(v.min())
+                hi.append(v.max())
+        if len(lo) < 3:
+            continue
+        left, right = float(np.median(lo)), float(np.median(hi))
+        if ext - 0.15 < right - left < ext + 0.2:
+            shift[ax] = (left + right) / 2
+    return M @ shift
+
+
 def fit_board_template(cloud, box: FilterBox, target: Target, spacing: float = 0.0):
     """Fit the whole hole pattern at once, for boards too sparse to find holes one by one.
 
@@ -543,9 +710,14 @@ def fit_board_template(cloud, box: FilterBox, target: Target, spacing: float = 0
     Returns a LidarDetection (method "template") or one with ok False and a reason.
     """
     from scipy.optimize import minimize
-    from scipy.signal import fftconvolve
 
-    got = _plane_points(cloud, box)
+    # `spacing` is one sweep's, so stacking sweeps of a downsampled cloud -- which
+    # crowds points around the same few positions -- does not make it look dense.
+    sparse = spacing >= SPARSE_SPACING
+    # A downsampled merged cloud is a centimetre or two thick (each point is the
+    # mean of a voxel, and the units disagree by that much), so its plane is too.
+    got = (_plane_points(cloud, box, threshold=float(np.clip(0.3 * spacing, 0.02, 0.04)), min_points=30)
+           if sparse else _plane_points(cloud, box))
     if got is None:
         return dl.LidarDetection(False, method="template", reason="평면을 찾지 못했습니다")
     plane, uv, centre, rot, rms = got
@@ -560,7 +732,9 @@ def fit_board_template(cloud, box: FilterBox, target: Target, spacing: float = 0
     holes = _hole_offsets(target)
 
     # ---- coarse: angle grid x FFT over shifts
-    cell = 0.01
+    # A sparse board has a sample every 10 cm; a 1 cm raster of it is mostly
+    # empty cells, and the fine fit below finds the centimetres anyway.
+    cell = 0.02 if sparse else 0.01
     lo = uv.min(axis=0) - 0.3
     size = np.ceil((uv.max(axis=0) + 0.3 - lo) / cell).astype(int)
     # Presence, not count, and each point grown by its own sampling gap. A board
@@ -580,8 +754,12 @@ def fit_board_template(cloud, box: FilterBox, target: Target, spacing: float = 0
     # so one board can have lines 3 cm apart at its top and 15 cm at its bottom.
     ij = np.floor((uv - lo) / cell).astype(int)
     nn, _ = cKDTree(uv).query(uv, k=4)
-    across = local_line_gap(uv)
+    # Sparse: the sample spacing floors the gap below, and is larger than any
+    # line spacing measured here -- skip the (per-point, slow) measurement.
+    across = 0.0 if sparse else local_line_gap(uv)
     gap = np.clip(np.maximum(np.median(nn[:, 1:], axis=1), across), cell, TEMPLATE_MAX_GAP)
+    if sparse:
+        gap = np.maximum(gap, min(spacing, TEMPLATE_MAX_GAP))
     grow = np.clip(np.round(0.6 * gap / cell).astype(int), 0, int(round(0.6 * TEMPLATE_MAX_GAP / cell)))
     img = np.zeros((size[1], size[0]), bool)
     from scipy import ndimage
@@ -606,33 +784,8 @@ def fit_board_template(cloud, box: FilterBox, target: Target, spacing: float = 0
     # the space below is as empty as any hole and the rim above still counts;
     # that is where it went on a sparse AT128 board.
     pw, ph = panel_size(target)
-    half = int(np.ceil(max(np.hypot(pw, ph) / 2, np.abs(holes).max() + TEMPLATE_RING_OUT * r) / cell)) + 1
-    g = (np.arange(-half, half + 1)) * cell
-    gx, gy = np.meshgrid(g, g)
-    best = None
-    for ang in np.radians(np.arange(-15.0, 15.01, 1.0)):
-        c, s_ = np.cos(ang), np.sin(ang)
-        k = np.zeros_like(gx)
-        lx, ly = c * gx + s_ * gy, -s_ * gx + c * gy  # kernel grid in the board's own axes
-        panel = (np.abs(lx) < pw / 2 - 0.03) & (np.abs(ly) < ph / 2 - 0.03)
-        for hx, hy in holes:
-            panel &= np.hypot(lx - hx, ly - hy) > TEMPLATE_RING_IN * r
-        k[panel] += TEMPLATE_PANEL_WEIGHT / max(panel.sum(), 1)
-        for hx, hy in holes:
-            px, py = c * hx - s_ * hy, s_ * hx + c * hy
-            d = np.hypot(gx - px, gy - py)
-            ring = (d > TEMPLATE_RING_IN * r) & (d < TEMPLATE_RING_OUT * r)
-            k[ring] += 1.0 / ring.sum()
-            # Normalised like the rewards. As a flat -0.5 per cell it came to
-            # about -100 for four slightly filled holes against at most +6 of
-            # reward, and the best score was wherever there was nothing at all
-            # -- below the board.
-            disc = d < r_empty
-            k[disc] -= TEMPLATE_HOLE_WEIGHT / max(disc.sum(), 1)
-        score = fftconvolve(img, k[::-1, ::-1], mode="same")
-        j = np.unravel_index(np.argmax(score), score.shape)
-        if best is None or score[j] > best[0]:
-            best = (score[j], ang, np.array([j[1], j[0]]) * cell + lo)
+    kernels = _template_kernels(pw, ph, tuple(map(tuple, holes)), r, round(r_empty, 5), cell)
+    best = _best_shift(img, kernels, lo, cell)
     _, ang0, t0 = best
 
     # ---- fine: rigid pattern, holes as empty as possible
@@ -670,7 +823,7 @@ def fit_board_template(cloud, box: FilterBox, target: Target, spacing: float = 0
     # spot with panel on both sides of it across the scan lines, within
     # TEMPLATE_BRACKET, counts as panel.
     H, W = img.shape
-    along_dir = scan_direction(uv)
+    along_dir = None if sparse else scan_direction(uv)
     across_dir = None if along_dir is None else np.array([-along_dir[1], along_dir[0]])
 
     def bracketed(pts: np.ndarray) -> np.ndarray:
@@ -686,13 +839,18 @@ def fit_board_template(cloud, box: FilterBox, target: Target, spacing: float = 0
             out[i] = bool(np.any(near_line & (c_ > 0)) and np.any(near_line & (c_ < 0)))
         return out
 
-    radii, reasons, covers = [], [], []
+    # The disc that must be empty. On a sparse cloud each point stands for a
+    # whole sample cell, and the cells cut by the rim keep a point on their solid
+    # side, up to half a cell inside the drawn edge -- so the disc is smaller.
+    r_in = (float(np.clip(r - 0.4 * spacing, 0.4 * r, TEMPLATE_EMPTY * r)) if sparse else TEMPLATE_EMPTY * r)
+    radii, reasons, covers, fills = [], [], [], []
     for k_, c2 in enumerate(centres2d):
         d = np.linalg.norm(uv - c2, axis=1)
-        inside = int((d < TEMPLATE_EMPTY * r).sum())
+        inside = int((d < r_in).sum())
         ring = uv[(d > TEMPLATE_RING_IN * r) & (d < TEMPLATE_RING_OUT * r)] - c2
         ring_density = len(ring) / (np.pi * r * r * (TEMPLATE_RING_OUT ** 2 - TEMPLATE_RING_IN ** 2))
-        inside_density = inside / (np.pi * (TEMPLATE_EMPTY * r) ** 2)
+        inside_density = inside / (np.pi * r_in ** 2)
+        fills.append((inside, ring_density * np.pi * r_in ** 2))
         covered = drawn = 0
         for sec in range(12):
             a0 = sec / 12 * 2 * np.pi
@@ -714,10 +872,29 @@ def fit_board_template(cloud, box: FilterBox, target: Target, spacing: float = 0
         cover = covered / 12
         covers.append((drawn / 12, cover))
         radii.append(float(np.sort(d)[:kn].mean()))
-        if inside_density > TEMPLATE_STRAY_DENSITY * max(ring_density, 1e-9):
+        if sparse:
+            pass  # judged below, over all four holes
+        elif inside_density > TEMPLATE_STRAY_DENSITY * max(ring_density, 1e-9):
             reasons.append(f"구멍{k_ + 1} 안에 점 {inside}개 (둘레 밀도의 {inside_density / max(ring_density, 1e-9):.0%})")
         if cover < TEMPLATE_RING_COVER:
             reasons.append(f"구멍{k_ + 1} 둘레 {cover:.0%}만 패널")
+    open_sides = _open_sides(uv, x[0], centres2d.mean(axis=0), target, spacing) if sparse else None
+    if sparse:
+        if open_sides is not None and open_sides[0] < SPARSE_OPEN_SIDES:
+            reasons.append(f"패널 둘레가 {4 - open_sides[0]}면 막혀 있음 — 벽 위의 무늬")
+        got_in, expect = np.array(fills).T
+        share = got_in / np.maximum(expect, 1e-9)
+        pooled = got_in.sum() / max(expect.sum(), 1e-9)
+        for k_ in np.flatnonzero(share > SPARSE_HOLE_FILL):
+            reasons.append(f"구멍{k_ + 1} 안에 점 {int(got_in[k_])}개 (패널이면 {expect[k_]:.1f}개, {share[k_]:.0%})")
+        if pooled > SPARSE_POOLED_FILL:
+            reasons.append(f"구멍 4개 안 점이 패널 밀도의 {pooled:.0%}")
+        if not reasons and open_sides is not None:
+            # Holes a sample or two across place the pattern only to the sample
+            # grid. Where the panel stands free on both sides of an axis, its two
+            # edges -- each seen along every row of samples -- centre it better.
+            shift = _outline_shift(uv, x[0], centres2d.mean(axis=0), target, spacing, open_sides[1])
+            centres2d = centres2d + shift
     centres = np.array([centre + rot[:, :2] @ c2 for c2 in centres2d])
     reach = float(np.linalg.norm(centres.mean(axis=0)))
     if reach > TEMPLATE_MAX_RANGE:
@@ -728,7 +905,7 @@ def fit_board_template(cloud, box: FilterBox, target: Target, spacing: float = 0
         reason="; ".join(reasons) if reasons else "보드 모델 정합",
     )
     det.template_angle_deg = float(np.degrees(x[0]))
-    det.template_debug = {"raster": img, "origin": lo, "cell": cell, "coarse": (float(ang0), t0), "gap": float(np.median(gap)),
+    det.template_debug = {"raster": img, "origin": lo, "cell": cell, "coarse": (float(ang0), t0), "gap": float(np.median(gap)), "fills": fills, "sparse": sparse, "open": open_sides,
                           "cover": covers}
     return det
 
@@ -874,6 +1051,15 @@ def _add_board(boards: list, det, box, size) -> None:
     boards.append(LidarBoard("", c, box, det, size))
 
 
+def sweep_spacing(xyz) -> float:
+    """Median nearest-neighbour distance of one sweep within 15 m (see SPARSE_SPACING)."""
+    xyz = np.asarray(xyz)
+    if not len(xyz):
+        return 0.0
+    r = np.linalg.norm(xyz, axis=1)
+    return dl.point_spacing(xyz[(r > 0.8) & (r < 15.0)])
+
+
 def find_lidar_boards(cloud: np.ndarray, single: np.ndarray | None, target: Target,
                       method: str = "occupancy", max_range: float = 25.0,
                       min_range: float = 0.8, voxels=(0.03, 0.05), complete: bool = True,
@@ -896,11 +1082,20 @@ def find_lidar_boards(cloud: np.ndarray, single: np.ndarray | None, target: Targ
         xyz = cloud[roi_mask(cloud, roi)]
     r = np.linalg.norm(xyz, axis=1)
     near = xyz[(r > min_range) & (r < max_range)]
+    spacing = sweep_spacing(single if single is not None and len(single) else near)
+    sparse = spacing >= SPARSE_SPACING
+    if sparse:
+        # A downsampled cloud: segment at its own sample size. Finer, the sweeps
+        # stacked around each sample read as separate jittery blobs and a board
+        # broke into a dozen pieces (280 patches, 22 s, on the PV5 recording);
+        # at the sample size every board came out whole (155 patches, 0.4 s).
+        voxels = (float(np.clip(1.05 * spacing, 0.06, 0.2)),)
     # Two scales: the finer keeps neighbouring boards apart, the coarser holds a
     # noisy board together. A merged cloud from several units carries a few
     # millimetres of disagreement between them, which breaks fine normals.
-    patches = [p for v in voxels for p in planar_patches(near, voxel=v)]
-    stats = {"patches": len(patches), "sized": 0, "stacked": 0, "detected": 0, "points": stats_in, "searched": len(near)}
+    patches = [p for v in voxels for p in planar_patches(near, voxel=v, min_points=25 if sparse else 60)]
+    stats = {"patches": len(patches), "sized": 0, "stacked": 0, "detected": 0, "points": stats_in,
+             "searched": len(near), "spacing": spacing, "sparse": sparse}
 
     boards: list[LidarBoard] = []
     tried: list[np.ndarray] = []
@@ -928,8 +1123,10 @@ def find_lidar_boards(cloud: np.ndarray, single: np.ndarray | None, target: Targ
             tried.append(centre)
             stats["sized"] += 1
             box = box_for_patch(centre, rot, target)
+            # A sparse board never shows its holes to the hole detector, so no
+            # window could prove the stack and the model fit is all there is.
             det = detect_in_box(cloud, single, box, target, method, complete=complete,
-                                template=template and not windowed)
+                                template=template and (sparse or not windowed))
             if not det.ok:
                 later.append(box)
                 continue
@@ -1606,10 +1803,96 @@ class Capture:
     n_sweeps: int
     intensity: np.ndarray | None
     stamp_ns: int = 0  # recording time of that moment
+    note: str = ""  # e.g. that the moment was moved to where the vehicle stands still
+
+
+# A LiDAR sample counts as standing still when nearly as many of its points
+# lie within a few centimetres of the samples STILL_GAP_S before and after it as
+# on the quietest stretch of the recording (its 90th percentile, less
+# STILL_MARGIN, and never below STILL_OVERLAP). Compared one second apart, a
+# vehicle creeping at 10 cm/s still overlapped itself; three seconds apart it
+# reads 0.42-0.71 on the PV5 recording against 0.89-0.95 while parked.
+STILL_OVERLAP = 0.85
+STILL_MARGIN = 0.06
+STILL_GAP_S = 3
+STILL_STEP_S = 1.0
+STILL_MAX_SAMPLES = 120
+
+
+def _sample_cloud(msg, cap: int = 20000) -> np.ndarray:
+    from gui.core.decode import cloud_to_struct
+
+    rec = cloud_to_struct(msg)
+    xyz = np.column_stack([rec["x"], rec["y"], rec["z"]]).astype(np.float32)
+    xyz = xyz[np.isfinite(xyz).all(axis=1)]
+    r = np.linalg.norm(xyz, axis=1)
+    xyz = xyz[(r > 1.0) & (r < 15.0)]
+    return xyz[:: max(1, len(xyz) // cap)]
+
+
+def still_moment(src, topic: str, t_ns: int) -> tuple[int, str]:
+    """`t_ns`, or the middle of the nearest stretch where the scene stands still, and a note.
+
+    Calibration needs the vehicle and the boards to stand still, but a recording
+    often goes on after that: the PV5 calibration bag is parked for its first
+    18 s and driving for the remaining 41, so its middle -- the default moment
+    -- was taken on the move, and stacking sweeps there smeared every board.
+    Samples the LiDAR about once a second and compares each with its neighbours.
+    """
+    stamps = sorted(src.timestamps(topic))
+    if len(stamps) < 3:
+        return t_ns, ""
+    step = max(int(STILL_STEP_S * 1e9), (stamps[-1] - stamps[0]) // STILL_MAX_SAMPLES)
+    times, clouds, nxt = [], [], stamps[0]
+    for st in stamps:
+        if st < nxt:
+            continue
+        nxt = st + step
+        _, msg = src.first_after(topic, st)
+        if msg is None:
+            continue
+        times.append(st)
+        clouds.append(_sample_cloud(msg))
+    if len(clouds) < 3 or min(len(c) for c in clouds) < 100:
+        return t_ns, ""
+    # Each point of a downsampled cloud is a voxel's mean and moves by a few
+    # centimetres from sweep to sweep on its own, so the tolerance follows the
+    # sample spacing.
+    tol = max(0.05, 0.75 * dl.point_spacing(clouds[len(clouds) // 2]))
+    # Short recordings get a shorter gap, so every sample still has a partner.
+    gap = max(1, min(int(round(STILL_GAP_S * 1e9 / step)), (len(clouds) - 1) // 2))
+    ov = [float(np.mean(cKDTree(a).query(b, k=1, distance_upper_bound=tol)[0] < tol))
+          for a, b in zip(clouds, clouds[gap:])]
+    thr = max(STILL_OVERLAP, float(np.percentile(ov, 90)) - STILL_MARGIN)
+    still = []
+    for k in range(len(clouds)):
+        pair = [ov[i] for i in (k - gap, k) if 0 <= i < len(ov)]
+        still.append(bool(pair) and min(pair) >= thr)
+    times = np.asarray(times)
+    k = int(np.argmin(np.abs(times - t_ns)))
+    if still[k]:
+        return t_ns, ""
+    runs, a = [], None
+    for i, ok in enumerate(still + [False]):
+        if ok and a is None:
+            a = i
+        elif not ok and a is not None:
+            runs.append((a, i - 1))
+            a = None
+    sec = lambda t: (t - stamps[0]) / 1e9  # noqa: E731
+    if not runs:
+        return t_ns, ("⚠ 녹화 내내 차량이나 보드가 움직입니다 — 정지한 상태에서 다시 녹화하세요 "
+                      "(움직이는 중의 캡처는 보드가 번지고 카메라와 시각이 어긋납니다)")
+    # The longest still stretch, the nearest of equals: a moment's pause while
+    # driving is not where the boards were set up for.
+    lo, hi = min(runs, key=lambda r: (-(r[1] - r[0]), min(abs(times[r[0]] - t_ns), abs(times[r[1]] - t_ns))))
+    t = int((times[lo] + times[hi]) // 2)
+    return t, (f"요청한 시점({sec(t_ns):.0f}s)에는 차량이나 보드가 움직이고 있어, 정지 구간 "
+               f"{sec(times[lo]):.0f}~{sec(times[hi]):.0f}s 의 가운데({sec(t):.0f}s)를 씁니다")
 
 
 def load_capture_multi(bag: str, lidar_topic, camera_topics, at: float = 0.5,
-                       sweeps: int = 1, frames: int = 1) -> Capture:
+                       sweeps: int = 1, frames: int = 1, still: bool = True) -> Capture:
     """The LiDAR and every camera in `camera_topics`, around one moment of a recording.
 
     The room stands still, so no scene picking is needed: the middle of the
@@ -1622,13 +1905,24 @@ def load_capture_multi(bag: str, lidar_topic, camera_topics, at: float = 0.5,
     sends far more than the ground to `ground_points` -- everything above about
     2 m at board range, the two elevated boards included -- so the whole scene
     is only there when both halves are read.
+
+    With `still`, a moment where the scene is moving is replaced by the nearest
+    one where it stands still (`still_moment`); `Capture.note` says so. A
+    `sweeps` of 0 lets `auto_sweeps` choose.
     """
     from gui.core.bag_reader import BagSource, accumulate_cloud, sweep_window
     from gui.core.decode import image_to_bgr
 
     topics = [t.strip() for t in lidar_topic.split(",")] if isinstance(lidar_topic, str) else list(lidar_topic)
+    notes = []
     with BagSource(bag) as src:
         t = src.at_fraction(at)
+        if still and topics:
+            t, note = still_moment(src, topics[0], t)
+            notes.append(note)
+        if sweeps <= 0:  # automatic: see auto_sweeps
+            sweeps, note = auto_sweeps(accumulate_cloud(src, topics[0], t, 1)[2]) if topics else (1, "")
+            notes.append(note)
         parts = [accumulate_cloud(src, tp, t, sweeps) for tp in topics if tp]
         cloud = np.vstack([p[0] for p in parts])
         n = min(p[1] for p in parts)
@@ -1653,7 +1947,7 @@ def load_capture_multi(bag: str, lidar_topic, camera_topics, at: float = 0.5,
                     if msg is not None:
                         imgs.append(image_to_bgr(msg))
             images[cam] = imgs
-    return Capture(cloud, single, ring, images, n, intensity, int(t))
+    return Capture(cloud, single, ring, images, n, intensity, int(t), "\n".join(n_ for n_ in notes if n_))
 
 
 # A principal point further than this from the image centre, as a fraction of

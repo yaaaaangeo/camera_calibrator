@@ -100,7 +100,8 @@ def main(argv=None):
     ap.add_argument("--layouts", default=None,
                     help="보드별 마커 id (TL,TR,BR,BL), ';' 로 구분. 생략하면 모든 보드가 1,2,4,3")
     ap.add_argument("--method", default="occupancy", help="LiDAR 구멍 검출 방식: occupancy(기본, 실패 시 template 재시도) / template")
-    ap.add_argument("--sweeps", type=int, default=1)
+    ap.add_argument("--sweeps", type=int, default=0,
+                    help="쌓을 LiDAR 스윕 수. 0(기본)=자동: 보통 1, 다운샘플된 점군이면 10")
     ap.add_argument("--frames", type=int, default=1)
     ap.add_argument("--at", type=float, default=0.5)
     ap.add_argument("--out", default=None, help="세션 폴더를 직접 지정")
@@ -131,6 +132,8 @@ def main(argv=None):
     sid = session.session_id(cap.stamp_ns)
     print(f"입력: 스윕 {cap.n_sweeps}개 {len(cap.cloud):,}점, 카메라 {len(cams)}대 "
           f"({', '.join(f'{n} {len(cap.images[t])}장' for t, n, _ in cams)})  ({time.time() - t0:.1f}s)")
+    for line in cap.note.splitlines():
+        print("  " + line)
 
     t0 = time.time()
     lidar, stats = room.find_lidar_boards(cap.cloud, cap.single, target, args.method, roi=roi or None)
